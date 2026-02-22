@@ -1,0 +1,37 @@
+[]endpoint endpoints:
+    |allow = [@admin, @public]
+
+    .healthCheck:
+        path = "/health"
+
+    - Primary:
+        address = "http://localhost:8004"
+
+    - Secondary:
+        address = "localhost:8001"
+
+
+[]resource resources:
+    - Home:
+        |allow = [@public]
+        path = "/"
+
+    - Dashboard:
+        |allow = [@private]
+        path = "/dashboard"
+
+    - UserProfile:
+        path = "/user/{*}"
+
+    - "/static/assets"
+
+
+service FullService:
+    |allow:
+        - @role/admin
+        - @public
+    |deny = []
+
+    localMount = "/"
+    resources = resources
+    endpoints = endpoints

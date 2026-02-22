@@ -1,0 +1,23 @@
+roleTemplate @admin:
+    label = "Nudge Admin"
+    description = ""
+    members:
+        - @user/gmatty@gmail.com
+
+roleTemplate @role/admin:
+    label = "Admin Role"
+    members:
+        - @user/gmatty@gmail.com
+
+roleTemplate @nudge:research/admin:
+    label = "Research Admin"
+    description = ""
+
+roleTemplate @nudge:marketing/admin:
+    label = "Marketing Admin"
+    members:
+        - @user/gmatty
+        - @email/gmatty@gmail.com
+
+roleTemplate @role/pro-user:
+    label = "Pro User Role"

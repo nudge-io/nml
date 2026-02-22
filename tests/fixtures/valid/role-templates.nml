@@ -1,0 +1,11 @@
+roleTemplate @admin:
+    label = "Admin"
+    description = "Full administrative access"
+    members:
+        - @user/admin@example.com
+
+roleTemplate @role/editor:
+    label = "Editor"
+    members:
+        - @user/editor1@example.com
+        - @user/editor2@example.com

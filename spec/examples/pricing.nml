@@ -1,0 +1,22 @@
+subscription ProPlan:
+    name = "Professional"
+    monthlyPrice = 29.99 USD
+    annualPrice = 299.99 USD
+    trialDays = 30
+    maxSeats = 50
+
+subscription EnterprisePlan:
+    name = "Enterprise"
+    monthlyPrice = 99.99 USD
+    annualPrice = 999.99 USD
+    trialDays = 14
+
+multiRegionPricing UKPricing:
+    region = "uk"
+    price = 24.99 GBP
+    taxRate = 0.20
+
+multiRegionPricing EUPricing:
+    region = "eu"
+    price = 27.99 EUR
+    taxRate = 0.19

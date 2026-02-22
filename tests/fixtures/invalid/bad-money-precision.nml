@@ -1,0 +1,3 @@
+subscription BadPlan:
+    name = "Bad"
+    monthlyPrice = 19.999 USD

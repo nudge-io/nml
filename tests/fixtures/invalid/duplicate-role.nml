@@ -1,0 +1,6 @@
+// Duplicate roleTemplate declarations for the same name
+roleTemplate @role/admin:
+    label = "Admin"
+
+roleTemplate @role/admin:
+    label = "Duplicate Admin"

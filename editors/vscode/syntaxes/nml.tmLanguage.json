@@ -1,0 +1,198 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "NML",
+  "scopeName": "source.nml",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#array-declaration" },
+    { "include": "#block-declaration" },
+    { "include": "#body" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.double-slash.nml",
+      "match": "//.*$"
+    },
+    "array-declaration": {
+      "match": "^(\\[\\])(\\w[\\w-]*)\\s+(\\w[\\w-]*)(:)",
+      "captures": {
+        "1": { "name": "punctuation.definition.array.nml" },
+        "2": { "name": "storage.type.nml" },
+        "3": { "name": "entity.name.type.nml" },
+        "4": { "name": "punctuation.separator.colon.nml" }
+      }
+    },
+    "block-declaration": {
+      "match": "^(model|trait|enum|service|resource|endpoint|roleTemplate|role|member|restriction|webServer|peer|accessControl|packageView|webPackages|action|trigger|postmark)\\s+([^:]+)(:)",
+      "captures": {
+        "1": { "name": "storage.type.nml" },
+        "2": { "name": "entity.name.type.nml" },
+        "3": { "name": "punctuation.separator.colon.nml" }
+      }
+    },
+    "body": {
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#modifier" },
+        { "include": "#shared-property" },
+        { "include": "#list-item-named" },
+        { "include": "#list-item-string" },
+        { "include": "#list-item-role-ref" },
+        { "include": "#list-item-ref" },
+        { "include": "#property" },
+        { "include": "#nested-block" },
+        { "include": "#value" }
+      ]
+    },
+    "modifier": {
+      "match": "(\\|)(\\w+)\\s*(=)?",
+      "captures": {
+        "1": { "name": "keyword.operator.modifier.nml" },
+        "2": { "name": "keyword.other.modifier.nml" },
+        "3": { "name": "keyword.operator.assignment.nml" }
+      }
+    },
+    "shared-property": {
+      "match": "(\\.)([\\w-]+)(:)",
+      "captures": {
+        "1": { "name": "keyword.operator.shared.nml" },
+        "2": { "name": "variable.other.shared.nml" },
+        "3": { "name": "punctuation.separator.colon.nml" }
+      }
+    },
+    "list-item-named": {
+      "match": "^(\\s*)(-)\\s+(\\w[\\w-]*)(:)",
+      "captures": {
+        "2": { "name": "punctuation.definition.list.nml" },
+        "3": { "name": "entity.name.tag.nml" },
+        "4": { "name": "punctuation.separator.colon.nml" }
+      }
+    },
+    "list-item-string": {
+      "match": "^(\\s*)(-)\\s+(\"[^\"]*\")",
+      "captures": {
+        "2": { "name": "punctuation.definition.list.nml" },
+        "3": { "name": "string.quoted.double.nml" }
+      }
+    },
+    "list-item-role-ref": {
+      "match": "^(\\s*)(-)\\s+(@[\\w/:@{}.+-]+)",
+      "captures": {
+        "2": { "name": "punctuation.definition.list.nml" },
+        "3": { "name": "variable.other.role-ref.nml" }
+      }
+    },
+    "list-item-ref": {
+      "match": "^(\\s*)(-)\\s+(\\w[\\w-]*)",
+      "captures": {
+        "2": { "name": "punctuation.definition.list.nml" },
+        "3": { "name": "variable.other.reference.nml" }
+      }
+    },
+    "property": {
+      "match": "([\\w-]+)\\s*(=)\\s*",
+      "captures": {
+        "1": { "name": "variable.other.property.nml" },
+        "2": { "name": "keyword.operator.assignment.nml" }
+      }
+    },
+    "nested-block": {
+      "match": "^(\\s+)([\\w-]+)(:)\\s*$",
+      "captures": {
+        "2": { "name": "variable.other.block.nml" },
+        "3": { "name": "punctuation.separator.colon.nml" }
+      }
+    },
+    "value": {
+      "patterns": [
+        { "include": "#string" },
+        { "include": "#money-literal" },
+        { "include": "#number" },
+        { "include": "#boolean" },
+        { "include": "#secret-ref" },
+        { "include": "#role-ref" },
+        { "include": "#array-literal" },
+        { "include": "#constraint" },
+        { "include": "#type-annotation" }
+      ]
+    },
+    "string": {
+      "name": "string.quoted.double.nml",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.nml",
+          "match": "\\\\[\"\\\\nt]"
+        },
+        {
+          "name": "variable.other.placeholder.nml",
+          "match": "\\{[^}]*\\}"
+        }
+      ]
+    },
+    "money-literal": {
+      "match": "\\b(\\d+\\.?\\d*)\\s+([A-Z]{3})\\b",
+      "captures": {
+        "1": { "name": "constant.numeric.money.nml" },
+        "2": { "name": "constant.other.currency.nml" }
+      }
+    },
+    "number": {
+      "name": "constant.numeric.nml",
+      "match": "-?\\b\\d+(\\.\\d+)?\\b"
+    },
+    "boolean": {
+      "name": "constant.language.boolean.nml",
+      "match": "\\b(true|false)\\b"
+    },
+    "secret-ref": {
+      "name": "variable.other.secret.nml",
+      "match": "\\$ENV\\.[A-Za-z_][A-Za-z0-9_]*"
+    },
+    "role-ref": {
+      "name": "variable.other.role-ref.nml",
+      "match": "@[\\w/:@{}.+-]+"
+    },
+    "array-literal": {
+      "begin": "\\[",
+      "end": "\\]",
+      "beginCaptures": { "0": { "name": "punctuation.definition.array.begin.nml" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.array.end.nml" } },
+      "patterns": [
+        { "include": "#value" },
+        {
+          "name": "punctuation.separator.comma.nml",
+          "match": ","
+        }
+      ]
+    },
+    "constraint": {
+      "begin": "<",
+      "end": ">",
+      "beginCaptures": { "0": { "name": "punctuation.definition.constraint.begin.nml" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.constraint.end.nml" } },
+      "name": "meta.constraint.nml",
+      "patterns": [
+        {
+          "name": "keyword.other.constraint.nml",
+          "match": "\\b(unique|secret|token|distinct|shorthand|integer|min|max|minLength|maxLength|pattern|currency)\\b"
+        },
+        { "include": "#string" },
+        { "include": "#number" },
+        {
+          "name": "keyword.operator.assignment.nml",
+          "match": "="
+        },
+        {
+          "name": "punctuation.separator.comma.nml",
+          "match": ","
+        }
+      ]
+    },
+    "type-annotation": {
+      "name": "support.type.nml",
+      "match": "\\b(string|number|money|bool|duration|path|secret)\\b"
+    }
+  }
+}

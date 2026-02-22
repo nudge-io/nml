@@ -1,0 +1,9 @@
+[package]
+name = "nml-fmt"
+description = "Canonical formatter for the NML configuration language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nml-core = { workspace = true }

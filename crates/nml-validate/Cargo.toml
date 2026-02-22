@@ -1,0 +1,10 @@
+[package]
+name = "nml-validate"
+description = "Schema validation layer for the NML configuration language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nml-core = { workspace = true }
+thiserror = { workspace = true }

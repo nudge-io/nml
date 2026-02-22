@@ -1,0 +1,30 @@
+trait accessControlled:
+    |allow []@roleRef
+    |deny []@roleRef
+
+enum httpMethod:
+    - "GET"
+    - "POST"
+    - "PUT"
+    - "DELETE"
+    - "PATCH"
+
+model resource (accessControlled):
+    path path <shorthand>
+    method httpMethod = "GET"
+
+model endpoint (accessControlled):
+    address string
+
+    .healthCheck:
+        path path
+
+model service (accessControlled):
+    localMount path
+    resources []resource
+    endpoints []endpoint
+
+model roleTemplate:
+    label string
+    description string?
+    members []@roleRef?

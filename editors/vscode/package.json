@@ -1,0 +1,43 @@
+{
+  "name": "nml-lang",
+  "displayName": "NML Language Support",
+  "description": "Syntax highlighting and language support for the NML configuration language",
+  "version": "0.1.0",
+  "publisher": "nudge",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "nml",
+        "aliases": ["NML", "nml"],
+        "extensions": [".nml"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "nml",
+        "scopeName": "source.nml",
+        "path": "./syntaxes/nml.tmLanguage.json"
+      }
+    ]
+  },
+  "main": "./out/extension.js",
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.0.0"
+  }
+}

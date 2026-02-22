@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nml-core",
+    "crates/nml-validate",
+    "crates/nml-fmt",
+    "crates/nml-lsp",
+    "nml-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nicknudge/nml"
+
+[workspace.dependencies]
+nml-core = { path = "crates/nml-core" }
+nml-validate = { path = "crates/nml-validate" }
+nml-fmt = { path = "crates/nml-fmt" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,33 @@
+// === traits ===
+
+trait accessControlled:
+    |allow []@roleRef
+    |deny []@roleRef
+
+
+// === enums ===
+
+enum httpMethod:
+    - "GET"
+    - "POST"
+    - "PUT"
+    - "DELETE"
+    - "PATCH"
+
+
+// === models ===
+
+model resource (accessControlled):
+    path path <shorthand>
+    method httpMethod = "GET"
+
+model endpoint (accessControlled):
+    address string
+
+    .healthCheck:
+        path path
+
+model service (accessControlled):
+    localMount path
+    resources []resource
+    endpoints []endpoint

@@ -1,0 +1,22 @@
+webServer TestServer:
+    rootProfile:
+        domain = "test.example.com:8000"
+
+    webProfiles:
+        - Default:
+            debug = "trace"
+            domains:
+                - "test.example.com"
+            siteName = "Test Site"
+
+    listeners:
+        - HTTPSListener:
+            address = ":443"
+            tls = "dev:auto"
+
+        - HTTPListener:
+            address = ":80"
+            redirectTo = HTTPSListener
+
+peer TestPeer:
+    webServer = TestServer

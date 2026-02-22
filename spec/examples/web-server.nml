@@ -1,0 +1,24 @@
+webServer DefaultWebServer:
+
+    rootProfile:
+        domain = "dev.nudge.io:8000"
+
+    webProfiles:
+        - Default:
+            debug = "trace"
+            domains:
+                - "dev.nudge.io"
+            siteName = "WorkDAO"
+
+    listeners:
+        - SecureListener:
+            address = ":8000"
+            tls = "dev:auto"
+
+        - InsecureListener:
+            address = ":6000"
+            redirectTo = SecureListener
+
+
+peer Peer:
+    webServer = DefaultWebServer

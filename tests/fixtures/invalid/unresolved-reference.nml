@@ -1,0 +1,4 @@
+// References a resource list that doesn't exist
+service BrokenService:
+    localMount = "/"
+    resources = nonExistentResources

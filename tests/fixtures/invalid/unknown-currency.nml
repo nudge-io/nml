@@ -1,0 +1,5 @@
+// XYZ is not a valid ISO 4217 currency code
+subscription FakeCurrency:
+    name = "Fake"
+    monthlyPrice = 10.00 XYZ
+    annualPrice = 100.00 XYZ

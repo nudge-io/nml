@@ -1,0 +1,15 @@
+subscription FreePlan:
+    name = "Free"
+    monthlyPrice = 0.00 USD
+    annualPrice = 0.00 USD
+    trialDays = 0
+
+subscription ProPlan:
+    name = "Professional"
+    monthlyPrice = 29.99 USD
+    annualPrice = 299.99 USD
+    maxSeats = 25
+
+subscription JapanPlan:
+    name = "Japan"
+    monthlyPrice = 1299 JPY

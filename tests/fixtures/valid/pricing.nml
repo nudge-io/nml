@@ -1,0 +1,21 @@
+subscription FreePlan:
+    name = "Free"
+    monthlyPrice = 0.00 USD
+    annualPrice = 0.00 USD
+    trialDays = 0
+
+subscription ProPlan:
+    name = "Professional"
+    monthlyPrice = 29.99 USD
+    annualPrice = 299.99 USD
+    maxSeats = 25
+
+multiRegionPricing USPricing:
+    region = "us"
+    price = 29.99 USD
+    taxRate = 0.08
+
+multiRegionPricing UKPricing:
+    region = "uk"
+    price = 24.99 GBP
+    taxRate = 0.20

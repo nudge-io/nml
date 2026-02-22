@@ -1,0 +1,10 @@
+[package]
+name = "nml-core"
+description = "Core parsing and AST library for the NML configuration language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }

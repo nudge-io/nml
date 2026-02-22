@@ -1,0 +1,11 @@
+model subscription:
+    name string
+    monthlyPrice money <currency = "USD">
+    annualPrice money <currency = "USD">
+    trialDays number <integer, min = 0> = 14
+    maxSeats number? <integer, min = 1>
+
+model multiRegionPricing:
+    region string
+    price money <currency = ["USD", "GBP", "EUR"]>
+    taxRate number <min = 0.0, max = 1.0>

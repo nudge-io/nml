@@ -1,0 +1,52 @@
+[]endpoint registrationEndpoints:
+    |allow = [@admin, @public]
+
+    .healthCheck:
+        path = "/health"
+
+    - Reg1:
+        |allow:
+            - @role/pro-user
+        address = "http://localhost:8004"
+
+    - Reg2:
+        address = "localhost:8001"
+
+    - Reg3:
+        address = "localhost:8002"
+
+
+[]resource registrationResources:
+
+    - DefaultIndex:
+        |allow = [@public]
+        path = "/"
+
+    - DefaultHome:
+        |allow = [@private]
+        path = "/post/test"
+        method = "POST"
+
+    - UserHome:
+        |allow = [@private]
+        path = "/home"
+
+    - UserProfile:
+        path = "/user/{*}"
+
+    - "/test/matt"
+
+    - BetaVersionCheck:
+        |allow = [@public]
+        path = "/release/beta/version/latest"
+
+
+service NudgeService:
+    |allow:
+        - @role/admin
+        - @public
+    |deny = []
+
+    localMount = "/"
+    resources = registrationResources
+    endpoints = registrationEndpoints
