@@ -5,6 +5,9 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
+use nml_core::ast::*;
+use nml_core::span::SourceMap;
+
 use crate::diagnostics;
 
 pub struct NmlLanguageServer {
@@ -27,6 +30,90 @@ impl NmlLanguageServer {
             .publish_diagnostics(uri, diags, None)
             .await;
     }
+
+    fn find_definition(&self, name: &str) -> Option<(Url, Range)> {
+        let docs = self.documents.lock().unwrap();
+        for (uri, source) in docs.iter() {
+            if let Ok(file) = nml_core::parse(source) {
+                let source_map = SourceMap::new(source);
+                if let Some(range) = find_name_in_file(&file, name, &source_map) {
+                    return Some((uri.clone(), range));
+                }
+            } else if let Some(range) = find_name_by_text(source, name) {
+                return Some((uri.clone(), range));
+            }
+        }
+        None
+    }
+}
+
+fn span_to_range(span: nml_core::span::Span, source_map: &SourceMap) -> Range {
+    let start = source_map.location(span.start);
+    let end = source_map.location(span.end);
+    Range {
+        start: Position::new(start.line as u32 - 1, start.column as u32 - 1),
+        end: Position::new(end.line as u32 - 1, end.column as u32 - 1),
+    }
+}
+
+fn find_name_in_file(file: &File, name: &str, source_map: &SourceMap) -> Option<Range> {
+    for decl in &file.declarations {
+        match &decl.kind {
+            DeclarationKind::Block(block) => {
+                if block.name.name == name {
+                    return Some(span_to_range(block.name.span, source_map));
+                }
+                if let Some(r) = find_name_in_body(&block.body, name, source_map) {
+                    return Some(r);
+                }
+            }
+            DeclarationKind::Array(arr) => {
+                if arr.name.name == name {
+                    return Some(span_to_range(arr.name.span, source_map));
+                }
+                for item in &arr.body.items {
+                    if let Some(r) = find_name_in_list_item(item, name, source_map) {
+                        return Some(r);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_name_in_body(body: &Body, name: &str, source_map: &SourceMap) -> Option<Range> {
+    for entry in &body.entries {
+        match &entry.kind {
+            BodyEntryKind::ListItem(item) => {
+                if let Some(r) = find_name_in_list_item(item, name, source_map) {
+                    return Some(r);
+                }
+            }
+            BodyEntryKind::NestedBlock(nb) => {
+                if nb.name.name == name {
+                    return Some(span_to_range(nb.name.span, source_map));
+                }
+                if let Some(r) = find_name_in_body(&nb.body, name, source_map) {
+                    return Some(r);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_name_in_list_item(item: &ListItem, name: &str, source_map: &SourceMap) -> Option<Range> {
+    match &item.kind {
+        ListItemKind::Named { name: ident, body } => {
+            if ident.name == name {
+                return Some(span_to_range(ident.span, source_map));
+            }
+            find_name_in_body(body, name, source_map)
+        }
+        _ => None,
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -47,6 +134,7 @@ impl LanguageServer for NmlLanguageServer {
                     ..Default::default()
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -173,6 +261,73 @@ impl LanguageServer for NmlLanguageServer {
             range: None,
         }))
     }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let pos = params.text_document_position_params.position;
+        let uri = params.text_document_position_params.text_document.uri;
+
+        let word = {
+            let docs = self.documents.lock().unwrap();
+            let Some(source) = docs.get(&uri) else {
+                return Ok(None);
+            };
+            let lines: Vec<&str> = source.lines().collect();
+            let Some(line) = lines.get(pos.line as usize) else {
+                return Ok(None);
+            };
+            extract_word_at(line, pos.character as usize)
+        };
+
+        if word.is_empty() {
+            return Ok(None);
+        }
+
+        if let Some((target_uri, range)) = self.find_definition(&word) {
+            Ok(Some(GotoDefinitionResponse::Scalar(
+                tower_lsp::lsp_types::Location {
+                    uri: target_uri,
+                    range,
+                },
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+fn find_name_by_text(source: &str, name: &str) -> Option<Range> {
+    for (line_idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        // Match declaration patterns: `keyword Name:` or `[]keyword Name:`
+        if trimmed.ends_with(':') {
+            let before_colon = &trimmed[..trimmed.len() - 1];
+            let parts: Vec<&str> = before_colon.split_whitespace().collect();
+            if parts.len() == 2 && parts[1] == name {
+                let col_start = line.find(name).unwrap_or(0) as u32;
+                let col_end = col_start + name.len() as u32;
+                return Some(Range {
+                    start: Position::new(line_idx as u32, col_start),
+                    end: Position::new(line_idx as u32, col_end),
+                });
+            }
+        }
+        // Match named list items: `- Name:`
+        if trimmed.starts_with('-') && trimmed.ends_with(':') {
+            let inner = trimmed[1..trimmed.len() - 1].trim();
+            if inner == name {
+                let col_start = line.find(name).unwrap_or(0) as u32;
+                let col_end = col_start + name.len() as u32;
+                return Some(Range {
+                    start: Position::new(line_idx as u32, col_start),
+                    end: Position::new(line_idx as u32, col_end),
+                });
+            }
+        }
+    }
+    None
 }
 
 fn extract_word_at(line: &str, col: usize) -> String {
