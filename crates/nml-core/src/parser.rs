@@ -148,7 +148,8 @@ impl Parser {
             });
         }
 
-        // Identifier: could be property (name = value) or nested block (name:)
+        // Identifier: could be property (name = value), nested block (name:),
+        // or field definition (name type[?] [= default])
         let ident = self.expect_identifier()?;
 
         if self.check(TokenKind::Equals) {
@@ -163,6 +164,15 @@ impl Parser {
             let end = self.prev_span();
             Ok(BodyEntry {
                 kind: BodyEntryKind::NestedBlock(nested),
+                span: span.merge(end),
+            })
+        } else if self.peek_kind_matches(|k| matches!(k, TokenKind::Identifier(_)))
+            || self.check(TokenKind::ArrayPrefix)
+        {
+            let field = self.parse_field_definition(ident)?;
+            let end = self.prev_span();
+            Ok(BodyEntry {
+                kind: BodyEntryKind::FieldDefinition(field),
                 span: span.merge(end),
             })
         } else {
@@ -187,6 +197,39 @@ impl Parser {
         Ok(NestedBlock { name, body })
     }
 
+    fn parse_field_definition(&mut self, name: Identifier) -> NmlResult<FieldDefinition> {
+        let field_type = if self.check(TokenKind::ArrayPrefix) {
+            self.advance();
+            let type_name = self.expect_identifier()?;
+            FieldTypeExpr::Array(type_name)
+        } else {
+            let type_name = self.expect_identifier()?;
+            FieldTypeExpr::Named(type_name)
+        };
+
+        let optional = if self.check(TokenKind::Question) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let default_value = if self.check(TokenKind::Equals) {
+            self.advance();
+            Some(self.parse_value()?)
+        } else {
+            None
+        };
+
+        self.skip_newlines();
+        Ok(FieldDefinition {
+            name,
+            field_type,
+            optional,
+            default_value,
+        })
+    }
+
     fn parse_modifier(&mut self) -> NmlResult<Modifier> {
         self.expect_kind(TokenKind::Pipe)?;
         let name = self.expect_identifier()?;
@@ -206,6 +249,28 @@ impl Parser {
             Ok(Modifier {
                 name,
                 value: ModifierValue::Block(items),
+            })
+        } else if self.peek_kind_matches(|k| matches!(k, TokenKind::Identifier(_)))
+            || self.check(TokenKind::ArrayPrefix)
+        {
+            let field_type = if self.check(TokenKind::ArrayPrefix) {
+                self.advance();
+                let type_name = self.expect_identifier()?;
+                FieldTypeExpr::Array(type_name)
+            } else {
+                let type_name = self.expect_identifier()?;
+                FieldTypeExpr::Named(type_name)
+            };
+            let optional = if self.check(TokenKind::Question) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            self.skip_newlines();
+            Ok(Modifier {
+                name,
+                value: ModifierValue::TypeAnnotation { field_type, optional },
             })
         } else {
             Err(NmlError::parse(
@@ -781,6 +846,133 @@ mod tests {
                         assert_eq!(nb.name.name, "rootProfile");
                     }
                     _ => panic!("expected nested block"),
+                }
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_model_field_simple() {
+        let source = "model mount:\n    path path\n    wasm string\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                assert_eq!(block.keyword.name, "model");
+                assert_eq!(block.name.name, "mount");
+                assert_eq!(block.body.entries.len(), 2);
+
+                match &block.body.entries[0].kind {
+                    BodyEntryKind::FieldDefinition(f) => {
+                        assert_eq!(f.name.name, "path");
+                        assert!(matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "path"));
+                        assert!(!f.optional);
+                        assert!(f.default_value.is_none());
+                    }
+                    other => panic!("expected field definition, got {other:?}"),
+                }
+
+                match &block.body.entries[1].kind {
+                    BodyEntryKind::FieldDefinition(f) => {
+                        assert_eq!(f.name.name, "wasm");
+                        assert!(matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "string"));
+                    }
+                    other => panic!("expected field definition, got {other:?}"),
+                }
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_model_field_optional() {
+        let source = "model provider:\n    baseUrl string?\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                match &block.body.entries[0].kind {
+                    BodyEntryKind::FieldDefinition(f) => {
+                        assert_eq!(f.name.name, "baseUrl");
+                        assert!(matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "string"));
+                        assert!(f.optional);
+                    }
+                    other => panic!("expected field definition, got {other:?}"),
+                }
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_model_field_default() {
+        let source = "model prompt:\n    outputFormat string = \"text\"\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                match &block.body.entries[0].kind {
+                    BodyEntryKind::FieldDefinition(f) => {
+                        assert_eq!(f.name.name, "outputFormat");
+                        assert!(!f.optional);
+                        match &f.default_value {
+                            Some(v) => assert_eq!(v.value, Value::String("text".into())),
+                            None => panic!("expected default value"),
+                        }
+                    }
+                    other => panic!("expected field definition, got {other:?}"),
+                }
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_model_field_array_type() {
+        let source = "model workflow:\n    steps []step\n    extensions []extensionPoint?\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                assert_eq!(block.body.entries.len(), 2);
+
+                match &block.body.entries[0].kind {
+                    BodyEntryKind::FieldDefinition(f) => {
+                        assert_eq!(f.name.name, "steps");
+                        assert!(matches!(&f.field_type, FieldTypeExpr::Array(id) if id.name == "step"));
+                        assert!(!f.optional);
+                    }
+                    other => panic!("expected field definition, got {other:?}"),
+                }
+
+                match &block.body.entries[1].kind {
+                    BodyEntryKind::FieldDefinition(f) => {
+                        assert_eq!(f.name.name, "extensions");
+                        assert!(matches!(&f.field_type, FieldTypeExpr::Array(id) if id.name == "extensionPoint"));
+                        assert!(f.optional);
+                    }
+                    other => panic!("expected field definition, got {other:?}"),
+                }
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_model_field_type_ref() {
+        let source = "model provider:\n    type providerType\n    model string\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                assert_eq!(block.body.entries.len(), 2);
+                match &block.body.entries[0].kind {
+                    BodyEntryKind::FieldDefinition(f) => {
+                        assert_eq!(f.name.name, "type");
+                        assert!(matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "providerType"));
+                    }
+                    other => panic!("expected field definition, got {other:?}"),
                 }
             }
             _ => panic!("expected block"),

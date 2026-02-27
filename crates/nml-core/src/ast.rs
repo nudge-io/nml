@@ -2,6 +2,22 @@ use crate::span::Span;
 use crate::types::SpannedValue;
 use serde::Serialize;
 
+/// The type expression in a field definition (e.g. `string`, `[]route`).
+#[derive(Debug, Clone, Serialize)]
+pub enum FieldTypeExpr {
+    Named(Identifier),
+    Array(Identifier),
+}
+
+/// A field definition within a model/trait body: `name type[?] [= default]`.
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldDefinition {
+    pub name: Identifier,
+    pub field_type: FieldTypeExpr,
+    pub optional: bool,
+    pub default_value: Option<SpannedValue>,
+}
+
 /// A parsed NML file.
 #[derive(Debug, Clone, Serialize)]
 pub struct File {
@@ -64,6 +80,8 @@ pub enum BodyEntryKind {
     SharedProperty(SharedProperty),
     /// A list item within a body (when the body is used inline in a service, etc.)
     ListItem(ListItem),
+    /// A field definition in a model/trait: `name type[?] [= default]`
+    FieldDefinition(FieldDefinition),
 }
 
 /// A key-value property: `key = value`.
@@ -91,6 +109,10 @@ pub struct Modifier {
 pub enum ModifierValue {
     Inline(SpannedValue),
     Block(Vec<ListItem>),
+    TypeAnnotation {
+        field_type: FieldTypeExpr,
+        optional: bool,
+    },
 }
 
 /// A shared/inherited property: `.key: <body>`.

@@ -6,6 +6,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use nml_core::ast::*;
+use nml_core::model::{EnumDef, ModelDef};
 use nml_core::span::SourceMap;
 
 use crate::diagnostics;
@@ -13,6 +14,8 @@ use crate::diagnostics;
 pub struct NmlLanguageServer {
     client: Client,
     documents: Mutex<HashMap<Url, String>>,
+    models: Mutex<Vec<ModelDef>>,
+    enums: Mutex<Vec<EnumDef>>,
 }
 
 impl NmlLanguageServer {
@@ -20,15 +23,70 @@ impl NmlLanguageServer {
         Self {
             client,
             documents: Mutex::new(HashMap::new()),
+            models: Mutex::new(Vec::new()),
+            enums: Mutex::new(Vec::new()),
         }
     }
 
+    fn rebuild_schema_registry(&self) {
+        let docs = self.documents.lock().unwrap();
+        let mut all_models = Vec::new();
+        let mut all_enums = Vec::new();
+
+        for (uri, source) in docs.iter() {
+            if !uri.as_str().ends_with(".model.nml") {
+                continue;
+            }
+            if let Ok(file) = nml_core::parse(source) {
+                let schema = nml_core::model_extract::extract(&file);
+                all_models.extend(schema.models);
+                all_enums.extend(schema.enums);
+            }
+        }
+
+        *self.models.lock().unwrap() = all_models;
+        *self.enums.lock().unwrap() = all_enums;
+    }
+
     async fn on_change(&self, uri: Url, text: String) {
-        let diags = diagnostics::compute(&text);
-        self.documents.lock().unwrap().insert(uri.clone(), text);
+        self.documents
+            .lock()
+            .unwrap()
+            .insert(uri.clone(), text.clone());
+
+        let is_model_file = uri.as_str().ends_with(".model.nml");
+        if is_model_file {
+            self.rebuild_schema_registry();
+        }
+
+        let models = self.models.lock().unwrap().clone();
+        let enums = self.enums.lock().unwrap().clone();
+        let diags = diagnostics::compute(&text, &models, &enums);
+
         self.client
-            .publish_diagnostics(uri, diags, None)
+            .publish_diagnostics(uri.clone(), diags, None)
             .await;
+
+        if is_model_file {
+            self.revalidate_all_documents().await;
+        }
+    }
+
+    async fn revalidate_all_documents(&self) {
+        let docs: Vec<(Url, String)> = {
+            let d = self.documents.lock().unwrap();
+            d.iter().map(|(u, s)| (u.clone(), s.clone())).collect()
+        };
+        let models = self.models.lock().unwrap().clone();
+        let enums = self.enums.lock().unwrap().clone();
+
+        for (uri, source) in docs {
+            if uri.as_str().ends_with(".model.nml") {
+                continue;
+            }
+            let diags = diagnostics::compute(&source, &models, &enums);
+            self.client.publish_diagnostics(uri, diags, None).await;
+        }
     }
 
     fn find_definition(&self, name: &str) -> Option<(Url, Range)> {
@@ -166,10 +224,16 @@ impl LanguageServer for NmlLanguageServer {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let was_model = params.text_document.uri.as_str().ends_with(".model.nml");
         self.documents
             .lock()
             .unwrap()
             .remove(&params.text_document.uri);
+
+        if was_model {
+            self.rebuild_schema_registry();
+            self.revalidate_all_documents().await;
+        }
     }
 
     async fn completion(&self, _params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -301,7 +365,6 @@ impl LanguageServer for NmlLanguageServer {
 fn find_name_by_text(source: &str, name: &str) -> Option<Range> {
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim();
-        // Match declaration patterns: `keyword Name:` or `[]keyword Name:`
         if trimmed.ends_with(':') {
             let before_colon = &trimmed[..trimmed.len() - 1];
             let parts: Vec<&str> = before_colon.split_whitespace().collect();
@@ -314,7 +377,6 @@ fn find_name_by_text(source: &str, name: &str) -> Option<Range> {
                 });
             }
         }
-        // Match named list items: `- Name:`
         if trimmed.starts_with('-') && trimmed.ends_with(':') {
             let inner = trimmed[1..trimmed.len() - 1].trim();
             if inner == name {

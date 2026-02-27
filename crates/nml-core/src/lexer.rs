@@ -28,6 +28,7 @@ pub enum TokenKind {
     BracketClose,   // ]
     ArrayPrefix,    // []
     Comma,          // ,
+    Question,       // ?
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +172,10 @@ impl<'a> Lexer<'a> {
                 }
                 ',' => {
                     tokens.push(Token::new(TokenKind::Comma, Span::new(self.pos, self.pos + 1)));
+                    self.pos += 1;
+                }
+                '?' => {
+                    tokens.push(Token::new(TokenKind::Question, Span::new(self.pos, self.pos + 1)));
                     self.pos += 1;
                 }
                 '@' => {

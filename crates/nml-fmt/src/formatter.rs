@@ -73,6 +73,26 @@ fn format_body_entry(out: &mut String, entry: &BodyEntry, depth: usize) {
         BodyEntryKind::ListItem(item) => {
             format_list_item(out, item, depth);
         }
+        BodyEntryKind::FieldDefinition(f) => {
+            write_indent(out, depth);
+            out.push_str(&f.name.name);
+            out.push(' ');
+            match &f.field_type {
+                nml_core::ast::FieldTypeExpr::Named(id) => out.push_str(&id.name),
+                nml_core::ast::FieldTypeExpr::Array(id) => {
+                    out.push_str("[]");
+                    out.push_str(&id.name);
+                }
+            }
+            if f.optional {
+                out.push('?');
+            }
+            if let Some(ref default) = f.default_value {
+                out.push_str(" = ");
+                format_value(out, &default.value);
+            }
+            out.push('\n');
+        }
     }
 }
 
@@ -92,6 +112,20 @@ fn format_modifier(out: &mut String, m: &Modifier, depth: usize) {
             for item in items {
                 format_list_item(out, item, depth + 1);
             }
+        }
+        ModifierValue::TypeAnnotation { field_type, optional } => {
+            out.push(' ');
+            match field_type {
+                nml_core::ast::FieldTypeExpr::Named(id) => out.push_str(&id.name),
+                nml_core::ast::FieldTypeExpr::Array(id) => {
+                    out.push_str("[]");
+                    out.push_str(&id.name);
+                }
+            }
+            if *optional {
+                out.push('?');
+            }
+            out.push('\n');
         }
     }
 }
