@@ -287,6 +287,9 @@ impl SchemaValidator {
 }
 
 fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
+    if matches!(value, Value::Reference(_)) {
+        return true;
+    }
     match prim {
         PrimitiveType::String => matches!(value, Value::String(_)),
         PrimitiveType::Number => matches!(value, Value::Number(_)),

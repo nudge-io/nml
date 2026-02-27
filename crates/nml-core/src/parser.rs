@@ -228,12 +228,18 @@ impl Parser {
     fn parse_property_rest(&mut self, name: Identifier) -> NmlResult<Property> {
         self.expect_kind(TokenKind::Equals)?;
         self.skip_newlines();
-        if self.check(TokenKind::Indent) {
+        let had_indent = if self.check(TokenKind::Indent) {
             self.advance();
-        }
+            true
+        } else {
+            false
+        };
         let value = self.parse_value()?;
-        if self.check(TokenKind::Dedent) {
-            self.advance();
+        if had_indent {
+            self.skip_newlines();
+            if self.check(TokenKind::Dedent) {
+                self.advance();
+            }
         }
         self.skip_newlines();
         Ok(Property { name, value })
