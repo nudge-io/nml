@@ -44,8 +44,9 @@ impl Token {
 }
 
 pub struct Lexer<'a> {
-    _source: &'a str,
+    source: &'a str,
     chars: Vec<char>,
+    byte_offsets: Vec<usize>,
     pos: usize,
     indent_stack: Vec<usize>,
     pending_tokens: Vec<Token>,
@@ -54,14 +55,35 @@ pub struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     pub fn new(source: &'a str) -> Self {
+        let mut chars = Vec::new();
+        let mut byte_offsets = Vec::new();
+        for (byte_idx, ch) in source.char_indices() {
+            chars.push(ch);
+            byte_offsets.push(byte_idx);
+        }
         Self {
-            _source: source,
-            chars: source.chars().collect(),
+            source,
+            chars,
+            byte_offsets,
             pos: 0,
             indent_stack: vec![0],
             pending_tokens: Vec::new(),
             at_line_start: true,
         }
+    }
+
+    fn byte_pos(&self) -> usize {
+        self.byte_offsets
+            .get(self.pos)
+            .copied()
+            .unwrap_or(self.source.len())
+    }
+
+    fn byte_pos_at(&self, char_idx: usize) -> usize {
+        self.byte_offsets
+            .get(char_idx)
+            .copied()
+            .unwrap_or(self.source.len())
     }
 
     pub fn tokenize(&mut self) -> NmlResult<Vec<Token>> {
@@ -74,12 +96,11 @@ impl<'a> Lexer<'a> {
             }
 
             if self.pos >= self.chars.len() {
-                // Emit remaining DEDENTs
                 while self.indent_stack.len() > 1 {
                     self.indent_stack.pop();
-                    tokens.push(Token::new(TokenKind::Dedent, Span::empty(self.pos)));
+                    tokens.push(Token::new(TokenKind::Dedent, Span::empty(self.byte_pos())));
                 }
-                tokens.push(Token::new(TokenKind::Eof, Span::empty(self.pos)));
+                tokens.push(Token::new(TokenKind::Eof, Span::empty(self.byte_pos())));
                 break;
             }
 
@@ -96,7 +117,8 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 '\n' => {
-                    tokens.push(Token::new(TokenKind::Newline, Span::new(self.pos, self.pos + 1)));
+                    let bp = self.byte_pos();
+                    tokens.push(Token::new(TokenKind::Newline, Span::new(bp, bp + 1)));
                     self.pos += 1;
                     self.at_line_start = true;
                 }
@@ -107,17 +129,17 @@ impl<'a> Lexer<'a> {
                     tokens.push(self.read_string()?);
                 }
                 ':' => {
-                    tokens.push(Token::new(TokenKind::Colon, Span::new(self.pos, self.pos + 1)));
+                    let bp = self.byte_pos();
+                    tokens.push(Token::new(TokenKind::Colon, Span::new(bp, bp + 1)));
                     self.pos += 1;
                 }
                 '=' => {
-                    tokens.push(Token::new(TokenKind::Equals, Span::new(self.pos, self.pos + 1)));
+                    let bp = self.byte_pos();
+                    tokens.push(Token::new(TokenKind::Equals, Span::new(bp, bp + 1)));
                     self.pos += 1;
                 }
                 '-' => {
-                    // Could be a negative number or a dash (list item)
                     if self.peek_char().map_or(false, |c| c.is_ascii_digit()) {
-                        // Check if preceded by '=' or '[' or ',' to determine if negative number
                         let prev_meaningful = tokens.iter().rev().find(|t| {
                             !matches!(t.kind, TokenKind::Newline | TokenKind::Indent)
                         });
@@ -126,26 +148,29 @@ impl<'a> Lexer<'a> {
                         }) {
                             tokens.push(self.read_number()?);
                         } else {
-                            tokens.push(Token::new(TokenKind::Dash, Span::new(self.pos, self.pos + 1)));
+                            let bp = self.byte_pos();
+                            tokens.push(Token::new(TokenKind::Dash, Span::new(bp, bp + 1)));
                             self.pos += 1;
                         }
                     } else {
-                        tokens.push(Token::new(TokenKind::Dash, Span::new(self.pos, self.pos + 1)));
+                        let bp = self.byte_pos();
+                        tokens.push(Token::new(TokenKind::Dash, Span::new(bp, bp + 1)));
                         self.pos += 1;
                     }
                 }
                 '|' => {
-                    tokens.push(Token::new(TokenKind::Pipe, Span::new(self.pos, self.pos + 1)));
+                    let bp = self.byte_pos();
+                    tokens.push(Token::new(TokenKind::Pipe, Span::new(bp, bp + 1)));
                     self.pos += 1;
                 }
                 '.' => {
-                    tokens.push(Token::new(TokenKind::Dot, Span::new(self.pos, self.pos + 1)));
+                    let bp = self.byte_pos();
+                    tokens.push(Token::new(TokenKind::Dot, Span::new(bp, bp + 1)));
                     self.pos += 1;
                 }
                 '[' => {
                     if self.peek_char() == Some(']') {
-                        let span = Span::new(self.pos, self.pos + 2);
-                        // Check if next char after ] is a letter (array type prefix) or not (empty array)
+                        let span = Span::new(self.byte_pos(), self.byte_pos_at(self.pos + 2));
                         let after_bracket = if self.pos + 2 < self.chars.len() {
                             Some(self.chars[self.pos + 2])
                         } else {
@@ -154,28 +179,34 @@ impl<'a> Lexer<'a> {
                         if after_bracket.map_or(false, |c| c.is_alphabetic() || c == '_') {
                             tokens.push(Token::new(TokenKind::ArrayPrefix, span));
                         } else {
-                            tokens.push(Token::new(TokenKind::BracketOpen, Span::new(self.pos, self.pos + 1)));
+                            let bp = self.byte_pos();
+                            tokens.push(Token::new(TokenKind::BracketOpen, Span::new(bp, bp + 1)));
                             self.pos += 1;
-                            tokens.push(Token::new(TokenKind::BracketClose, Span::new(self.pos, self.pos + 1)));
+                            let bp = self.byte_pos();
+                            tokens.push(Token::new(TokenKind::BracketClose, Span::new(bp, bp + 1)));
                             self.pos += 1;
                             continue;
                         }
                         self.pos += 2;
                     } else {
-                        tokens.push(Token::new(TokenKind::BracketOpen, Span::new(self.pos, self.pos + 1)));
+                        let bp = self.byte_pos();
+                        tokens.push(Token::new(TokenKind::BracketOpen, Span::new(bp, bp + 1)));
                         self.pos += 1;
                     }
                 }
                 ']' => {
-                    tokens.push(Token::new(TokenKind::BracketClose, Span::new(self.pos, self.pos + 1)));
+                    let bp = self.byte_pos();
+                    tokens.push(Token::new(TokenKind::BracketClose, Span::new(bp, bp + 1)));
                     self.pos += 1;
                 }
                 ',' => {
-                    tokens.push(Token::new(TokenKind::Comma, Span::new(self.pos, self.pos + 1)));
+                    let bp = self.byte_pos();
+                    tokens.push(Token::new(TokenKind::Comma, Span::new(bp, bp + 1)));
                     self.pos += 1;
                 }
                 '?' => {
-                    tokens.push(Token::new(TokenKind::Question, Span::new(self.pos, self.pos + 1)));
+                    let bp = self.byte_pos();
+                    tokens.push(Token::new(TokenKind::Question, Span::new(bp, bp + 1)));
                     self.pos += 1;
                 }
                 '@' => {
@@ -191,9 +222,10 @@ impl<'a> Lexer<'a> {
                     tokens.push(self.read_identifier_or_keyword());
                 }
                 _ => {
+                    let bp = self.byte_pos();
                     return Err(NmlError::lex(
                         format!("unexpected character: '{ch}'"),
-                        Span::new(self.pos, self.pos + 1),
+                        Span::new(bp, bp + 1),
                     ));
                 }
             }
@@ -213,7 +245,6 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
 
-        // Skip blank lines and comment-only lines
         if self.pos >= self.chars.len()
             || self.chars[self.pos] == '\n'
             || (self.chars[self.pos] == '/' && self.peek_char() == Some('/'))
@@ -228,16 +259,22 @@ impl<'a> Lexer<'a> {
 
         if indent > current_indent {
             self.indent_stack.push(indent);
-            tokens.push(Token::new(TokenKind::Indent, Span::new(self.pos - indent, self.pos)));
+            tokens.push(Token::new(
+                TokenKind::Indent,
+                Span::new(self.byte_pos_at(self.pos - indent), self.byte_pos()),
+            ));
         } else if indent < current_indent {
             while self.indent_stack.len() > 1 && *self.indent_stack.last().unwrap() > indent {
                 self.indent_stack.pop();
-                tokens.push(Token::new(TokenKind::Dedent, Span::new(self.pos - indent, self.pos)));
+                tokens.push(Token::new(
+                    TokenKind::Dedent,
+                    Span::new(self.byte_pos_at(self.pos - indent), self.byte_pos()),
+                ));
             }
             if *self.indent_stack.last().unwrap() != indent {
                 return Err(NmlError::lex(
                     "inconsistent indentation",
-                    Span::new(self.pos - indent, self.pos),
+                    Span::new(self.byte_pos_at(self.pos - indent), self.byte_pos()),
                 ));
             }
         }
@@ -252,8 +289,8 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_string(&mut self) -> NmlResult<Token> {
-        let start = self.pos;
-        self.pos += 1; // skip opening quote
+        let start = self.byte_pos();
+        self.pos += 1;
         let mut value = String::new();
 
         while self.pos < self.chars.len() {
@@ -263,7 +300,7 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                     return Ok(Token::new(
                         TokenKind::StringLiteral(value),
-                        Span::new(start, self.pos),
+                        Span::new(start, self.byte_pos()),
                     ));
                 }
                 '\\' => {
@@ -271,7 +308,7 @@ impl<'a> Lexer<'a> {
                     if self.pos >= self.chars.len() {
                         return Err(NmlError::lex(
                             "unexpected end of string",
-                            Span::new(start, self.pos),
+                            Span::new(start, self.byte_pos()),
                         ));
                     }
                     match self.chars[self.pos] {
@@ -282,7 +319,10 @@ impl<'a> Lexer<'a> {
                         c => {
                             return Err(NmlError::lex(
                                 format!("unknown escape sequence: '\\{c}'"),
-                                Span::new(self.pos - 1, self.pos + 1),
+                                Span::new(
+                                    self.byte_pos_at(self.pos - 1),
+                                    self.byte_pos_at(self.pos + 1),
+                                ),
                             ));
                         }
                     }
@@ -291,7 +331,7 @@ impl<'a> Lexer<'a> {
                 '\n' => {
                     return Err(NmlError::lex(
                         "unterminated string literal",
-                        Span::new(start, self.pos),
+                        Span::new(start, self.byte_pos()),
                     ));
                 }
                 _ => {
@@ -303,12 +343,12 @@ impl<'a> Lexer<'a> {
 
         Err(NmlError::lex(
             "unterminated string literal",
-            Span::new(start, self.pos),
+            Span::new(start, self.byte_pos()),
         ))
     }
 
     fn read_number(&mut self) -> NmlResult<Token> {
-        let start = self.pos;
+        let start = self.byte_pos();
         let mut s = String::new();
 
         if self.chars[self.pos] == '-' {
@@ -331,17 +371,20 @@ impl<'a> Lexer<'a> {
         }
 
         let value: f64 = s.parse().map_err(|_| {
-            NmlError::lex(format!("invalid number: \"{s}\""), Span::new(start, self.pos))
+            NmlError::lex(
+                format!("invalid number: \"{s}\""),
+                Span::new(start, self.byte_pos()),
+            )
         })?;
 
         Ok(Token::new(
             TokenKind::NumberLiteral(value),
-            Span::new(start, self.pos),
+            Span::new(start, self.byte_pos()),
         ))
     }
 
     fn read_role_ref(&mut self) -> Token {
-        let start = self.pos;
+        let start = self.byte_pos();
         self.pos += 1; // skip @
         let mut value = String::from("@");
 
@@ -365,29 +408,26 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        // If the role ref ends with ':', check if it's actually a declaration colon
-        // (followed by newline/whitespace/EOF) rather than an internal separator like @nudge:research
         if value.ends_with(':') {
-            let next = self.chars.get(self.pos);
-            if next.is_none() || next == Some(&'\n') || next == Some(&' ') || next == Some(&'\t') {
+            let next = self.chars.get(self.pos).map(|&c| c);
+            if next.is_none() || next == Some('\n') || next == Some(' ') || next == Some('\t') {
                 value.pop();
                 self.pos -= 1;
             }
         }
 
-        Token::new(TokenKind::RoleRef(value), Span::new(start, self.pos))
+        Token::new(TokenKind::RoleRef(value), Span::new(start, self.byte_pos()))
     }
 
     fn read_secret_ref(&mut self) -> NmlResult<Token> {
-        let start = self.pos;
+        let start = self.byte_pos();
         self.pos += 1; // skip $
 
-        // Expect "ENV."
         let remaining: String = self.chars[self.pos..].iter().take(4).collect();
         if remaining != "ENV." {
             return Err(NmlError::lex(
                 "expected $ENV. for secret reference",
-                Span::new(start, self.pos + 4),
+                Span::new(start, self.byte_pos_at(self.pos + 4)),
             ));
         }
         self.pos += 4;
@@ -405,19 +445,19 @@ impl<'a> Lexer<'a> {
         if self.pos == name_start {
             return Err(NmlError::lex(
                 "expected variable name after $ENV.",
-                Span::new(start, self.pos),
+                Span::new(start, self.byte_pos()),
             ));
         }
 
-        let full: String = self.chars[start..self.pos].iter().collect();
+        let full = self.source[start..self.byte_pos()].to_string();
         Ok(Token::new(
             TokenKind::SecretRef(full),
-            Span::new(start, self.pos),
+            Span::new(start, self.byte_pos()),
         ))
     }
 
     fn read_identifier_or_keyword(&mut self) -> Token {
-        let start = self.pos;
+        let start = self.byte_pos();
         let mut value = String::new();
 
         while self.pos < self.chars.len() {
@@ -434,7 +474,6 @@ impl<'a> Lexer<'a> {
             "true" => TokenKind::BoolLiteral(true),
             "false" => TokenKind::BoolLiteral(false),
             _ => {
-                // Check if this is a 3-letter uppercase currency code after a number
                 if value.len() == 3 && value.chars().all(|c| c.is_ascii_uppercase()) {
                     TokenKind::CurrencyCode(value)
                 } else {
@@ -443,7 +482,7 @@ impl<'a> Lexer<'a> {
             }
         };
 
-        Token::new(kind, Span::new(start, self.pos))
+        Token::new(kind, Span::new(start, self.byte_pos()))
     }
 }
 
@@ -649,5 +688,28 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn test_spans_use_byte_offsets_with_multibyte_chars() {
+        // "─" (U+2500) is 3 bytes in UTF-8
+        let source = "// ─\nname = \"test\"";
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize().unwrap();
+
+        let name_tok = tokens
+            .iter()
+            .find(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "name"))
+            .expect("should find 'name' identifier");
+
+        // "// ─\n" = 2(//) + 1( ) + 3(─) + 1(\n) = 7 bytes, so 'name' starts at byte 7
+        assert_eq!(name_tok.span.start, 7);
+        assert_eq!(name_tok.span.end, 11);
+
+        // Verify via SourceMap that it resolves to line 2, column 1
+        let source_map = crate::span::SourceMap::new(source);
+        let loc = source_map.location(name_tok.span.start);
+        assert_eq!(loc.line, 2);
+        assert_eq!(loc.column, 1);
     }
 }
