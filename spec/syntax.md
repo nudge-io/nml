@@ -42,7 +42,18 @@ Strings are enclosed in double quotes:
 "/api/v1/{*}"
 ```
 
-Escape sequences:
+**Multiline strings** use triple quotes (`"""`) and support dedent (strip common leading whitespace from each line):
+
+```
+system = """
+    You are an intent classifier.
+    Analyze the user's message.
+    """
+```
+
+The content is dedented: the minimum leading indent is stripped from each line. The newline immediately after the opening `"""` and before the closing `"""` is trimmed (TOML-style).
+
+Escape sequences (same for single and multiline strings):
 - `\"` -- literal double quote
 - `\\` -- literal backslash
 - `\n` -- newline
@@ -128,6 +139,23 @@ Role and identity references use the `@` prefix:
 ```
 
 ## Structural Syntax
+
+### Const Declarations
+
+File-level constants use `const Name = value`. The value can be inline or on the next line (for long strings):
+
+```
+const Port = 8000
+const ClassifierPrompt = "You are a classifier."
+
+const LongPrompt =
+    """
+    You are an intent classifier for a recipe assistant.
+    Analyze the user's message and determine their intent.
+    """
+```
+
+References to consts use the bare identifier: `system = ClassifierPrompt`. The resolver substitutes the const's value.
 
 ### Top-Level Declarations
 

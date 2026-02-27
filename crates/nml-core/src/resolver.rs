@@ -3,11 +3,13 @@ use std::collections::HashMap;
 use crate::ast::*;
 use crate::error::NmlError;
 use crate::span::Span;
+use crate::types::Value;
 
 /// Tracks named declarations for cross-reference resolution.
 #[derive(Debug, Default)]
 pub struct Resolver {
     declarations: HashMap<String, Vec<DeclInfo>>,
+    const_values: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,12 +38,26 @@ impl Resolver {
                     name: arr.name.name.clone(),
                     span: decl.span,
                 },
+                DeclarationKind::Const(c) => {
+                    self.const_values
+                        .insert(c.name.name.clone(), c.value.value.clone());
+                    DeclInfo {
+                        keyword: "const".into(),
+                        name: c.name.name.clone(),
+                        span: decl.span,
+                    }
+                }
             };
             self.declarations
                 .entry(info.name.clone())
                 .or_default()
                 .push(info);
         }
+    }
+
+    /// Resolve a const reference to its value. Returns None if the name is not a const.
+    pub fn resolve_const_value(&self, name: &str) -> Option<&Value> {
+        self.const_values.get(name)
     }
 
     /// Resolve a reference name to its declaration info.

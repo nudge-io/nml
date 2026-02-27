@@ -62,6 +62,25 @@ impl Parser {
     fn parse_block_declaration(&mut self, start_span: Span) -> NmlResult<Declaration> {
         let keyword = self.expect_identifier()?;
         let name = self.parse_declaration_name()?;
+
+        if keyword.name == "const" {
+            self.expect_kind(TokenKind::Equals)?;
+            self.skip_newlines();
+            // Allow value on next line (optionally after Indent)
+            if self.check(TokenKind::Indent) {
+                self.advance();
+            }
+            let value = self.parse_value()?;
+            if self.check(TokenKind::Dedent) {
+                self.advance();
+            }
+            let end_span = self.prev_span();
+            return Ok(Declaration {
+                kind: DeclarationKind::Const(ConstDecl { name, value }),
+                span: start_span.merge(end_span),
+            });
+        }
+
         self.expect_kind(TokenKind::Colon)?;
         self.skip_newlines();
         let body = self.parse_body()?;
@@ -185,7 +204,14 @@ impl Parser {
 
     fn parse_property_rest(&mut self, name: Identifier) -> NmlResult<Property> {
         self.expect_kind(TokenKind::Equals)?;
+        self.skip_newlines();
+        if self.check(TokenKind::Indent) {
+            self.advance();
+        }
         let value = self.parse_value()?;
+        if self.check(TokenKind::Dedent) {
+            self.advance();
+        }
         self.skip_newlines();
         Ok(Property { name, value })
     }
@@ -607,6 +633,28 @@ pub fn parse(source: &str) -> NmlResult<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_const() {
+        let source = "const Port = 8000\nconst Greeting = \"hello\"\n";
+        let file = parse(source).unwrap();
+        assert_eq!(file.declarations.len(), 2);
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Const(c) => {
+                assert_eq!(c.name.name, "Port");
+                assert!(matches!(&c.value.value, Value::Number(n) if *n == 8000.0));
+            }
+            _ => panic!("expected const declaration"),
+        }
+        match &file.declarations[1].kind {
+            DeclarationKind::Const(c) => {
+                assert_eq!(c.name.name, "Greeting");
+                assert!(matches!(&c.value.value, Value::String(s) if s == "hello"));
+            }
+            _ => panic!("expected const declaration"),
+        }
+    }
 
     #[test]
     fn test_parse_simple_block() {

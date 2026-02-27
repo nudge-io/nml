@@ -37,6 +37,7 @@ impl SchemaValidator {
                 DeclarationKind::Array(arr) => {
                     self.validate_array(arr, &mut diagnostics);
                 }
+                DeclarationKind::Const(_) => {}
             }
         }
 

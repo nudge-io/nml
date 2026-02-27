@@ -37,6 +37,15 @@ pub enum DeclarationKind {
     Block(BlockDecl),
     /// An array declaration: `[]keyword Name: ...`
     Array(ArrayDecl),
+    /// A constant: `const Name = value`
+    Const(ConstDecl),
+}
+
+/// A constant declaration: `const Name = value`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConstDecl {
+    pub name: Identifier,
+    pub value: SpannedValue,
 }
 
 /// A block declaration like `service NudgeService:` or `model service:`.

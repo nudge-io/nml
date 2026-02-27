@@ -126,7 +126,11 @@ impl<'a> Lexer<'a> {
                     self.skip_comment();
                 }
                 '"' => {
-                    tokens.push(self.read_string()?);
+                    if self.peek_char() == Some('"') && self.chars.get(self.pos + 2) == Some(&'"') {
+                        tokens.push(self.read_multiline_string()?);
+                    } else {
+                        tokens.push(self.read_string()?);
+                    }
                 }
                 ':' => {
                     let bp = self.byte_pos();
@@ -345,6 +349,105 @@ impl<'a> Lexer<'a> {
             "unterminated string literal",
             Span::new(start, self.byte_pos()),
         ))
+    }
+
+    fn read_multiline_string(&mut self) -> NmlResult<Token> {
+        let start = self.byte_pos();
+        self.pos += 3; // skip """
+        let mut raw = String::new();
+
+        while self.pos < self.chars.len() {
+            if self.chars[self.pos] == '"'
+                && self.chars.get(self.pos + 1) == Some(&'"')
+                && self.chars.get(self.pos + 2) == Some(&'"')
+            {
+                self.pos += 3; // skip closing """
+                let value = Self::dedent_multiline_string(&raw);
+                return Ok(Token::new(
+                    TokenKind::StringLiteral(value),
+                    Span::new(start, self.byte_pos()),
+                ));
+            }
+            match self.chars[self.pos] {
+                '\\' => {
+                    self.pos += 1;
+                    if self.pos >= self.chars.len() {
+                        return Err(NmlError::lex(
+                            "unexpected end of string",
+                            Span::new(start, self.byte_pos()),
+                        ));
+                    }
+                    match self.chars[self.pos] {
+                        '"' => raw.push('"'),
+                        '\\' => raw.push('\\'),
+                        'n' => raw.push('\n'),
+                        't' => raw.push('\t'),
+                        c => {
+                            return Err(NmlError::lex(
+                                format!("unknown escape sequence: '\\{c}'"),
+                                Span::new(
+                                    self.byte_pos_at(self.pos - 1),
+                                    self.byte_pos_at(self.pos + 1),
+                                ),
+                            ));
+                        }
+                    }
+                    self.pos += 1;
+                }
+                ch => {
+                    raw.push(ch);
+                    self.pos += 1;
+                }
+            }
+        }
+
+        Err(NmlError::lex(
+            "unterminated multiline string literal",
+            Span::new(start, self.byte_pos()),
+        ))
+    }
+
+    /// Dedent multiline string content: strip minimum leading whitespace from each line,
+    /// trim leading newline after opening \"\"\" and trailing newline before closing \"\"\".
+    fn dedent_multiline_string(raw: &str) -> String {
+        let mut lines: Vec<&str> = raw.split('\n').collect();
+
+        // Trim leading newline: if first line is empty, remove it
+        if let Some(first) = lines.first() {
+            if first.is_empty() || first.chars().all(|c| c.is_whitespace()) {
+                lines.remove(0);
+            }
+        }
+
+        // Trim trailing newline: if last line is empty, remove it
+        if let Some(last) = lines.last() {
+            if last.is_empty() || last.chars().all(|c| c.is_whitespace()) {
+                lines.pop();
+            }
+        }
+
+        if lines.is_empty() {
+            return String::new();
+        }
+
+        let min_indent = lines
+            .iter()
+            .filter(|line| !line.chars().all(|c| c.is_whitespace()))
+            .map(|line| line.chars().take_while(|c| *c == ' ').count())
+            .min()
+            .unwrap_or(0);
+
+        lines
+            .iter()
+            .map(|line| {
+                if line.len() >= min_indent && line.chars().take(min_indent).all(|c| c == ' ') {
+                    &line[min_indent..]
+                } else {
+                    *line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn read_number(&mut self) -> NmlResult<Token> {
@@ -685,6 +788,48 @@ mod tests {
                 TokenKind::Equals,
                 TokenKind::StringLiteral("/health".into()),
                 TokenKind::Dedent,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_multiline_string() {
+        let input = "x = \"\"\"\n    hello\n    world\n    \"\"\"";
+        let mut lexer = Lexer::new(input);
+        let tokens = lexer.tokenize().unwrap();
+        let kinds: Vec<_> = tokens
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|k| !matches!(k, TokenKind::Newline))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier("x".into()),
+                TokenKind::Equals,
+                TokenKind::StringLiteral("hello\nworld".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_multiline_string_inline() {
+        let input = "x = \"\"\"one line\"\"\"";
+        let mut lexer = Lexer::new(input);
+        let tokens = lexer.tokenize().unwrap();
+        let kinds: Vec<_> = tokens
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|k| !matches!(k, TokenKind::Newline))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::Identifier("x".into()),
+                TokenKind::Equals,
+                TokenKind::StringLiteral("one line".into()),
                 TokenKind::Eof,
             ]
         );

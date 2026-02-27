@@ -10,3 +10,4 @@ pub mod span;
 pub mod types;
 
 pub use parser::parse;
+pub use resolver::Resolver;

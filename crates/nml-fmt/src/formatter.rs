@@ -36,6 +36,14 @@ fn format_declaration(out: &mut String, decl: &Declaration, depth: usize) {
             out.push_str(":\n");
             format_array_body(out, &arr.body, depth + 1);
         }
+        DeclarationKind::Const(c) => {
+            write_indent(out, depth);
+            out.push_str("const ");
+            out.push_str(&c.name.name);
+            out.push_str(" = ");
+            format_value(out, &c.value.value, depth);
+            out.push('\n');
+        }
     }
 }
 
@@ -51,7 +59,7 @@ fn format_body_entry(out: &mut String, entry: &BodyEntry, depth: usize) {
             write_indent(out, depth);
             out.push_str(&prop.name.name);
             out.push_str(" = ");
-            format_value(out, &prop.value.value);
+            format_value(out, &prop.value.value, depth);
             out.push('\n');
         }
         BodyEntryKind::NestedBlock(nb) => {
@@ -89,7 +97,7 @@ fn format_body_entry(out: &mut String, entry: &BodyEntry, depth: usize) {
             }
             if let Some(ref default) = f.default_value {
                 out.push_str(" = ");
-                format_value(out, &default.value);
+                format_value(out, &default.value, depth);
             }
             out.push('\n');
         }
@@ -104,7 +112,7 @@ fn format_modifier(out: &mut String, m: &Modifier, depth: usize) {
     match &m.value {
         ModifierValue::Inline(val) => {
             out.push_str(" = ");
-            format_value(out, &val.value);
+            format_value(out, &val.value, depth);
             out.push('\n');
         }
         ModifierValue::Block(items) => {
@@ -145,7 +153,7 @@ fn format_array_body(out: &mut String, body: &ArrayBody, depth: usize) {
         write_indent(out, depth);
         out.push_str(&prop.name.name);
         out.push_str(" = ");
-        format_value(out, &prop.value.value);
+        format_value(out, &prop.value.value, depth);
         out.push('\n');
     }
     if (!body.modifiers.is_empty() || !body.shared_properties.is_empty() || !body.properties.is_empty())
@@ -169,7 +177,7 @@ fn format_list_item(out: &mut String, item: &ListItem, depth: usize) {
             format_body(out, body, depth + 1);
         }
         ListItemKind::Shorthand(val) => {
-            format_value(out, &val.value);
+            format_value(out, &val.value, depth);
             out.push('\n');
         }
         ListItemKind::Reference(ident) => {
@@ -183,20 +191,35 @@ fn format_list_item(out: &mut String, item: &ListItem, depth: usize) {
     }
 }
 
-fn format_value(out: &mut String, value: &Value) {
+fn format_value(out: &mut String, value: &Value, depth: usize) {
     match value {
         Value::String(s) => {
-            out.push('"');
-            for ch in s.chars() {
-                match ch {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '\n' => out.push_str("\\n"),
-                    '\t' => out.push_str("\\t"),
-                    c => out.push(c),
+            if s.contains('\n') {
+                out.push_str("\"\"\"\n");
+                for line in s.split('\n') {
+                    write_indent(out, depth + 1);
+                    for ch in line.chars() {
+                        match ch {
+                            '\\' => out.push_str("\\\\"),
+                            c => out.push(c),
+                        }
+                    }
+                    out.push('\n');
                 }
+                write_indent(out, depth + 1);
+                out.push_str("\"\"\"");
+            } else {
+                out.push('"');
+                for ch in s.chars() {
+                    match ch {
+                        '"' => out.push_str("\\\""),
+                        '\\' => out.push_str("\\\\"),
+                        '\t' => out.push_str("\\t"),
+                        c => out.push(c),
+                    }
+                }
+                out.push('"');
             }
-            out.push('"');
         }
         Value::Number(n) => {
             if n.fract() == 0.0 {
@@ -236,7 +259,7 @@ fn format_value(out: &mut String, value: &Value) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                format_value(out, &item.value);
+                format_value(out, &item.value, depth);
             }
             out.push(']');
         }
