@@ -39,11 +39,20 @@ pub enum DeclarationKind {
     Array(ArrayDecl),
     /// A constant: `const Name = value`
     Const(ConstDecl),
+    /// A template: `template Name: <string value>`
+    Template(TemplateDecl),
 }
 
 /// A constant declaration: `const Name = value`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConstDecl {
+    pub name: Identifier,
+    pub value: SpannedValue,
+}
+
+/// A template declaration: `template Name:` followed by a string value.
+#[derive(Debug, Clone, Serialize)]
+pub struct TemplateDecl {
     pub name: Identifier,
     pub value: SpannedValue,
 }

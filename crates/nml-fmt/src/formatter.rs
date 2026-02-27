@@ -44,6 +44,15 @@ fn format_declaration(out: &mut String, decl: &Declaration, depth: usize) {
             format_value(out, &c.value.value, depth);
             out.push('\n');
         }
+        DeclarationKind::Template(t) => {
+            write_indent(out, depth);
+            out.push_str("template ");
+            out.push_str(&t.name.name);
+            out.push_str(":\n");
+            write_indent(out, depth + 1);
+            format_value(out, &t.value.value, depth + 1);
+            out.push('\n');
+        }
     }
 }
 

@@ -140,6 +140,11 @@ fn find_name_in_file(file: &File, name: &str, source_map: &SourceMap) -> Option<
                     return Some(span_to_range(c.name.span, source_map));
                 }
             }
+            DeclarationKind::Template(t) => {
+                if t.name.name == name {
+                    return Some(span_to_range(t.name.span, source_map));
+                }
+            }
         }
     }
     None

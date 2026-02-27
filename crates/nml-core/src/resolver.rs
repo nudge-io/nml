@@ -47,6 +47,15 @@ impl Resolver {
                         span: decl.span,
                     }
                 }
+                DeclarationKind::Template(t) => {
+                    self.const_values
+                        .insert(t.name.name.clone(), t.value.value.clone());
+                    DeclInfo {
+                        keyword: "template".into(),
+                        name: t.name.name.clone(),
+                        span: decl.span,
+                    }
+                }
             };
             self.declarations
                 .entry(info.name.clone())

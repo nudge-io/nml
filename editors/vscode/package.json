@@ -30,7 +30,15 @@
         "scopeName": "source.nml",
         "path": "./syntaxes/nml.tmLanguage.json"
       }
-    ]
+    ],
+    "configurationDefaults": {
+      "[nml]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.detectIndentation": false,
+        "editor.autoIndent": "full"
+      }
+    }
   },
   "main": "./out/extension.js",
   "scripts": {

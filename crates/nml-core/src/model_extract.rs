@@ -35,7 +35,7 @@ pub fn extract(file: &File) -> ExtractedSchema {
                 _ => {}
             },
             DeclarationKind::Array(_) => {}
-            DeclarationKind::Const(_) => {}
+            DeclarationKind::Const(_) | DeclarationKind::Template(_) => {}
         }
     }
 

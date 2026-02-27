@@ -66,7 +66,6 @@ impl Parser {
         if keyword.name == "const" {
             self.expect_kind(TokenKind::Equals)?;
             self.skip_newlines();
-            // Allow value on next line (optionally after Indent)
             if self.check(TokenKind::Indent) {
                 self.advance();
             }
@@ -77,6 +76,30 @@ impl Parser {
             let end_span = self.prev_span();
             return Ok(Declaration {
                 kind: DeclarationKind::Const(ConstDecl { name, value }),
+                span: start_span.merge(end_span),
+            });
+        }
+
+        if keyword.name == "template" {
+            self.expect_kind(TokenKind::Colon)?;
+            self.skip_newlines();
+            if self.check(TokenKind::Indent) {
+                self.advance();
+            }
+            let value = self.parse_value()?;
+            if !matches!(&value.value, Value::String(_)) {
+                return Err(NmlError::parse(
+                    "template value must be a string",
+                    value.span,
+                ));
+            }
+            self.skip_newlines();
+            if self.check(TokenKind::Dedent) {
+                self.advance();
+            }
+            let end_span = self.prev_span();
+            return Ok(Declaration {
+                kind: DeclarationKind::Template(TemplateDecl { name, value }),
                 span: start_span.merge(end_span),
             });
         }
@@ -653,6 +676,36 @@ mod tests {
                 assert!(matches!(&c.value.value, Value::String(s) if s == "hello"));
             }
             _ => panic!("expected const declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_template() {
+        let source = "template Greeting:\n    \"hello world\"\n";
+        let file = parse(source).unwrap();
+        assert_eq!(file.declarations.len(), 1);
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Template(t) => {
+                assert_eq!(t.name.name, "Greeting");
+                assert!(matches!(&t.value.value, Value::String(s) if s == "hello world"));
+            }
+            _ => panic!("expected template declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_template_multiline() {
+        let source = "template Prompt:\n    \"\"\"\n    line one\n    line two\n    \"\"\"\n";
+        let file = parse(source).unwrap();
+        assert_eq!(file.declarations.len(), 1);
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Template(t) => {
+                assert_eq!(t.name.name, "Prompt");
+                assert!(matches!(&t.value.value, Value::String(s) if s == "line one\nline two"));
+            }
+            _ => panic!("expected template declaration"),
         }
     }
 
