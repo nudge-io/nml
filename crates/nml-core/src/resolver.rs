@@ -94,6 +94,63 @@ impl Resolver {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.declarations.keys().map(|s| s.as_str())
     }
+
+    /// Find all unresolved references in the file.
+    /// Walks property values looking for `Value::Reference` that don't match
+    /// any registered declaration name.
+    pub fn find_unresolved_references(&self, file: &File) -> Vec<NmlError> {
+        let mut errors = Vec::new();
+        for decl in &file.declarations {
+            match &decl.kind {
+                DeclarationKind::Block(block) => {
+                    let is_schema_def =
+                        matches!(block.keyword.name.as_str(), "model" | "trait" | "enum");
+                    if !is_schema_def {
+                        self.check_body_refs(&block.body, &mut errors);
+                    }
+                }
+                DeclarationKind::Array(arr) => {
+                    let is_schema_def =
+                        matches!(arr.item_keyword.name.as_str(), "model" | "trait" | "enum");
+                    if !is_schema_def {
+                        for item in &arr.body.items {
+                            if let ListItemKind::Named { body, .. } = &item.kind {
+                                self.check_body_refs(body, &mut errors);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        errors
+    }
+
+    fn check_body_refs(&self, body: &Body, errors: &mut Vec<NmlError>) {
+        for entry in &body.entries {
+            match &entry.kind {
+                BodyEntryKind::Property(prop) => {
+                    if let Value::Reference(name) = &prop.value.value {
+                        if self.resolve(name).is_none() {
+                            errors.push(NmlError::Validation {
+                                message: format!("unresolved reference '{name}'"),
+                                span: prop.value.span,
+                            });
+                        }
+                    }
+                }
+                BodyEntryKind::NestedBlock(nb) => {
+                    self.check_body_refs(&nb.body, errors);
+                }
+                BodyEntryKind::ListItem(item) => {
+                    if let ListItemKind::Named { body, .. } = &item.kind {
+                        self.check_body_refs(body, errors);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +168,66 @@ mod tests {
         assert!(resolver.resolve("Svc").is_some());
         assert!(resolver.resolve("Res").is_some());
         assert!(resolver.resolve("Unknown").is_none());
+    }
+
+    #[test]
+    fn test_unresolved_reference() {
+        let source = "provider Groq:\n    type = \"groq\"\n\nworkflow W:\n    entrypoint = lasda\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_unresolved_references(&file);
+        assert!(
+            errors.iter().any(|e| e.message().contains("unresolved reference 'lasda'")),
+            "should flag unresolved reference; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_valid_reference_no_error() {
+        let source = "provider Groq:\n    type = \"groq\"\n\nworkflow W:\n    provider = Groq\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_unresolved_references(&file);
+        assert!(
+            errors.is_empty(),
+            "valid reference should not be flagged; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_unresolved_ref_in_list_item() {
+        let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - s1:\n            provider = NonExistent\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_unresolved_references(&file);
+        assert!(
+            errors.iter().any(|e| e.message().contains("unresolved reference 'NonExistent'")),
+            "should flag unresolved reference inside list item; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_model_definitions_skipped() {
+        let source = "model step:\n    provider string?\n    prompt prompt?\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_unresolved_references(&file);
+        assert!(
+            errors.is_empty(),
+            "model/trait/enum definitions should not be checked for value refs; errors: {:?}",
+            errors
+        );
     }
 
     #[test]

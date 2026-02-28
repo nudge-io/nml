@@ -18,6 +18,10 @@ pub fn compute(source: &str, models: &[ModelDef], enums: &[EnumDef]) -> Vec<Diag
                 diagnostics.push(nml_error_to_diagnostic(&err, &source_map));
             }
 
+            for err in resolver.find_unresolved_references(&file) {
+                diagnostics.push(nml_error_to_diagnostic(&err, &source_map));
+            }
+
             if !models.is_empty() || !enums.is_empty() {
                 let validator = SchemaValidator::new(models.to_vec(), enums.to_vec());
                 for diag in validator.validate(&file) {
