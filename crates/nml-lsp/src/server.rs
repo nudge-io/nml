@@ -130,18 +130,44 @@ impl NmlLanguageServer {
         }
     }
 
-    fn find_definition(&self, name: &str) -> Option<(Url, Range)> {
+    fn find_definition(&self, name: &str, current_uri: &Url) -> Option<(Url, Range)> {
         let docs = self.documents.lock().unwrap();
+
+        // Priority 1: Field definitions in .model.nml files
+        for (uri, source) in docs.iter() {
+            if !uri.as_str().ends_with(".model.nml") {
+                continue;
+            }
+            if let Ok(file) = nml_core::parse(source) {
+                let source_map = SourceMap::new(source);
+                if let Some(range) = find_field_definition(&file, name, &source_map) {
+                    return Some((uri.clone(), range));
+                }
+            }
+        }
+
+        // Priority 2: Top-level declaration names across all files
         for (uri, source) in docs.iter() {
             if let Ok(file) = nml_core::parse(source) {
                 let source_map = SourceMap::new(source);
-                if let Some(range) = find_name_in_file(&file, name, &source_map) {
+                if let Some(range) = find_top_level_decl(&file, name, &source_map) {
                     return Some((uri.clone(), range));
                 }
-            } else if let Some(range) = find_name_by_text(source, name) {
-                return Some((uri.clone(), range));
             }
         }
+
+        // Priority 3: Nested names in current file only
+        if let Some(source) = docs.get(current_uri) {
+            if let Ok(file) = nml_core::parse(source) {
+                let source_map = SourceMap::new(source);
+                if let Some(range) = find_name_in_file(&file, name, &source_map) {
+                    return Some((current_uri.clone(), range));
+                }
+            } else if let Some(range) = find_name_by_text(source, name) {
+                return Some((current_uri.clone(), range));
+            }
+        }
+
         None
     }
 }
@@ -153,6 +179,51 @@ fn span_to_range(span: nml_core::span::Span, source_map: &SourceMap) -> Range {
         start: Position::new(start.line as u32 - 1, start.column as u32 - 1),
         end: Position::new(end.line as u32 - 1, end.column as u32 - 1),
     }
+}
+
+fn find_field_definition(file: &File, name: &str, source_map: &SourceMap) -> Option<Range> {
+    for decl in &file.declarations {
+        if let DeclarationKind::Block(block) = &decl.kind {
+            if matches!(block.keyword.name.as_str(), "model" | "trait") {
+                for entry in &block.body.entries {
+                    if let BodyEntryKind::FieldDefinition(fd) = &entry.kind {
+                        if fd.name.name == name {
+                            return Some(span_to_range(fd.name.span, source_map));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_top_level_decl(file: &File, name: &str, source_map: &SourceMap) -> Option<Range> {
+    for decl in &file.declarations {
+        match &decl.kind {
+            DeclarationKind::Block(block) => {
+                if block.name.name == name {
+                    return Some(span_to_range(block.name.span, source_map));
+                }
+            }
+            DeclarationKind::Array(arr) => {
+                if arr.name.name == name {
+                    return Some(span_to_range(arr.name.span, source_map));
+                }
+            }
+            DeclarationKind::Const(c) => {
+                if c.name.name == name {
+                    return Some(span_to_range(c.name.span, source_map));
+                }
+            }
+            DeclarationKind::Template(t) => {
+                if t.name.name == name {
+                    return Some(span_to_range(t.name.span, source_map));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn find_name_in_file(file: &File, name: &str, source_map: &SourceMap) -> Option<Range> {
@@ -417,7 +488,7 @@ impl LanguageServer for NmlLanguageServer {
             return Ok(None);
         }
 
-        if let Some((target_uri, range)) = self.find_definition(&word) {
+        if let Some((target_uri, range)) = self.find_definition(&word, &uri) {
             Ok(Some(GotoDefinitionResponse::Scalar(
                 tower_lsp::lsp_types::Location {
                     uri: target_uri,
