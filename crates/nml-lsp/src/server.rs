@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
 use std::sync::Mutex;
 
 use tower_lsp::jsonrpc::Result;
@@ -14,6 +16,7 @@ use crate::diagnostics;
 pub struct NmlLanguageServer {
     client: Client,
     documents: Mutex<HashMap<Url, String>>,
+    indexed_uris: Mutex<HashSet<Url>>,
     models: Mutex<Vec<ModelDef>>,
     enums: Mutex<Vec<EnumDef>>,
 }
@@ -23,8 +26,46 @@ impl NmlLanguageServer {
         Self {
             client,
             documents: Mutex::new(HashMap::new()),
+            indexed_uris: Mutex::new(HashSet::new()),
             models: Mutex::new(Vec::new()),
             enums: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn find_nml_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name != "node_modules" && name != ".git" && !name.starts_with('.') {
+                        Self::find_nml_files(&path, files);
+                    }
+                } else if path.extension().map_or(false, |e| e == "nml") {
+                    files.push(path);
+                }
+            }
+        }
+    }
+
+    fn index_workspace(&self, roots: &[Url]) {
+        let mut docs = self.documents.lock().unwrap();
+        let mut indexed = self.indexed_uris.lock().unwrap();
+        for root in roots {
+            let path = match root.to_file_path() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let mut files = Vec::new();
+            Self::find_nml_files(&path, &mut files);
+            for path in files {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(uri) = Url::from_file_path(&path) {
+                        docs.insert(uri.clone(), content);
+                        indexed.insert(uri);
+                    }
+                }
+            }
         }
     }
 
@@ -186,7 +227,23 @@ fn find_name_in_list_item(item: &ListItem, name: &str, source_map: &SourceMap) -
 
 #[tower_lsp::async_trait]
 impl LanguageServer for NmlLanguageServer {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let roots: Vec<Url> = params
+            .workspace_folders
+            .as_ref()
+            .map(|folders| folders.iter().map(|f| f.uri.clone()).collect())
+            .or_else(|| params.root_uri.clone().map(|u| vec![u]))
+            .unwrap_or_default();
+        if !roots.is_empty() {
+            self.index_workspace(&roots);
+            self.rebuild_schema_registry();
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("NML: indexed {} workspace root(s)", roots.len()),
+                )
+                .await;
+        }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -234,11 +291,12 @@ impl LanguageServer for NmlLanguageServer {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        let was_model = params.text_document.uri.as_str().ends_with(".model.nml");
-        self.documents
-            .lock()
-            .unwrap()
-            .remove(&params.text_document.uri);
+        let uri = params.text_document.uri;
+        let was_model = uri.as_str().ends_with(".model.nml");
+        let indexed = self.indexed_uris.lock().unwrap().contains(&uri);
+        if !indexed {
+            self.documents.lock().unwrap().remove(&uri);
+        }
 
         if was_model {
             self.rebuild_schema_registry();

@@ -12,6 +12,9 @@
   "engines": {
     "vscode": "^1.75.0"
   },
+  "activationEvents": [
+    "onLanguage:nml"
+  ],
   "categories": [
     "Programming Languages"
   ],
@@ -19,8 +22,13 @@
     "languages": [
       {
         "id": "nml",
-        "aliases": ["NML", "nml"],
-        "extensions": [".nml"],
+        "aliases": [
+          "NML",
+          "nml"
+        ],
+        "extensions": [
+          ".nml"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -49,6 +57,7 @@
     "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
+    "@types/node": "^25.3.2",
     "@types/vscode": "^1.75.0",
     "typescript": "^5.0.0"
   }

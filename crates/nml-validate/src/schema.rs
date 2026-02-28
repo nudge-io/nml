@@ -152,7 +152,36 @@ impl SchemaValidator {
                 BodyEntryKind::NestedBlock(nb) => {
                     seen_fields.push(&nb.name.name);
 
-                    if model.fields.iter().all(|f| f.name != nb.name.name) {
+                    if let Some(field_def) = model.fields.iter().find(|f| f.name == nb.name.name) {
+                        match &field_def.field_type {
+                            FieldType::ModelRef(ref_name) => {
+                                if let Some(nested_model) = self.find_model(ref_name) {
+                                    self.validate_instance_against_model(
+                                        &nb.body,
+                                        nested_model,
+                                        diags,
+                                    );
+                                }
+                            }
+                            FieldType::List(inner) => {
+                                for entry in &nb.body.entries {
+                                    if let BodyEntryKind::ListItem(item) = &entry.kind {
+                                        if let ListItemKind::Named { body, .. } = &item.kind {
+                                            if let FieldType::ModelRef(ref_name) = inner.as_ref() {
+                                                if let Some(inner_model) = self.find_model(ref_name) {
+                                                    self.validate_instance_against_model(body, inner_model, diags);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            FieldType::Primitive(PrimitiveType::Object) => {
+                                // object type: allow any keys, no inner validation
+                            }
+                            _ => {}
+                        }
+                    } else {
                         diags.push(
                             Diagnostic::warning(format!(
                                 "unknown property '{name}' (not defined in model '{model_name}')",
@@ -298,6 +327,7 @@ fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
         PrimitiveType::Duration => matches!(value, Value::String(_) | Value::Duration(_)),
         PrimitiveType::Path => matches!(value, Value::String(_)),
         PrimitiveType::Secret => matches!(value, Value::Secret(_)),
+        PrimitiveType::Object => false, // object is for nested blocks, not scalar values
     }
 }
 
@@ -476,5 +506,217 @@ mod tests {
         let diags = validator.validate(&file);
         let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
         assert!(type_diags.is_empty());
+    }
+
+    #[test]
+    fn test_object_type_accepts_nested_block_with_any_keys() {
+        let schema = "model plugin:\n    wasm string\n    config object?\n";
+        let validator = make_validator(schema);
+
+        let source = "plugin EchoPlugin:\n    wasm = \"echo.wasm\"\n    config:\n        prefix = \"echo\"\n        count = 3\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.is_empty(),
+            "object type should accept nested block with any keys; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_nested_validation_catches_typo_in_nested_block() {
+        let schema = "model prompt:\n    system string?\n    outputFormat string?\n\nmodel step:\n    prompt prompt?\n";
+        let validator = make_validator(schema);
+
+        let source = "step MyStep:\n    prompt:\n        systm = \"typo\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unknown property 'systm'")),
+            "nested validation should catch typo; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_nested_validation_valid_nested_block() {
+        let schema = "model prompt:\n    system string?\n    outputFormat string?\n\nmodel step:\n    prompt prompt?\n";
+        let validator = make_validator(schema);
+
+        let source = "step MyStep:\n    prompt:\n        system = \"You are helpful\"\n        outputFormat = \"text\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.is_empty(),
+            "valid nested block should pass; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_nested_validation_missing_required_in_nested_block() {
+        let schema = "model nested:\n    required string\n\nmodel parent:\n    child nested?\n";
+        let validator = make_validator(schema);
+
+        let source = "parent P:\n    child:\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("missing required field 'required'")),
+            "nested validation should catch missing required; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_list_field_validates_item_properties() {
+        let schema = "model prompt:\n    system string?\n    outputFormat string?\n\nmodel step:\n    provider string?\n    prompt prompt?\n    next string?\n\nmodel workflow:\n    entrypoint string\n    steps []step\n";
+        let validator = make_validator(schema);
+
+        let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - myStep:\n            provder = \"bad-typo\"\n            next = \"end\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unknown property 'provder'")),
+            "should catch typo inside list item; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_list_field_valid_items_pass() {
+        let schema = "model prompt:\n    system string?\n    outputFormat string?\n\nmodel step:\n    provider string?\n    prompt prompt?\n    next string?\n\nmodel workflow:\n    entrypoint string\n    steps []step\n";
+        let validator = make_validator(schema);
+
+        let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - s1:\n            provider = \"groq\"\n            next = \"s2\"\n        - s2:\n            provider = \"openai\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.is_empty(),
+            "valid list items should pass; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_real_workflow_model_parses_and_validates() {
+        let schema = r#"
+enum providerType:
+    - "anthropic"
+    - "openai"
+    - "groq"
+    - "ollama"
+
+enum outputFormat:
+    - "json"
+    - "text"
+    - "stream"
+
+model provider:
+    type providerType
+    model string
+    temperature number?
+    baseUrl string?
+    apiKey secret?
+
+model prompt:
+    system string?
+    template string?
+    outputFormat outputFormat = "text"
+
+model condition:
+    field string
+    equals string?
+    pattern string?
+
+model route:
+    when condition
+    goto string
+
+model plugin:
+    |allow []string?
+    |deny []string?
+    wasm string
+    config object?
+
+model step:
+    provider string?
+    prompt prompt?
+    plugin string?
+    wasm string?
+    routes []route?
+    default string?
+    next string?
+    fixed bool = true
+
+model extensionPoint:
+    after string
+    allowedCapabilities []string?
+
+model workflow:
+    entrypoint string
+    steps []step
+    extensions []extensionPoint?
+"#;
+
+        let parse_result = parser::parse(schema);
+        assert!(
+            parse_result.is_ok(),
+            "workflow.model.nml should parse; error: {:?}",
+            parse_result.err()
+        );
+
+        let validator = make_validator(schema);
+        let wf_model = validator.find_model("workflow");
+        assert!(wf_model.is_some(), "should find 'workflow' model");
+        let step_model = validator.find_model("step");
+        assert!(step_model.is_some(), "should find 'step' model");
+
+        let source = r#"
+workflow W:
+    entrypoint = "classify"
+    steps:
+        - classify:
+            provider = "groq"
+            blaasdsa = "asdasd"
+            next = "end"
+"#;
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unknown property 'blaasdsa'")),
+            "should catch blaasdsa; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_list_field_catches_unknown_prop_no_spaces() {
+        let schema = "model prompt:\n    system string?\n    outputFormat string?\n\nmodel step:\n    provider string?\n    prompt prompt?\n    next string?\n\nmodel workflow:\n    entrypoint string\n    steps []step\n";
+        let validator = make_validator(schema);
+
+        let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - s1:\n            provider = \"groq\"\n            blaasdsa=\"asdasd\"\n            next = \"end\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unknown property 'blaasdsa'")),
+            "should catch unknown prop with no-space equals; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_list_field_nested_model_ref_in_item() {
+        let schema = "model prompt:\n    system string?\n    outputFormat string?\n\nmodel step:\n    provider string?\n    prompt prompt?\n    next string?\n\nmodel workflow:\n    entrypoint string\n    steps []step\n";
+        let validator = make_validator(schema);
+
+        let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - s1:\n            provider = \"groq\"\n            prompt:\n                systm = \"typo\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unknown property 'systm'")),
+            "should catch typo in nested model inside list item; diags: {:?}",
+            diags
+        );
     }
 }

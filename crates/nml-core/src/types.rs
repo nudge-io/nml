@@ -40,6 +40,8 @@ pub enum PrimitiveType {
     Duration,
     Path,
     Secret,
+    /// Flexible key-value nested block; accepts any keys with scalar values.
+    Object,
 }
 
 impl PrimitiveType {
@@ -52,6 +54,7 @@ impl PrimitiveType {
             "duration" => Some(PrimitiveType::Duration),
             "path" => Some(PrimitiveType::Path),
             "secret" => Some(PrimitiveType::Secret),
+            "object" => Some(PrimitiveType::Object),
             _ => None,
         }
     }
@@ -65,6 +68,18 @@ impl PrimitiveType {
             PrimitiveType::Duration => "duration",
             PrimitiveType::Path => "path",
             PrimitiveType::Secret => "secret",
+            PrimitiveType::Object => "object",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_primitive_type_object() {
+        assert_eq!(PrimitiveType::from_str("object"), Some(PrimitiveType::Object));
+        assert_eq!(PrimitiveType::Object.as_str(), "object");
     }
 }

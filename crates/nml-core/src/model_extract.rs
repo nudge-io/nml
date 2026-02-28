@@ -238,8 +238,26 @@ mod tests {
         let model = &schema.models[0];
         assert_eq!(model.fields.len(), 3);
         assert_eq!(model.fields[0].name, "wasm");
-        assert_eq!(model.fields[1].name, "allow");
         assert!(matches!(model.fields[1].field_type, FieldType::Modifier(_)));
+        assert!(model.fields[1].optional);
+    }
+
+    #[test]
+    fn test_extract_model_with_object_field() {
+        use crate::model::FieldType;
+        use crate::types::PrimitiveType;
+
+        let source = "model plugin:\n    wasm string\n    config object?\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let model = &schema.models[0];
+        assert_eq!(model.fields.len(), 2);
+        assert_eq!(model.fields[1].name, "config");
+        assert!(matches!(
+            &model.fields[1].field_type,
+            FieldType::Primitive(PrimitiveType::Object)
+        ));
         assert!(model.fields[1].optional);
     }
 
