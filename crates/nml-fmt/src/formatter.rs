@@ -272,6 +272,11 @@ fn format_value(out: &mut String, value: &Value, depth: usize) {
             }
             out.push(']');
         }
+        Value::Fallback(primary, fallback) => {
+            format_value(out, &primary.value, depth);
+            out.push_str(" | ");
+            format_value(out, &fallback.value, depth);
+        }
     }
 }
 

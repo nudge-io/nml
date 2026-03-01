@@ -522,20 +522,13 @@ impl<'a> Lexer<'a> {
         Token::new(TokenKind::RoleRef(value), Span::new(start, self.byte_pos()))
     }
 
+    const KNOWN_NAMESPACES: &'static [&'static str] = &["ENV"];
+
     fn read_secret_ref(&mut self) -> NmlResult<Token> {
         let start = self.byte_pos();
         self.pos += 1; // skip $
 
-        let remaining: String = self.chars[self.pos..].iter().take(4).collect();
-        if remaining != "ENV." {
-            return Err(NmlError::lex(
-                "expected $ENV. for secret reference",
-                Span::new(start, self.byte_pos_at(self.pos + 4)),
-            ));
-        }
-        self.pos += 4;
-
-        let name_start = self.pos;
+        let ns_start = self.pos;
         while self.pos < self.chars.len() {
             let ch = self.chars[self.pos];
             if ch.is_alphanumeric() || ch == '_' {
@@ -545,9 +538,47 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        if self.pos == name_start {
+        if self.pos == ns_start {
             return Err(NmlError::lex(
-                "expected variable name after $ENV.",
+                "expected namespace after '$' (e.g. $ENV.MY_VAR)",
+                Span::new(start, self.byte_pos()),
+            ));
+        }
+
+        let namespace: String = self.chars[ns_start..self.pos].iter().collect();
+
+        if !Self::KNOWN_NAMESPACES.contains(&namespace.as_str()) {
+            let valid = Self::KNOWN_NAMESPACES.join(", ");
+            return Err(NmlError::lex(
+                format!(
+                    "unknown variable source '{}'. Valid sources: {}",
+                    namespace, valid
+                ),
+                Span::new(start, self.byte_pos()),
+            ));
+        }
+
+        if self.pos >= self.chars.len() || self.chars[self.pos] != '.' {
+            return Err(NmlError::lex(
+                format!("expected '.' after ${}", namespace),
+                Span::new(start, self.byte_pos()),
+            ));
+        }
+        self.pos += 1; // skip '.'
+
+        let key_start = self.pos;
+        while self.pos < self.chars.len() {
+            let ch = self.chars[self.pos];
+            if ch.is_alphanumeric() || ch == '_' || ch == '.' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+
+        if self.pos == key_start {
+            return Err(NmlError::lex(
+                format!("expected variable name after ${namespace}."),
                 Span::new(start, self.byte_pos()),
             ));
         }
@@ -830,6 +861,88 @@ mod tests {
                 TokenKind::Identifier("x".into()),
                 TokenKind::Equals,
                 TokenKind::StringLiteral("one line".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_secret_ref_with_dotted_key() {
+        let tokens = lex("x = $ENV.MY.DOTTED.VAR");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Identifier("x".into()),
+                TokenKind::Equals,
+                TokenKind::SecretRef("$ENV.MY.DOTTED.VAR".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_secret_ref_unknown_namespace() {
+        let mut lexer = Lexer::new("x = $FOOBAR.KEY");
+        let result = lexer.tokenize();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message().contains("unknown variable source 'FOOBAR'"),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_secret_ref_empty_key() {
+        let mut lexer = Lexer::new("x = $ENV.");
+        let result = lexer.tokenize();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message().contains("expected variable name after $ENV."),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_secret_ref_dollar_alone() {
+        let mut lexer = Lexer::new("x = $ ");
+        let result = lexer.tokenize();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message().contains("expected namespace after '$'"),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_secret_ref_no_dot_after_namespace() {
+        let mut lexer = Lexer::new("x = $ENV ");
+        let result = lexer.tokenize();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message().contains("expected '.' after $ENV"),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_secret_ref_with_fallback_tokens() {
+        let tokens = lex("port = $ENV.PORT | 3000");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Identifier("port".into()),
+                TokenKind::Equals,
+                TokenKind::SecretRef("$ENV.PORT".into()),
+                TokenKind::Pipe,
+                TokenKind::NumberLiteral(3000.0),
                 TokenKind::Eof,
             ]
         );

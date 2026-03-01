@@ -319,6 +319,10 @@ fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
     if matches!(value, Value::Reference(_)) {
         return true;
     }
+    if let Value::Fallback(primary, fallback) = value {
+        return value_matches_primitive(&primary.value, prim)
+            || value_matches_primitive(&fallback.value, prim);
+    }
     match prim {
         PrimitiveType::String => matches!(value, Value::String(_)),
         PrimitiveType::Number => matches!(value, Value::Number(_)),
@@ -327,7 +331,7 @@ fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
         PrimitiveType::Duration => matches!(value, Value::String(_) | Value::Duration(_)),
         PrimitiveType::Path => matches!(value, Value::String(_)),
         PrimitiveType::Secret => matches!(value, Value::Secret(_)),
-        PrimitiveType::Object => false, // object is for nested blocks, not scalar values
+        PrimitiveType::Object => false,
     }
 }
 
@@ -343,6 +347,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::RoleRef(_) => "role reference",
         Value::Reference(_) => "reference",
         Value::Array(_) => "array",
+        Value::Fallback(_, _) => "fallback",
     }
 }
 

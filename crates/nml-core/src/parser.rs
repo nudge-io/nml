@@ -69,7 +69,7 @@ impl Parser {
             if self.check(TokenKind::Indent) {
                 self.advance();
             }
-            let value = self.parse_value()?;
+            let value = self.parse_value_or_fallback()?;
             if self.check(TokenKind::Dedent) {
                 self.advance();
             }
@@ -234,7 +234,7 @@ impl Parser {
         } else {
             false
         };
-        let value = self.parse_value()?;
+        let value = self.parse_value_or_fallback()?;
         if had_indent {
             self.skip_newlines();
             if self.check(TokenKind::Dedent) {
@@ -271,7 +271,7 @@ impl Parser {
 
         let default_value = if self.check(TokenKind::Equals) {
             self.advance();
-            Some(self.parse_value()?)
+            Some(self.parse_value_or_fallback()?)
         } else {
             None
         };
@@ -291,7 +291,7 @@ impl Parser {
 
         if self.check(TokenKind::Equals) {
             self.advance();
-            let value = self.parse_value()?;
+            let value = self.parse_value_or_fallback()?;
             self.skip_newlines();
             Ok(Modifier {
                 name,
@@ -476,6 +476,21 @@ impl Parser {
                 kind: ListItemKind::Reference(ident),
                 span,
             })
+        }
+    }
+
+    fn parse_value_or_fallback(&mut self) -> NmlResult<SpannedValue> {
+        let value = self.parse_value()?;
+        if self.check(TokenKind::Pipe) {
+            self.advance();
+            let fallback = self.parse_value_or_fallback()?;
+            let span = value.span.merge(fallback.span);
+            Ok(SpannedValue::new(
+                Value::Fallback(Box::new(value), Box::new(fallback)),
+                span,
+            ))
+        } else {
+            Ok(value)
         }
     }
 
@@ -1083,6 +1098,138 @@ mod tests {
                 }
             }
             _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fallback_single() {
+        let source = "server Srv:\n    port = $ENV.PORT | 3000\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                match &block.body.entries[0].kind {
+                    BodyEntryKind::Property(prop) => {
+                        assert_eq!(prop.name.name, "port");
+                        match &prop.value.value {
+                            Value::Fallback(primary, fallback) => {
+                                assert!(matches!(&primary.value, Value::Secret(s) if s == "$ENV.PORT"));
+                                assert!(matches!(&fallback.value, Value::Number(n) if *n == 3000.0));
+                            }
+                            other => panic!("expected Fallback, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected property, got {other:?}"),
+                }
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fallback_chained() {
+        let source = "server Srv:\n    port = $ENV.PORT | $ENV.DEFAULT_PORT | 8080\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                match &block.body.entries[0].kind {
+                    BodyEntryKind::Property(prop) => {
+                        match &prop.value.value {
+                            Value::Fallback(primary, middle) => {
+                                assert!(matches!(&primary.value, Value::Secret(s) if s == "$ENV.PORT"));
+                                match &middle.value {
+                                    Value::Fallback(mid_primary, final_val) => {
+                                        assert!(matches!(&mid_primary.value, Value::Secret(s) if s == "$ENV.DEFAULT_PORT"));
+                                        assert!(matches!(&final_val.value, Value::Number(n) if *n == 8080.0));
+                                    }
+                                    other => panic!("expected nested Fallback, got {other:?}"),
+                                }
+                            }
+                            other => panic!("expected Fallback, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected property, got {other:?}"),
+                }
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_secret_no_fallback_backward_compat() {
+        let source = "provider P:\n    apiKey = $ENV.API_KEY\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                match &block.body.entries[0].kind {
+                    BodyEntryKind::Property(prop) => {
+                        assert!(matches!(&prop.value.value, Value::Secret(s) if s == "$ENV.API_KEY"));
+                    }
+                    other => panic!("expected property, got {other:?}"),
+                }
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fallback_string() {
+        let source = "auth A:\n    secret = $ENV.AUTH_SECRET | \"dev-secret\"\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                match &block.body.entries[0].kind {
+                    BodyEntryKind::Property(prop) => {
+                        match &prop.value.value {
+                            Value::Fallback(primary, fallback) => {
+                                assert!(matches!(&primary.value, Value::Secret(s) if s == "$ENV.AUTH_SECRET"));
+                                assert!(matches!(&fallback.value, Value::String(s) if s == "dev-secret"));
+                            }
+                            other => panic!("expected Fallback, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected property, got {other:?}"),
+                }
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_modifier_does_not_consume_next_line_pipe() {
+        let source = "service Svc:\n    port = $ENV.PORT\n    |allow = [@public]\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                assert_eq!(block.body.entries.len(), 2);
+                assert!(matches!(&block.body.entries[0].kind, BodyEntryKind::Property(p) if p.name.name == "port"));
+                assert!(matches!(&block.body.entries[1].kind, BodyEntryKind::Modifier(m) if m.name.name == "allow"));
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_const_with_fallback() {
+        let source = "const Port = $ENV.PORT | 3000\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Const(c) => {
+                assert_eq!(c.name.name, "Port");
+                match &c.value.value {
+                    Value::Fallback(primary, fallback) => {
+                        assert!(matches!(&primary.value, Value::Secret(s) if s == "$ENV.PORT"));
+                        assert!(matches!(&fallback.value, Value::Number(n) if *n == 3000.0));
+                    }
+                    other => panic!("expected Fallback, got {other:?}"),
+                }
+            }
+            _ => panic!("expected const"),
         }
     }
 }

@@ -15,6 +15,7 @@ pub enum Value {
     RoleRef(String),
     Reference(String),
     Array(Vec<SpannedValue>),
+    Fallback(Box<SpannedValue>, Box<SpannedValue>),
 }
 
 /// A value with its source location.
