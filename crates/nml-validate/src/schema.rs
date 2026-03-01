@@ -221,14 +221,25 @@ impl SchemaValidator {
         span: nml_core::span::Span,
         diags: &mut Vec<Diagnostic>,
     ) {
+        if let Value::Fallback(primary, fallback) = value {
+            self.validate_value_type(&primary.value, field, primary.span, diags);
+            self.validate_value_type(&fallback.value, field, fallback.span, diags);
+            return;
+        }
+
         match &field.field_type {
             FieldType::Primitive(prim) => {
                 if !value_matches_primitive(value, prim) {
+                    let expected = if *prim == PrimitiveType::Secret {
+                        "environment variable ($ENV.VARIABLE_NAME)".to_string()
+                    } else {
+                        prim.as_str().to_string()
+                    };
                     diags.push(
                         Diagnostic::error(format!(
                             "type mismatch for '{}': expected {}, got {}",
                             field.name,
-                            prim.as_str(),
+                            expected,
                             value_type_name(value)
                         ))
                         .with_span(span),
@@ -316,12 +327,8 @@ impl SchemaValidator {
 }
 
 fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
-    if matches!(value, Value::Reference(_)) {
+    if matches!(value, Value::Reference(_) | Value::Secret(_)) {
         return true;
-    }
-    if let Value::Fallback(primary, fallback) = value {
-        return value_matches_primitive(&primary.value, prim)
-            || value_matches_primitive(&fallback.value, prim);
     }
     match prim {
         PrimitiveType::String => matches!(value, Value::String(_)),
@@ -330,7 +337,7 @@ fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
         PrimitiveType::Money => matches!(value, Value::Money(_)),
         PrimitiveType::Duration => matches!(value, Value::String(_) | Value::Duration(_)),
         PrimitiveType::Path => matches!(value, Value::String(_)),
-        PrimitiveType::Secret => matches!(value, Value::Secret(_)),
+        PrimitiveType::Secret => false,
         PrimitiveType::Object => false,
     }
 }
@@ -708,6 +715,87 @@ workflow W:
             "should catch unknown prop with no-space equals; diags: {:?}",
             diags
         );
+    }
+
+    #[test]
+    fn test_secret_plain_string_error_message() {
+        let schema = "model auth:\n    secret secret?\n";
+        let validator = make_validator(schema);
+
+        let source = "auth A:\n    secret = \"dev-secret\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("expected environment variable ($ENV.VARIABLE_NAME)")),
+            "should show helpful secret error message; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_fallback_flags_string_in_secret_field() {
+        let schema = "model auth:\n    secret secret?\n";
+        let validator = make_validator(schema);
+
+        let source = "auth A:\n    secret = $ENV.AUTH_SECRET | \"dev-secret\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("type mismatch") && d.message.contains("got string")),
+            "should flag string fallback in secret field; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_fallback_secret_primary_ok() {
+        let schema = "model auth:\n    secret secret?\n";
+        let validator = make_validator(schema);
+
+        let source = "auth A:\n    secret = $ENV.AUTH_SECRET\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
+        assert!(type_diags.is_empty(), "env var should match secret type; diags: {:?}", type_diags);
+    }
+
+    #[test]
+    fn test_fallback_env_var_for_number_field() {
+        let schema = "model server:\n    port number?\n";
+        let validator = make_validator(schema);
+
+        let source = "server S:\n    port = $ENV.PORT | 3000\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
+        assert!(type_diags.is_empty(), "env var + number fallback should be valid for number field; diags: {:?}", type_diags);
+    }
+
+    #[test]
+    fn test_fallback_string_for_number_field_flagged() {
+        let schema = "model server:\n    port number?\n";
+        let validator = make_validator(schema);
+
+        let source = "server S:\n    port = $ENV.PORT | \"three\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("type mismatch") && d.message.contains("got string")),
+            "string fallback should be flagged for number field; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_fallback_both_env_vars_ok() {
+        let schema = "model auth:\n    secret secret?\n";
+        let validator = make_validator(schema);
+
+        let source = "auth A:\n    secret = $ENV.PRIMARY | $ENV.FALLBACK\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
+        assert!(type_diags.is_empty(), "two env vars should both be valid; diags: {:?}", type_diags);
     }
 
     #[test]
