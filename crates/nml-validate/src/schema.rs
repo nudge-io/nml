@@ -4,7 +4,7 @@ use nml_core::types::{PrimitiveType, Value};
 
 use crate::diagnostics::Diagnostic;
 
-const VALID_MODIFIERS: &[&str] = &["allow", "deny"];
+const VALID_MODIFIERS: &[&str] = &["allow", "deny", "capabilities"];
 
 /// Validates instance declarations against model definitions.
 pub struct SchemaValidator {
