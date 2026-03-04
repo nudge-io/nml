@@ -59,6 +59,7 @@ pub fn compute(source: &str, models: &[ModelDef], enums: &[EnumDef]) -> Vec<Diag
     diagnostics
 }
 
+/// Convert a single NML error to an LSP diagnostic.
 fn nml_error_to_diagnostic(err: &nml_core::error::NmlError, source_map: &SourceMap) -> Diagnostic {
     let span = err.span();
     let start = source_map.location(span.start);
@@ -78,5 +79,57 @@ fn nml_error_to_diagnostic(err: &nml_core::error::NmlError, source_map: &SourceM
         message: err.message().to_string(),
         source: Some("nml".to_string()),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_source_no_diagnostics() {
+        let source = "service Svc:\n    localMount = \"/\"\n";
+        let diags = compute(source, &[], &[]);
+        assert!(
+            diags.is_empty(),
+            "valid source should produce no diagnostics: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn parse_error_produces_diagnostic() {
+        let source = "service\n";
+        let diags = compute(source, &[], &[]);
+        assert!(
+            !diags.is_empty(),
+            "parse error should produce diagnostics"
+        );
+        assert!(diags
+            .iter()
+            .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)));
+    }
+
+    #[test]
+    fn duplicate_decl_produces_diagnostic() {
+        let source =
+            "service Svc:\n    localMount = \"/\"\n\nservice Svc:\n    localMount = \"/other\"\n";
+        let diags = compute(source, &[], &[]);
+        assert!(
+            diags.iter().any(|d| d.message.contains("duplicate")),
+            "duplicate declarations should be flagged: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn unresolved_ref_produces_diagnostic() {
+        let source = "workflow W:\n    provider = NonExistent\n";
+        let diags = compute(source, &[], &[]);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unresolved")),
+            "unresolved references should be flagged: {:?}",
+            diags
+        );
     }
 }

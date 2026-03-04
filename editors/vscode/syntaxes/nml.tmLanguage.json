@@ -4,6 +4,8 @@
   "scopeName": "source.nml",
   "patterns": [
     { "include": "#comment" },
+    { "include": "#const-declaration" },
+    { "include": "#template-declaration" },
     { "include": "#array-declaration" },
     { "include": "#block-declaration" },
     { "include": "#body" }
@@ -12,6 +14,22 @@
     "comment": {
       "name": "comment.line.double-slash.nml",
       "match": "//.*$"
+    },
+    "const-declaration": {
+      "match": "^(const)\\s+(\\w[\\w-]*)\\s*(=)",
+      "captures": {
+        "1": { "name": "storage.type.nml" },
+        "2": { "name": "entity.name.type.nml" },
+        "3": { "name": "keyword.operator.assignment.nml" }
+      }
+    },
+    "template-declaration": {
+      "match": "^(template)\\s+(\\w[\\w-]*)(:)",
+      "captures": {
+        "1": { "name": "storage.type.nml" },
+        "2": { "name": "entity.name.type.nml" },
+        "3": { "name": "punctuation.separator.colon.nml" }
+      }
     },
     "array-declaration": {
       "match": "^(\\[\\])(\\w[\\w-]*)\\s+(\\w[\\w-]*)(:)",
@@ -23,7 +41,7 @@
       }
     },
     "block-declaration": {
-      "match": "^(model|trait|enum|service|resource|endpoint|roleTemplate|role|member|restriction|webServer|peer|accessControl|packageView|webPackages|action|trigger|postmark)\\s+([^:]+)(:)",
+      "match": "^(model|trait|enum|service|resource|endpoint|roleTemplate|role|member|restriction|webServer|peer|accessControl|packageView|webPackages|action|trigger|postmark|provider|workflow|app)\\s+([^:]+)(:)",
       "captures": {
         "1": { "name": "storage.type.nml" },
         "2": { "name": "entity.name.type.nml" },

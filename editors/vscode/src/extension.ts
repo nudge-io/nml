@@ -8,17 +8,42 @@ import {
   LanguageClientOptions,
   ServerOptions,
 } from "vscode-languageclient/node";
+import * as path from "path";
 
 let client: LanguageClient | undefined;
 
 const DEFAULT_SERVER_PATH =
   (process.env.HOME || process.env.USERPROFILE || "") + "/.cargo/bin/nml-lsp";
 
+function resolveServerPath(): string | undefined {
+  const config = workspace.getConfiguration("nml");
+  const configuredPath = config.get<string>("server.path", "");
+  const serverPath = configuredPath || DEFAULT_SERVER_PATH;
+
+  const inspected = config.inspect<string>("server.path");
+  if (
+    inspected?.workspaceValue &&
+    !inspected?.globalValue
+  ) {
+    const basename = path.basename(serverPath);
+    if (basename !== "nml-lsp" && basename !== "nml-lsp.exe") {
+      window.showWarningMessage(
+        `NML: ignoring workspace-level nml.server.path ("${serverPath}") ` +
+          `because it does not point to an nml-lsp binary. ` +
+          `Set the path in your User settings instead.`
+      );
+      return DEFAULT_SERVER_PATH;
+    }
+  }
+
+  return serverPath;
+}
+
 export function activate(context: ExtensionContext) {
-  const configuredPath = workspace
-    .getConfiguration("nml")
-    .get<string>("server.path", "");
-  const serverCommand = configuredPath || DEFAULT_SERVER_PATH;
+  const serverCommand = resolveServerPath();
+  if (!serverCommand) {
+    return;
+  }
 
   const serverOptions: ServerOptions = {
     command: serverCommand,

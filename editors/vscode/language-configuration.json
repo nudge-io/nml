@@ -17,7 +17,7 @@
   ],
   "indentationRules": {
     "increaseIndentPattern": "^.*:\\s*(//.*)?$",
-    "decreaseIndentPattern": "^\\s*$"
+    "decreaseIndentPattern": "^\\s*\\S"
   },
   "folding": {
     "offSide": true

@@ -4,7 +4,7 @@
   "description": "Syntax highlighting and language support for the NML configuration language",
   "version": "0.1.0",
   "publisher": "nudge",
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/nudge-io/nml.git"
@@ -39,6 +39,17 @@
         "path": "./syntaxes/nml.tmLanguage.json"
       }
     ],
+    "configuration": {
+      "title": "NML",
+      "properties": {
+        "nml.server.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "description": "Absolute path to the nml-lsp binary. Defaults to ~/.cargo/bin/nml-lsp."
+        }
+      }
+    },
     "configurationDefaults": {
       "[nml]": {
         "editor.tabSize": 4,
