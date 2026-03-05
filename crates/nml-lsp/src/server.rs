@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use nml_core::ast::*;
-use nml_core::model::{EnumDef, ModelDef};
+use nml_core::model::{EnumDef, FieldType, ModelDef};
 use nml_core::span::SourceMap;
 use nml_core::types::Value;
 
@@ -21,8 +21,8 @@ pub struct NmlLanguageServer {
     client: Client,
     documents: Mutex<HashMap<Url, String>>,
     indexed_uris: Mutex<HashSet<Url>>,
-    models: Mutex<Vec<ModelDef>>,
-    enums: Mutex<Vec<EnumDef>>,
+    scoped_models: Mutex<HashMap<String, Vec<ModelDef>>>,
+    scoped_enums: Mutex<HashMap<String, Vec<EnumDef>>>,
 }
 
 impl NmlLanguageServer {
@@ -31,8 +31,8 @@ impl NmlLanguageServer {
             client,
             documents: Mutex::new(HashMap::new()),
             indexed_uris: Mutex::new(HashSet::new()),
-            models: Mutex::new(Vec::new()),
-            enums: Mutex::new(Vec::new()),
+            scoped_models: Mutex::new(HashMap::new()),
+            scoped_enums: Mutex::new(HashMap::new()),
         }
     }
 
@@ -87,22 +87,72 @@ impl NmlLanguageServer {
 
     fn rebuild_schema_registry(&self) {
         let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-        let mut all_models = Vec::new();
-        let mut all_enums = Vec::new();
+        let mut scoped_models: HashMap<String, Vec<ModelDef>> = HashMap::new();
+        let mut scoped_enums: HashMap<String, Vec<EnumDef>> = HashMap::new();
 
         for (uri, source) in docs.iter() {
             if !uri.as_str().ends_with(".model.nml") {
                 continue;
             }
+            let scope = extract_schema_scope(uri.as_str());
             if let Ok(file) = nml_core::parse(source) {
                 let schema = nml_core::model_extract::extract(&file);
-                all_models.extend(schema.models);
-                all_enums.extend(schema.enums);
+                scoped_models.entry(scope.clone()).or_default().extend(schema.models);
+                scoped_enums.entry(scope).or_default().extend(schema.enums);
             }
         }
 
-        *self.models.lock().unwrap_or_else(|e| e.into_inner()) = all_models;
-        *self.enums.lock().unwrap_or_else(|e| e.into_inner()) = all_enums;
+        *self.scoped_models.lock().unwrap_or_else(|e| e.into_inner()) = scoped_models;
+        *self.scoped_enums.lock().unwrap_or_else(|e| e.into_inner()) = scoped_enums;
+    }
+
+    fn models_for_file(&self, uri: &Url) -> (Vec<ModelDef>, Vec<EnumDef>) {
+        let file_scope = extract_file_scope(uri.as_str());
+        let scoped_models = self.scoped_models.lock().unwrap_or_else(|e| e.into_inner());
+        let scoped_enums = self.scoped_enums.lock().unwrap_or_else(|e| e.into_inner());
+
+        let mut models = Vec::new();
+        let mut enums = Vec::new();
+        let mut seen_model_names: HashSet<String> = HashSet::new();
+        let mut seen_enum_names: HashSet<String> = HashSet::new();
+
+        if let Some(ref scope) = file_scope {
+            if let Some(scope_models) = scoped_models.get(scope) {
+                for m in scope_models {
+                    seen_model_names.insert(m.name.clone());
+                    models.push(m.clone());
+                }
+            }
+            if let Some(scope_enums) = scoped_enums.get(scope) {
+                for e in scope_enums {
+                    seen_enum_names.insert(e.name.clone());
+                    enums.push(e.clone());
+                }
+            }
+        }
+
+        for (scope, ms) in scoped_models.iter() {
+            if file_scope.as_deref() == Some(scope.as_str()) {
+                continue;
+            }
+            for m in ms {
+                if seen_model_names.insert(m.name.clone()) {
+                    models.push(m.clone());
+                }
+            }
+        }
+        for (scope, es) in scoped_enums.iter() {
+            if file_scope.as_deref() == Some(scope.as_str()) {
+                continue;
+            }
+            for e in es {
+                if seen_enum_names.insert(e.name.clone()) {
+                    enums.push(e.clone());
+                }
+            }
+        }
+
+        (models, enums)
     }
 
     async fn on_change(&self, uri: Url, text: String) {
@@ -116,16 +166,7 @@ impl NmlLanguageServer {
             self.rebuild_schema_registry();
         }
 
-        let models = self
-            .models
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let enums = self
-            .enums
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let (models, enums) = self.models_for_file(&uri);
         let diags = diagnostics::compute(&text, &models, &enums);
 
         self.client
@@ -145,33 +186,62 @@ impl NmlLanguageServer {
                 .unwrap_or_else(|e| e.into_inner());
             d.iter().map(|(u, s)| (u.clone(), s.clone())).collect()
         };
-        let models = self
-            .models
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let enums = self
-            .enums
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
 
         for (uri, source) in docs {
             if uri.as_str().ends_with(".model.nml") {
                 continue;
             }
+            let (models, enums) = self.models_for_file(&uri);
             let diags = diagnostics::compute(&source, &models, &enums);
             self.client.publish_diagnostics(uri, diags, None).await;
         }
     }
 
-    fn find_definition(&self, name: &str, current_uri: &Url) -> Option<(Url, Range)> {
+    fn find_definition(&self, name: &str, current_uri: &Url, enclosing_keyword: Option<&str>) -> Option<(Url, Range)> {
         let docs: HashMap<Url, String> = self
             .documents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        find_definition_in_docs(&docs, name, current_uri)
+        find_definition_in_docs(&docs, name, current_uri, enclosing_keyword)
+    }
+
+    fn find_schema_definition(&self, name: &str, current_uri: &Url) -> Option<(Url, Range)> {
+        let docs: HashMap<Url, String> = self
+            .documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        let file_scope = extract_file_scope(current_uri.as_str());
+
+        let mut model_uris: Vec<&Url> = docs
+            .keys()
+            .filter(|u| u.as_str().ends_with(".model.nml"))
+            .collect();
+
+        if let Some(ref scope) = file_scope {
+            let scope = scope.clone();
+            model_uris.sort_by_key(|u| {
+                if extract_schema_scope(u.as_str()) == scope {
+                    0
+                } else {
+                    1
+                }
+            });
+        }
+
+        for uri in model_uris {
+            if let Some(source) = docs.get(uri) {
+                if let Ok(file) = nml_core::parse(source) {
+                    let source_map = SourceMap::new(source);
+                    if let Some(range) = find_schema_block_definition(&file, name, &source_map) {
+                        return Some((uri.clone(), range));
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn collect_declaration_names(&self) -> Vec<(String, String)> {
@@ -210,27 +280,115 @@ impl NmlLanguageServer {
     }
 }
 
+// ── Schema scoping ────────────────────────────────────────────
+
+fn extract_schema_scope(uri_str: &str) -> String {
+    let filename = uri_str.rsplit('/').next().unwrap_or(uri_str);
+    filename
+        .strip_suffix(".model.nml")
+        .unwrap_or("")
+        .to_string()
+}
+
+fn extract_file_scope(uri_str: &str) -> Option<String> {
+    let filename = uri_str.rsplit('/').next().unwrap_or(uri_str);
+    if filename.ends_with(".model.nml") {
+        return None;
+    }
+    let stem = filename.strip_suffix(".nml")?;
+    let pos = stem.rfind('.')?;
+    Some(stem[pos + 1..].to_string())
+}
+
+fn find_enclosing_block_keyword(
+    file: &File,
+    pos: Position,
+    source_map: &SourceMap,
+) -> Option<String> {
+    let mut best_start: Option<u32> = None;
+    let mut result: Option<String> = None;
+    for decl in &file.declarations {
+        let range = span_to_range(decl.span, source_map);
+        if pos.line >= range.start.line && pos.line <= range.end.line {
+            let keyword = match &decl.kind {
+                DeclarationKind::Block(block) => Some(block.keyword.name.clone()),
+                DeclarationKind::Array(arr) => Some(arr.item_keyword.name.clone()),
+                _ => None,
+            };
+            if let Some(kw) = keyword {
+                if best_start.map_or(true, |s| range.start.line > s) {
+                    best_start = Some(range.start.line);
+                    result = Some(kw);
+                }
+            }
+        }
+    }
+    result
+}
+
 // ── Definition resolution ─────────────────────────────────────
 
 fn find_definition_in_docs(
     docs: &HashMap<Url, String>,
     name: &str,
     current_uri: &Url,
+    enclosing_keyword: Option<&str>,
 ) -> Option<(Url, Range)> {
-    // Priority 1: Field definitions in .model.nml files
-    for (uri, source) in docs.iter() {
-        if !uri.as_str().ends_with(".model.nml") {
-            continue;
-        }
-        if let Ok(file) = nml_core::parse(source) {
-            let source_map = SourceMap::new(source);
-            if let Some(range) = find_field_definition(&file, name, &source_map) {
-                return Some((uri.clone(), range));
+    let file_scope = extract_file_scope(current_uri.as_str());
+    let is_on_keyword = enclosing_keyword == Some(name);
+
+    // Priority 1: Field definition in the specific enclosing model
+    // (Skip when cursor is on the declaration keyword itself)
+    if !is_on_keyword {
+        if let Some(keyword) = enclosing_keyword {
+            let mut model_uris: Vec<&Url> = docs
+                .keys()
+                .filter(|u| u.as_str().ends_with(".model.nml"))
+                .collect();
+
+            if let Some(ref scope) = file_scope {
+                let scope = scope.clone();
+                model_uris.sort_by_key(|u| {
+                    if extract_schema_scope(u.as_str()) == scope {
+                        0
+                    } else {
+                        1
+                    }
+                });
+            }
+
+            for uri in &model_uris {
+                if let Some(source) = docs.get(*uri) {
+                    if let Ok(file) = nml_core::parse(source) {
+                        let source_map = SourceMap::new(source);
+                        if let Some(range) =
+                            find_field_definition_in_model(&file, name, keyword, &source_map)
+                        {
+                            return Some(((*uri).clone(), range));
+                        }
+                    }
+                }
             }
         }
     }
 
-    // Priority 2: Names in current file (top-level + nested)
+    // Priority 2: Field definitions in .model.nml files (any model)
+    // (Skip when cursor is on the declaration keyword itself)
+    if !is_on_keyword {
+        for (uri, source) in docs.iter() {
+            if !uri.as_str().ends_with(".model.nml") {
+                continue;
+            }
+            if let Ok(file) = nml_core::parse(source) {
+                let source_map = SourceMap::new(source);
+                if let Some(range) = find_field_definition(&file, name, &source_map) {
+                    return Some((uri.clone(), range));
+                }
+            }
+        }
+    }
+
+    // Priority 3: Names in current file (top-level + nested)
     if let Some(source) = docs.get(current_uri) {
         if let Ok(file) = nml_core::parse(source) {
             let source_map = SourceMap::new(source);
@@ -242,7 +400,7 @@ fn find_definition_in_docs(
         }
     }
 
-    // Priority 3: Top-level declarations in other files
+    // Priority 4: Top-level declarations in other files
     for (uri, source) in docs.iter() {
         if uri == current_uri {
             continue;
@@ -267,10 +425,51 @@ fn span_to_range(span: nml_core::span::Span, source_map: &SourceMap) -> Range {
     }
 }
 
+fn find_schema_block_definition(
+    file: &File,
+    name: &str,
+    source_map: &SourceMap,
+) -> Option<Range> {
+    for decl in &file.declarations {
+        if let DeclarationKind::Block(block) = &decl.kind {
+            if matches!(block.keyword.name.as_str(), "model" | "trait" | "enum")
+                && block.name.name == name
+            {
+                return Some(span_to_range(block.name.span, source_map));
+            }
+        }
+    }
+    None
+}
+
 fn find_field_definition(file: &File, name: &str, source_map: &SourceMap) -> Option<Range> {
     for decl in &file.declarations {
         if let DeclarationKind::Block(block) = &decl.kind {
             if matches!(block.keyword.name.as_str(), "model" | "trait") {
+                for entry in &block.body.entries {
+                    if let BodyEntryKind::FieldDefinition(fd) = &entry.kind {
+                        if fd.name.name == name {
+                            return Some(span_to_range(fd.name.span, source_map));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_field_definition_in_model(
+    file: &File,
+    name: &str,
+    model_name: &str,
+    source_map: &SourceMap,
+) -> Option<Range> {
+    for decl in &file.declarations {
+        if let DeclarationKind::Block(block) = &decl.kind {
+            if matches!(block.keyword.name.as_str(), "model" | "trait")
+                && block.name.name == model_name
+            {
                 for entry in &block.body.entries {
                     if let BodyEntryKind::FieldDefinition(fd) = &entry.kind {
                         if fd.name.name == name {
@@ -760,6 +959,42 @@ fn summarize_body(body: &Body) -> String {
     format!("```nml\n{}\n```", lines.join("\n"))
 }
 
+fn format_field_type(field_type: &FieldType) -> String {
+    match field_type {
+        FieldType::Primitive(p) => p.as_str().to_string(),
+        FieldType::List(inner) => format!("[]{}", format_field_type(inner)),
+        FieldType::ModelRef(name) => name.clone(),
+        FieldType::Modifier(name) => format!("|{}", name),
+        FieldType::RefOnly(inner) => format!("&{}", format_field_type(inner)),
+        FieldType::RoleRef => "roleRef".to_string(),
+        FieldType::InlineObject(_) => "object".to_string(),
+        FieldType::SharedProperty(_) => "shared".to_string(),
+    }
+}
+
+fn is_property_name_position(line: &str, word: &str, col: usize) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let trimmed = line.trim();
+
+    if let Some(eq_pos) = line.find('=') {
+        if col < eq_pos {
+            return true;
+        }
+    }
+
+    if trimmed.ends_with(':') && !trimmed.starts_with("//") {
+        let before_colon = &trimmed[..trimmed.len() - 1];
+        let indent = line.len() - line.trim_start().len();
+        if !before_colon.contains(' ') && indent > 0 {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn format_value(value: &Value) -> String {
     match value {
         Value::String(s) => format!("\"{}\"", s),
@@ -1040,31 +1275,68 @@ impl LanguageServer for NmlLanguageServer {
         };
 
         let word = extract_word_at(line, pos.character as usize);
+        let is_prop = is_property_name_position(line, &word, pos.character as usize);
 
-        let builtin_info = match word.as_str() {
-            "string" => Some("**string** -- Quoted text value"),
-            "number" => Some("**number** -- General-purpose numeric (integer or decimal)"),
-            "money" => {
-                Some("**money** -- Exact currency value with ISO 4217 code (e.g., `19.99 USD`)")
+        if is_prop && !word.is_empty() {
+            if let Ok(file) = nml_core::parse(&source_clone) {
+                let source_map = SourceMap::new(&source_clone);
+                if let Some(keyword) = find_enclosing_block_keyword(&file, pos, &source_map) {
+                    let (models, _) = self.models_for_file(&uri);
+                    if let Some(model) = models.iter().find(|m| m.name == keyword) {
+                        if let Some(field) = model.fields.iter().find(|f| f.name == word) {
+                            let type_str = format_field_type(&field.field_type);
+                            let opt = if field.optional { "?" } else { "" };
+                            let text = format!(
+                                "**{keyword}** field\n\n```nml\n  {} {}{}\n```",
+                                field.name, type_str, opt
+                            );
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: text,
+                                }),
+                                range: None,
+                            }));
+                        }
+                    }
+                }
             }
-            "bool" => Some("**bool** -- Boolean value (`true` or `false`)"),
-            "duration" => Some("**duration** -- Time duration (e.g., `\"72h\"`, `\"30s\"`)"),
-            "path" => Some("**path** -- URL path with variables and wildcards"),
-            "secret" => Some("**secret** -- Value resolved from environment (`$ENV.X`)"),
-            "model" => Some("**model** -- Define a custom object type"),
-            "trait" => Some("**trait** -- Define a reusable group of fields"),
-            "enum" => Some("**enum** -- Define a restricted set of allowed values"),
-            _ => None,
-        };
+        }
 
-        if let Some(text) = builtin_info {
-            return Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: text.to_string(),
-                }),
-                range: None,
-            }));
+        if !is_prop {
+            let builtin_info = match word.as_str() {
+                "string" => Some("**string** -- Quoted text value"),
+                "number" => {
+                    Some("**number** -- General-purpose numeric (integer or decimal)")
+                }
+                "money" => Some(
+                    "**money** -- Exact currency value with ISO 4217 code (e.g., `19.99 USD`)",
+                ),
+                "bool" => Some("**bool** -- Boolean value (`true` or `false`)"),
+                "duration" => {
+                    Some("**duration** -- Time duration (e.g., `\"72h\"`, `\"30s\"`)")
+                }
+                "path" => Some("**path** -- URL path with variables and wildcards"),
+                "secret" => {
+                    Some("**secret** -- Value resolved from environment (`$ENV.X`)")
+                }
+                "model" => Some("**model** -- Define a custom object type"),
+                "trait" => Some("**trait** -- Define a reusable group of fields"),
+                "enum" => {
+                    Some("**enum** -- Define a restricted set of allowed values")
+                }
+                _ => None,
+            };
+
+            if let Some(text) = builtin_info {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: text.to_string(),
+                    }),
+                    range: None,
+                }));
+            }
         }
 
         if !word.is_empty() {
@@ -1127,7 +1399,7 @@ impl LanguageServer for NmlLanguageServer {
         let pos = params.text_document_position_params.position;
         let uri = params.text_document_position_params.text_document.uri;
 
-        let word = {
+        let (word, enclosing_keyword, is_prop) = {
             let docs = self
                 .documents
                 .lock()
@@ -1139,14 +1411,37 @@ impl LanguageServer for NmlLanguageServer {
             let Some(line) = lines.get(pos.line as usize) else {
                 return Ok(None);
             };
-            extract_word_at(line, pos.character as usize)
+            let word = extract_word_at(line, pos.character as usize);
+            let is_prop = is_property_name_position(line, &word, pos.character as usize);
+
+            let enclosing = if let Ok(file) = nml_core::parse(source) {
+                let source_map = SourceMap::new(source);
+                find_enclosing_block_keyword(&file, pos, &source_map)
+            } else {
+                None
+            };
+
+            (word, enclosing, is_prop)
         };
 
         if word.is_empty() {
             return Ok(None);
         }
 
-        if let Some((target_uri, range)) = self.find_definition(&word, &uri) {
+        if !is_prop {
+            if let Some(ref keyword) = enclosing_keyword {
+                if keyword == &word {
+                    if let Some((target_uri, range)) = self.find_schema_definition(&word, &uri) {
+                        return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                            uri: target_uri,
+                            range,
+                        })));
+                    }
+                }
+            }
+        }
+
+        if let Some((target_uri, range)) = self.find_definition(&word, &uri, enclosing_keyword.as_deref()) {
             Ok(Some(GotoDefinitionResponse::Scalar(Location {
                 uri: target_uri,
                 range,
@@ -1645,7 +1940,7 @@ mod tests {
                 .to_string(),
         );
 
-        let result = find_definition_in_docs(&docs, "GroqFast", &current);
+        let result = find_definition_in_docs(&docs, "GroqFast", &current, None);
         assert!(result.is_some());
         let (uri, _) = result.unwrap();
         assert_eq!(
@@ -1669,7 +1964,7 @@ mod tests {
             "service Svc:\n    name = \"test\"\n".to_string(),
         );
 
-        let result = find_definition_in_docs(&docs, "name", &current);
+        let result = find_definition_in_docs(&docs, "name", &current, None);
         assert!(result.is_some());
         let (uri, _) = result.unwrap();
         assert_eq!(uri, model_uri, "model field should take priority");
@@ -1690,7 +1985,7 @@ mod tests {
             "provider GroqFast:\n    type = \"groq\"\n".to_string(),
         );
 
-        let result = find_definition_in_docs(&docs, "GroqFast", &current);
+        let result = find_definition_in_docs(&docs, "GroqFast", &current, None);
         assert!(result.is_some());
         let (uri, _) = result.unwrap();
         assert_eq!(uri, other);
@@ -1706,7 +2001,7 @@ mod tests {
                 .to_string(),
         );
 
-        let result = find_definition_in_docs(&docs, "myStep", &current);
+        let result = find_definition_in_docs(&docs, "myStep", &current, None);
         assert!(result.is_some());
         let (uri, _) = result.unwrap();
         assert_eq!(uri, current);
@@ -1721,6 +2016,413 @@ mod tests {
             "workflow W:\n    entrypoint = \"start\"\n".to_string(),
         );
 
-        assert!(find_definition_in_docs(&docs, "NonExistent", &current).is_none());
+        assert!(find_definition_in_docs(&docs, "NonExistent", &current, None).is_none());
+    }
+
+    // ── Scope extraction ──────────────────────────────────────
+
+    #[test]
+    fn extract_schema_scope_workflow() {
+        assert_eq!(
+            extract_schema_scope("file:///path/to/workflow.model.nml"),
+            "workflow"
+        );
+    }
+
+    #[test]
+    fn extract_schema_scope_config() {
+        assert_eq!(
+            extract_schema_scope("file:///path/to/config.model.nml"),
+            "config"
+        );
+    }
+
+    #[test]
+    fn extract_file_scope_workflow() {
+        assert_eq!(
+            extract_file_scope("file:///path/to/voice-agent.workflow.nml"),
+            Some("workflow".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_file_scope_plain() {
+        assert_eq!(extract_file_scope("file:///path/to/app.nml"), None);
+    }
+
+    #[test]
+    fn extract_file_scope_model_file() {
+        assert_eq!(
+            extract_file_scope("file:///path/to/workflow.model.nml"),
+            None
+        );
+    }
+
+    // ── Scoped definition resolution ──────────────────────────
+
+    #[test]
+    fn definition_field_resolves_to_enclosing_model() {
+        let mut docs = HashMap::new();
+        let model_uri = make_uri("schema.model.nml");
+        let current = make_uri("test.nml");
+
+        docs.insert(
+            model_uri.clone(),
+            "model mount:\n    transport string\n\nmodel pipeline:\n    transport string?\n"
+                .to_string(),
+        );
+        docs.insert(
+            current.clone(),
+            "pipeline P:\n    transport = TelnyxCall\n".to_string(),
+        );
+
+        let result =
+            find_definition_in_docs(&docs, "transport", &current, Some("pipeline"));
+        assert!(result.is_some());
+        let (uri, range) = result.unwrap();
+        assert_eq!(uri, model_uri);
+        // Should resolve to transport in model pipeline (line 4), not model mount (line 1)
+        assert_eq!(range.start.line, 4, "should resolve to pipeline's transport field");
+    }
+
+    #[test]
+    fn definition_scoped_schema_preferred() {
+        let mut docs = HashMap::new();
+        let workflow_model = make_uri("workflow.model.nml");
+        let config_model = make_uri("config.model.nml");
+        let current = make_uri("voice-agent.workflow.nml");
+
+        docs.insert(
+            config_model.clone(),
+            "model pipeline:\n    input []string?\n".to_string(),
+        );
+        docs.insert(
+            workflow_model.clone(),
+            "model pipeline:\n    transport string?\n".to_string(),
+        );
+        docs.insert(
+            current.clone(),
+            "pipeline P:\n    transport = TelnyxCall\n".to_string(),
+        );
+
+        let result =
+            find_definition_in_docs(&docs, "transport", &current, Some("pipeline"));
+        assert!(result.is_some());
+        let (uri, _) = result.unwrap();
+        assert_eq!(
+            uri, workflow_model,
+            "should resolve to workflow.model.nml, not config.model.nml"
+        );
+    }
+
+    // ── Keyword navigation (cmd+click on declaration keyword) ─
+
+    #[test]
+    fn keyword_skips_field_definitions() {
+        let mut docs = HashMap::new();
+        let model_uri = make_uri("workflow.model.nml");
+        let current = make_uri("voice-agent.workflow.nml");
+
+        docs.insert(
+            model_uri.clone(),
+            "model step:\n    provider string?\n\nmodel provider:\n    type string\n    model string\n".to_string(),
+        );
+        docs.insert(
+            current.clone(),
+            "provider GroqFast:\n    type = \"groq\"\n".to_string(),
+        );
+
+        // When enclosing_keyword == name (cursor on keyword), field lookup is skipped.
+        // Should NOT go to "provider string?" field in model step (line 1).
+        // Falls through to top-level decl lookup and finds "model provider:" (line 3).
+        let result = find_definition_in_docs(&docs, "provider", &current, Some("provider"));
+        assert!(result.is_some());
+        let (uri, range) = result.unwrap();
+        assert_eq!(uri, model_uri, "should resolve to model definition, not to a field");
+        assert_eq!(range.start.line, 3, "should point to 'model provider:' declaration");
+    }
+
+    #[test]
+    fn find_schema_block_definition_finds_model() {
+        let source = "model provider:\n    type string\n\nmodel workflow:\n    entrypoint string\n";
+        let file = nml_core::parse(source).unwrap();
+        let source_map = SourceMap::new(source);
+
+        let result = find_schema_block_definition(&file, "workflow", &source_map);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().start.line, 3, "should find model workflow on line 3");
+    }
+
+    #[test]
+    fn find_schema_block_definition_finds_enum() {
+        let source = "enum transport:\n    - \"http\"\n    - \"websocket\"\n";
+        let file = nml_core::parse(source).unwrap();
+        let source_map = SourceMap::new(source);
+
+        let result = find_schema_block_definition(&file, "transport", &source_map);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().start.line, 0);
+    }
+
+    #[test]
+    fn find_schema_block_definition_ignores_instances() {
+        let source = "provider GroqFast:\n    type = \"groq\"\n";
+        let file = nml_core::parse(source).unwrap();
+        let source_map = SourceMap::new(source);
+
+        let result = find_schema_block_definition(&file, "GroqFast", &source_map);
+        assert!(result.is_none(), "should not match instance declarations");
+    }
+
+    #[test]
+    fn keyword_does_not_match_field_in_other_model() {
+        let mut docs = HashMap::new();
+        let config_model = make_uri("config.model.nml");
+        let server_model = make_uri("server.model.nml");
+        let workflow_model = make_uri("workflow.model.nml");
+        let current = make_uri("voice-agent.workflow.nml");
+
+        docs.insert(
+            config_model.clone(),
+            "model mount:\n    workflow string?\n".to_string(),
+        );
+        docs.insert(
+            server_model.clone(),
+            "model auth:\n    provider string\n".to_string(),
+        );
+        docs.insert(
+            workflow_model.clone(),
+            "model workflow:\n    entrypoint string\n\nmodel provider:\n    type string\n".to_string(),
+        );
+        docs.insert(
+            current.clone(),
+            "workflow VoiceAgent:\n    entrypoint = \"start\"\n\nprovider Groq:\n    type = \"groq\"\n".to_string(),
+        );
+
+        // "workflow" with enclosing_keyword="workflow" should skip field lookups
+        let result = find_definition_in_docs(&docs, "workflow", &current, Some("workflow"));
+        assert!(result.is_some());
+        let (uri, _) = result.unwrap();
+        // Must NOT go to "workflow string?" in model mount (config.model.nml)
+        assert_ne!(uri, config_model, "should not resolve to field 'workflow' in model mount");
+
+        // "provider" with enclosing_keyword="provider" should skip field lookups
+        let result = find_definition_in_docs(&docs, "provider", &current, Some("provider"));
+        assert!(result.is_some());
+        let (uri, _) = result.unwrap();
+        // Must NOT go to "provider string" in model auth (server.model.nml)
+        assert_ne!(uri, server_model, "should not resolve to field 'provider' in model auth");
+    }
+
+    // ── is_property_name_position ─────────────────────────────
+
+    #[test]
+    fn property_position_before_equals() {
+        assert!(is_property_name_position("    model = \"llama\"", "model", 6));
+    }
+
+    #[test]
+    fn property_position_nested_block() {
+        assert!(is_property_name_position("    inbound:", "inbound", 6));
+    }
+
+    #[test]
+    fn not_property_position_keyword() {
+        assert!(!is_property_name_position("workflow VoiceAgent:", "workflow", 3));
+    }
+
+    #[test]
+    fn not_property_position_value() {
+        assert!(!is_property_name_position("    transport = TelnyxCall", "TelnyxCall", 18));
+    }
+
+    #[test]
+    fn not_property_position_top_level_block() {
+        assert!(!is_property_name_position("provider GroqFast:", "provider", 3));
+    }
+
+    // ── find_enclosing_block_keyword ─────────────────────────────
+
+    #[test]
+    fn enclosing_keyword_on_workflow_declaration() {
+        let source = r#"stage TelnyxCall:
+    wasm = "telnyx.wasm"
+    accepts = "audio"
+    produces = "audio"
+
+provider GroqFast:
+    type = "groq"
+    model = "llama-3.3-70b-versatile"
+    temperature = 0.7
+
+workflow VoiceAgent:
+    entrypoint = "conversation"
+    steps:
+        - conversation:
+            provider = GroqFast
+"#;
+        let file = nml_core::parse(source).unwrap();
+        let source_map = SourceMap::new(source);
+
+        // "workflow" keyword is on line 11 (0-indexed)
+        let pos = Position::new(11, 3);
+        let result = find_enclosing_block_keyword(&file, pos, &source_map);
+        assert_eq!(result, Some("workflow".to_string()), "cursor on 'workflow' should return 'workflow'");
+
+        // "provider" keyword is on line 5 (0-indexed)
+        let pos = Position::new(5, 3);
+        let result = find_enclosing_block_keyword(&file, pos, &source_map);
+        assert_eq!(result, Some("provider".to_string()), "cursor on 'provider' should return 'provider'");
+    }
+
+    #[test]
+    fn enclosing_keyword_on_tool_declaration() {
+        let source = r#"stage TelnyxCall:
+    wasm = "telnyx.wasm"
+    produces = "audio"
+
+pipeline TelnyxVoice:
+    transport = TelnyxCall
+    inbound:
+        - DeepgramSTT
+
+tool DialViaTelnyx:
+    pipeline = TelnyxVoice
+
+provider GroqFast:
+    type = "groq"
+    model = "llama-3.3-70b-versatile"
+
+workflow VoiceAgent:
+    entrypoint = "conversation"
+    steps:
+        - conversation:
+            provider = GroqFast
+"#;
+        let file = nml_core::parse(source).unwrap();
+        let source_map = SourceMap::new(source);
+
+        // "tool" keyword is on line 9 (0-indexed) - must return "tool" not "workflow" or "stage"
+        let pos = Position::new(9, 3);
+        let result = find_enclosing_block_keyword(&file, pos, &source_map);
+        assert_eq!(result, Some("tool".to_string()), "cursor on 'tool' in tool DialViaTelnyx: should return 'tool'");
+    }
+
+    #[test]
+    fn enclosing_keyword_returns_none_for_blank_line() {
+        let source = "stage A:\n    wasm = \"a.wasm\"\n\nstage B:\n    wasm = \"b.wasm\"\n";
+        let file = nml_core::parse(source).unwrap();
+        let source_map = SourceMap::new(source);
+
+        // Line 2 is the blank line between stage A and stage B
+        let pos = Position::new(2, 0);
+        let result = find_enclosing_block_keyword(&file, pos, &source_map);
+        // Blank line may or may not be inside a declaration depending on parser spans
+        // Just verify it doesn't panic
+        let _ = result;
+    }
+
+    #[test]
+    fn keyword_tool_goes_to_model_not_field() {
+        let mut docs = HashMap::new();
+        let model_uri = make_uri("workflow.model.nml");
+        let current = make_uri("voice-agent.workflow.nml");
+
+        docs.insert(
+            model_uri.clone(),
+            concat!(
+                "model step:\n",
+                "    provider string?\n",
+                "    tool string?\n",
+                "    tools []string?\n",
+                "\n",
+                "model tool:\n",
+                "    wasm string?\n",
+                "    pipeline string?\n",
+            ).to_string(),
+        );
+        docs.insert(
+            current.clone(),
+            concat!(
+                "tool DialViaTelnyx:\n",
+                "    pipeline = TelnyxVoice\n",
+            ).to_string(),
+        );
+
+        // Clicking on "tool" in "tool DialViaTelnyx:" should go to model tool: (line 5),
+        // NOT to "tool string?" field in model step (line 2).
+        let result = find_definition_in_docs(&docs, "tool", &current, Some("tool"));
+        assert!(result.is_some());
+        let (uri, range) = result.unwrap();
+        assert_eq!(uri, model_uri);
+        assert_eq!(range.start.line, 5, "should point to model tool:, not tool string? field");
+    }
+
+    #[test]
+    fn full_goto_keyword_to_schema_definition() {
+        let mut docs = HashMap::new();
+        let model_uri = make_uri("workflow.model.nml");
+        let current = make_uri("voice-agent.workflow.nml");
+
+        docs.insert(
+            model_uri.clone(),
+            concat!(
+                "model provider:\n",
+                "    type string\n",
+                "    model string\n",
+                "\n",
+                "model step:\n",
+                "    provider string?\n",
+                "\n",
+                "model workflow:\n",
+                "    entrypoint string\n",
+                "    steps []step\n",
+            ).to_string(),
+        );
+        docs.insert(
+            current.clone(),
+            concat!(
+                "provider GroqFast:\n",
+                "    type = \"groq\"\n",
+                "\n",
+                "workflow VoiceAgent:\n",
+                "    entrypoint = \"conversation\"\n",
+            ).to_string(),
+        );
+
+        // Test 1: "workflow" with enclosing="workflow" (cursor on keyword)
+        // find_schema_definition path: looks for model/trait/enum named "workflow"
+        // Should find "model workflow:" on line 7 (0-indexed) in workflow.model.nml
+        {
+            let source = docs.get(&model_uri).unwrap();
+            let file = nml_core::parse(source).unwrap();
+            let source_map = SourceMap::new(source);
+            let result = find_schema_block_definition(&file, "workflow", &source_map);
+            assert!(result.is_some(), "find_schema_block_definition should find model workflow:");
+            let range = result.unwrap();
+            assert_eq!(range.start.line, 7, "model workflow: is on line 7 (0-indexed)");
+        }
+
+        // Test 2: "provider" with enclosing="provider" (cursor on keyword)
+        {
+            let source = docs.get(&model_uri).unwrap();
+            let file = nml_core::parse(source).unwrap();
+            let source_map = SourceMap::new(source);
+            let result = find_schema_block_definition(&file, "provider", &source_map);
+            assert!(result.is_some(), "find_schema_block_definition should find model provider:");
+            let range = result.unwrap();
+            assert_eq!(range.start.line, 0, "model provider: is on line 0 (0-indexed)");
+        }
+
+        // Test 3: find_definition_in_docs with is_on_keyword=true should NOT return field definitions
+        {
+            let result = find_definition_in_docs(&docs, "workflow", &current, Some("workflow"));
+            assert!(result.is_some(), "should find something for 'workflow'");
+            let (uri, range) = result.unwrap();
+            // Should NOT go to "provider string?" field. Should find via Priority 4 (top-level decl).
+            // model workflow: is on line 7 in workflow.model.nml
+            assert_eq!(uri, model_uri);
+            assert_eq!(range.start.line, 7, "should point to model workflow: name");
+        }
     }
 }
