@@ -415,6 +415,30 @@ impl<'de> MapAccess<'de> for NamedItemMapAccess<'de> {
 // Value deserializer
 // ---------------------------------------------------------------------------
 
+/// Coerce a string-typed Value to f64 if parseable.
+/// Env vars resolve to Value::String, so `$ENV.PORT` = "3000" needs to
+/// deserialize into numeric fields.
+fn coerce_to_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::String(s) | Value::Secret(s) | Value::Duration(s) | Value::Path(s) => {
+            s.parse::<f64>().ok()
+        }
+        _ => None,
+    }
+}
+
+/// Coerce a string-typed Value to bool if it matches common truthy/falsy strings.
+fn coerce_to_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::String(s) | Value::Secret(s) => match s.as_str() {
+            "true" | "1" | "yes" => Some(true),
+            "false" | "0" | "no" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 struct ValueDeserializer<'a> {
     value: &'a Value,
 }
@@ -457,110 +481,143 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Bool(b) => visitor.visit_bool(*b),
-            _ => Err(Error(format!(
-                "expected bool, got {}",
-                self.value.type_name()
-            ))),
+            _ => match coerce_to_bool(self.value) {
+                Some(b) => visitor.visit_bool(b),
+                None => Err(Error(format!(
+                    "expected bool, got {}",
+                    self.value.type_name()
+                ))),
+            },
         }
     }
 
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Number(n) => visitor.visit_f64(*n),
-            _ => Err(Error(format!(
-                "expected number, got {}",
-                self.value.type_name()
-            ))),
+            _ => match coerce_to_f64(self.value) {
+                Some(n) => visitor.visit_f64(n),
+                None => Err(Error(format!(
+                    "expected number, got {}",
+                    self.value.type_name()
+                ))),
+            },
         }
     }
 
     fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Number(n) => visitor.visit_f32(*n as f32),
-            _ => Err(Error(format!(
-                "expected number, got {}",
-                self.value.type_name()
-            ))),
+            _ => match coerce_to_f64(self.value) {
+                Some(n) => visitor.visit_f32(n as f32),
+                None => Err(Error(format!(
+                    "expected number, got {}",
+                    self.value.type_name()
+                ))),
+            },
         }
     }
 
     fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Number(n) => visitor.visit_i64(*n as i64),
-            _ => Err(Error(format!(
-                "expected number, got {}",
-                self.value.type_name()
-            ))),
+            _ => match coerce_to_f64(self.value) {
+                Some(n) => visitor.visit_i64(n as i64),
+                None => Err(Error(format!(
+                    "expected number, got {}",
+                    self.value.type_name()
+                ))),
+            },
         }
     }
 
     fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Number(n) => visitor.visit_i32(*n as i32),
-            _ => Err(Error(format!(
-                "expected number, got {}",
-                self.value.type_name()
-            ))),
+            _ => match coerce_to_f64(self.value) {
+                Some(n) => visitor.visit_i32(n as i32),
+                None => Err(Error(format!(
+                    "expected number, got {}",
+                    self.value.type_name()
+                ))),
+            },
         }
     }
 
     fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Number(n) => visitor.visit_i16(*n as i16),
-            _ => Err(Error(format!(
-                "expected number, got {}",
-                self.value.type_name()
-            ))),
+            _ => match coerce_to_f64(self.value) {
+                Some(n) => visitor.visit_i16(n as i16),
+                None => Err(Error(format!(
+                    "expected number, got {}",
+                    self.value.type_name()
+                ))),
+            },
         }
     }
 
     fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Number(n) => visitor.visit_i8(*n as i8),
-            _ => Err(Error(format!(
-                "expected number, got {}",
-                self.value.type_name()
-            ))),
+            _ => match coerce_to_f64(self.value) {
+                Some(n) => visitor.visit_i8(n as i8),
+                None => Err(Error(format!(
+                    "expected number, got {}",
+                    self.value.type_name()
+                ))),
+            },
         }
     }
 
     fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Number(n) if *n >= 0.0 => visitor.visit_u64(*n as u64),
-            _ => Err(Error(format!(
-                "expected unsigned number, got {}",
-                self.value.type_name()
-            ))),
+            _ => match coerce_to_f64(self.value) {
+                Some(n) if n >= 0.0 => visitor.visit_u64(n as u64),
+                _ => Err(Error(format!(
+                    "expected unsigned number, got {}",
+                    self.value.type_name()
+                ))),
+            },
         }
     }
 
     fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Number(n) if *n >= 0.0 => visitor.visit_u32(*n as u32),
-            _ => Err(Error(format!(
-                "expected unsigned number, got {}",
-                self.value.type_name()
-            ))),
+            _ => match coerce_to_f64(self.value) {
+                Some(n) if n >= 0.0 => visitor.visit_u32(n as u32),
+                _ => Err(Error(format!(
+                    "expected unsigned number, got {}",
+                    self.value.type_name()
+                ))),
+            },
         }
     }
 
     fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Number(n) if *n >= 0.0 => visitor.visit_u16(*n as u16),
-            _ => Err(Error(format!(
-                "expected unsigned number, got {}",
-                self.value.type_name()
-            ))),
+            _ => match coerce_to_f64(self.value) {
+                Some(n) if n >= 0.0 => visitor.visit_u16(n as u16),
+                _ => Err(Error(format!(
+                    "expected unsigned number, got {}",
+                    self.value.type_name()
+                ))),
+            },
         }
     }
 
     fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Number(n) if *n >= 0.0 => visitor.visit_u8(*n as u8),
-            _ => Err(Error(format!(
-                "expected unsigned number, got {}",
-                self.value.type_name()
-            ))),
+            _ => match coerce_to_f64(self.value) {
+                Some(n) if n >= 0.0 => visitor.visit_u8(n as u8),
+                _ => Err(Error(format!(
+                    "expected unsigned number, got {}",
+                    self.value.type_name()
+                ))),
+            },
         }
     }
 
@@ -1246,5 +1303,86 @@ workflow W:
         let body = doc.block("plan", "ProPlan").body().unwrap();
         let plan: Plan = from_block(body).unwrap();
         assert_eq!(plan.monthly_price, "29.99 USD");
+    }
+
+    #[test]
+    fn string_coerces_to_u16() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            port: u16,
+        }
+        let source = "server S:\n    port = \"3000\"\n";
+        let file = parser::parse(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("server", "S").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert_eq!(config.port, 3000);
+    }
+
+    #[test]
+    fn resolved_env_var_coerces_to_number() {
+        use crate::resolve::ValueResolver;
+
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            port: u16,
+        }
+
+        let source = "server S:\n    port = $ENV.PORT | 8080\n";
+        let file = parser::parse(source).unwrap();
+        let resolver = ValueResolver::new(|key| match key {
+            "PORT" => Some("3000".into()),
+            _ => None,
+        });
+        let doc = Document::new(&file);
+        let body = doc.block("server", "S").body().unwrap();
+        let config: Config = from_body_resolved(body, &resolver).unwrap();
+        assert_eq!(config.port, 3000);
+    }
+
+    #[test]
+    fn resolved_env_var_fallback_uses_number() {
+        use crate::resolve::ValueResolver;
+
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            port: u16,
+        }
+
+        let source = "server S:\n    port = $ENV.PORT | 8080\n";
+        let file = parser::parse(source).unwrap();
+        let resolver = ValueResolver::new(|_| None);
+        let doc = Document::new(&file);
+        let body = doc.block("server", "S").body().unwrap();
+        let config: Config = from_body_resolved(body, &resolver).unwrap();
+        assert_eq!(config.port, 8080);
+    }
+
+    #[test]
+    fn string_coerces_to_bool() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            enabled: bool,
+        }
+        let source = "server S:\n    enabled = \"true\"\n";
+        let file = parser::parse(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("server", "S").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn non_numeric_string_rejects_as_number() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            port: u16,
+        }
+        let source = "server S:\n    port = \"not-a-number\"\n";
+        let file = parser::parse(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("server", "S").body().unwrap();
+        let result: Result<Config, _> = from_block(body);
+        assert!(result.is_err());
     }
 }
