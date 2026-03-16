@@ -1155,6 +1155,58 @@ fn detect_template_hover(line: &str, col: usize) -> Option<String> {
     Some(hover)
 }
 
+// ── On-type indent computation ───────────────────────────────
+
+fn is_inside_triple_quote(lines: &[&str], line_idx: usize) -> bool {
+    let mut open = false;
+    for (i, line) in lines.iter().enumerate() {
+        if i >= line_idx {
+            break;
+        }
+        let count = line.matches("\"\"\"").count();
+        for _ in 0..count {
+            open = !open;
+        }
+    }
+    open
+}
+
+/// Compute the desired indentation (in spaces) for a new line inserted after
+/// `line_idx` in the given source lines.  This drives `onTypeFormatting` for
+/// the `\n` trigger so the cursor lands at the right column.
+fn compute_indent_after_line(lines: &[&str], line_idx: usize) -> usize {
+    let effective_idx = if line_idx < lines.len() {
+        let mut idx = line_idx;
+        while idx > 0 && lines[idx].trim().is_empty() {
+            idx -= 1;
+        }
+        idx
+    } else if !lines.is_empty() {
+        lines.len() - 1
+    } else {
+        return 0;
+    };
+
+    let line = lines[effective_idx];
+    let trimmed = line.trim();
+
+    if trimmed.is_empty() {
+        return 0;
+    }
+
+    if is_inside_triple_quote(lines, line_idx + 1) {
+        return line.len() - line.trim_start().len();
+    }
+
+    let prev_indent = line.len() - line.trim_start().len();
+
+    if trimmed.ends_with(':') && !trimmed.starts_with("//") {
+        return prev_indent + 4;
+    }
+
+    prev_indent
+}
+
 // ── LanguageServer implementation ─────────────────────────────
 
 #[tower_lsp::async_trait]
@@ -1201,6 +1253,12 @@ impl LanguageServer for NmlLanguageServer {
                     work_done_progress_options: Default::default(),
                 })),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                document_on_type_formatting_provider: Some(
+                    DocumentOnTypeFormattingOptions {
+                        first_trigger_character: "\n".to_string(),
+                        more_trigger_character: None,
+                    },
+                ),
                 ..Default::default()
             },
             ..Default::default()
@@ -1831,6 +1889,63 @@ impl LanguageServer for NmlLanguageServer {
                 end: Position::new(end_line, end_char),
             },
             new_text: formatted,
+        }]))
+    }
+
+    async fn on_type_formatting(
+        &self,
+        params: DocumentOnTypeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        if params.ch != "\n" {
+            return Ok(None);
+        }
+
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+
+        let source = {
+            let docs = self
+                .documents
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match docs.get(&uri) {
+                Some(s) => s.clone(),
+                None => return Ok(None),
+            }
+        };
+
+        let lines: Vec<&str> = source.lines().collect();
+
+        if pos.line == 0 {
+            return Ok(None);
+        }
+
+        let prev_line_idx = (pos.line - 1) as usize;
+        if prev_line_idx >= lines.len() {
+            return Ok(None);
+        }
+
+        let desired = compute_indent_after_line(&lines, prev_line_idx);
+        let indent_str: String = " ".repeat(desired);
+
+        let current_line_idx = pos.line as usize;
+        let existing_ws = if current_line_idx < lines.len() {
+            let cur = lines[current_line_idx];
+            cur.len() - cur.trim_start().len()
+        } else {
+            0
+        };
+
+        if existing_ws == desired {
+            return Ok(None);
+        }
+
+        Ok(Some(vec![TextEdit {
+            range: Range {
+                start: Position::new(pos.line, 0),
+                end: Position::new(pos.line, existing_ws as u32),
+            },
+            new_text: indent_str,
         }]))
     }
 
@@ -2645,5 +2760,89 @@ workflow VoiceAgent:
             assert_eq!(uri, model_uri);
             assert_eq!(range.start.line, 7, "should point to model workflow: name");
         }
+    }
+
+    // ── compute_indent_after_line ───────────────────────────────
+
+    #[test]
+    fn indent_after_block_colon() {
+        let lines = vec!["workflow RecipeAssistant:", "    steps:"];
+        assert_eq!(compute_indent_after_line(&lines, 0), 4);
+        assert_eq!(compute_indent_after_line(&lines, 1), 8);
+    }
+
+    #[test]
+    fn indent_after_list_item_colon() {
+        let lines = vec!["    steps:", "        - classify:"];
+        assert_eq!(compute_indent_after_line(&lines, 1), 12);
+    }
+
+    #[test]
+    fn indent_after_property() {
+        let lines = vec!["        - classify:", "            provider = Groq"];
+        assert_eq!(compute_indent_after_line(&lines, 1), 12);
+    }
+
+    #[test]
+    fn indent_after_goto_property() {
+        let lines = vec![
+            "                - clarifyRoute:",
+            "                    when:",
+            "                        field = \"response_mode\"",
+            "                        equals = \"clarify\"",
+            "                    goto = \"respond\"",
+        ];
+        assert_eq!(compute_indent_after_line(&lines, 4), 20);
+    }
+
+    #[test]
+    fn indent_after_blank_line_uses_prev_non_empty() {
+        let lines = vec!["    steps:", "        - classify:", ""];
+        assert_eq!(compute_indent_after_line(&lines, 2), 12);
+    }
+
+    #[test]
+    fn indent_after_nested_block_colon() {
+        let lines = vec![
+            "        - router:",
+            "            routes:",
+        ];
+        assert_eq!(compute_indent_after_line(&lines, 1), 16);
+    }
+
+    #[test]
+    fn indent_inside_triple_quote() {
+        let lines = vec![
+            "            system = \"\"\"",
+            "            You are a helpful assistant.",
+        ];
+        assert_eq!(compute_indent_after_line(&lines, 1), 12);
+    }
+
+    #[test]
+    fn indent_after_scalar_list_item() {
+        let lines = vec![
+            "enum providerType:",
+            "    - \"anthropic\"",
+        ];
+        assert_eq!(compute_indent_after_line(&lines, 1), 4);
+    }
+
+    #[test]
+    fn indent_after_comment_ending_with_colon() {
+        let lines = vec!["    // this is a comment:"];
+        assert_eq!(compute_indent_after_line(&lines, 0), 4);
+    }
+
+    #[test]
+    fn indent_empty_source() {
+        let lines: Vec<&str> = vec![];
+        assert_eq!(compute_indent_after_line(&lines, 0), 0);
+    }
+
+    #[test]
+    fn indent_at_top_level() {
+        let lines = vec!["workflow RecipeAssistant:"];
+        assert_eq!(compute_indent_after_line(&lines, 0), 4);
     }
 }

@@ -16,8 +16,7 @@
     ["<", ">"]
   ],
   "indentationRules": {
-    "increaseIndentPattern": "^.*:\\s*(//.*)?$",
-    "decreaseIndentPattern": "^\\s*\\S"
+    "increaseIndentPattern": "^.*:\\s*(//.*)?$"
   },
   "folding": {
     "offSide": true

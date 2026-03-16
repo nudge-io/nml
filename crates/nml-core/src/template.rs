@@ -2,7 +2,7 @@ use crate::span::Span;
 use crate::types::TemplateSegment;
 
 /// Known template expression namespaces.
-pub const VALID_NAMESPACES: &[&str] = &["args", "input", "steps", "artifacts"];
+pub const VALID_NAMESPACES: &[&str] = &["args", "input", "steps", "artifacts", "item"];
 
 /// Parse a string containing `{{...}}` template expressions into segments.
 ///
