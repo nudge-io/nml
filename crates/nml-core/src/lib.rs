@@ -7,6 +7,7 @@ pub mod money;
 pub mod parser;
 pub mod resolver;
 pub mod span;
+pub mod template;
 pub mod types;
 
 pub use parser::parse;

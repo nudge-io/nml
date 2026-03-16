@@ -57,6 +57,7 @@
         { "include": "#list-item-string" },
         { "include": "#list-item-role-ref" },
         { "include": "#list-item-ref" },
+        { "include": "#multiline-string" },
         { "include": "#property" },
         { "include": "#nested-block" },
         { "include": "#value" }
@@ -123,6 +124,7 @@
     },
     "value": {
       "patterns": [
+        { "include": "#multiline-string" },
         { "include": "#string" },
         { "include": "#money-literal" },
         { "include": "#number" },
@@ -134,6 +136,35 @@
         { "include": "#type-annotation" }
       ]
     },
+    "template-expression": {
+      "name": "meta.template.expression.nml",
+      "begin": "[{][{]",
+      "end": "[}][}]",
+      "beginCaptures": { "0": { "name": "punctuation.definition.template-expression.begin.nml" } },
+      "endCaptures": { "0": { "name": "punctuation.definition.template-expression.end.nml" } },
+      "patterns": [
+        {
+          "name": "variable.other.readwrite.nml",
+          "match": "[a-zA-Z_][a-zA-Z0-9_.]*"
+        }
+      ]
+    },
+    "multiline-string": {
+      "name": "string.quoted.triple.nml",
+      "begin": "\"\"\"",
+      "end": "\"\"\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.nml",
+          "match": "\\\\[\"\\\\nt]"
+        },
+        { "include": "#template-expression" },
+        {
+          "name": "variable.other.placeholder.nml",
+          "match": "[{][^}]*[}]"
+        }
+      ]
+    },
     "string": {
       "name": "string.quoted.double.nml",
       "begin": "\"",
@@ -143,9 +174,10 @@
           "name": "constant.character.escape.nml",
           "match": "\\\\[\"\\\\nt]"
         },
+        { "include": "#template-expression" },
         {
           "name": "variable.other.placeholder.nml",
-          "match": "\\{[^}]*\\}"
+          "match": "[{][^}]*[}]"
         }
       ]
     },

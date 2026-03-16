@@ -1009,6 +1009,116 @@ fn format_value(value: &Value) -> String {
     }
 }
 
+enum TemplateCompletionContext {
+    Namespace,
+    StepName(Vec<String>),
+}
+
+fn detect_template_context(before_cursor: &str, source: &str) -> Option<TemplateCompletionContext> {
+    let last_open = before_cursor.rfind("{{")?;
+    let after_open = &before_cursor[last_open + 2..];
+    if after_open.contains("}}") {
+        return None;
+    }
+    let typed = after_open.trim();
+    if typed.is_empty() {
+        return Some(TemplateCompletionContext::Namespace);
+    }
+    if typed == "steps." || typed.starts_with("steps.") && !typed[6..].contains('.') {
+        if let Ok(file) = nml_core::parse(source) {
+            let mut step_names = Vec::new();
+            for decl in &file.declarations {
+                if let DeclarationKind::Block(block) = &decl.kind {
+                    if block.keyword.name == "workflow" {
+                        for entry in &block.body.entries {
+                            if let BodyEntryKind::NestedBlock(nested) = &entry.kind {
+                                if nested.name.name == "steps" {
+                                    for step_entry in &nested.body.entries {
+                                        if let BodyEntryKind::ListItem(item) = &step_entry.kind {
+                                            if let ListItemKind::Named { name, .. } = &item.kind {
+                                                step_names.push(name.name.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !step_names.is_empty() {
+                return Some(TemplateCompletionContext::StepName(step_names));
+            }
+        }
+    }
+    None
+}
+
+fn detect_template_hover(line: &str, col: usize) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut start = None;
+    let mut i = col.min(line.len());
+    while i >= 2 {
+        if bytes.get(i - 1) == Some(&b'{') && bytes.get(i - 2) == Some(&b'{') {
+            start = Some(i);
+            break;
+        }
+        if bytes.get(i - 1) == Some(&b'}') && i >= 2 && bytes.get(i - 2) == Some(&b'}') {
+            break;
+        }
+        i -= 1;
+    }
+    let start = start?;
+    let end = line[start..].find("}}")?;
+    let expr = line[start..start + end].trim();
+    let parts: Vec<&str> = expr.splitn(2, '.').collect();
+    let (namespace, path_str) = if parts.len() == 2 {
+        (parts[0], parts[1])
+    } else {
+        (parts[0], "")
+    };
+
+    let hover = match namespace {
+        "args" => {
+            if path_str.is_empty() {
+                "**args** -- LLM tool call arguments".to_string()
+            } else {
+                format!("**args.{path_str}** -- Tool argument `{path_str}` (resolved from LLM tool call)")
+            }
+        }
+        "steps" => {
+            let step_parts: Vec<&str> = path_str.splitn(2, '.').collect();
+            if step_parts.len() == 2 {
+                format!(
+                    "**steps.{}** -- Output field `{}` from step `{}`",
+                    path_str, step_parts[1], step_parts[0]
+                )
+            } else if !path_str.is_empty() {
+                format!("**steps.{path_str}** -- Output of step `{path_str}`")
+            } else {
+                "**steps** -- Workflow step outputs".to_string()
+            }
+        }
+        "input" => {
+            if path_str.is_empty() {
+                "**input** -- Workflow input data".to_string()
+            } else {
+                format!("**input.{path_str}** -- Workflow input field `{path_str}`")
+            }
+        }
+        "artifacts" => {
+            if path_str.is_empty() {
+                "**artifacts** -- Workflow artifacts".to_string()
+            } else {
+                format!("**artifacts.{path_str}** -- Workflow artifact `{path_str}`")
+            }
+        }
+        _ => return None,
+    };
+
+    Some(hover)
+}
+
 // ── LanguageServer implementation ─────────────────────────────
 
 #[tower_lsp::async_trait]
@@ -1167,6 +1277,46 @@ impl LanguageServer for NmlLanguageServer {
         };
 
         if is_value_position {
+            let template_context = {
+                let docs = self
+                    .documents
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                docs.get(&uri).and_then(|source| {
+                    let lines: Vec<&str> = source.lines().collect();
+                    let line = lines.get(pos.line as usize)?;
+                    let end = (pos.character as usize).min(line.len());
+                    let before_cursor = &line[..end];
+                    detect_template_context(before_cursor, source)
+                })
+            };
+
+            if let Some(ctx) = template_context {
+                match ctx {
+                    TemplateCompletionContext::Namespace => {
+                        for ns in nml_core::template::VALID_NAMESPACES {
+                            items.push(CompletionItem {
+                                label: format!("{ns}."),
+                                kind: Some(CompletionItemKind::MODULE),
+                                detail: Some("template namespace".to_string()),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    TemplateCompletionContext::StepName(step_names) => {
+                        for name in step_names {
+                            items.push(CompletionItem {
+                                label: format!("{name}."),
+                                kind: Some(CompletionItemKind::FIELD),
+                                detail: Some("workflow step".to_string()),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+
             let names = self.collect_declaration_names();
             for (name, keyword) in names {
                 items.push(CompletionItem {
@@ -1273,6 +1423,16 @@ impl LanguageServer for NmlLanguageServer {
         let Some(line) = lines.get(pos.line as usize) else {
             return Ok(None);
         };
+
+        if let Some(template_hover) = detect_template_hover(line, pos.character as usize) {
+            return Ok(Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: template_hover,
+                }),
+                range: None,
+            }));
+        }
 
         let word = extract_word_at(line, pos.character as usize);
         let is_prop = is_property_name_position(line, &word, pos.character as usize);

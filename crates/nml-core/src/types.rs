@@ -2,10 +2,23 @@ use crate::money::Money;
 use crate::span::Span;
 use serde::Serialize;
 
+/// A segment of a template string: either literal text or a `{{...}}` expression.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum TemplateSegment {
+    Literal(String),
+    Expression {
+        namespace: String,
+        path: Vec<String>,
+        raw: String,
+        span: Span,
+    },
+}
+
 /// A parsed value in NML.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Value {
     String(String),
+    TemplateString(Vec<TemplateSegment>),
     Number(f64),
     Money(Money),
     Bool(bool),

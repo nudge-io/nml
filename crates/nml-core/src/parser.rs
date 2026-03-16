@@ -3,6 +3,7 @@ use crate::error::{NmlError, NmlResult};
 use crate::lexer::{Token, TokenKind};
 use crate::money;
 use crate::span::Span;
+use crate::template;
 use crate::types::{SpannedValue, Value};
 
 pub struct Parser {
@@ -87,7 +88,7 @@ impl Parser {
                 self.advance();
             }
             let value = self.parse_value()?;
-            if !matches!(&value.value, Value::String(_)) {
+            if !matches!(&value.value, Value::String(_) | Value::TemplateString(_)) {
                 return Err(NmlError::parse(
                     "template value must be a string",
                     value.span,
@@ -501,7 +502,12 @@ impl Parser {
             Some(TokenKind::StringLiteral(s)) => {
                 let s = s.clone();
                 self.advance();
-                Ok(SpannedValue::new(Value::String(s), span))
+                if s.contains("{{") {
+                    let segments = template::parse_template_string(&s, span.start);
+                    Ok(SpannedValue::new(Value::TemplateString(segments), span))
+                } else {
+                    Ok(SpannedValue::new(Value::String(s), span))
+                }
             }
             Some(TokenKind::NumberLiteral(n)) => {
                 let n = *n;
@@ -725,6 +731,62 @@ mod tests {
             DeclarationKind::Template(t) => {
                 assert_eq!(t.name.name, "Prompt");
                 assert!(matches!(&t.value.value, Value::String(s) if s == "line one\nline two"));
+            }
+            _ => panic!("expected template declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_string_with_template_expression() {
+        let source = "service Svc:\n    instructions = \"{{args.instructions}} base rules\"\n";
+        let file = parse(source).unwrap();
+        let block = match &file.declarations[0].kind {
+            DeclarationKind::Block(b) => b,
+            _ => panic!("expected block"),
+        };
+        match &block.body.entries[0].kind {
+            BodyEntryKind::Property(p) => {
+                match &p.value.value {
+                    Value::TemplateString(segs) => {
+                        assert_eq!(segs.len(), 2);
+                        match &segs[0] {
+                            crate::types::TemplateSegment::Expression { namespace, path, .. } => {
+                                assert_eq!(namespace, "args");
+                                assert_eq!(path, &["instructions"]);
+                            }
+                            _ => panic!("expected expression segment"),
+                        }
+                    }
+                    _ => panic!("expected TemplateString, got {:?}", p.value.value),
+                }
+            }
+            _ => panic!("expected property"),
+        }
+    }
+
+    #[test]
+    fn test_parse_plain_string_stays_string() {
+        let source = "service Svc:\n    name = \"hello world\"\n";
+        let file = parse(source).unwrap();
+        let block = match &file.declarations[0].kind {
+            DeclarationKind::Block(b) => b,
+            _ => panic!("expected block"),
+        };
+        match &block.body.entries[0].kind {
+            BodyEntryKind::Property(p) => {
+                assert!(matches!(&p.value.value, Value::String(s) if s == "hello world"));
+            }
+            _ => panic!("expected property"),
+        }
+    }
+
+    #[test]
+    fn test_parse_template_declaration_with_template_expr() {
+        let source = "template Greeting:\n    \"{{args.name}} welcome\"\n";
+        let file = parse(source).unwrap();
+        match &file.declarations[0].kind {
+            DeclarationKind::Template(t) => {
+                assert!(matches!(&t.value.value, Value::TemplateString(_)));
             }
             _ => panic!("expected template declaration"),
         }

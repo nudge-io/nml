@@ -1,4 +1,5 @@
 use nml_core::ast::*;
+use nml_core::template;
 use nml_core::types::Value;
 
 const INDENT: &str = "    ";
@@ -203,6 +204,35 @@ fn format_list_item(out: &mut String, item: &ListItem, depth: usize) {
 fn format_value(out: &mut String, value: &Value, depth: usize) {
     match value {
         Value::String(s) => {
+            if s.contains('\n') {
+                out.push_str("\"\"\"\n");
+                for line in s.split('\n') {
+                    write_indent(out, depth + 1);
+                    for ch in line.chars() {
+                        match ch {
+                            '\\' => out.push_str("\\\\"),
+                            c => out.push(c),
+                        }
+                    }
+                    out.push('\n');
+                }
+                write_indent(out, depth + 1);
+                out.push_str("\"\"\"");
+            } else {
+                out.push('"');
+                for ch in s.chars() {
+                    match ch {
+                        '"' => out.push_str("\\\""),
+                        '\\' => out.push_str("\\\\"),
+                        '\t' => out.push_str("\\t"),
+                        c => out.push(c),
+                    }
+                }
+                out.push('"');
+            }
+        }
+        Value::TemplateString(segments) => {
+            let s = template::segments_to_string(segments);
             if s.contains('\n') {
                 out.push_str("\"\"\"\n");
                 for line in s.split('\n') {

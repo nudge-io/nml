@@ -331,12 +331,12 @@ fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
         return true;
     }
     match prim {
-        PrimitiveType::String => matches!(value, Value::String(_)),
+        PrimitiveType::String => matches!(value, Value::String(_) | Value::TemplateString(_)),
         PrimitiveType::Number => matches!(value, Value::Number(_)),
         PrimitiveType::Bool => matches!(value, Value::Bool(_)),
         PrimitiveType::Money => matches!(value, Value::Money(_)),
-        PrimitiveType::Duration => matches!(value, Value::String(_) | Value::Duration(_)),
-        PrimitiveType::Path => matches!(value, Value::String(_)),
+        PrimitiveType::Duration => matches!(value, Value::String(_) | Value::TemplateString(_) | Value::Duration(_)),
+        PrimitiveType::Path => matches!(value, Value::String(_) | Value::TemplateString(_)),
         PrimitiveType::Secret => false,
         PrimitiveType::Object => false,
     }
@@ -345,6 +345,7 @@ fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
 fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::String(_) => "string",
+        Value::TemplateString(_) => "string",
         Value::Number(_) => "number",
         Value::Money(_) => "money",
         Value::Bool(_) => "bool",
