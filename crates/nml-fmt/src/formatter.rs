@@ -315,3 +315,225 @@ fn write_indent(out: &mut String, depth: usize) {
         out.push_str(INDENT);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nml_core::parse;
+
+    fn roundtrip(source: &str) {
+        let file = parse(source).unwrap();
+        let formatted = format(&file);
+        let reparsed = parse(&formatted).unwrap_or_else(|e| {
+            panic!(
+                "failed to reparse formatted output:\n{}\nerror: {}",
+                formatted,
+                e.message()
+            )
+        });
+        assert_eq!(
+            file.declarations.len(),
+            reparsed.declarations.len(),
+            "declaration count mismatch after round-trip"
+        );
+    }
+
+    fn idempotent(source: &str) {
+        let file = parse(source).unwrap();
+        let first = format(&file);
+        let file2 = parse(&first).unwrap();
+        let second = format(&file2);
+        assert_eq!(first, second, "formatting is not idempotent");
+    }
+
+    // -------------------------------------------------------------------
+    // Round-trip tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn roundtrip_simple_block() {
+        roundtrip("service App:\n    port = 8080\n    host = \"localhost\"\n");
+    }
+
+    #[test]
+    fn roundtrip_nested_block() {
+        roundtrip("server App:\n    port = 8080\n    db:\n        backend = \"postgres\"\n");
+    }
+
+    #[test]
+    fn roundtrip_const() {
+        roundtrip("const Port = 8080\n");
+    }
+
+    #[test]
+    fn roundtrip_multiple_blocks() {
+        roundtrip("service A:\n    x = 1\n\nservice B:\n    y = 2\n");
+    }
+
+    #[test]
+    fn roundtrip_list_items() {
+        roundtrip("workflow W:\n    steps:\n        - step1:\n            x = 1\n        - step2:\n            y = 2\n");
+    }
+
+    #[test]
+    fn roundtrip_shorthand_list() {
+        roundtrip("service S:\n    items:\n        - \"a\"\n        - \"b\"\n");
+    }
+
+    #[test]
+    fn roundtrip_array_property() {
+        roundtrip("service App:\n    tags = [\"web\", \"api\"]\n");
+    }
+
+    #[test]
+    fn roundtrip_bool_values() {
+        roundtrip("service App:\n    debug = true\n    verbose = false\n");
+    }
+
+    #[test]
+    fn roundtrip_secret() {
+        roundtrip("service App:\n    key = $ENV.SECRET\n");
+    }
+
+    #[test]
+    fn roundtrip_fallback() {
+        roundtrip("const Port = $ENV.PORT | 3000\n");
+    }
+
+    #[test]
+    fn roundtrip_model() {
+        roundtrip("model User:\n    name string\n    age number\n");
+    }
+
+    #[test]
+    fn roundtrip_enum() {
+        roundtrip("enum Status:\n    - \"active\"\n    - \"inactive\"\n");
+    }
+
+    #[test]
+    fn roundtrip_shared_property() {
+        roundtrip("workflow W:\n    .defaults:\n        retries = 3\n    - step1:\n        x = 1\n");
+    }
+
+    #[test]
+    fn roundtrip_modifier() {
+        roundtrip("service App:\n    port = 8080\n    |allow:\n        - @role/admin\n");
+    }
+
+    // -------------------------------------------------------------------
+    // Idempotency tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn idempotent_simple() {
+        idempotent("service App:\n    port = 8080\n    host = \"localhost\"\n");
+    }
+
+    #[test]
+    fn idempotent_nested() {
+        idempotent("server S:\n    db:\n        url = \"postgres://localhost\"\n");
+    }
+
+    #[test]
+    fn idempotent_complex() {
+        idempotent("workflow W:\n    steps:\n        - s1:\n            provider = \"fast\"\n        - s2:\n            provider = \"slow\"\n");
+    }
+
+    // -------------------------------------------------------------------
+    // Edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn format_empty_file() {
+        let file = parse("").unwrap();
+        let formatted = format(&file);
+        assert!(formatted.is_empty() || formatted.trim().is_empty());
+    }
+
+    #[test]
+    fn format_negative_number() {
+        roundtrip("service App:\n    offset = -10\n");
+    }
+
+    #[test]
+    fn format_float_number() {
+        roundtrip("service App:\n    rate = 0.75\n");
+    }
+
+    #[test]
+    fn format_empty_array() {
+        roundtrip("service App:\n    tags = []\n");
+    }
+
+    #[test]
+    fn format_single_item_array() {
+        roundtrip("service App:\n    tags = [\"web\"]\n");
+    }
+
+    // -------------------------------------------------------------------
+    // Fixture round-trip tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn roundtrip_fixture_minimal_service() {
+        let source = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/minimal-service.nml")
+        ).unwrap();
+        roundtrip(&source);
+        idempotent(&source);
+    }
+
+    #[test]
+    fn roundtrip_fixture_full_service() {
+        let source = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/full-service.nml")
+        ).unwrap();
+        roundtrip(&source);
+        idempotent(&source);
+    }
+
+    #[test]
+    fn roundtrip_fixture_web_server() {
+        let source = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/web-server.nml")
+        ).unwrap();
+        roundtrip(&source);
+        idempotent(&source);
+    }
+
+    #[test]
+    fn roundtrip_fixture_role_templates() {
+        let source = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/role-templates.nml")
+        ).unwrap();
+        roundtrip(&source);
+        idempotent(&source);
+    }
+
+    #[test]
+    fn roundtrip_fixture_secret_values() {
+        let source = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/secret-values.nml")
+        ).unwrap();
+        roundtrip(&source);
+        idempotent(&source);
+    }
+
+    #[test]
+    fn roundtrip_fixture_money_values() {
+        let source = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/money-values.nml")
+        ).unwrap();
+        roundtrip(&source);
+        idempotent(&source);
+    }
+
+    #[test]
+    fn roundtrip_fixture_pricing() {
+        let source = std::fs::read_to_string(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/pricing.nml")
+        ).unwrap();
+        roundtrip(&source);
+        idempotent(&source);
+    }
+}

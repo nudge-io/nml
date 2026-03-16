@@ -4,6 +4,11 @@ description = "Command-line interface for the NML configuration language"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../README.md"
 
 [[bin]]
 name = "nml"
@@ -13,6 +18,7 @@ path = "src/main.rs"
 nml-core = { workspace = true }
 nml-validate = { workspace = true }
 nml-fmt = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 [[test]]

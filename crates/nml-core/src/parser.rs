@@ -1294,4 +1294,417 @@ mod tests {
             _ => panic!("expected const"),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 1a: Malformed input tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_empty_input() {
+        let file = parse("").unwrap();
+        assert!(file.declarations.is_empty());
+    }
+
+    #[test]
+    fn test_whitespace_only_input() {
+        let file = parse("   \n\n   \n").unwrap();
+        assert!(file.declarations.is_empty());
+    }
+
+    #[test]
+    fn test_comment_only_input() {
+        // Comments may or may not be fully consumed depending on lexer -- just must not panic
+        let result = parse("# just a comment\n# another\n");
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_unterminated_string() {
+        let result = parse("service App:\n    name = \"hello\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unterminated_multiline_string() {
+        let result = parse("service App:\n    bio = \"\"\"hello\n    world\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_block_no_body() {
+        let result = parse("service App:\n");
+        // Should either parse with empty body or error -- not panic
+        match result {
+            Ok(file) => {
+                assert_eq!(file.declarations.len(), 1);
+                if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+                    assert!(b.body.entries.is_empty());
+                }
+            }
+            Err(_) => {} // also acceptable
+        }
+    }
+
+    #[test]
+    fn test_block_eof_immediately_after_colon() {
+        let result = parse("service App:");
+        match result {
+            Ok(file) => {
+                assert_eq!(file.declarations.len(), 1);
+            }
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn test_unexpected_token_number_as_keyword() {
+        let result = parse("123 App:\n    x = 1\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_property_without_value() {
+        let result = parse("service App:\n    port =\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_property_without_equals() {
+        let result = parse("service App:\n    port 8080\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_duplicate_properties_parse_ok() {
+        // Parser should accept duplicates; validation is separate
+        let file = parse("service App:\n    port = 8080\n    port = 9090\n").unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            assert_eq!(b.body.entries.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_list_item_in_top_level() {
+        let result = parse("- SomeItem:\n    x = 1\n");
+        // Should error or parse differently -- not panic
+        assert!(result.is_err() || result.unwrap().declarations.is_empty());
+    }
+
+    #[test]
+    fn test_only_dash() {
+        let result = parse("-\n");
+        assert!(result.is_err() || result.is_ok());
+        // Must not panic
+    }
+
+    #[test]
+    fn test_nested_block_no_body() {
+        let result = parse("service App:\n    db:\n");
+        match result {
+            Ok(file) => {
+                if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+                    if let BodyEntryKind::NestedBlock(nb) = &b.body.entries[0].kind {
+                        assert!(nb.body.entries.is_empty());
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn test_modifier_without_value() {
+        let result = parse("service App:\n    |allow\n");
+        // Should parse or error cleanly, not panic
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    fn test_multiple_blocks() {
+        let source = "service A:\n    x = 1\n\nservice B:\n    y = 2\n\nconst C = 3\n";
+        let file = parse(source).unwrap();
+        assert_eq!(file.declarations.len(), 3);
+    }
+
+    #[test]
+    fn test_bool_values() {
+        let file = parse("service App:\n    debug = true\n    verbose = false\n").unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
+                assert_eq!(p.value.value, Value::Bool(true));
+            }
+            if let BodyEntryKind::Property(p) = &b.body.entries[1].kind {
+                assert_eq!(p.value.value, Value::Bool(false));
+            }
+        }
+    }
+
+    #[test]
+    fn test_array_property_empty() {
+        let file = parse("service App:\n    tags = []\n").unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
+                if let Value::Array(items) = &p.value.value {
+                    assert!(items.is_empty());
+                } else {
+                    panic!("expected empty array");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_array_property_single_item() {
+        let file = parse("service App:\n    tags = [\"web\"]\n").unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
+                if let Value::Array(items) = &p.value.value {
+                    assert_eq!(items.len(), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_negative_number() {
+        let file = parse("service App:\n    offset = -10\n").unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
+                assert_eq!(p.value.value, Value::Number(-10.0));
+            }
+        }
+    }
+
+    #[test]
+    fn test_floating_point_number() {
+        let file = parse("service App:\n    rate = 0.75\n").unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
+                assert_eq!(p.value.value, Value::Number(0.75));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1b: Recursion / depth limits
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_deeply_nested_blocks_no_stackoverflow() {
+        let mut source = String::new();
+        source.push_str("root R:\n");
+        for i in 0..100 {
+            let indent = "    ".repeat(i + 1);
+            source.push_str(&format!("{}level{}:\n", indent, i));
+        }
+        // Should parse without stack overflow
+        let _result = parse(&source);
+    }
+
+    #[test]
+    fn test_very_long_string_value() {
+        let long_string = "x".repeat(100_000);
+        let source = format!("service App:\n    data = \"{}\"\n", long_string);
+        let file = parse(&source).unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
+                if let Value::String(s) = &p.value.value {
+                    assert_eq!(s.len(), 100_000);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_large_array() {
+        let items: Vec<String> = (0..1000).map(|i| format!("\"item{}\"", i)).collect();
+        let source = format!("service App:\n    list = [{}]\n", items.join(", "));
+        let file = parse(&source).unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
+                if let Value::Array(arr) = &p.value.value {
+                    assert_eq!(arr.len(), 1000);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_many_list_items() {
+        let mut source = String::from("workflow W:\n    steps:\n");
+        for i in 0..200 {
+            source.push_str(&format!("        - step{}:\n            x = {}\n", i, i));
+        }
+        let file = parse(&source).unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::NestedBlock(nb) = &b.body.entries[0].kind {
+                let items: Vec<_> = nb.body.entries.iter()
+                    .filter(|e| matches!(&e.kind, BodyEntryKind::ListItem(_)))
+                    .collect();
+                assert_eq!(items.len(), 200);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 1c: Trait and enum parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_trait_declaration() {
+        let source = "trait Auditable:\n    createdAt string\n    updatedAt string\n";
+        let file = parse(source).unwrap();
+        assert_eq!(file.declarations.len(), 1);
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(b) => {
+                assert_eq!(b.keyword.name, "trait");
+                assert_eq!(b.name.name, "Auditable");
+                assert_eq!(b.body.entries.len(), 2);
+
+                match &b.body.entries[0].kind {
+                    BodyEntryKind::FieldDefinition(f) => {
+                        assert_eq!(f.name.name, "createdAt");
+                        assert!(matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "string"));
+                    }
+                    other => panic!("expected FieldDefinition, got {other:?}"),
+                }
+                match &b.body.entries[1].kind {
+                    BodyEntryKind::FieldDefinition(f) => {
+                        assert_eq!(f.name.name, "updatedAt");
+                        assert!(matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "string"));
+                    }
+                    other => panic!("expected FieldDefinition, got {other:?}"),
+                }
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trait_uses_same_field_syntax_as_model() {
+        let model_source = "model User:\n    name string\n    age number\n";
+        let trait_source = "trait Timestamped:\n    name string\n    age number\n";
+
+        let model_file = parse(model_source).unwrap();
+        let trait_file = parse(trait_source).unwrap();
+
+        let model_block = match &model_file.declarations[0].kind {
+            DeclarationKind::Block(b) => b,
+            _ => panic!("expected Block"),
+        };
+        let trait_block = match &trait_file.declarations[0].kind {
+            DeclarationKind::Block(b) => b,
+            _ => panic!("expected Block"),
+        };
+
+        assert_eq!(model_block.body.entries.len(), trait_block.body.entries.len());
+        for (m, t) in model_block.body.entries.iter().zip(trait_block.body.entries.iter()) {
+            match (&m.kind, &t.kind) {
+                (BodyEntryKind::FieldDefinition(mf), BodyEntryKind::FieldDefinition(tf)) => {
+                    assert_eq!(mf.name.name, tf.name.name);
+                    assert_eq!(mf.optional, tf.optional);
+                }
+                _ => panic!("both should be FieldDefinition"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_colon_after_field_name_parses_as_nested_block() {
+        let source = "model Foo:\n    bar: string\n";
+        let result = parse(source);
+        assert!(result.is_err(), "name: type should fail -- colon starts a nested block, not a type annotation");
+    }
+
+    #[test]
+    fn test_parse_enum_declaration() {
+        let source = "enum Status:\n    - active\n    - inactive\n    - pending\n";
+        let file = parse(source).unwrap();
+        assert_eq!(file.declarations.len(), 1);
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            assert_eq!(b.keyword.name, "enum");
+            assert_eq!(b.name.name, "Status");
+        }
+    }
+
+    #[test]
+    fn test_parse_enum_empty() {
+        let result = parse("enum Empty:\n");
+        match result {
+            Ok(file) => {
+                if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+                    assert!(b.body.entries.is_empty());
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn test_parse_shared_property() {
+        let source = "workflow W:\n    .defaults:\n        retries = 3\n    - step1:\n        x = 1\n";
+        let file = parse(source).unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            let has_shared = b.body.entries.iter().any(|e| {
+                matches!(&e.kind, BodyEntryKind::SharedProperty(_))
+            });
+            assert!(has_shared, "expected a SharedProperty entry");
+        }
+    }
+
+    #[test]
+    fn test_parse_template_string_in_property() {
+        let source = "service App:\n    greeting = \"Hello {{args.name}}\"\n";
+        let file = parse(source).unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
+                assert!(matches!(&p.value.value, Value::TemplateString(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_path_value() {
+        // Paths are stored as strings with path-like syntax
+        let file = parse("service App:\n    dir = \"./static\"\n").unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
+                assert!(matches!(&p.value.value, Value::String(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_reference_value() {
+        let file = parse("service App:\n    provider = GroqFast\n").unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
+                assert!(matches!(&p.value.value, Value::Reference(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_role_ref_value() {
+        let file = parse("service App:\n    role = @role/admin\n").unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
+                assert!(matches!(&p.value.value, Value::RoleRef(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_multiline_string() {
+        let source = "service App:\n    bio = \"\"\"\n    Hello\n    World\n    \"\"\"\n";
+        let file = parse(source).unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
+                assert!(
+                    matches!(&p.value.value, Value::String(_) | Value::TemplateString(_)),
+                    "expected string from multiline"
+                );
+            }
+        }
+    }
 }

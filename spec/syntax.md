@@ -59,6 +59,41 @@ Escape sequences (same for single and multiline strings):
 - `\n` -- newline
 - `\t` -- tab
 
+### Template Expressions
+
+Strings may contain **template expressions** delimited by double braces:
+
+```
+"Hello, {{args.name}}!"
+"Welcome to {{config.appName}}"
+```
+
+A template expression has the form `{{namespace.key}}` where:
+- `namespace` identifies the value source (e.g. `args`, `config`, `env`)
+- `key` is the variable name within that namespace (may contain dots for nested access)
+
+Template expressions are preserved as `TemplateString` nodes in the AST. The host
+application is responsible for resolving them at runtime.
+
+Double braces `{{...}}` are distinct from single-brace path variables `{name}` and
+`{*}` which appear in path-typed values.
+
+### Fallback Values
+
+Any value can have a **fallback chain** using the pipe operator `|`:
+
+```
+apiKey = $ENV.API_KEY | $ENV.FALLBACK_KEY | "dev-default"
+port = $ENV.PORT | 3000
+```
+
+The resolver evaluates fallbacks left-to-right: if the primary value cannot be
+resolved (e.g. an unset environment variable), the next value is tried. The final
+value in the chain is used if all preceding values fail.
+
+Fallbacks produce a `Fallback(primary, fallback)` node in the AST and can be
+chained to arbitrary depth.
+
 ### Number Literals
 
 Numbers are unquoted decimal values:
@@ -156,6 +191,45 @@ const LongPrompt =
 ```
 
 References to consts use the bare identifier: `system = ClassifierPrompt`. The resolver substitutes the const's value.
+
+### Template Declarations
+
+Template declarations define named string values, typically for long text content:
+
+```
+template ClassifierPrompt:
+    """
+    You are an intent classifier for a recipe assistant.
+    Analyze the user's message and determine their intent.
+    """
+```
+
+The value must be a string (regular or multiline). Template declarations can
+contain `{{...}}` expressions. They are accessed via `Document::template_value()`.
+
+### Field Definitions (in Models and Traits)
+
+Inside `model` and `trait` blocks, fields are defined using space-separated
+`name type` syntax:
+
+```
+model service:
+    host string
+    port number
+    debug bool?
+    tags []string
+    method httpMethod = "GET"
+```
+
+| Syntax | Meaning |
+|--------|---------|
+| `name type` | Required field |
+| `name type?` | Optional field |
+| `name type = value` | Field with default value |
+| `name []type` | List-typed field |
+
+Field definitions produce `FieldDefinition` nodes in the AST. Note that `:` after
+a field name would start a nested block, not a type annotation.
 
 ### Top-Level Declarations
 
@@ -289,28 +363,38 @@ The parser distinguishes references from string values by the absence of quotes.
 
 ```peg
 File            <- Declaration* EOF
-Declaration     <- ArrayDecl / BlockDecl
+Declaration     <- ConstDecl / TemplateDecl / ArrayDecl / BlockDecl
+ConstDecl       <- "const" Identifier "=" ValueOrFallback NEWLINE
+TemplateDecl    <- "template" Identifier ":" NEWLINE? StringLiteral NEWLINE
 ArrayDecl       <- "[]" Keyword Identifier ":" NEWLINE INDENT ArrayBody DEDENT
 BlockDecl       <- Keyword Identifier ":" NEWLINE INDENT Body DEDENT
-Body            <- (Property / NestedBlock / Modifier / SharedProp / Comment / NEWLINE)*
+Body            <- (FieldDef / Property / NestedBlock / Modifier / SharedProp
+                   / ListItem / Comment / NEWLINE)*
 ArrayBody       <- (ListItem / Modifier / SharedProp / Property / Comment / NEWLINE)*
-ListItem        <- "-" (NamedItem / ShorthandItem / ReferenceItem)
+FieldDef        <- Identifier FieldType "?"? ("=" ValueOrFallback)? NEWLINE
+FieldType       <- "[]" Identifier / Identifier
+ListItem        <- "-" (NamedItem / ShorthandItem / ReferenceItem / RoleRef)
 NamedItem       <- Identifier ":" NEWLINE INDENT Body DEDENT
 ShorthandItem   <- StringLiteral NEWLINE
 ReferenceItem   <- Identifier NEWLINE
-Property        <- Identifier "=" Value NEWLINE
+Property        <- Identifier "=" ValueOrFallback NEWLINE
 NestedBlock     <- Identifier ":" NEWLINE INDENT Body DEDENT
-Modifier        <- "|" Identifier "=" Value NEWLINE
+Modifier        <- "|" Identifier "=" ValueOrFallback NEWLINE
                  / "|" Identifier ":" NEWLINE INDENT ListBody DEDENT
+                 / "|" Identifier FieldType "?"? NEWLINE
 SharedProp      <- "." Identifier ":" NEWLINE INDENT Body DEDENT
 ListBody        <- (ListItem / Comment / NEWLINE)*
+ValueOrFallback <- Value ("|" Value)*
 Value           <- MoneyLiteral / NumberLiteral / BoolLiteral / StringLiteral
-                 / SecretRef / ArrayLiteral / Identifier
+                 / SecretRef / ArrayLiteral / RoleRef / Identifier
 MoneyLiteral    <- Decimal CurrencyCode
 NumberLiteral   <- "-"? [0-9]+ ("." [0-9]+)?
 BoolLiteral     <- "true" / "false"
-StringLiteral   <- '"' StringChar* '"'
-SecretRef       <- "$ENV." Identifier
+StringLiteral   <- '"""' MultilineContent '"""'
+                 / '"' StringContent '"'
+StringContent   <- (StringChar / TemplateExpr)*
+TemplateExpr    <- "{{" [^}]+ "}}"
+SecretRef       <- "$ENV." Identifier ("." Identifier)*
 ArrayLiteral    <- "[" (Value ("," Value)*)? "]"
 CurrencyCode    <- [A-Z]{3}
 Decimal         <- "-"? [0-9]+ ("." [0-9]+)?

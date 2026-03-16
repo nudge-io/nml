@@ -21,11 +21,10 @@ impl Money {
         let divisor = 10i64.pow(self.exponent as u32);
         let whole = self.amount / divisor;
         let frac = (self.amount % divisor).abs();
+        let sign = if self.amount < 0 && whole == 0 { "-" } else { "" };
         format!(
-            "{}.{:0>width$} {}",
-            whole,
-            frac,
-            self.currency,
+            "{sign}{whole}.{frac:0>width$} {currency}",
+            currency = self.currency,
             width = self.exponent as usize
         )
     }
@@ -192,5 +191,112 @@ mod tests {
         let m = parse_money("5.5", "USD", span()).unwrap();
         assert_eq!(m.amount, 550);
         assert_eq!(m.format_display(), "5.50 USD");
+    }
+
+    #[test]
+    fn test_negative_amount() {
+        let m = parse_money("-19.99", "USD", span()).unwrap();
+        assert_eq!(m.amount, -1999);
+        assert_eq!(m.exponent, 2);
+        assert_eq!(m.format_display(), "-19.99 USD");
+    }
+
+    #[test]
+    fn test_whole_number_usd() {
+        let m = parse_money("100", "USD", span()).unwrap();
+        assert_eq!(m.amount, 10000);
+        assert_eq!(m.format_display(), "100.00 USD");
+    }
+
+    #[test]
+    fn test_zero_amount() {
+        let m = parse_money("0", "USD", span()).unwrap();
+        assert_eq!(m.amount, 0);
+        assert_eq!(m.format_display(), "0.00 USD");
+    }
+
+    #[test]
+    fn test_zero_with_decimals() {
+        let m = parse_money("0.00", "USD", span()).unwrap();
+        assert_eq!(m.amount, 0);
+        assert_eq!(m.format_display(), "0.00 USD");
+    }
+
+    #[test]
+    fn test_exponent_4_currency() {
+        let m = parse_money("1.2345", "CLF", span()).unwrap();
+        assert_eq!(m.amount, 12345);
+        assert_eq!(m.exponent, 4);
+        assert_eq!(m.format_display(), "1.2345 CLF");
+    }
+
+    #[test]
+    fn test_exponent_4_too_many_decimals() {
+        let result = parse_money("1.23456", "CLF", span());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_exponent_4_partial_fraction() {
+        let m = parse_money("1.5", "CLF", span()).unwrap();
+        assert_eq!(m.amount, 15000);
+        assert_eq!(m.format_display(), "1.5000 CLF");
+    }
+
+    #[test]
+    fn test_large_amount() {
+        let m = parse_money("999999999.99", "USD", span()).unwrap();
+        assert_eq!(m.amount, 99999999999);
+        assert_eq!(m.format_display(), "999999999.99 USD");
+    }
+
+    #[test]
+    fn test_one_cent() {
+        let m = parse_money("0.01", "USD", span()).unwrap();
+        assert_eq!(m.amount, 1);
+        assert_eq!(m.format_display(), "0.01 USD");
+    }
+
+    #[test]
+    fn test_negative_zero() {
+        let m = parse_money("-0.00", "USD", span()).unwrap();
+        assert_eq!(m.amount, 0);
+    }
+
+    #[test]
+    fn test_bhd_partial() {
+        let m = parse_money("5.12", "BHD", span()).unwrap();
+        assert_eq!(m.amount, 5120);
+        assert_eq!(m.format_display(), "5.120 BHD");
+    }
+
+    #[test]
+    fn test_jpy_rejects_decimals() {
+        let result = parse_money("100.5", "JPY", span());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_format_display_negative_fraction() {
+        let m = Money {
+            amount: -50,
+            currency: "USD".to_string(),
+            exponent: 2,
+        };
+        assert_eq!(m.format_display(), "-0.50 USD");
+    }
+
+    #[test]
+    fn test_currency_exponent_lookup() {
+        assert_eq!(currency_exponent("USD"), Some(2));
+        assert_eq!(currency_exponent("EUR"), Some(2));
+        assert_eq!(currency_exponent("GBP"), Some(2));
+        assert_eq!(currency_exponent("JPY"), Some(0));
+        assert_eq!(currency_exponent("KRW"), Some(0));
+        assert_eq!(currency_exponent("BHD"), Some(3));
+        assert_eq!(currency_exponent("KWD"), Some(3));
+        assert_eq!(currency_exponent("CLF"), Some(4));
+        assert_eq!(currency_exponent("FAKE"), None);
+        assert_eq!(currency_exponent(""), None);
     }
 }

@@ -23,6 +23,7 @@ pub struct NmlLanguageServer {
     indexed_uris: Mutex<HashSet<Url>>,
     scoped_models: Mutex<HashMap<String, Vec<ModelDef>>>,
     scoped_enums: Mutex<HashMap<String, Vec<EnumDef>>>,
+    project_config: Mutex<nml_core::ProjectConfig>,
 }
 
 impl NmlLanguageServer {
@@ -33,6 +34,7 @@ impl NmlLanguageServer {
             indexed_uris: Mutex::new(HashSet::new()),
             scoped_models: Mutex::new(HashMap::new()),
             scoped_enums: Mutex::new(HashMap::new()),
+            project_config: Mutex::new(nml_core::ProjectConfig::default()),
         }
     }
 
@@ -72,6 +74,21 @@ impl NmlLanguageServer {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+
+            let project_file = path.join("nml-project.nml");
+            if project_file.exists() {
+                if let Ok(content) = fs::read_to_string(&project_file) {
+                    if let Ok(file) = nml_core::parse(&content) {
+                        let config = nml_core::ProjectConfig::from_file(&file);
+                        *self.project_config.lock().unwrap_or_else(|e| e.into_inner()) = config;
+                    }
+                    if let Ok(uri) = Url::from_file_path(&project_file) {
+                        docs.insert(uri.clone(), content);
+                        indexed.insert(uri);
+                    }
+                }
+            }
+
             let mut files = Vec::new();
             Self::find_nml_files(&path, &mut files, 0);
             for path in files {
@@ -155,11 +172,28 @@ impl NmlLanguageServer {
         (models, enums)
     }
 
+    fn diagnostic_config(&self) -> diagnostics::DiagnosticConfig {
+        let pc = self.project_config.lock().unwrap_or_else(|e| e.into_inner());
+        diagnostics::DiagnosticConfig {
+            template_namespaces: pc.template_namespaces.clone(),
+            modifiers: pc.modifiers.clone(),
+        }
+    }
+
     async fn on_change(&self, uri: Url, text: String) {
         self.documents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(uri.clone(), text.clone());
+
+        if uri.as_str().ends_with("nml-project.nml") {
+            if let Ok(file) = nml_core::parse(&text) {
+                let config = nml_core::ProjectConfig::from_file(&file);
+                *self.project_config.lock().unwrap_or_else(|e| e.into_inner()) = config;
+            }
+            self.revalidate_all_documents().await;
+            return;
+        }
 
         let is_model_file = uri.as_str().ends_with(".model.nml");
         if is_model_file {
@@ -167,7 +201,8 @@ impl NmlLanguageServer {
         }
 
         let (models, enums) = self.models_for_file(&uri);
-        let diags = diagnostics::compute(&text, &models, &enums);
+        let dc = self.diagnostic_config();
+        let diags = diagnostics::compute(&text, &models, &enums, &dc);
 
         self.client
             .publish_diagnostics(uri.clone(), diags, None)
@@ -187,12 +222,13 @@ impl NmlLanguageServer {
             d.iter().map(|(u, s)| (u.clone(), s.clone())).collect()
         };
 
+        let dc = self.diagnostic_config();
         for (uri, source) in docs {
             if uri.as_str().ends_with(".model.nml") {
                 continue;
             }
             let (models, enums) = self.models_for_file(&uri);
-            let diags = diagnostics::compute(&source, &models, &enums);
+            let diags = diagnostics::compute(&source, &models, &enums, &dc);
             self.client.publish_diagnostics(uri, diags, None).await;
         }
     }
@@ -1294,7 +1330,15 @@ impl LanguageServer for NmlLanguageServer {
             if let Some(ctx) = template_context {
                 match ctx {
                     TemplateCompletionContext::Namespace => {
-                        for ns in nml_core::template::VALID_NAMESPACES {
+                        let namespaces: Vec<String> = {
+                            let pc = self.project_config.lock().unwrap_or_else(|e| e.into_inner());
+                            if pc.template_namespaces.is_empty() {
+                                nml_core::template::VALID_NAMESPACES.iter().map(|s| s.to_string()).collect()
+                            } else {
+                                pc.template_namespaces.clone()
+                            }
+                        };
+                        for ns in &namespaces {
                             items.push(CompletionItem {
                                 label: format!("{ns}."),
                                 kind: Some(CompletionItemKind::MODULE),
@@ -1328,34 +1372,51 @@ impl LanguageServer for NmlLanguageServer {
             }
         }
 
-        let keywords = [
-            "model",
-            "trait",
-            "enum",
-            "service",
-            "resource",
-            "endpoint",
-            "roleTemplate",
-            "role",
-            "member",
-            "restriction",
-            "webServer",
-            "peer",
-            "accessControl",
-            "action",
-            "trigger",
-            "provider",
-            "workflow",
-            "app",
-            "const",
-            "template",
-        ];
-        for kw in keywords {
+        let language_keywords = ["model", "trait", "enum", "const", "template"];
+        for kw in language_keywords {
             items.push(CompletionItem {
                 label: kw.to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
+                detail: Some("language".to_string()),
                 ..Default::default()
             });
+        }
+
+        {
+            let mut seen: HashSet<String> =
+                language_keywords.iter().map(|s| s.to_string()).collect();
+
+            let pc = self.project_config.lock().unwrap_or_else(|e| e.into_inner());
+            for kw in &pc.keywords {
+                if seen.insert(kw.clone()) {
+                    items.push(CompletionItem {
+                        label: kw.clone(),
+                        kind: Some(CompletionItemKind::KEYWORD),
+                        detail: Some("project".to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+            drop(pc);
+
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            for source in docs.values() {
+                if let Ok(file) = nml_core::parse(source) {
+                    for decl in &file.declarations {
+                        if let nml_core::ast::DeclarationKind::Block(block) = &decl.kind {
+                            let kw = &block.keyword.name;
+                            if seen.insert(kw.clone()) {
+                                items.push(CompletionItem {
+                                    label: kw.clone(),
+                                    kind: Some(CompletionItemKind::KEYWORD),
+                                    detail: Some("workspace".to_string()),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let types = [

@@ -11,24 +11,36 @@ a built-in type system, model definitions, and composable traits.
 - **Enums** -- restricted sets of allowed values
 - **Access control** -- built-in `|allow` and `|deny` modifiers
 - **Money type** -- exact currency values with ISO 4217 codes, stored as integer minor units
-- **Secret references** -- `$ENV.MY_SECRET` resolved at runtime
+- **Secret references** -- `$ENV.MY_SECRET` resolved at runtime, with fallback chains
+- **Template expressions** -- `{{namespace.key}}` for dynamic value interpolation
+- **Serde integration** -- deserialize NML blocks directly into Rust structs
+- **Constants** -- `const Name = value` for reusable values across a file
+- **Schema validation** -- validate config instances against model definitions
 
 ## Quick Example
 
 ```
-// Define a model
-model service (accessControlled):
-    localMount path
-    resources []resource
-    endpoints []endpoint
+const DefaultPort = 8080
 
-// Use it
-service MyService:
-    |allow:
-        - @role/admin
-        - @public
-    localMount = "/"
-    resources = myResources
+service MyApp:
+    host = "0.0.0.0"
+    port = DefaultPort
+    apiKey = $ENV.API_KEY | "dev-key"
+    greeting = "Hello, {{args.name}}!"
+
+    database:
+        url = $ENV.DATABASE_URL
+        pool_size = 10
+
+model service:
+    host string
+    port number
+    apiKey secret
+    greeting string
+
+    database:
+        url secret
+        pool_size number
 ```
 
 ## CLI
@@ -40,17 +52,26 @@ nml fmt <file>         # Format in canonical style
 nml check <file>       # Parse + validate + report
 ```
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Language Guide](docs/language-guide.md) | Complete guide to NML syntax and features |
+| [Integration Guide](docs/integration.md) | Using NML as a config language in Rust projects |
+| [Language Specification](spec/README.md) | Formal syntax, type system, and grammar |
+
 ## Project Structure
 
 ```
 crates/
-  nml-core/       Core parsing and AST library
+  nml-core/       Core parsing, AST, serde, query, and resolution library
   nml-validate/   Schema validation layer
   nml-fmt/        Canonical formatter
   nml-lsp/        Language Server Protocol implementation
 nml-cli/          CLI binary
 editors/vscode/   VS Code extension with syntax highlighting
 spec/             Language specification
+docs/             Guides and integration documentation
 ```
 
 ## Building

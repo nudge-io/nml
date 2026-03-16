@@ -1,9 +1,21 @@
+use std::fmt;
+
 use nml_core::span::Span;
 
+/// The severity level of a validation diagnostic.
 #[derive(Debug, Clone)]
 pub enum Severity {
     Error,
     Warning,
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Severity::Error => write!(f, "error"),
+            Severity::Warning => write!(f, "warning"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -4,17 +4,31 @@ use nml_core::types::{PrimitiveType, Value};
 
 use crate::diagnostics::Diagnostic;
 
-const VALID_MODIFIERS: &[&str] = &["allow", "deny", "grant"];
+/// Default modifier names accepted when no custom set is configured.
+pub const DEFAULT_MODIFIERS: &[&str] = &["allow", "deny", "grant"];
 
 /// Validates instance declarations against model definitions.
 pub struct SchemaValidator {
     models: Vec<ModelDef>,
     enums: Vec<EnumDef>,
+    valid_modifiers: Vec<String>,
 }
 
 impl SchemaValidator {
     pub fn new(models: Vec<ModelDef>, enums: Vec<EnumDef>) -> Self {
-        Self { models, enums }
+        Self {
+            models,
+            enums,
+            valid_modifiers: DEFAULT_MODIFIERS.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Set custom valid modifier names.
+    pub fn with_modifiers(mut self, modifiers: Vec<String>) -> Self {
+        if !modifiers.is_empty() {
+            self.valid_modifiers = modifiers;
+        }
+        self
     }
 
     pub fn find_model(&self, name: &str) -> Option<&ModelDef> {
@@ -107,12 +121,12 @@ impl SchemaValidator {
     }
 
     fn validate_modifier_name(&self, m: &Modifier, diags: &mut Vec<Diagnostic>) {
-        if !VALID_MODIFIERS.contains(&m.name.name.as_str()) {
+        if !self.valid_modifiers.iter().any(|v| v == &m.name.name) {
             diags.push(
                 Diagnostic::warning(format!(
                     "unknown modifier '|{}'; expected one of: {}",
                     m.name.name,
-                    VALID_MODIFIERS
+                    self.valid_modifiers
                         .iter()
                         .map(|s| format!("|{s}"))
                         .collect::<Vec<_>>()

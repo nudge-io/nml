@@ -184,4 +184,109 @@ mod tests {
         let reconstructed = segments_to_string(&segs);
         assert_eq!(reconstructed, original);
     }
+
+    // -------------------------------------------------------------------
+    // Phase 5: Template parsing edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn deeply_nested_path() {
+        let segs = parse_template_string("{{steps.generate.items.0.name}}", 0);
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            TemplateSegment::Expression { namespace, path, .. } => {
+                assert_eq!(namespace, "steps");
+                assert_eq!(path, &["generate", "items", "0", "name"]);
+            }
+            _ => panic!("expected expression"),
+        }
+    }
+
+    #[test]
+    fn empty_braces() {
+        let segs = parse_template_string("{{}}", 0);
+        // Empty braces: should be literal or empty expression
+        assert!(!segs.is_empty());
+    }
+
+    #[test]
+    fn adjacent_expressions() {
+        let segs = parse_template_string("{{a.b}}{{c.d}}", 0);
+        assert_eq!(segs.len(), 2);
+        assert!(matches!(&segs[0], TemplateSegment::Expression { namespace, .. } if namespace == "a"));
+        assert!(matches!(&segs[1], TemplateSegment::Expression { namespace, .. } if namespace == "c"));
+    }
+
+    #[test]
+    fn expression_at_start() {
+        let segs = parse_template_string("{{args.x}} suffix", 0);
+        assert_eq!(segs.len(), 2);
+        assert!(matches!(&segs[0], TemplateSegment::Expression { .. }));
+        assert!(matches!(&segs[1], TemplateSegment::Literal(s) if s == " suffix"));
+    }
+
+    #[test]
+    fn expression_at_end() {
+        let segs = parse_template_string("prefix {{args.x}}", 0);
+        assert_eq!(segs.len(), 2);
+        assert!(matches!(&segs[0], TemplateSegment::Literal(s) if s == "prefix "));
+        assert!(matches!(&segs[1], TemplateSegment::Expression { .. }));
+    }
+
+    #[test]
+    fn lone_closing_braces() {
+        let segs = parse_template_string("hello }} world", 0);
+        // Should be treated as literal text
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(&segs[0], TemplateSegment::Literal(s) if s == "hello }} world"));
+    }
+
+    #[test]
+    fn single_open_brace_literal() {
+        let segs = parse_template_string("hello { world", 0);
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(&segs[0], TemplateSegment::Literal(s) if s == "hello { world"));
+    }
+
+    #[test]
+    fn mixed_literal_expression_literal() {
+        let segs = parse_template_string("Hello {{args.name}}, welcome!", 0);
+        assert_eq!(segs.len(), 3);
+        assert!(matches!(&segs[0], TemplateSegment::Literal(s) if s == "Hello "));
+        assert!(matches!(&segs[1], TemplateSegment::Expression { .. }));
+        assert!(matches!(&segs[2], TemplateSegment::Literal(s) if s == ", welcome!"));
+    }
+
+    #[test]
+    fn empty_string_input() {
+        let segs = parse_template_string("", 0);
+        assert!(segs.is_empty() || (segs.len() == 1 && matches!(&segs[0], TemplateSegment::Literal(s) if s.is_empty())));
+    }
+
+    #[test]
+    fn only_whitespace_input() {
+        let segs = parse_template_string("   ", 0);
+        assert_eq!(segs.len(), 1);
+        assert!(matches!(&segs[0], TemplateSegment::Literal(s) if s == "   "));
+    }
+
+    #[test]
+    fn expression_with_single_segment_path() {
+        let segs = parse_template_string("{{args.name}}", 0);
+        match &segs[0] {
+            TemplateSegment::Expression { namespace, path, .. } => {
+                assert_eq!(namespace, "args");
+                assert_eq!(path, &["name"]);
+            }
+            _ => panic!("expected expression"),
+        }
+    }
+
+    #[test]
+    fn round_trip_complex() {
+        let original = "Hello {{args.name}}, your order {{steps.order.id}} is {{steps.status.value}}.";
+        let segs = parse_template_string(original, 0);
+        let reconstructed = segments_to_string(&segs);
+        assert_eq!(reconstructed, original);
+    }
 }

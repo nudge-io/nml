@@ -117,6 +117,40 @@ apiKey = $ENV.API_KEY
 
 Secret values are masked in logs and diagnostic output.
 
+## Template Strings
+
+Any string value may contain **template expressions** using `{{namespace.key}}`
+syntax. When a string contains template expressions, it is stored as a
+`TemplateString` in the AST rather than a plain `String`:
+
+```
+greeting = "Hello, {{args.name}}!"
+system = "You are {{config.persona}}. Your job is {{config.role}}."
+```
+
+Template strings are composed of alternating literal text and expression segments.
+The host application resolves expressions at runtime using a namespace-aware
+lookup.
+
+Template expressions are distinct from path variables (`{name}`, `{*}`), which
+use single braces.
+
+## Fallback Values
+
+Any value may have a **fallback chain** using the `|` operator. Fallbacks provide
+default values when the primary value cannot be resolved:
+
+```
+apiKey = $ENV.API_KEY | $ENV.FALLBACK_KEY | "dev-default"
+port = $ENV.PORT | 3000
+```
+
+Fallbacks are evaluated left-to-right. The chain terminates at the first
+successfully resolved value. If all values fail to resolve, an error is raised.
+
+Fallback chains are represented as nested `Fallback(primary, fallback)` nodes
+in the AST.
+
 ## Compound Types
 
 ### `[]T` -- List

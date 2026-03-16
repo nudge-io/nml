@@ -9,8 +9,22 @@ use nml_validate::diagnostics::Severity;
 use nml_validate::schema::SchemaValidator;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
+/// Configuration for diagnostics computation.
+#[derive(Debug, Default)]
+pub struct DiagnosticConfig {
+    /// Valid template namespaces. If empty, defaults to `template::VALID_NAMESPACES`.
+    pub template_namespaces: Vec<String>,
+    /// Valid modifier names. If empty, defaults to `nml_validate::schema::VALID_MODIFIERS`.
+    pub modifiers: Vec<String>,
+}
+
 /// Compute diagnostics for an NML source document.
-pub fn compute(source: &str, models: &[ModelDef], enums: &[EnumDef]) -> Vec<Diagnostic> {
+pub fn compute(
+    source: &str,
+    models: &[ModelDef],
+    enums: &[EnumDef],
+    config: &DiagnosticConfig,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let source_map = SourceMap::new(source);
 
@@ -28,7 +42,8 @@ pub fn compute(source: &str, models: &[ModelDef], enums: &[EnumDef]) -> Vec<Diag
             }
 
             if !models.is_empty() || !enums.is_empty() {
-                let validator = SchemaValidator::new(models.to_vec(), enums.to_vec());
+                let validator = SchemaValidator::new(models.to_vec(), enums.to_vec())
+                    .with_modifiers(config.modifiers.clone());
                 for diag in validator.validate(&file) {
                     if let Some(span) = diag.span {
                         let start = source_map.location(span.start);
@@ -56,7 +71,12 @@ pub fn compute(source: &str, models: &[ModelDef], enums: &[EnumDef]) -> Vec<Diag
                 }
             }
 
-            validate_templates(&file, &source_map, &mut diagnostics);
+            let ns: Vec<&str> = if config.template_namespaces.is_empty() {
+                template::VALID_NAMESPACES.to_vec()
+            } else {
+                config.template_namespaces.iter().map(|s| s.as_str()).collect()
+            };
+            validate_templates(&file, &ns, &source_map, &mut diagnostics);
         }
         Err(err) => {
             diagnostics.push(nml_error_to_diagnostic(&err, &source_map));
@@ -66,25 +86,36 @@ pub fn compute(source: &str, models: &[ModelDef], enums: &[EnumDef]) -> Vec<Diag
     diagnostics
 }
 
-fn validate_templates(file: &File, source_map: &SourceMap, diags: &mut Vec<Diagnostic>) {
+fn validate_templates(
+    file: &File,
+    valid_ns: &[&str],
+    source_map: &SourceMap,
+    diags: &mut Vec<Diagnostic>,
+) {
     for decl in &file.declarations {
         let step_names = collect_step_names(decl);
         match &decl.kind {
             DeclarationKind::Block(block) => {
-                validate_body_templates(&block.body, &step_names, source_map, diags);
+                validate_body_templates(&block.body, &step_names, valid_ns, source_map, diags);
             }
             DeclarationKind::Template(t) => {
-                validate_value_templates(&t.value.value, &step_names, source_map, diags);
+                validate_value_templates(&t.value.value, &step_names, valid_ns, source_map, diags);
             }
             DeclarationKind::Const(c) => {
-                validate_value_templates(&c.value.value, &step_names, source_map, diags);
+                validate_value_templates(&c.value.value, &step_names, valid_ns, source_map, diags);
             }
             DeclarationKind::Array(arr) => {
                 for prop in &arr.body.properties {
-                    validate_value_templates(&prop.value.value, &step_names, source_map, diags);
+                    validate_value_templates(
+                        &prop.value.value,
+                        &step_names,
+                        valid_ns,
+                        source_map,
+                        diags,
+                    );
                 }
                 for item in &arr.body.items {
-                    validate_list_item_templates(item, &step_names, source_map, diags);
+                    validate_list_item_templates(item, &step_names, valid_ns, source_map, diags);
                 }
             }
         }
@@ -120,22 +151,29 @@ fn collect_step_names_from_body(body: &Body, names: &mut HashSet<String>) {
 fn validate_body_templates(
     body: &Body,
     step_names: &HashSet<String>,
+    valid_ns: &[&str],
     source_map: &SourceMap,
     diags: &mut Vec<Diagnostic>,
 ) {
     for entry in &body.entries {
         match &entry.kind {
             BodyEntryKind::Property(prop) => {
-                validate_value_templates(&prop.value.value, step_names, source_map, diags);
+                validate_value_templates(
+                    &prop.value.value,
+                    step_names,
+                    valid_ns,
+                    source_map,
+                    diags,
+                );
             }
             BodyEntryKind::NestedBlock(nested) => {
-                validate_body_templates(&nested.body, step_names, source_map, diags);
+                validate_body_templates(&nested.body, step_names, valid_ns, source_map, diags);
             }
             BodyEntryKind::ListItem(item) => {
-                validate_list_item_templates(item, step_names, source_map, diags);
+                validate_list_item_templates(item, step_names, valid_ns, source_map, diags);
             }
             BodyEntryKind::SharedProperty(shared) => {
-                validate_body_templates(&shared.body, step_names, source_map, diags);
+                validate_body_templates(&shared.body, step_names, valid_ns, source_map, diags);
             }
             _ => {}
         }
@@ -145,15 +183,16 @@ fn validate_body_templates(
 fn validate_list_item_templates(
     item: &ListItem,
     step_names: &HashSet<String>,
+    valid_ns: &[&str],
     source_map: &SourceMap,
     diags: &mut Vec<Diagnostic>,
 ) {
     match &item.kind {
         ListItemKind::Named { body, .. } => {
-            validate_body_templates(body, step_names, source_map, diags);
+            validate_body_templates(body, step_names, valid_ns, source_map, diags);
         }
         ListItemKind::Shorthand(val) => {
-            validate_value_templates(&val.value, step_names, source_map, diags);
+            validate_value_templates(&val.value, step_names, valid_ns, source_map, diags);
         }
         _ => {}
     }
@@ -162,6 +201,7 @@ fn validate_list_item_templates(
 fn validate_value_templates(
     value: &Value,
     step_names: &HashSet<String>,
+    valid_ns: &[&str],
     source_map: &SourceMap,
     diags: &mut Vec<Diagnostic>,
 ) {
@@ -174,7 +214,7 @@ fn validate_value_templates(
                 ..
             } = seg
             {
-                if !template::VALID_NAMESPACES.contains(&namespace.as_str()) {
+                if !valid_ns.contains(&namespace.as_str()) {
                     let start = source_map.location(span.start);
                     let end = source_map.location(span.end);
                     let suggestion = match namespace.as_str() {
@@ -256,10 +296,14 @@ fn nml_error_to_diagnostic(err: &nml_core::error::NmlError, source_map: &SourceM
 mod tests {
     use super::*;
 
+    fn default_config() -> DiagnosticConfig {
+        DiagnosticConfig::default()
+    }
+
     #[test]
     fn valid_source_no_diagnostics() {
         let source = "service Svc:\n    localMount = \"/\"\n";
-        let diags = compute(source, &[], &[]);
+        let diags = compute(source, &[], &[], &default_config());
         assert!(
             diags.is_empty(),
             "valid source should produce no diagnostics: {:?}",
@@ -270,7 +314,7 @@ mod tests {
     #[test]
     fn parse_error_produces_diagnostic() {
         let source = "service\n";
-        let diags = compute(source, &[], &[]);
+        let diags = compute(source, &[], &[], &default_config());
         assert!(
             !diags.is_empty(),
             "parse error should produce diagnostics"
@@ -284,7 +328,7 @@ mod tests {
     fn duplicate_decl_produces_diagnostic() {
         let source =
             "service Svc:\n    localMount = \"/\"\n\nservice Svc:\n    localMount = \"/other\"\n";
-        let diags = compute(source, &[], &[]);
+        let diags = compute(source, &[], &[], &default_config());
         assert!(
             diags.iter().any(|d| d.message.contains("duplicate")),
             "duplicate declarations should be flagged: {:?}",
@@ -295,7 +339,7 @@ mod tests {
     #[test]
     fn unresolved_ref_produces_diagnostic() {
         let source = "workflow W:\n    provider = NonExistent\n";
-        let diags = compute(source, &[], &[]);
+        let diags = compute(source, &[], &[], &default_config());
         assert!(
             diags.iter().any(|d| d.message.contains("unresolved")),
             "unresolved references should be flagged: {:?}",
@@ -306,7 +350,7 @@ mod tests {
     #[test]
     fn valid_template_namespace_no_diagnostic() {
         let source = "service Svc:\n    instructions = \"{{args.instructions}} base\"\n";
-        let diags = compute(source, &[], &[]);
+        let diags = compute(source, &[], &[], &default_config());
         assert!(
             !diags.iter().any(|d| d.message.contains("namespace")),
             "valid namespace should not be flagged: {:?}",
@@ -317,7 +361,7 @@ mod tests {
     #[test]
     fn invalid_template_namespace_produces_warning() {
         let source = "service Svc:\n    instructions = \"{{arg.instructions}} base\"\n";
-        let diags = compute(source, &[], &[]);
+        let diags = compute(source, &[], &[], &default_config());
         assert!(
             diags.iter().any(|d| d.message.contains("unknown template namespace 'arg'")
                 && d.message.contains("did you mean 'args'")),
@@ -329,7 +373,7 @@ mod tests {
     #[test]
     fn unknown_namespace_no_suggestion() {
         let source = "service Svc:\n    val = \"{{foo.bar}} baz\"\n";
-        let diags = compute(source, &[], &[]);
+        let diags = compute(source, &[], &[], &default_config());
         assert!(
             diags.iter().any(|d| d.message.contains("unknown template namespace 'foo'")
                 && !d.message.contains("did you mean")),
@@ -350,7 +394,7 @@ mod tests {
             "            prompt:\n",
             "                system = \"{{steps.classify.intent}} generate\"\n",
         );
-        let diags = compute(source, &[], &[]);
+        let diags = compute(source, &[], &[], &default_config());
         assert!(
             !diags.iter().any(|d| d.message.contains("unknown step")),
             "valid step reference should not be flagged: {:?}",
@@ -370,7 +414,7 @@ mod tests {
             "            prompt:\n",
             "                system = \"{{steps.clasify.intent}} generate\"\n",
         );
-        let diags = compute(source, &[], &[]);
+        let diags = compute(source, &[], &[], &default_config());
         assert!(
             diags.iter().any(|d| d.message.contains("unknown step 'clasify'")),
             "invalid step reference should be flagged: {:?}",

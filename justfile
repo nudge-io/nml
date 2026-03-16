@@ -22,7 +22,7 @@ package-ext: compile-ext
 
 # Install the VSIX into Cursor
 install-ext: package-ext
-    cursor --install-extension editors/vscode/nml-lang-0.2.0.vsix
+    cursor --install-extension editors/vscode/nml-lang-0.3.0.vsix
 
 # Full rebuild and reinstall: LSP binary + extension + install into Cursor
 install: install-bin install-ext

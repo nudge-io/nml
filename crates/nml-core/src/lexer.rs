@@ -1,6 +1,12 @@
+//! Lexer (tokenizer) for NML source text.
+//!
+//! Converts raw NML source into a stream of [`Token`]s with span information,
+//! handling indentation-based scoping (similar to Python).
+
 use crate::error::{NmlError, NmlResult};
 use crate::span::Span;
 
+/// The kind of token produced by the lexer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // Structure
@@ -31,6 +37,7 @@ pub enum TokenKind {
     Question,       // ?
 }
 
+/// A single token with its source location.
 #[derive(Debug, Clone)]
 pub struct Token {
     pub kind: TokenKind,
@@ -43,6 +50,7 @@ impl Token {
     }
 }
 
+/// Indent-aware tokenizer for NML source text.
 pub struct Lexer<'a> {
     source: &'a str,
     chars: Vec<char>,

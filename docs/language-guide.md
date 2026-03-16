@@ -39,6 +39,33 @@ Prefix a keyword with `[]` to declare a named list of typed items:
         path = "/user/{*}"
 ```
 
+## Constants
+
+Constants define reusable values at the file level:
+
+```
+const MaxRetries = 3
+const DefaultGreeting = "Welcome!"
+```
+
+For long strings, the value can go on the next line:
+
+```
+const SystemPrompt =
+    """
+    You are an intent classifier for a recipe assistant.
+    Analyze the user's message and determine their intent.
+    """
+```
+
+Reference a constant by using its bare name as a value:
+
+```
+service MyApp:
+    greeting = DefaultGreeting
+    retries = MaxRetries
+```
+
 ## Properties
 
 Properties assign values using `=`:
@@ -151,6 +178,54 @@ Secret values are resolved at runtime and masked in logs:
 ```
 serverToken = $ENV.POSTMARK_SERVER_TOKEN
 ```
+
+### Multiline Strings
+
+Multiline strings use triple double-quotes (`"""`). The content is dedented
+(minimum leading indent is stripped) and surrounding newlines are trimmed:
+
+```
+const SystemPrompt =
+    """
+    You are a helpful assistant.
+    Be concise and accurate.
+    """
+```
+
+Single-line escape sequences work in both regular and multiline strings:
+`\"` (literal quote), `\\` (literal backslash), `\t` (tab), `\n` (newline).
+
+### Template Expressions
+
+Strings can contain `{{namespace.key}}` expressions for dynamic interpolation.
+Template expressions are preserved in the AST and resolved at runtime by the
+host application:
+
+```
+instructions = "You are {{args.persona}}. Help the user with {{args.topic}}."
+greeting = "Welcome to {{config.appName}}!"
+```
+
+The namespace prefix (e.g. `args`, `config`, `env`) identifies the source of
+the value. Valid namespaces are configured per-project via `nml-project.nml`
+or through the host application.
+
+Template expressions use double braces `{{...}}` to distinguish them from
+single-brace path variables like `/user/{id}`.
+
+### Fallback Values
+
+Any value can have a fallback chain using `|`. If the primary value cannot be
+resolved (e.g. an environment variable is not set), the next value in the
+chain is used:
+
+```
+apiKey = $ENV.API_KEY | $ENV.FALLBACK_KEY | "dev-key-default"
+port = $ENV.PORT | 3000
+```
+
+Fallbacks work with any value type -- secrets, strings, numbers, and
+references.
 
 ### Compound Types
 
@@ -379,12 +454,49 @@ webServer = DefaultWebServer
 
 Quoted values are strings; unquoted identifiers are references.
 
+## Template Declarations
+
+Template declarations provide a named string value, typically used for long
+text content like prompts:
+
+```
+template ClassifierPrompt:
+    """
+    You are an intent classifier.
+    Analyze the user's message and determine their intent.
+    Return one of: greeting, question, farewell, other.
+    """
+```
+
+The value must be a string (regular or multiline). Template declarations can
+contain `{{...}}` expressions just like any other string.
+
+## Project Configuration
+
+Create an `nml-project.nml` at your workspace root to configure NML tooling:
+
+```
+project MyProject:
+    schema:
+        - "schemas/service.model.nml"
+        - "schemas/database.model.nml"
+    templateNamespaces = ["env", "config", "args"]
+    modifiers = ["allow", "deny", "readonly"]
+    keywords = ["service", "database", "cache"]
+```
+
+This file is automatically detected by the NML language server and affects
+schema validation, template namespace checking, modifier validation, and
+keyword completions.
+
 ## File Conventions
 
 | Pattern | Purpose |
 |---------|---------|
 | `*.model.nml` | Model, trait, and enum definitions |
+| `*.workflow.nml` | Workflow definitions |
 | `*.service.nml` | Service instance declarations |
 | `*.nml` | General configuration |
+| `nml-project.nml` | Project-level tooling configuration |
 
 Models are loaded first, then instance files are validated against them.

@@ -7,6 +7,7 @@
     { "include": "#const-declaration" },
     { "include": "#template-declaration" },
     { "include": "#array-declaration" },
+    { "include": "#block-declaration-builtin" },
     { "include": "#block-declaration" },
     { "include": "#body" }
   ],
@@ -40,8 +41,16 @@
         "4": { "name": "punctuation.separator.colon.nml" }
       }
     },
+    "block-declaration-builtin": {
+      "match": "^(model|trait|enum)\\s+([^:]+)(:)",
+      "captures": {
+        "1": { "name": "storage.type.builtin.nml" },
+        "2": { "name": "entity.name.type.nml" },
+        "3": { "name": "punctuation.separator.colon.nml" }
+      }
+    },
     "block-declaration": {
-      "match": "^(model|trait|enum|service|resource|endpoint|roleTemplate|role|member|restriction|webServer|peer|accessControl|packageView|webPackages|action|trigger|postmark|provider|workflow|app)\\s+([^:]+)(:)",
+      "match": "^([a-zA-Z][\\w]*)\\s+([^:]+)(:)",
       "captures": {
         "1": { "name": "storage.type.nml" },
         "2": { "name": "entity.name.type.nml" },
