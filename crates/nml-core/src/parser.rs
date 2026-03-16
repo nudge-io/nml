@@ -894,6 +894,42 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_mixed_list_named_and_shorthand() {
+        let source = r#"
+workflow W:
+    steps:
+        - classify:
+            provider = "openai"
+        - "/fallback/path"
+        - DefaultHandler
+        - respond:
+            provider = "anthropic"
+"#;
+        let file = parse(source).unwrap();
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(b) => {
+                match &b.body.entries[0].kind {
+                    BodyEntryKind::NestedBlock(nb) => {
+                        let items: Vec<_> = nb.body.entries.iter()
+                            .filter_map(|e| match &e.kind {
+                                BodyEntryKind::ListItem(item) => Some(item),
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(items.len(), 4);
+                        assert!(matches!(&items[0].kind, ListItemKind::Named { name, .. } if name.name == "classify"));
+                        assert!(matches!(&items[1].kind, ListItemKind::Shorthand(v) if v.value == Value::String("/fallback/path".into())));
+                        assert!(matches!(&items[2].kind, ListItemKind::Reference(id) if id.name == "DefaultHandler"));
+                        assert!(matches!(&items[3].kind, ListItemKind::Named { name, .. } if name.name == "respond"));
+                    }
+                    other => panic!("expected NestedBlock, got {other:?}"),
+                }
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_parse_reference_list_item() {
         let source = "[]resource items:\n    - AuthDevByPass\n";
         let file = parse(source).unwrap();

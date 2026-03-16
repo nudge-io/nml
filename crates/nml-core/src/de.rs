@@ -855,6 +855,85 @@ service S:
     }
 
     #[test]
+    fn shorthand_items_do_not_get_name_injected() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            paths: Vec<String>,
+        }
+
+        let source = r#"
+service S:
+    paths:
+        - "/api/v1"
+        - "/api/v2"
+        - "/health"
+"#;
+        let file = parser::parse(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "S").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert_eq!(config.paths, vec!["/api/v1", "/api/v2", "/health"]);
+    }
+
+    #[test]
+    fn mixed_named_and_shorthand_items_via_untagged_enum() {
+        #[derive(Deserialize, Debug)]
+        struct Step {
+            name: String,
+            provider: String,
+        }
+
+        #[derive(Deserialize, Debug)]
+        #[serde(untagged)]
+        enum Item {
+            Named(Step),
+            Shorthand(String),
+        }
+
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            items: Vec<Item>,
+        }
+
+        let source = r#"
+service S:
+    items:
+        - step1:
+            provider = "openai"
+        - "/shorthand/path"
+        - step2:
+            provider = "anthropic"
+"#;
+        let file = parser::parse(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "S").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+
+        assert_eq!(config.items.len(), 3);
+
+        match &config.items[0] {
+            Item::Named(s) => {
+                assert_eq!(s.name, "step1");
+                assert_eq!(s.provider, "openai");
+            }
+            Item::Shorthand(s) => panic!("expected Named, got Shorthand({s})"),
+        }
+
+        match &config.items[1] {
+            Item::Shorthand(s) => assert_eq!(s, "/shorthand/path"),
+            Item::Named(s) => panic!("expected Shorthand, got Named({})", s.name),
+        }
+
+        match &config.items[2] {
+            Item::Named(s) => {
+                assert_eq!(s.name, "step2");
+                assert_eq!(s.provider, "anthropic");
+            }
+            Item::Shorthand(s) => panic!("expected Named, got Shorthand({s})"),
+        }
+    }
+
+    #[test]
     fn deserialize_nested_with_list_items_and_nested_blocks() {
         #[derive(Deserialize, Debug)]
         #[serde(rename_all = "camelCase")]
