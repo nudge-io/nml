@@ -181,10 +181,43 @@ impl SchemaValidator {
                                 for entry in &nb.body.entries {
                                     if let BodyEntryKind::ListItem(item) = &entry.kind {
                                         if let ListItemKind::Named { body, .. } = &item.kind {
-                                            if let FieldType::ModelRef(ref_name) = inner.as_ref() {
-                                                if let Some(inner_model) = self.find_model(ref_name) {
-                                                    self.validate_instance_against_model(body, inner_model, diags);
+                                            match inner.as_ref() {
+                                                FieldType::ModelRef(ref_name) => {
+                                                    if let Some(inner_model) = self.find_model(ref_name) {
+                                                        self.validate_instance_against_model(body, inner_model, diags);
+                                                    }
                                                 }
+                                                FieldType::Union(variants) => {
+                                                    let has_list_items = body.entries.iter().any(|e|
+                                                        matches!(&e.kind, BodyEntryKind::ListItem(_))
+                                                    );
+                                                    for variant in variants {
+                                                        match variant {
+                                                            FieldType::ModelRef(ref_name) if !has_list_items => {
+                                                                if let Some(m) = self.find_model(ref_name) {
+                                                                    self.validate_instance_against_model(body, m, diags);
+                                                                }
+                                                                break;
+                                                            }
+                                                            FieldType::List(list_inner) if has_list_items => {
+                                                                if let FieldType::ModelRef(ref_name) = list_inner.as_ref() {
+                                                                    if let Some(m) = self.find_model(ref_name) {
+                                                                        for sub_entry in &body.entries {
+                                                                            if let BodyEntryKind::ListItem(sub_item) = &sub_entry.kind {
+                                                                                if let ListItemKind::Named { body: sub_body, .. } = &sub_item.kind {
+                                                                                    self.validate_instance_against_model(sub_body, m, diags);
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                break;
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                }
+                                                _ => {}
                                             }
                                         }
                                     }
@@ -826,5 +859,40 @@ workflow W:
             "should catch typo in nested model inside list item; diags: {:?}",
             diags
         );
+    }
+
+    #[test]
+    fn test_union_flat_branch_validates() {
+        let schema = "model step:\n    provider string?\n    emit string?\n    parallel [](step | []step)?\n";
+        let validator = make_validator(schema);
+
+        let source = "step Fork:\n    parallel:\n        - branchA:\n            emit = \"hello\"\n        - branchB:\n            provider = \"fast\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let warnings: Vec<_> = diags.iter().filter(|d| d.message.contains("unknown property")).collect();
+        assert!(warnings.is_empty(), "unexpected warnings: {:?}", warnings);
+    }
+
+    #[test]
+    fn test_union_grouped_thread_validates() {
+        let schema = "model step:\n    provider string?\n    emit string?\n    parallel [](step | []step)?\n";
+        let validator = make_validator(schema);
+
+        let source = "step Fork:\n    parallel:\n        - pipeline:\n            - stepA:\n                emit = \"starting\"\n            - stepB:\n                emit = \"done\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let warnings: Vec<_> = diags.iter().filter(|d| d.message.contains("unknown property")).collect();
+        assert!(warnings.is_empty(), "unexpected warnings: {:?}", warnings);
+    }
+
+    #[test]
+    fn test_union_grouped_thread_catches_unknown_property() {
+        let schema = "model step:\n    provider string?\n    emit string?\n    parallel [](step | []step)?\n";
+        let validator = make_validator(schema);
+
+        let source = "step Fork:\n    parallel:\n        - pipeline:\n            - stepA:\n                emit = \"hello\"\n                bogus = \"bad\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(diags.iter().any(|d| d.message.contains("unknown property 'bogus'")), "expected warning about 'bogus', got: {:?}", diags);
     }
 }

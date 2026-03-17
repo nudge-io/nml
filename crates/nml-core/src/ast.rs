@@ -6,7 +6,8 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 pub enum FieldTypeExpr {
     Named(Identifier),
-    Array(Identifier),
+    Array(Box<FieldTypeExpr>),
+    Union(Vec<FieldTypeExpr>),
 }
 
 /// A field definition within a model/trait body: `name type[?] [= default]`.

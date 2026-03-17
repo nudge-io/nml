@@ -211,6 +211,7 @@ impl Parser {
             })
         } else if self.peek_kind_matches(|k| matches!(k, TokenKind::Identifier(_)))
             || self.check(TokenKind::ArrayPrefix)
+            || self.check(TokenKind::ParenOpen)
         {
             let field = self.parse_field_definition(ident)?;
             let end = self.prev_span();
@@ -253,15 +254,28 @@ impl Parser {
         Ok(NestedBlock { name, body })
     }
 
-    fn parse_field_definition(&mut self, name: Identifier) -> NmlResult<FieldDefinition> {
-        let field_type = if self.check(TokenKind::ArrayPrefix) {
+    fn parse_field_type_expr(&mut self) -> NmlResult<FieldTypeExpr> {
+        if self.check(TokenKind::ArrayPrefix) {
             self.advance();
-            let type_name = self.expect_identifier()?;
-            FieldTypeExpr::Array(type_name)
+            let inner = self.parse_field_type_expr()?;
+            Ok(FieldTypeExpr::Array(Box::new(inner)))
+        } else if self.check(TokenKind::ParenOpen) {
+            self.advance();
+            let mut variants = vec![self.parse_field_type_expr()?];
+            while self.check(TokenKind::Pipe) {
+                self.advance();
+                variants.push(self.parse_field_type_expr()?);
+            }
+            self.expect_kind(TokenKind::ParenClose)?;
+            Ok(FieldTypeExpr::Union(variants))
         } else {
-            let type_name = self.expect_identifier()?;
-            FieldTypeExpr::Named(type_name)
-        };
+            let name = self.expect_identifier()?;
+            Ok(FieldTypeExpr::Named(name))
+        }
+    }
+
+    fn parse_field_definition(&mut self, name: Identifier) -> NmlResult<FieldDefinition> {
+        let field_type = self.parse_field_type_expr()?;
 
         let optional = if self.check(TokenKind::Question) {
             self.advance();
@@ -308,15 +322,9 @@ impl Parser {
             })
         } else if self.peek_kind_matches(|k| matches!(k, TokenKind::Identifier(_)))
             || self.check(TokenKind::ArrayPrefix)
+            || self.check(TokenKind::ParenOpen)
         {
-            let field_type = if self.check(TokenKind::ArrayPrefix) {
-                self.advance();
-                let type_name = self.expect_identifier()?;
-                FieldTypeExpr::Array(type_name)
-            } else {
-                let type_name = self.expect_identifier()?;
-                FieldTypeExpr::Named(type_name)
-            };
+            let field_type = self.parse_field_type_expr()?;
             let optional = if self.check(TokenKind::Question) {
                 self.advance();
                 true
@@ -1160,7 +1168,7 @@ workflow W:
                 match &block.body.entries[0].kind {
                     BodyEntryKind::FieldDefinition(f) => {
                         assert_eq!(f.name.name, "steps");
-                        assert!(matches!(&f.field_type, FieldTypeExpr::Array(id) if id.name == "step"));
+                        assert!(matches!(&f.field_type, FieldTypeExpr::Array(inner) if matches!(inner.as_ref(), FieldTypeExpr::Named(id) if id.name == "step")));
                         assert!(!f.optional);
                     }
                     other => panic!("expected field definition, got {other:?}"),
@@ -1169,13 +1177,42 @@ workflow W:
                 match &block.body.entries[1].kind {
                     BodyEntryKind::FieldDefinition(f) => {
                         assert_eq!(f.name.name, "extensions");
-                        assert!(matches!(&f.field_type, FieldTypeExpr::Array(id) if id.name == "extensionPoint"));
+                        assert!(matches!(&f.field_type, FieldTypeExpr::Array(inner) if matches!(inner.as_ref(), FieldTypeExpr::Named(id) if id.name == "extensionPoint")));
                         assert!(f.optional);
                     }
                     other => panic!("expected field definition, got {other:?}"),
                 }
             }
             _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_model_field_union_type() {
+        let source = "model step:\n    parallel [](step | []step)?\n";
+        let file = parse(source).unwrap();
+        let decl = &file.declarations[0];
+        if let DeclarationKind::Block(block) = &decl.kind {
+            match &block.body.entries[0].kind {
+                BodyEntryKind::FieldDefinition(f) => {
+                    assert_eq!(f.name.name, "parallel");
+                    assert!(f.optional);
+                    if let FieldTypeExpr::Array(inner) = &f.field_type {
+                        if let FieldTypeExpr::Union(variants) = inner.as_ref() {
+                            assert_eq!(variants.len(), 2);
+                            assert!(matches!(&variants[0], FieldTypeExpr::Named(id) if id.name == "step"));
+                            assert!(matches!(&variants[1], FieldTypeExpr::Array(inner) if matches!(inner.as_ref(), FieldTypeExpr::Named(id) if id.name == "step")));
+                        } else {
+                            panic!("expected Union, got {:?}", inner);
+                        }
+                    } else {
+                        panic!("expected Array, got {:?}", f.field_type);
+                    }
+                }
+                other => panic!("expected field definition, got {other:?}"),
+            }
+        } else {
+            panic!("expected block");
         }
     }
 

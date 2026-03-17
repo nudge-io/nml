@@ -138,8 +138,39 @@ fn collect_step_names_from_body(body: &Body, names: &mut HashSet<String>) {
             if nested.name.name == "steps" {
                 for step_entry in &nested.body.entries {
                     if let BodyEntryKind::ListItem(item) = &step_entry.kind {
-                        if let ListItemKind::Named { name, .. } = &item.kind {
+                        if let ListItemKind::Named { name, body } = &item.kind {
                             names.insert(name.name.clone());
+                            collect_parallel_step_names(body, names);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_parallel_step_names(body: &Body, names: &mut HashSet<String>) {
+    for entry in &body.entries {
+        if let BodyEntryKind::NestedBlock(nested) = &entry.kind {
+            if nested.name.name == "parallel" {
+                for branch_entry in &nested.body.entries {
+                    if let BodyEntryKind::ListItem(item) = &branch_entry.kind {
+                        if let ListItemKind::Named { name, body } = &item.kind {
+                            let has_sub_items = body
+                                .entries
+                                .iter()
+                                .any(|e| matches!(&e.kind, BodyEntryKind::ListItem(_)));
+                            if has_sub_items {
+                                for sub_entry in &body.entries {
+                                    if let BodyEntryKind::ListItem(sub_item) = &sub_entry.kind {
+                                        if let ListItemKind::Named { name, .. } = &sub_item.kind {
+                                            names.insert(name.name.clone());
+                                        }
+                                    }
+                                }
+                            } else {
+                                names.insert(name.name.clone());
+                            }
                         }
                     }
                 }

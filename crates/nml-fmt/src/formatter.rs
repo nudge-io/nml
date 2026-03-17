@@ -4,6 +4,26 @@ use nml_core::types::Value;
 
 const INDENT: &str = "    ";
 
+fn format_field_type_expr_out(out: &mut String, expr: &FieldTypeExpr) {
+    match expr {
+        FieldTypeExpr::Named(id) => out.push_str(&id.name),
+        FieldTypeExpr::Array(inner) => {
+            out.push_str("[]");
+            format_field_type_expr_out(out, inner);
+        }
+        FieldTypeExpr::Union(variants) => {
+            out.push('(');
+            for (i, v) in variants.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(" | ");
+                }
+                format_field_type_expr_out(out, v);
+            }
+            out.push(')');
+        }
+    }
+}
+
 /// Format a parsed NML file into canonical form.
 pub fn format(file: &File) -> String {
     let mut output = String::new();
@@ -95,13 +115,7 @@ fn format_body_entry(out: &mut String, entry: &BodyEntry, depth: usize) {
             write_indent(out, depth);
             out.push_str(&f.name.name);
             out.push(' ');
-            match &f.field_type {
-                nml_core::ast::FieldTypeExpr::Named(id) => out.push_str(&id.name),
-                nml_core::ast::FieldTypeExpr::Array(id) => {
-                    out.push_str("[]");
-                    out.push_str(&id.name);
-                }
-            }
+            format_field_type_expr_out(out, &f.field_type);
             if f.optional {
                 out.push('?');
             }
@@ -133,13 +147,7 @@ fn format_modifier(out: &mut String, m: &Modifier, depth: usize) {
         }
         ModifierValue::TypeAnnotation { field_type, optional } => {
             out.push(' ');
-            match field_type {
-                nml_core::ast::FieldTypeExpr::Named(id) => out.push_str(&id.name),
-                nml_core::ast::FieldTypeExpr::Array(id) => {
-                    out.push_str("[]");
-                    out.push_str(&id.name);
-                }
-            }
+            format_field_type_expr_out(out, field_type);
             if *optional {
                 out.push('?');
             }

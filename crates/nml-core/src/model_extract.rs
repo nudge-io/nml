@@ -143,13 +143,11 @@ fn resolve_field_type(expr: &FieldTypeExpr) -> FieldType {
                 FieldType::ModelRef(id.name.clone())
             }
         }
-        FieldTypeExpr::Array(id) => {
-            let inner = if let Some(prim) = PrimitiveType::from_str(&id.name) {
-                FieldType::Primitive(prim)
-            } else {
-                FieldType::ModelRef(id.name.clone())
-            };
-            FieldType::List(Box::new(inner))
+        FieldTypeExpr::Array(inner) => {
+            FieldType::List(Box::new(resolve_field_type(inner)))
+        }
+        FieldTypeExpr::Union(variants) => {
+            FieldType::Union(variants.iter().map(resolve_field_type).collect())
         }
     }
 }
@@ -157,7 +155,11 @@ fn resolve_field_type(expr: &FieldTypeExpr) -> FieldType {
 fn resolve_type_name(expr: &FieldTypeExpr) -> String {
     match expr {
         FieldTypeExpr::Named(id) => id.name.clone(),
-        FieldTypeExpr::Array(id) => format!("[]{}", id.name),
+        FieldTypeExpr::Array(inner) => format!("[]{}", resolve_type_name(inner)),
+        FieldTypeExpr::Union(variants) => {
+            let names: Vec<_> = variants.iter().map(resolve_type_name).collect();
+            format!("({})", names.join(" | "))
+        }
     }
 }
 

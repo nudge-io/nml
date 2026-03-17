@@ -35,6 +35,8 @@ pub enum TokenKind {
     ArrayPrefix,    // []
     Comma,          // ,
     Question,       // ?
+    ParenOpen,      // (
+    ParenClose,     // )
 }
 
 /// A single token with its source location.
@@ -175,6 +177,16 @@ impl<'a> Lexer<'a> {
                     tokens.push(Token::new(TokenKind::Pipe, Span::new(bp, bp + 1)));
                     self.pos += 1;
                 }
+                '(' => {
+                    let bp = self.byte_pos();
+                    tokens.push(Token::new(TokenKind::ParenOpen, Span::new(bp, bp + 1)));
+                    self.pos += 1;
+                }
+                ')' => {
+                    let bp = self.byte_pos();
+                    tokens.push(Token::new(TokenKind::ParenClose, Span::new(bp, bp + 1)));
+                    self.pos += 1;
+                }
                 '.' => {
                     let bp = self.byte_pos();
                     tokens.push(Token::new(TokenKind::Dot, Span::new(bp, bp + 1)));
@@ -188,7 +200,7 @@ impl<'a> Lexer<'a> {
                         } else {
                             None
                         };
-                        if after_bracket.map_or(false, |c| c.is_alphabetic() || c == '_') {
+                        if after_bracket.map_or(false, |c| c.is_alphabetic() || c == '_' || c == '(') {
                             tokens.push(Token::new(TokenKind::ArrayPrefix, span));
                         } else {
                             let bp = self.byte_pos();
@@ -977,5 +989,17 @@ mod tests {
         let loc = source_map.location(name_tok.span.start);
         assert_eq!(loc.line, 2);
         assert_eq!(loc.column, 1);
+    }
+
+    #[test]
+    fn test_lex_parentheses() {
+        let source = "(hello | world)";
+        let tokens = Lexer::new(source).tokenize().unwrap();
+        let kinds: Vec<_> = tokens.iter().map(|t| &t.kind).collect();
+        assert!(matches!(kinds[0], TokenKind::ParenOpen));
+        assert!(matches!(kinds[1], TokenKind::Identifier(s) if s == "hello"));
+        assert!(matches!(kinds[2], TokenKind::Pipe));
+        assert!(matches!(kinds[3], TokenKind::Identifier(s) if s == "world"));
+        assert!(matches!(kinds[4], TokenKind::ParenClose));
     }
 }

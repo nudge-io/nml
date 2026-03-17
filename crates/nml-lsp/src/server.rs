@@ -789,10 +789,7 @@ fn build_body_symbols(body: &Body, source_map: &SourceMap) -> Vec<DocumentSymbol
             BodyEntryKind::FieldDefinition(fd) => {
                 let range = span_to_range(entry.span, source_map);
                 let selection_range = span_to_range(fd.name.span, source_map);
-                let type_name = match &fd.field_type {
-                    FieldTypeExpr::Named(id) => id.name.clone(),
-                    FieldTypeExpr::Array(id) => format!("[]{}", id.name),
-                };
+                let type_name = format_field_type_expr(&fd.field_type);
                 #[allow(deprecated)]
                 symbols.push(DocumentSymbol {
                     name: fd.name.name.clone(),
@@ -962,6 +959,17 @@ fn collect_list_item_references(
     }
 }
 
+fn format_field_type_expr(expr: &FieldTypeExpr) -> String {
+    match expr {
+        FieldTypeExpr::Named(id) => id.name.clone(),
+        FieldTypeExpr::Array(inner) => format!("[]{}", format_field_type_expr(inner)),
+        FieldTypeExpr::Union(variants) => {
+            let names: Vec<_> = variants.iter().map(|v| format_field_type_expr(v)).collect();
+            format!("({})", names.join(" | "))
+        }
+    }
+}
+
 // ── Hover helpers ─────────────────────────────────────────────
 
 fn summarize_body(body: &Body) -> String {
@@ -979,10 +987,7 @@ fn summarize_body(body: &Body) -> String {
                 lines.push(format!("  {}:", nb.name.name));
             }
             BodyEntryKind::FieldDefinition(fd) => {
-                let type_name = match &fd.field_type {
-                    FieldTypeExpr::Named(id) => id.name.clone(),
-                    FieldTypeExpr::Array(id) => format!("[]{}", id.name),
-                };
+                let type_name = format_field_type_expr(&fd.field_type);
                 let opt = if fd.optional { "?" } else { "" };
                 lines.push(format!("  {} {}{}", fd.name.name, type_name, opt));
             }
@@ -1005,6 +1010,10 @@ fn format_field_type(field_type: &FieldType) -> String {
         FieldType::RoleRef => "roleRef".to_string(),
         FieldType::InlineObject(_) => "object".to_string(),
         FieldType::SharedProperty(_) => "shared".to_string(),
+        FieldType::Union(variants) => {
+            let names: Vec<_> = variants.iter().map(|v| format_field_type(v)).collect();
+            format!("({})", names.join(" | "))
+        }
     }
 }
 

@@ -49,6 +49,7 @@ pub enum FieldType {
     Modifier(String),
     InlineObject(Vec<FieldDef>),
     SharedProperty(Vec<FieldDef>),
+    Union(Vec<FieldType>),
 }
 
 /// A constraint on a field.
