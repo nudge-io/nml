@@ -1,4 +1,7 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::ast::*;
+use crate::error::NmlError;
 use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, TraitDef};
 use crate::types::PrimitiveType;
 
@@ -40,6 +43,114 @@ pub fn extract(file: &File) -> ExtractedSchema {
     }
 
     schema
+}
+
+/// Detect cycles in the model dependency graph.
+///
+/// Builds a directed graph of model-to-model edges via `FieldType::ModelRef`
+/// (including through `List` and `Union` wrappers) and reports any cycles found.
+pub fn find_model_cycles(schema: &ExtractedSchema) -> Vec<NmlError> {
+    let model_names: HashSet<&str> = schema.models.iter().map(|m| m.name.as_str()).collect();
+
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for model in &schema.models {
+        let refs = collect_model_refs(&model.fields, &model_names);
+        edges.insert(model.name.as_str(), refs);
+    }
+
+    let mut errors = Vec::new();
+    let mut globally_visited = HashSet::new();
+
+    for model in &schema.models {
+        if globally_visited.contains(model.name.as_str()) {
+            continue;
+        }
+        let mut path = Vec::new();
+        detect_cycle(
+            model.name.as_str(),
+            &edges,
+            &mut path,
+            &mut globally_visited,
+            schema,
+            &mut errors,
+        );
+    }
+
+    errors
+}
+
+fn collect_model_refs<'a>(fields: &'a [FieldDef], known_models: &HashSet<&str>) -> Vec<&'a str> {
+    let mut refs = Vec::new();
+    for field in fields {
+        collect_refs_from_type(&field.field_type, known_models, &mut refs);
+    }
+    refs
+}
+
+fn collect_refs_from_type<'a>(
+    ft: &'a FieldType,
+    known_models: &HashSet<&str>,
+    refs: &mut Vec<&'a str>,
+) {
+    match ft {
+        FieldType::ModelRef(name) if known_models.contains(name.as_str()) => {
+            refs.push(name.as_str());
+        }
+        FieldType::List(inner) => collect_refs_from_type(inner, known_models, refs),
+        FieldType::Union(variants) => {
+            for v in variants {
+                collect_refs_from_type(v, known_models, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn detect_cycle<'a>(
+    name: &'a str,
+    edges: &HashMap<&'a str, Vec<&'a str>>,
+    path: &mut Vec<&'a str>,
+    globally_visited: &mut HashSet<&'a str>,
+    schema: &ExtractedSchema,
+    errors: &mut Vec<NmlError>,
+) {
+    if let Some(pos) = path.iter().position(|n| *n == name) {
+        let cycle: Vec<&str> = path[pos..].to_vec();
+        for member in &cycle {
+            let span = schema
+                .models
+                .iter()
+                .find(|m| m.name == *member)
+                .map(|m| m.span)
+                .unwrap_or(crate::span::Span::empty(0));
+            let cycle_desc: Vec<_> = cycle
+                .iter()
+                .chain(std::iter::once(&cycle[0]))
+                .copied()
+                .collect();
+            errors.push(NmlError::Validation {
+                message: format!(
+                    "circular dependency in model definitions: {}",
+                    cycle_desc.join(" -> ")
+                ),
+                span,
+            });
+        }
+        return;
+    }
+
+    if globally_visited.contains(name) {
+        return;
+    }
+
+    path.push(name);
+    if let Some(neighbors) = edges.get(name) {
+        for neighbor in neighbors {
+            detect_cycle(neighbor, edges, path, globally_visited, schema, errors);
+        }
+    }
+    path.pop();
+    globally_visited.insert(name);
 }
 
 fn extract_model(block: &BlockDecl, span: crate::span::Span) -> Option<ModelDef> {
@@ -299,5 +410,199 @@ trait timestamped:\n    createdAt string\n";
         assert_eq!(schema.enums.len(), 1);
         assert_eq!(schema.models.len(), 1);
         assert_eq!(schema.traits.len(), 1);
+    }
+
+    #[test]
+    fn test_model_cycle_direct() {
+        let source = "model A:\n    child B?\n\nmodel B:\n    parent A?\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_model_cycles(&schema);
+        assert!(
+            !errors.is_empty(),
+            "should detect cycle between A and B; errors: {:?}",
+            errors
+        );
+        assert!(
+            errors.iter().any(|e| e.message().contains("circular dependency")),
+            "error should mention circular dependency; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_model_cycle_self_referencing() {
+        let source = "model tree:\n    value string\n    left tree?\n    right tree?\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_model_cycles(&schema);
+        assert!(
+            !errors.is_empty(),
+            "should detect self-referencing model; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_model_cycle_three_way() {
+        let source = "model A:\n    b B?\n\nmodel B:\n    c C?\n\nmodel C:\n    a A?\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_model_cycles(&schema);
+        assert!(
+            !errors.is_empty(),
+            "should detect three-way cycle; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_model_no_cycle() {
+        let source = "model prompt:\n    system string?\n\nmodel step:\n    prompt prompt?\n    next string?\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_model_cycles(&schema);
+        assert!(
+            errors.is_empty(),
+            "should not detect cycle in acyclic models; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_model_cycle_through_list() {
+        let source = "model workflow:\n    steps []step\n\nmodel step:\n    parent workflow?\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_model_cycles(&schema);
+        assert!(
+            !errors.is_empty(),
+            "should detect cycle through list field; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_model_ref_to_enum_no_cycle() {
+        let source = "enum status:\n    - \"active\"\n    - \"inactive\"\n\nmodel user:\n    status status\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_model_cycles(&schema);
+        assert!(
+            errors.is_empty(),
+            "enum refs should not be treated as model cycles; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_model_cycle_through_union() {
+        let source = "model step:\n    provider string?\n    parallel [](step | []step)?\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_model_cycles(&schema);
+        assert!(
+            !errors.is_empty(),
+            "should detect self-referencing model through union type; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_model_cycle_indirect_through_union() {
+        let source = "model container:\n    items [](itemA | itemB)\n\nmodel itemA:\n    parent container?\n\nmodel itemB:\n    value string\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_model_cycles(&schema);
+        assert!(
+            !errors.is_empty(),
+            "should detect cycle container -> itemA -> container through union; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_multiple_disjoint_model_cycles() {
+        let source = "model A:\n    b B?\n\nmodel B:\n    a A?\n\nmodel X:\n    y Y?\n\nmodel Y:\n    x X?\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_model_cycles(&schema);
+        assert!(
+            errors.len() >= 4,
+            "should detect both independent cycles; got {} errors: {:?}",
+            errors.len(),
+            errors
+        );
+    }
+
+    #[test]
+    fn test_model_cycle_error_message_contains_path() {
+        let source = "model A:\n    b B?\n\nmodel B:\n    c C?\n\nmodel C:\n    a A?\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_model_cycles(&schema);
+        let has_path = errors.iter().any(|e| {
+            let msg = e.message();
+            msg.contains("A -> B") || msg.contains("B -> C") || msg.contains("C -> A")
+        });
+        assert!(
+            has_path,
+            "error message should include the cycle path; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_large_acyclic_model_graph_no_false_positive() {
+        let mut source = String::new();
+        for i in 0..50 {
+            source.push_str(&format!("model m{}:\n    value string\n    child m{}?\n\n", i, i + 1));
+        }
+        source.push_str("model m50:\n    value string\n");
+        let file = parser::parse(&source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_model_cycles(&schema);
+        assert!(
+            errors.is_empty(),
+            "large acyclic model graph should not produce false positives; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_large_model_graph_performance() {
+        let mut source = String::new();
+        for i in 0..100 {
+            source.push_str(&format!(
+                "model node{}:\n    value string\n    left node{}?\n    right node{}?\n\n",
+                i,
+                (i + 1) % 100,
+                (i + 2) % 100,
+            ));
+        }
+        let file = parser::parse(&source).unwrap();
+        let schema = extract(&file);
+
+        let start = std::time::Instant::now();
+        let errors = find_model_cycles(&schema);
+        let elapsed = start.elapsed();
+
+        assert!(!errors.is_empty(), "should detect cycles in circular graph");
+        assert!(
+            elapsed.as_millis() < 1000,
+            "cycle detection on 100-node graph should complete in <1s; took {:?}",
+            elapsed
+        );
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::error::NmlError;
@@ -126,6 +126,68 @@ impl Resolver {
         errors
     }
 
+    /// Detect cycles in const/template reference chains.
+    ///
+    /// A cycle exists when `const A = B` and `const B = A` (or longer chains).
+    /// Returns an error for each const that participates in a cycle.
+    pub fn find_const_cycles(&self) -> Vec<NmlError> {
+        let mut errors = Vec::new();
+        let mut globally_visited = HashSet::new();
+
+        for name in self.const_values.keys() {
+            if globally_visited.contains(name.as_str()) {
+                continue;
+            }
+            let mut path = Vec::new();
+            self.walk_const_chain(name, &mut path, &mut globally_visited, &mut errors);
+        }
+        errors
+    }
+
+    fn walk_const_chain(
+        &self,
+        name: &str,
+        path: &mut Vec<String>,
+        globally_visited: &mut HashSet<String>,
+        errors: &mut Vec<NmlError>,
+    ) {
+        if let Some(pos) = path.iter().position(|n| n == name) {
+            let cycle: Vec<_> = path[pos..].to_vec();
+            for member in &cycle {
+                let span = self
+                    .declarations
+                    .get(member.as_str())
+                    .and_then(|v| v.first())
+                    .map(|d| d.span)
+                    .unwrap_or(Span::empty(0));
+                errors.push(NmlError::Validation {
+                    message: format!(
+                        "circular reference in const/template chain: {}",
+                        cycle.iter().chain(std::iter::once(&cycle[0])).cloned().collect::<Vec<_>>().join(" -> ")
+                    ),
+                    span,
+                });
+            }
+            return;
+        }
+
+        if globally_visited.contains(name) {
+            return;
+        }
+
+        if let Some(value) = self.const_values.get(name) {
+            if let Value::Reference(ref_name) = value {
+                if self.const_values.contains_key(ref_name.as_str()) {
+                    path.push(name.to_string());
+                    self.walk_const_chain(ref_name, path, globally_visited, errors);
+                    path.pop();
+                }
+            }
+        }
+
+        globally_visited.insert(name.to_string());
+    }
+
     fn check_body_refs(&self, body: &Body, errors: &mut Vec<NmlError>) {
         for entry in &body.entries {
             match &entry.kind {
@@ -240,5 +302,156 @@ mod tests {
 
         let errors = resolver.find_duplicates();
         assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn test_const_cycle_direct() {
+        let source = "const A = B\n\nconst B = A\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_const_cycles();
+        assert!(
+            !errors.is_empty(),
+            "should detect cycle between A and B; errors: {:?}",
+            errors
+        );
+        assert!(
+            errors.iter().any(|e| e.message().contains("circular reference")),
+            "error should mention circular reference; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_const_cycle_three_way() {
+        let source = "const A = B\n\nconst B = C\n\nconst C = A\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_const_cycles();
+        assert!(
+            !errors.is_empty(),
+            "should detect three-way cycle; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_const_no_cycle() {
+        let source = "const A = B\n\nconst B = \"hello\"\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_const_cycles();
+        assert!(
+            errors.is_empty(),
+            "should not detect cycle in valid chain; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_const_self_reference() {
+        let source = "const A = A\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_const_cycles();
+        assert!(
+            !errors.is_empty(),
+            "should detect self-referencing const; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_template_no_false_positive() {
+        // Templates always hold string values, not references, so they can't form cycles.
+        let source = "template Greeting:\n    \"Hello world\"\n\nconst Name = \"Alice\"\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_const_cycles();
+        assert!(
+            errors.is_empty(),
+            "templates with string values should not trigger cycle detection; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_const_referencing_template_no_cycle() {
+        // A const referencing a template name: const uses Value::Reference, but the
+        // template stores a string value, so the chain terminates.
+        let source = "template Prompt:\n    \"You are a helpful assistant.\"\n\nconst SystemPrompt = Prompt\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_const_cycles();
+        assert!(
+            errors.is_empty(),
+            "const referencing a template should not be a cycle; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_multiple_disjoint_cycles() {
+        let source = "const A = B\n\nconst B = A\n\nconst X = Y\n\nconst Y = X\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_const_cycles();
+        assert!(
+            errors.len() >= 4,
+            "should detect both independent cycles (at least 4 errors); got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_long_acyclic_chain_no_false_positive() {
+        let mut source = String::new();
+        for i in 0..20 {
+            source.push_str(&format!("const c{} = c{}\n\n", i, i + 1));
+        }
+        source.push_str("const c20 = \"end\"\n");
+        let file = parser::parse(&source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_const_cycles();
+        assert!(
+            errors.is_empty(),
+            "long acyclic chain should not produce false positives; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_const_cycle_error_message_contains_path() {
+        let source = "const A = B\n\nconst B = C\n\nconst C = A\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_const_cycles();
+        let has_path = errors.iter().any(|e| {
+            let msg = e.message();
+            msg.contains("A -> B") || msg.contains("B -> C") || msg.contains("C -> A")
+        });
+        assert!(
+            has_path,
+            "error message should include the cycle path; errors: {:?}",
+            errors
+        );
     }
 }

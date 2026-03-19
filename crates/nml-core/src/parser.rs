@@ -6,14 +6,17 @@ use crate::span::Span;
 use crate::template;
 use crate::types::{SpannedValue, Value};
 
+const MAX_NESTING_DEPTH: u32 = 64;
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: u32,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self { tokens, pos: 0, depth: 0 }
     }
 
     pub fn parse(&mut self) -> NmlResult<File> {
@@ -139,6 +142,15 @@ impl Parser {
         if !self.check(TokenKind::Indent) {
             return Ok(Body { entries });
         }
+
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            return Err(NmlError::parse(
+                format!("maximum nesting depth ({MAX_NESTING_DEPTH}) exceeded"),
+                self.current_span(),
+            ));
+        }
+
         self.advance(); // consume Indent
 
         while !self.check(TokenKind::Dedent) && !self.at_eof() {
@@ -154,6 +166,8 @@ impl Parser {
         if self.check(TokenKind::Dedent) {
             self.advance();
         }
+
+        self.depth -= 1;
 
         Ok(Body { entries })
     }
@@ -1563,15 +1577,101 @@ workflow W:
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_deeply_nested_blocks_no_stackoverflow() {
+    fn test_deeply_nested_blocks_within_limit() {
         let mut source = String::new();
         source.push_str("root R:\n");
-        for i in 0..100 {
+        for i in 0..60 {
             let indent = "    ".repeat(i + 1);
             source.push_str(&format!("{}level{}:\n", indent, i));
         }
-        // Should parse without stack overflow
-        let _result = parse(&source);
+        let result = parse(&source);
+        assert!(result.is_ok(), "60 levels of nesting should be within limit");
+    }
+
+    #[test]
+    fn test_nesting_at_exact_limit() {
+        let mut source = String::new();
+        source.push_str("root R:\n");
+        // 63 nested blocks + the top-level body = 64 parse_body calls = exactly at limit
+        for i in 0..63 {
+            let indent = "    ".repeat(i + 1);
+            source.push_str(&format!("{}level{}:\n", indent, i));
+        }
+        let deepest_indent = "    ".repeat(64);
+        source.push_str(&format!("{}value = \"leaf\"\n", deepest_indent));
+        let result = parse(&source);
+        assert!(result.is_ok(), "exactly at MAX_NESTING_DEPTH should succeed");
+    }
+
+    #[test]
+    fn test_nesting_one_over_limit() {
+        let mut source = String::new();
+        source.push_str("root R:\n");
+        // 64 nested blocks: depth increments happen when parse_body finds an Indent token.
+        // Blocks 0..62 each have a child block (the next level), so they get Indent → 63 increments.
+        // Block 63 also needs content to trigger Indent → total 64 body increments + 1 root = 65.
+        for i in 0..64 {
+            let indent = "    ".repeat(i + 1);
+            source.push_str(&format!("{}level{}:\n", indent, i));
+        }
+        let deepest_indent = "    ".repeat(65);
+        source.push_str(&format!("{}value = \"deep\"\n", deepest_indent));
+        let result = parse(&source);
+        assert!(result.is_err(), "one over MAX_NESTING_DEPTH should fail");
+        let err = result.unwrap_err();
+        assert!(
+            err.message().contains("maximum nesting depth"),
+            "error should mention depth limit; got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_nesting_depth_limit_exceeded() {
+        let mut source = String::new();
+        source.push_str("root R:\n");
+        for i in 0..70 {
+            let indent = "    ".repeat(i + 1);
+            source.push_str(&format!("{}level{}:\n", indent, i));
+        }
+        let result = parse(&source);
+        assert!(result.is_err(), "70 levels of nesting should exceed limit");
+        let err = result.unwrap_err();
+        assert!(
+            err.message().contains("maximum nesting depth"),
+            "error should mention depth limit; got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_wide_shallow_nesting_ok() {
+        let mut source = String::new();
+        source.push_str("root R:\n");
+        for i in 0..200 {
+            source.push_str(&format!("    prop{} = {}\n", i, i));
+        }
+        let result = parse(&source);
+        assert!(result.is_ok(), "wide shallow nesting should not hit depth limit");
+    }
+
+    #[test]
+    fn test_depth_limit_in_list_items() {
+        let mut source = String::new();
+        source.push_str("root R:\n");
+        // Build nesting through list items: - item:\n        nested:\n ...
+        let mut depth = 1;
+        for i in 0..40 {
+            let indent = "    ".repeat(depth);
+            source.push_str(&format!("{}- item{}:\n", indent, i));
+            depth += 1;
+            let indent = "    ".repeat(depth);
+            source.push_str(&format!("{}nested:\n", indent));
+            depth += 1;
+        }
+        let result = parse(&source);
+        // 1 (top body) + 40 * 2 (list item body + nested block body) = 81 > 64
+        assert!(result.is_err(), "deep nesting through list items should be caught");
     }
 
     #[test]

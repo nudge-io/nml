@@ -60,6 +60,86 @@ impl de::Error for Error {
     }
 }
 
+fn f64_to_u8(n: f64) -> Result<u8, Error> {
+    if n.fract() != 0.0 {
+        return Err(Error(format!("u8 value {} has a fractional part", n)));
+    }
+    if n < 0.0 || n > u8::MAX as f64 {
+        return Err(Error(format!("u8 value {} out of range (0..=255)", n)));
+    }
+    Ok(n as u8)
+}
+
+fn f64_to_u16(n: f64) -> Result<u16, Error> {
+    if n.fract() != 0.0 {
+        return Err(Error(format!("u16 value {} has a fractional part", n)));
+    }
+    if n < 0.0 || n > u16::MAX as f64 {
+        return Err(Error(format!("u16 value {} out of range (0..=65535)", n)));
+    }
+    Ok(n as u16)
+}
+
+fn f64_to_u32(n: f64) -> Result<u32, Error> {
+    if n.fract() != 0.0 {
+        return Err(Error(format!("u32 value {} has a fractional part", n)));
+    }
+    if n < 0.0 || n > u32::MAX as f64 {
+        return Err(Error(format!("u32 value {} out of range (0..=4294967295)", n)));
+    }
+    Ok(n as u32)
+}
+
+fn f64_to_u64(n: f64) -> Result<u64, Error> {
+    if n.fract() != 0.0 {
+        return Err(Error(format!("u64 value {} has a fractional part", n)));
+    }
+    if n < 0.0 || n > u64::MAX as f64 {
+        return Err(Error(format!("u64 value {} out of range (0..={})", n, u64::MAX)));
+    }
+    Ok(n as u64)
+}
+
+fn f64_to_i8(n: f64) -> Result<i8, Error> {
+    if n.fract() != 0.0 {
+        return Err(Error(format!("i8 value {} has a fractional part", n)));
+    }
+    if n < i8::MIN as f64 || n > i8::MAX as f64 {
+        return Err(Error(format!("i8 value {} out of range (-128..=127)", n)));
+    }
+    Ok(n as i8)
+}
+
+fn f64_to_i16(n: f64) -> Result<i16, Error> {
+    if n.fract() != 0.0 {
+        return Err(Error(format!("i16 value {} has a fractional part", n)));
+    }
+    if n < i16::MIN as f64 || n > i16::MAX as f64 {
+        return Err(Error(format!("i16 value {} out of range (-32768..=32767)", n)));
+    }
+    Ok(n as i16)
+}
+
+fn f64_to_i32(n: f64) -> Result<i32, Error> {
+    if n.fract() != 0.0 {
+        return Err(Error(format!("i32 value {} has a fractional part", n)));
+    }
+    if n < i32::MIN as f64 || n > i32::MAX as f64 {
+        return Err(Error(format!("i32 value {} out of range (-2147483648..=2147483647)", n)));
+    }
+    Ok(n as i32)
+}
+
+fn f64_to_i64(n: f64) -> Result<i64, Error> {
+    if n.fract() != 0.0 {
+        return Err(Error(format!("i64 value {} has a fractional part", n)));
+    }
+    if n < i64::MIN as f64 || n > i64::MAX as f64 {
+        return Err(Error(format!("i64 value {} out of range ({}..={})", n, i64::MIN, i64::MAX)));
+    }
+    Ok(n as i64)
+}
+
 /// Deserialize a struct from an NML block body.
 pub fn from_block<'de, T: Deserialize<'de>>(body: &'de Body) -> Result<T, Error> {
     let deserializer = BodyDeserializer { body };
@@ -519,9 +599,9 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
 
     fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
-            Value::Number(n) => visitor.visit_i64(*n as i64),
+            Value::Number(n) => visitor.visit_i64(f64_to_i64(*n)?),
             _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_i64(n as i64),
+                Some(n) => visitor.visit_i64(f64_to_i64(n)?),
                 None => Err(Error(format!(
                     "expected number, got {}",
                     self.value.type_name()
@@ -532,9 +612,9 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
 
     fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
-            Value::Number(n) => visitor.visit_i32(*n as i32),
+            Value::Number(n) => visitor.visit_i32(f64_to_i32(*n)?),
             _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_i32(n as i32),
+                Some(n) => visitor.visit_i32(f64_to_i32(n)?),
                 None => Err(Error(format!(
                     "expected number, got {}",
                     self.value.type_name()
@@ -545,9 +625,9 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
 
     fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
-            Value::Number(n) => visitor.visit_i16(*n as i16),
+            Value::Number(n) => visitor.visit_i16(f64_to_i16(*n)?),
             _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_i16(n as i16),
+                Some(n) => visitor.visit_i16(f64_to_i16(n)?),
                 None => Err(Error(format!(
                     "expected number, got {}",
                     self.value.type_name()
@@ -558,9 +638,9 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
 
     fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
-            Value::Number(n) => visitor.visit_i8(*n as i8),
+            Value::Number(n) => visitor.visit_i8(f64_to_i8(*n)?),
             _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_i8(n as i8),
+                Some(n) => visitor.visit_i8(f64_to_i8(n)?),
                 None => Err(Error(format!(
                     "expected number, got {}",
                     self.value.type_name()
@@ -571,10 +651,10 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
 
     fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
-            Value::Number(n) if *n >= 0.0 => visitor.visit_u64(*n as u64),
+            Value::Number(n) => visitor.visit_u64(f64_to_u64(*n)?),
             _ => match coerce_to_f64(self.value) {
-                Some(n) if n >= 0.0 => visitor.visit_u64(n as u64),
-                _ => Err(Error(format!(
+                Some(n) => visitor.visit_u64(f64_to_u64(n)?),
+                None => Err(Error(format!(
                     "expected unsigned number, got {}",
                     self.value.type_name()
                 ))),
@@ -584,10 +664,10 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
 
     fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
-            Value::Number(n) if *n >= 0.0 => visitor.visit_u32(*n as u32),
+            Value::Number(n) => visitor.visit_u32(f64_to_u32(*n)?),
             _ => match coerce_to_f64(self.value) {
-                Some(n) if n >= 0.0 => visitor.visit_u32(n as u32),
-                _ => Err(Error(format!(
+                Some(n) => visitor.visit_u32(f64_to_u32(n)?),
+                None => Err(Error(format!(
                     "expected unsigned number, got {}",
                     self.value.type_name()
                 ))),
@@ -597,10 +677,10 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
 
     fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
-            Value::Number(n) if *n >= 0.0 => visitor.visit_u16(*n as u16),
+            Value::Number(n) => visitor.visit_u16(f64_to_u16(*n)?),
             _ => match coerce_to_f64(self.value) {
-                Some(n) if n >= 0.0 => visitor.visit_u16(n as u16),
-                _ => Err(Error(format!(
+                Some(n) => visitor.visit_u16(f64_to_u16(n)?),
+                None => Err(Error(format!(
                     "expected unsigned number, got {}",
                     self.value.type_name()
                 ))),
@@ -610,10 +690,10 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
 
     fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
-            Value::Number(n) if *n >= 0.0 => visitor.visit_u8(*n as u8),
+            Value::Number(n) => visitor.visit_u8(f64_to_u8(*n)?),
             _ => match coerce_to_f64(self.value) {
-                Some(n) if n >= 0.0 => visitor.visit_u8(n as u8),
-                _ => Err(Error(format!(
+                Some(n) => visitor.visit_u8(f64_to_u8(n)?),
+                None => Err(Error(format!(
                     "expected unsigned number, got {}",
                     self.value.type_name()
                 ))),
@@ -1384,5 +1464,184 @@ workflow W:
         let body = doc.block("server", "S").body().unwrap();
         let result: Result<Config, _> = from_block(body);
         assert!(result.is_err());
+    }
+
+    // --- Numeric range and fractional validation ---
+
+    #[test]
+    fn test_u16_valid_port() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            port: u16,
+        }
+        let nml = "server App:\n    port = 8080\n";
+        let file = parser::parse(nml).unwrap();
+        let doc = crate::query::Document::new(&file);
+        let body = doc.block("server", "App").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert_eq!(config.port, 8080);
+    }
+
+    #[test]
+    fn test_u16_boundary_max() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            port: u16,
+        }
+        let nml = "server App:\n    port = 65535\n";
+        let file = parser::parse(nml).unwrap();
+        let doc = crate::query::Document::new(&file);
+        let body = doc.block("server", "App").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert_eq!(config.port, 65535);
+    }
+
+    #[test]
+    fn test_u16_overflow_rejected() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            port: u16,
+        }
+        let nml = "server App:\n    port = 70000\n";
+        let file = parser::parse(nml).unwrap();
+        let doc = crate::query::Document::new(&file);
+        let body = doc.block("server", "App").body().unwrap();
+        let result: Result<Config, _> = from_block(body);
+        assert!(result.is_err(), "70000 should not fit in u16");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("out of range"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_u16_negative_rejected() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            port: u16,
+        }
+        let nml = "server App:\n    port = -1\n";
+        let file = parser::parse(nml).unwrap();
+        let doc = crate::query::Document::new(&file);
+        let body = doc.block("server", "App").body().unwrap();
+        let result: Result<Config, _> = from_block(body);
+        assert!(result.is_err(), "-1 should not fit in u16");
+    }
+
+    #[test]
+    fn test_u16_fractional_rejected() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            port: u16,
+        }
+        let nml = "server App:\n    port = 3000.5\n";
+        let file = parser::parse(nml).unwrap();
+        let doc = crate::query::Document::new(&file);
+        let body = doc.block("server", "App").body().unwrap();
+        let result: Result<Config, _> = from_block(body);
+        assert!(result.is_err(), "fractional values should not be valid for u16");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("fractional"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_u8_boundary() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            level: u8,
+        }
+        let nml = "server App:\n    level = 255\n";
+        let file = parser::parse(nml).unwrap();
+        let doc = crate::query::Document::new(&file);
+        let body = doc.block("server", "App").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert_eq!(config.level, 255);
+
+        let nml_bad = "server App:\n    level = 256\n";
+        let file2 = parser::parse(nml_bad).unwrap();
+        let doc2 = crate::query::Document::new(&file2);
+        let body2 = doc2.block("server", "App").body().unwrap();
+        let result: Result<Config, _> = from_block(body2);
+        assert!(result.is_err(), "256 should not fit in u8");
+    }
+
+    #[test]
+    fn test_i8_range() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            offset: i8,
+        }
+        let nml = "server App:\n    offset = -128\n";
+        let file = parser::parse(nml).unwrap();
+        let doc = crate::query::Document::new(&file);
+        let body = doc.block("server", "App").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert_eq!(config.offset, -128);
+
+        let nml_bad = "server App:\n    offset = 128\n";
+        let file2 = parser::parse(nml_bad).unwrap();
+        let doc2 = crate::query::Document::new(&file2);
+        let body2 = doc2.block("server", "App").body().unwrap();
+        let result: Result<Config, _> = from_block(body2);
+        assert!(result.is_err(), "128 should not fit in i8");
+    }
+
+    #[test]
+    fn test_u64_zero_valid() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            count: u64,
+        }
+        let nml = "server App:\n    count = 0\n";
+        let file = parser::parse(nml).unwrap();
+        let doc = crate::query::Document::new(&file);
+        let body = doc.block("server", "App").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert_eq!(config.count, 0);
+    }
+
+    #[test]
+    fn test_u64_negative_rejected() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            count: u64,
+        }
+        let nml = "server App:\n    count = -5\n";
+        let file = parser::parse(nml).unwrap();
+        let doc = crate::query::Document::new(&file);
+        let body = doc.block("server", "App").body().unwrap();
+        let result: Result<Config, _> = from_block(body);
+        assert!(result.is_err(), "negative should not fit in u64");
+    }
+
+    // --- Direct conversion function tests ---
+
+    #[test]
+    fn test_f64_to_u16_conversions() {
+        assert!(f64_to_u16(0.0).is_ok());
+        assert_eq!(f64_to_u16(3000.0).unwrap(), 3000);
+        assert_eq!(f64_to_u16(65535.0).unwrap(), 65535);
+        assert!(f64_to_u16(65536.0).is_err());
+        assert!(f64_to_u16(-1.0).is_err());
+        assert!(f64_to_u16(3000.5).is_err());
+        assert!(f64_to_u16(f64::NAN).is_err());
+        assert!(f64_to_u16(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn test_f64_to_u32_conversions() {
+        assert_eq!(f64_to_u32(0.0).unwrap(), 0);
+        assert_eq!(f64_to_u32(4294967295.0).unwrap(), u32::MAX);
+        assert!(f64_to_u32(4294967296.0).is_err());
+        assert!(f64_to_u32(-1.0).is_err());
+        assert!(f64_to_u32(1.1).is_err());
+    }
+
+    #[test]
+    fn test_f64_to_i32_conversions() {
+        assert_eq!(f64_to_i32(0.0).unwrap(), 0);
+        assert_eq!(f64_to_i32(-2147483648.0).unwrap(), i32::MIN);
+        assert_eq!(f64_to_i32(2147483647.0).unwrap(), i32::MAX);
+        assert!(f64_to_i32(2147483648.0).is_err());
+        assert!(f64_to_i32(-2147483649.0).is_err());
+        assert!(f64_to_i32(1.5).is_err());
     }
 }

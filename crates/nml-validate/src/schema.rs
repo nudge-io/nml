@@ -7,6 +7,8 @@ use crate::diagnostics::Diagnostic;
 /// Default modifier names accepted when no custom set is configured.
 pub const DEFAULT_MODIFIERS: &[&str] = &["allow", "deny", "grant"];
 
+const MAX_VALIDATION_DEPTH: u32 = 64;
+
 /// Validates instance declarations against model definitions.
 pub struct SchemaValidator {
     models: Vec<ModelDef>,
@@ -66,7 +68,7 @@ impl SchemaValidator {
 
         if !is_schema_def {
             if let Some(model) = self.find_model(keyword) {
-                self.validate_instance_against_model(&block.body, model, diags);
+                self.validate_instance_against_model(&block.body, model, 0, diags);
             }
         }
     }
@@ -85,7 +87,7 @@ impl SchemaValidator {
 
                 if !is_schema_def {
                     if let Some(model) = self.find_model(keyword) {
-                        self.validate_instance_against_model(body, model, diags);
+                        self.validate_instance_against_model(body, model, 0, diags);
                     }
                 }
             }
@@ -141,8 +143,13 @@ impl SchemaValidator {
         &self,
         body: &Body,
         model: &ModelDef,
+        depth: u32,
         diags: &mut Vec<Diagnostic>,
     ) {
+        if depth >= MAX_VALIDATION_DEPTH {
+            return;
+        }
+
         let mut seen_fields: Vec<&str> = Vec::new();
 
         for entry in &body.entries {
@@ -173,6 +180,7 @@ impl SchemaValidator {
                                     self.validate_instance_against_model(
                                         &nb.body,
                                         nested_model,
+                                        depth + 1,
                                         diags,
                                     );
                                 }
@@ -184,7 +192,7 @@ impl SchemaValidator {
                                             match inner.as_ref() {
                                                 FieldType::ModelRef(ref_name) => {
                                                     if let Some(inner_model) = self.find_model(ref_name) {
-                                                        self.validate_instance_against_model(body, inner_model, diags);
+                                                        self.validate_instance_against_model(body, inner_model, depth + 1, diags);
                                                     }
                                                 }
                                                 FieldType::Union(variants) => {
@@ -195,7 +203,7 @@ impl SchemaValidator {
                                                         match variant {
                                                             FieldType::ModelRef(ref_name) if !has_list_items => {
                                                                 if let Some(m) = self.find_model(ref_name) {
-                                                                    self.validate_instance_against_model(body, m, diags);
+                                                                    self.validate_instance_against_model(body, m, depth + 1, diags);
                                                                 }
                                                                 break;
                                                             }
@@ -205,7 +213,7 @@ impl SchemaValidator {
                                                                         for sub_entry in &body.entries {
                                                                             if let BodyEntryKind::ListItem(sub_item) = &sub_entry.kind {
                                                                                 if let ListItemKind::Named { body: sub_body, .. } = &sub_item.kind {
-                                                                                    self.validate_instance_against_model(sub_body, m, diags);
+                                                                                    self.validate_instance_against_model(sub_body, m, depth + 1, diags);
                                                                                 }
                                                                             }
                                                                         }
@@ -223,9 +231,7 @@ impl SchemaValidator {
                                     }
                                 }
                             }
-                            FieldType::Primitive(PrimitiveType::Object) => {
-                                // object type: allow any keys, no inner validation
-                            }
+                            FieldType::Primitive(PrimitiveType::Object) => {}
                             _ => {}
                         }
                     } else {
@@ -894,5 +900,122 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(diags.iter().any(|d| d.message.contains("unknown property 'bogus'")), "expected warning about 'bogus', got: {:?}", diags);
+    }
+
+    #[test]
+    fn test_circular_model_ref_no_infinite_recursion() {
+        let schema = "model nodeA:\n    name string\n    child nodeB?\n\nmodel nodeB:\n    name string\n    parent nodeA?\n";
+        let validator = make_validator(schema);
+
+        let source = "nodeA Root:\n    name = \"root\"\n    child:\n        name = \"leaf\"\n        parent:\n            name = \"back-ref\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("unknown property 'name'")),
+            "circular models should validate without infinite recursion; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_self_referencing_model_no_infinite_recursion() {
+        let schema = "model tree:\n    value string\n    left tree?\n    right tree?\n";
+        let validator = make_validator(schema);
+
+        let source = "tree Root:\n    value = \"root\"\n    left:\n        value = \"left\"\n    right:\n        value = \"right\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.is_empty(),
+            "self-referencing model should validate without infinite recursion; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_deeply_nested_circular_models_validates_without_hang() {
+        let schema = "model nodeA:\n    name string\n    child nodeB?\n\nmodel nodeB:\n    name string\n    parent nodeA?\n";
+        let validator = make_validator(schema);
+
+        // Build deeply nested alternating A/B instances
+        let source = r#"nodeA Root:
+    name = "r"
+    child:
+        name = "c1"
+        parent:
+            name = "p1"
+            child:
+                name = "c2"
+                parent:
+                    name = "p2"
+                    child:
+                        name = "c3"
+                        parent:
+                            name = "p3"
+"#;
+        let file = parser::parse(source).unwrap();
+        let start = std::time::Instant::now();
+        let _diags = validator.validate(&file);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 1000,
+            "deep circular nesting validation should complete in <1s; took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_circular_and_self_referencing_mixed() {
+        let schema = "model node:\n    value string\n    self_ref node?\n    partner peer?\n\nmodel peer:\n    name string\n    back node?\n";
+        let validator = make_validator(schema);
+
+        let source = "node N:\n    value = \"hello\"\n    self_ref:\n        value = \"nested\"\n    partner:\n        name = \"p\"\n        back:\n            value = \"back\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        // Should validate without crashing or hanging
+        assert!(
+            !diags.iter().any(|d| d.message.contains("unknown property 'value'")),
+            "mixed circular + self-ref models should validate correctly; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_validation_catches_errors_in_circular_models() {
+        let schema = "model nodeA:\n    name string\n    child nodeB?\n\nmodel nodeB:\n    name string\n    parent nodeA?\n";
+        let validator = make_validator(schema);
+
+        let source = "nodeA Root:\n    name = \"root\"\n    child:\n        name = \"leaf\"\n        typo_field = \"bad\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unknown property 'typo_field'")),
+            "should still catch errors inside circular model instances; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_large_schema_validation_performance() {
+        let mut schema = String::new();
+        for i in 0..30 {
+            schema.push_str(&format!(
+                "model type{}:\n    name string\n    ref type{}?\n\n",
+                i,
+                (i + 1) % 30
+            ));
+        }
+        let validator = make_validator(&schema);
+
+        let source = "type0 Instance:\n    name = \"test\"\n    ref:\n        name = \"nested\"\n";
+        let file = parser::parse(source).unwrap();
+        let start = std::time::Instant::now();
+        let _diags = validator.validate(&file);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 1000,
+            "validation with 30-model circular schema should complete in <1s; took {:?}",
+            elapsed
+        );
     }
 }
