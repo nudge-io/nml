@@ -2038,4 +2038,35 @@ workflow W:
             }
         }
     }
+
+    #[test]
+    fn test_parse_list_item_role_refs() {
+        let source = "role admin:\n    members:\n        - @role/editor\n        - @user/test@example.com\n";
+        let file = parse(source).unwrap();
+        if let DeclarationKind::Block(block) = &file.declarations[0].kind {
+            let members_entry = block.body.entries.iter().find(|e| {
+                matches!(&e.kind, BodyEntryKind::NestedBlock(nb) if nb.name.name == "members")
+            });
+            assert!(members_entry.is_some(), "should find members block");
+            if let BodyEntryKind::NestedBlock(nb) = &members_entry.unwrap().kind {
+                assert_eq!(nb.body.entries.len(), 2);
+                if let BodyEntryKind::ListItem(item) = &nb.body.entries[0].kind {
+                    assert!(
+                        matches!(&item.kind, ListItemKind::Role(s) if s == "@role/editor"),
+                        "first member should be @role/editor, got {:?}",
+                        item.kind
+                    );
+                }
+                if let BodyEntryKind::ListItem(item) = &nb.body.entries[1].kind {
+                    assert!(
+                        matches!(&item.kind, ListItemKind::Role(s) if s == "@user/test@example.com"),
+                        "second member should be @user/test@example.com, got {:?}",
+                        item.kind
+                    );
+                }
+            }
+        } else {
+            panic!("expected block declaration");
+        }
+    }
 }

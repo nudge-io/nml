@@ -452,4 +452,40 @@ mod tests {
             diags
         );
     }
+
+    #[test]
+    fn valid_bare_step_ref_no_diagnostic() {
+        let source = concat!(
+            "workflow W:\n",
+            "    entrypoint = start\n",
+            "    steps:\n",
+            "        - start:\n",
+            "            next = respond\n",
+            "        - respond:\n",
+            "            provider = \"groq\"\n",
+        );
+        let diags = compute(source, &[], &[], &default_config());
+        assert!(
+            !diags.iter().any(|d| d.message.contains("unresolved")),
+            "valid bare step refs should not produce diagnostics: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn invalid_bare_step_ref_produces_diagnostic() {
+        let source = concat!(
+            "workflow W:\n",
+            "    entrypoint = start\n",
+            "    steps:\n",
+            "        - start:\n",
+            "            next = nonexistent\n",
+        );
+        let diags = compute(source, &[], &[], &default_config());
+        assert!(
+            diags.iter().any(|d| d.message.contains("unresolved reference 'nonexistent'")),
+            "invalid bare step ref should be flagged: {:?}",
+            diags
+        );
+    }
 }

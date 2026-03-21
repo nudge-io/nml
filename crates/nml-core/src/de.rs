@@ -1644,4 +1644,32 @@ workflow W:
         assert!(f64_to_i32(-2147483649.0).is_err());
         assert!(f64_to_i32(1.5).is_err());
     }
+
+    #[test]
+    fn test_deserialize_value_role_to_string() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            access: String,
+        }
+        let source = "service App:\n    access = @role/admin\n";
+        let file = crate::parse(source).unwrap();
+        let doc = crate::query::Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert_eq!(config.access, "@role/admin");
+    }
+
+    #[test]
+    fn test_deserialize_list_item_role_to_vec_string() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            members: Vec<String>,
+        }
+        let source = "role admin:\n    members:\n        - @role/editor\n        - @public\n";
+        let file = crate::parse(source).unwrap();
+        let doc = crate::query::Document::new(&file);
+        let body = doc.block("role", "admin").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert_eq!(config.members, vec!["@role/editor", "@public"]);
+    }
 }

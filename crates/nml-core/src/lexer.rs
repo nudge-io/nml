@@ -1002,4 +1002,42 @@ mod tests {
         assert!(matches!(kinds[3], TokenKind::Identifier(s) if s == "world"));
         assert!(matches!(kinds[4], TokenKind::ParenClose));
     }
+
+    #[test]
+    fn test_role_user_email() {
+        let tokens = lex("@user/test@example.com");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Role("@user/test@example.com".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_role_user_email_in_context() {
+        let tokens = lex("member = @user/test@example.com");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Identifier("member".into()),
+                TokenKind::Equals,
+                TokenKind::Role("@user/test@example.com".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_role_user_email_with_plus() {
+        let tokens = lex("@user/test+tag@example.com");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Role("@user/test+tag@example.com".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
 }

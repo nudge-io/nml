@@ -281,31 +281,12 @@ impl NmlLanguageServer {
     }
 
     fn find_role_ref_definition(&self, role_ref: &str) -> Option<Location> {
-        let stripped = role_ref.strip_prefix('@')?;
-        let (keyword, name) = stripped.split_once('/')?;
-
         let docs: HashMap<Url, String> = self
             .documents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-
-        for (uri, source) in &docs {
-            if let Ok(file) = nml_core::parse(source) {
-                let source_map = SourceMap::new(source);
-                for decl in &file.declarations {
-                    if let DeclarationKind::Block(block) = &decl.kind {
-                        if block.keyword.name == keyword && block.name.name == name {
-                            return Some(Location {
-                                uri: uri.clone(),
-                                range: span_to_range(block.name.span, &source_map),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        None
+        find_role_ref_definition_in_docs(&docs, role_ref)
     }
 
     fn find_role_ref_hover(&self, keyword: &str, name: &str) -> Option<String> {
@@ -314,47 +295,7 @@ impl NmlLanguageServer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-
-        for (uri, source) in &docs {
-            if let Ok(file) = nml_core::parse(source) {
-                for decl in &file.declarations {
-                    if let DeclarationKind::Block(block) = &decl.kind {
-                        if block.keyword.name == keyword && block.name.name == name {
-                            let mut text = format!("**{keyword}** `{name}`");
-
-                            let desc = block.body.entries.iter().find_map(|e| {
-                                if let BodyEntryKind::Property(prop) = &e.kind {
-                                    if prop.name.name == "description" {
-                                        if let Value::String(s) = &prop.value.value {
-                                            return Some(s.clone());
-                                        }
-                                    }
-                                }
-                                None
-                            });
-                            if let Some(d) = desc {
-                                text.push_str(&format!("\n\n{d}"));
-                            }
-
-                            let summary = summarize_body(&block.body);
-                            if !summary.is_empty() {
-                                text.push_str("\n\n");
-                                text.push_str(&summary);
-                            }
-
-                            let file_name = uri
-                                .path_segments()
-                                .and_then(|s| s.last())
-                                .unwrap_or("unknown");
-                            text.push_str(&format!("\n\n*Source: {file_name}*"));
-
-                            return Some(text);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        find_role_ref_hover_in_docs(&docs, keyword, name)
     }
 
     fn collect_declaration_names(&self) -> Vec<(String, String)> {
@@ -391,6 +332,80 @@ impl NmlLanguageServer {
         }
         names
     }
+}
+
+// ── Role ref resolution (free functions for testability) ──────
+
+fn find_role_ref_definition_in_docs(
+    docs: &HashMap<Url, String>,
+    role_ref: &str,
+) -> Option<Location> {
+    let stripped = role_ref.strip_prefix('@')?;
+    let (keyword, name) = stripped.split_once('/')?;
+
+    for (uri, source) in docs {
+        if let Ok(file) = nml_core::parse(source) {
+            let source_map = SourceMap::new(source);
+            for decl in &file.declarations {
+                if let DeclarationKind::Block(block) = &decl.kind {
+                    if block.keyword.name == keyword && block.name.name == name {
+                        return Some(Location {
+                            uri: uri.clone(),
+                            range: span_to_range(block.name.span, &source_map),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_role_ref_hover_in_docs(
+    docs: &HashMap<Url, String>,
+    keyword: &str,
+    name: &str,
+) -> Option<String> {
+    for (uri, source) in docs {
+        if let Ok(file) = nml_core::parse(source) {
+            for decl in &file.declarations {
+                if let DeclarationKind::Block(block) = &decl.kind {
+                    if block.keyword.name == keyword && block.name.name == name {
+                        let mut text = format!("**{keyword}** `{name}`");
+
+                        let desc = block.body.entries.iter().find_map(|e| {
+                            if let BodyEntryKind::Property(prop) = &e.kind {
+                                if prop.name.name == "description" {
+                                    if let Value::String(s) = &prop.value.value {
+                                        return Some(s.clone());
+                                    }
+                                }
+                            }
+                            None
+                        });
+                        if let Some(d) = desc {
+                            text.push_str(&format!("\n\n{d}"));
+                        }
+
+                        let summary = summarize_body(&block.body);
+                        if !summary.is_empty() {
+                            text.push_str("\n\n");
+                            text.push_str(&summary);
+                        }
+
+                        let file_name = uri
+                            .path_segments()
+                            .and_then(|s| s.last())
+                            .unwrap_or("unknown");
+                        text.push_str(&format!("\n\n*Source: {file_name}*"));
+
+                        return Some(text);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 // ── Schema scoping ────────────────────────────────────────────
@@ -3235,5 +3250,135 @@ workflow VoiceAgent:
         let names: Vec<&str> = results.iter().map(|(n, _, _)| n.as_str()).collect();
         assert!(names.contains(&"classify"));
         assert!(names.contains(&"respond"));
+    }
+
+    // ── Role ref definition resolution ───────────────────────────
+
+    #[test]
+    fn definition_role_ref_standalone_block() {
+        let mut docs = HashMap::new();
+        let uri = make_uri("nudge.nml");
+        docs.insert(
+            uri.clone(),
+            "role admin:\n    description = \"Full admin\"\n".to_string(),
+        );
+
+        let result = find_role_ref_definition_in_docs(&docs, "@role/admin");
+        assert!(result.is_some(), "should find role admin definition");
+        assert_eq!(result.unwrap().uri, uri);
+    }
+
+    #[test]
+    fn definition_role_ref_plan_block() {
+        let mut docs = HashMap::new();
+        let uri = make_uri("nudge.nml");
+        docs.insert(
+            uri.clone(),
+            "plan Pro:\n    description = \"Pro tier\"\n".to_string(),
+        );
+
+        let result = find_role_ref_definition_in_docs(&docs, "@plan/Pro");
+        assert!(result.is_some(), "should find plan Pro definition");
+        assert_eq!(result.unwrap().uri, uri);
+    }
+
+    #[test]
+    fn definition_role_ref_builtin_returns_none() {
+        let docs = HashMap::new();
+        assert!(find_role_ref_definition_in_docs(&docs, "@public").is_none());
+        assert!(find_role_ref_definition_in_docs(&docs, "@authenticated").is_none());
+    }
+
+    #[test]
+    fn definition_role_ref_nonexistent_returns_none() {
+        let mut docs = HashMap::new();
+        docs.insert(
+            make_uri("nudge.nml"),
+            "role admin:\n    description = \"Admin\"\n".to_string(),
+        );
+        assert!(find_role_ref_definition_in_docs(&docs, "@role/nonexistent").is_none());
+    }
+
+    // ── Role ref hover ───────────────────────────────────────────
+
+    #[test]
+    fn hover_role_ref_with_description() {
+        let mut docs = HashMap::new();
+        docs.insert(
+            make_uri("nudge.nml"),
+            "role admin:\n    description = \"Full administrative access\"\n".to_string(),
+        );
+
+        let result = find_role_ref_hover_in_docs(&docs, "role", "admin");
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("**role** `admin`"), "should contain role name");
+        assert!(text.contains("Full administrative access"), "should contain description");
+        assert!(text.contains("Source: nudge.nml"), "should contain source file");
+    }
+
+    #[test]
+    fn hover_role_ref_without_description() {
+        let mut docs = HashMap::new();
+        docs.insert(
+            make_uri("nudge.nml"),
+            "role editor:\n    label = \"Editor\"\n".to_string(),
+        );
+
+        let result = find_role_ref_hover_in_docs(&docs, "role", "editor");
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("**role** `editor`"));
+        assert!(!text.contains("Full administrative"));
+    }
+
+    #[test]
+    fn hover_role_ref_nonexistent() {
+        let docs = HashMap::new();
+        assert!(find_role_ref_hover_in_docs(&docs, "role", "ghost").is_none());
+    }
+
+    // ── Role ref completion via collect_declarations_by_keyword ───
+
+    #[test]
+    fn collect_declarations_by_keyword_finds_roles() {
+        let mut docs = HashMap::new();
+        docs.insert(
+            make_uri("nudge.nml"),
+            "role admin:\n    description = \"Admin\"\n\nrole editor:\n    description = \"Editor\"\n".to_string(),
+        );
+
+        let results = collect_declarations_by_keyword(&docs, "role");
+        let names: Vec<&str> = results.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(names.contains(&"admin"), "should find role admin");
+        assert!(names.contains(&"editor"), "should find role editor");
+    }
+
+    #[test]
+    fn collect_declarations_by_keyword_finds_plans_in_array() {
+        let mut docs = HashMap::new();
+        docs.insert(
+            make_uri("nudge.nml"),
+            "[]plan plans:\n    - Free:\n        description = \"Free tier\"\n    - Pro:\n        description = \"Pro tier\"\n".to_string(),
+        );
+
+        let results = collect_declarations_by_keyword(&docs, "plan");
+        let names: Vec<&str> = results.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(names.contains(&"Free"), "should find plan Free");
+        assert!(names.contains(&"Pro"), "should find plan Pro");
+    }
+
+    #[test]
+    fn collect_declarations_by_keyword_role_does_not_include_steps() {
+        let mut docs = HashMap::new();
+        docs.insert(
+            make_uri("app.nml"),
+            "role admin:\n    description = \"Admin\"\n\nworkflow W:\n    steps:\n        - classify:\n            provider = \"groq\"\n".to_string(),
+        );
+
+        let roles = collect_declarations_by_keyword(&docs, "role");
+        let role_names: Vec<&str> = roles.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(role_names.contains(&"admin"));
+        assert!(!role_names.contains(&"classify"), "steps should not appear in role results");
     }
 }

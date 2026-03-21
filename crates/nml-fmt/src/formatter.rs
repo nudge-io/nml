@@ -593,4 +593,19 @@ mod tests {
         roundtrip(&source);
         idempotent(&source);
     }
+
+    #[test]
+    fn roundtrip_inline_role_refs() {
+        roundtrip("mount Api:\n    path = \"/api\"\n    |allow = [@public, @role/admin]\n");
+    }
+
+    #[test]
+    fn roundtrip_block_role_ref_list() {
+        roundtrip("role admin:\n    members:\n        - @role/editor\n        - @user/test@example.com\n");
+    }
+
+    #[test]
+    fn roundtrip_value_role_property() {
+        roundtrip("service App:\n    access = @role/admin\n");
+    }
 }
