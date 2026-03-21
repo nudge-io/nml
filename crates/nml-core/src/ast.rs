@@ -58,11 +58,12 @@ pub struct TemplateDecl {
     pub value: SpannedValue,
 }
 
-/// A block declaration like `service NudgeService:` or `model service:`.
+/// A block declaration like `service NudgeService:` or `model plan is role:`.
 #[derive(Debug, Clone, Serialize)]
 pub struct BlockDecl {
     pub keyword: Identifier,
     pub name: Identifier,
+    pub extends: Vec<Identifier>,
     pub body: Body,
 }
 
@@ -166,7 +167,7 @@ pub enum ListItemKind {
     /// `- ReferenceName`
     Reference(Identifier),
     /// `- @role/ref`
-    RoleRef(String),
+    Role(String),
 }
 
 /// An identifier with its source span.

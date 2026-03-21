@@ -20,7 +20,7 @@ pub enum TokenKind {
     NumberLiteral(f64),
     BoolLiteral(bool),
     Identifier(String),
-    RoleRef(String),       // @role/admin, @public, etc.
+    Role(String),       // @role/admin, @public, etc.
     SecretRef(String),     // $ENV.MY_SECRET
     CurrencyCode(String),  // USD, GBP, etc.
 
@@ -234,7 +234,7 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 '@' => {
-                    tokens.push(self.read_role_ref());
+                    tokens.push(self.read_role());
                 }
                 '$' => {
                     tokens.push(self.read_secret_ref()?);
@@ -506,7 +506,7 @@ impl<'a> Lexer<'a> {
         ))
     }
 
-    fn read_role_ref(&mut self) -> Token {
+    fn read_role(&mut self) -> Token {
         let start = self.byte_pos();
         self.pos += 1; // skip @
         let mut value = String::from("@");
@@ -539,7 +539,7 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        Token::new(TokenKind::RoleRef(value), Span::new(start, self.byte_pos()))
+        Token::new(TokenKind::Role(value), Span::new(start, self.byte_pos()))
     }
 
     const KNOWN_NAMESPACES: &'static [&'static str] = &["ENV"];
@@ -713,7 +713,7 @@ mod tests {
                 TokenKind::Identifier("allow".into()),
                 TokenKind::Equals,
                 TokenKind::BracketOpen,
-                TokenKind::RoleRef("@role/admin".into()),
+                TokenKind::Role("@role/admin".into()),
                 TokenKind::BracketClose,
                 TokenKind::Eof,
             ]
@@ -818,7 +818,7 @@ mod tests {
                 TokenKind::Colon,
                 TokenKind::Indent,
                 TokenKind::Dash,
-                TokenKind::RoleRef("@public".into()),
+                TokenKind::Role("@public".into()),
                 TokenKind::Dedent,
                 TokenKind::Eof,
             ]

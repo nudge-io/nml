@@ -45,8 +45,22 @@ fn format_declaration(out: &mut String, decl: &Declaration, depth: usize) {
             out.push_str(&block.keyword.name);
             out.push(' ');
             out.push_str(&block.name.name);
-            out.push_str(":\n");
-            format_body(out, &block.body, depth + 1);
+            if !block.extends.is_empty() {
+                out.push_str(" is ");
+                for (i, parent) in block.extends.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&parent.name);
+                }
+            }
+            let body_empty = block.body.entries.is_empty();
+            if body_empty && !block.extends.is_empty() {
+                out.push('\n');
+            } else {
+                out.push_str(":\n");
+                format_body(out, &block.body, depth + 1);
+            }
         }
         DeclarationKind::Array(arr) => {
             write_indent(out, depth);
@@ -202,7 +216,7 @@ fn format_list_item(out: &mut String, item: &ListItem, depth: usize) {
             out.push_str(&ident.name);
             out.push('\n');
         }
-        ListItemKind::RoleRef(r) => {
+        ListItemKind::Role(r) => {
             out.push_str(r);
             out.push('\n');
         }
@@ -294,7 +308,7 @@ fn format_value(out: &mut String, value: &Value, depth: usize) {
         Value::Secret(s) => {
             out.push_str(s);
         }
-        Value::RoleRef(r) => {
+        Value::Role(r) => {
             out.push_str(r);
         }
         Value::Reference(r) => {
@@ -414,6 +428,21 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_block_extends_with_body() {
+        roundtrip("model plan is role:\n    name string\n");
+    }
+
+    #[test]
+    fn roundtrip_block_extends_no_body() {
+        roundtrip("model plan is role\n");
+    }
+
+    #[test]
+    fn roundtrip_block_extends_multi_parent() {
+        roundtrip("model admin is role, auditable:\n    level number\n");
+    }
+
+    #[test]
     fn roundtrip_enum() {
         roundtrip("enum Status:\n    - \"active\"\n    - \"inactive\"\n");
     }
@@ -426,6 +455,26 @@ mod tests {
     #[test]
     fn roundtrip_modifier() {
         roundtrip("service App:\n    port = 8080\n    |allow:\n        - @role/admin\n");
+    }
+
+    #[test]
+    fn roundtrip_array_with_modifier() {
+        roundtrip("[]mount mounts:\n    |allow = [@authenticated]\n    - Main:\n        path = \"/\"\n");
+    }
+
+    #[test]
+    fn roundtrip_array_with_block_modifier() {
+        roundtrip("[]resource resources:\n    |allow:\n        - @role/admin\n        - @role/editor\n\n    - Dashboard:\n        path = \"/dashboard\"\n");
+    }
+
+    #[test]
+    fn roundtrip_array_with_multiple_modifiers() {
+        roundtrip("[]route routes:\n    |allow = [@authenticated]\n    |deny = [@anonymous]\n\n    - Home:\n        path = \"/\"\n");
+    }
+
+    #[test]
+    fn idempotent_array_with_modifier() {
+        idempotent("[]mount mounts:\n    |allow = [@authenticated]\n\n    - Main:\n        path = \"/\"\n");
     }
 
     // -------------------------------------------------------------------

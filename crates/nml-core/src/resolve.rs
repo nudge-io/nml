@@ -161,7 +161,7 @@ impl ValueResolver {
             ListItemKind::Shorthand(sv) => {
                 ListItemKind::Shorthand(self.resolve_spanned(sv)?)
             }
-            ListItemKind::Reference(_) | ListItemKind::RoleRef(_) => {
+            ListItemKind::Reference(_) | ListItemKind::Role(_) => {
                 return Ok(item.clone());
             }
         };

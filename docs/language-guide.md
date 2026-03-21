@@ -24,7 +24,7 @@ keyword Name:
     body...
 ```
 
-Keywords are either built-in (`model`, `trait`, `enum`, `roleTemplate`) or
+Keywords are either built-in (`model`, `trait`, `enum`, `role`) or
 user-defined via models (e.g. `service`, `resource`).
 
 ### Array Declarations

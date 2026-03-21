@@ -108,32 +108,58 @@ impl Parser {
             });
         }
 
-        self.expect_kind(TokenKind::Colon)?;
-        self.skip_newlines();
-        let body = self.parse_body()?;
+        let extends = self.parse_extends_clause()?;
 
-        let end_span = self.prev_span();
-        Ok(Declaration {
-            kind: DeclarationKind::Block(BlockDecl {
-                keyword,
-                name,
-                body,
-            }),
-            span: start_span.merge(end_span),
-        })
+        if self.check(TokenKind::Colon) {
+            self.advance();
+            self.skip_newlines();
+            let body = self.parse_body()?;
+            let end_span = self.prev_span();
+            Ok(Declaration {
+                kind: DeclarationKind::Block(BlockDecl {
+                    keyword,
+                    name,
+                    extends,
+                    body,
+                }),
+                span: start_span.merge(end_span),
+            })
+        } else if !extends.is_empty() {
+            let end_span = self.prev_span();
+            self.skip_newlines();
+            Ok(Declaration {
+                kind: DeclarationKind::Block(BlockDecl {
+                    keyword,
+                    name,
+                    extends,
+                    body: Body { entries: Vec::new() },
+                }),
+                span: start_span.merge(end_span),
+            })
+        } else {
+            Err(NmlError::parse(
+                format!("expected ':' after '{}'", name.name),
+                self.current_span(),
+            ))
+        }
     }
 
-    /// Parse the name of a declaration, which may be a regular identifier or a role ref
-    /// (for roleTemplate declarations like `roleTemplate @role/admin:`).
     fn parse_declaration_name(&mut self) -> NmlResult<Identifier> {
-        if let Some(TokenKind::RoleRef(ref_str)) = self.peek_kind() {
-            let span = self.current_span();
-            let name = ref_str.clone();
-            self.advance();
-            Ok(Identifier::new(name, span))
-        } else {
-            self.expect_identifier()
+        self.expect_identifier()
+    }
+
+    /// Parse an optional `is Parent1, Parent2` clause after a declaration name.
+    fn parse_extends_clause(&mut self) -> NmlResult<Vec<Identifier>> {
+        if !self.peek_kind_matches(|k| matches!(k, TokenKind::Identifier(s) if s == "is")) {
+            return Ok(Vec::new());
         }
+        self.advance();
+        let mut parents = vec![self.expect_identifier()?];
+        while self.check(TokenKind::Comma) {
+            self.advance();
+            parents.push(self.expect_identifier()?);
+        }
+        Ok(parents)
     }
 
     fn parse_body(&mut self) -> NmlResult<Body> {
@@ -465,14 +491,14 @@ impl Parser {
         }
 
         // - @role/ref
-        if let Some(TokenKind::RoleRef(ref_str)) = self.peek_kind() {
+        if let Some(TokenKind::Role(ref_str)) = self.peek_kind() {
             let role = ref_str.clone();
             let ref_span = self.current_span();
             self.advance();
             self.skip_newlines();
             let span = dash_span.merge(ref_span);
             return Ok(ListItem {
-                kind: ListItemKind::RoleRef(role),
+                kind: ListItemKind::Role(role),
                 span,
             });
         }
@@ -561,10 +587,10 @@ impl Parser {
                 self.advance();
                 Ok(SpannedValue::new(Value::Secret(s), span))
             }
-            Some(TokenKind::RoleRef(r)) => {
+            Some(TokenKind::Role(r)) => {
                 let r = r.clone();
                 self.advance();
-                Ok(SpannedValue::new(Value::RoleRef(r), span))
+                Ok(SpannedValue::new(Value::Role(r), span))
             }
             Some(TokenKind::BracketOpen) => {
                 self.parse_array_literal()
@@ -884,13 +910,61 @@ mod tests {
 
     #[test]
     fn test_parse_role_template() {
-        let source = "roleTemplate @role/admin:\n    label = \"Admin\"\n";
+        let source = "role admin:\n    label = \"Admin\"\n";
         let file = parse(source).unwrap();
 
         match &file.declarations[0].kind {
             DeclarationKind::Block(block) => {
-                assert_eq!(block.keyword.name, "roleTemplate");
-                assert_eq!(block.name.name, "@role/admin");
+                assert_eq!(block.keyword.name, "role");
+                assert_eq!(block.name.name, "admin");
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_extends_with_body() {
+        let source = "model plan is role:\n    includes []plan?\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                assert_eq!(block.keyword.name, "model");
+                assert_eq!(block.name.name, "plan");
+                assert_eq!(block.extends.len(), 1);
+                assert_eq!(block.extends[0].name, "role");
+                assert_eq!(block.body.entries.len(), 1);
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_extends_no_body() {
+        let source = "model plan is role\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                assert_eq!(block.name.name, "plan");
+                assert_eq!(block.extends.len(), 1);
+                assert_eq!(block.extends[0].name, "role");
+                assert!(block.body.entries.is_empty());
+            }
+            _ => panic!("expected block"),
+        }
+    }
+
+    #[test]
+    fn test_parse_extends_multi_parent() {
+        let source = "model admin is role, auditable:\n    level number\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Block(block) => {
+                assert_eq!(block.extends.len(), 2);
+                assert_eq!(block.extends[0].name, "role");
+                assert_eq!(block.extends[1].name, "auditable");
             }
             _ => panic!("expected block"),
         }
@@ -1862,8 +1936,92 @@ workflow W:
         let file = parse("service App:\n    role = @role/admin\n").unwrap();
         if let DeclarationKind::Block(b) = &file.declarations[0].kind {
             if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
-                assert!(matches!(&p.value.value, Value::RoleRef(_)));
+                assert!(matches!(&p.value.value, Value::Role(_)));
             }
+        }
+    }
+
+    #[test]
+    fn test_parse_array_with_modifiers() {
+        let source = "[]mount mounts:\n    |allow = [@authenticated]\n    - Main:\n        path = \"/\"\n";
+        let file = parse(source).unwrap();
+        assert_eq!(file.declarations.len(), 1);
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Array(arr) => {
+                assert_eq!(arr.item_keyword.name, "mount");
+                assert_eq!(arr.name.name, "mounts");
+
+                assert_eq!(arr.body.modifiers.len(), 1);
+                assert_eq!(arr.body.modifiers[0].name.name, "allow");
+                match &arr.body.modifiers[0].value {
+                    ModifierValue::Inline(val) => {
+                        assert!(matches!(&val.value, Value::Array(items) if items.len() == 1));
+                    }
+                    other => panic!("expected inline modifier value, got {other:?}"),
+                }
+
+                assert_eq!(arr.body.items.len(), 1);
+                match &arr.body.items[0].kind {
+                    ListItemKind::Named { name, body } => {
+                        assert_eq!(name.name, "Main");
+                        assert_eq!(body.entries.len(), 1);
+                    }
+                    other => panic!("expected named list item, got {other:?}"),
+                }
+            }
+            other => panic!("expected array declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_array_with_multiple_modifiers() {
+        let source = "[]route routes:\n    |allow = [@authenticated]\n    |deny = [@anonymous]\n    - Home:\n        path = \"/\"\n    - About:\n        path = \"/about\"\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Array(arr) => {
+                assert_eq!(arr.body.modifiers.len(), 2);
+                assert_eq!(arr.body.modifiers[0].name.name, "allow");
+                assert_eq!(arr.body.modifiers[1].name.name, "deny");
+                assert_eq!(arr.body.items.len(), 2);
+            }
+            other => panic!("expected array declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_array_with_block_modifier() {
+        let source = "[]resource resources:\n    |allow:\n        - @role/admin\n        - @role/editor\n    - Dashboard:\n        path = \"/dashboard\"\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Array(arr) => {
+                assert_eq!(arr.body.modifiers.len(), 1);
+                match &arr.body.modifiers[0].value {
+                    ModifierValue::Block(items) => {
+                        assert_eq!(items.len(), 2);
+                    }
+                    other => panic!("expected block modifier, got {other:?}"),
+                }
+                assert_eq!(arr.body.items.len(), 1);
+            }
+            other => panic!("expected array declaration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_array_modifiers_with_shared_properties() {
+        let source = "[]mount mounts:\n    |allow = [@authenticated]\n    .defaults:\n        wasm = \"handler.wasm\"\n    - Main:\n        path = \"/\"\n";
+        let file = parse(source).unwrap();
+
+        match &file.declarations[0].kind {
+            DeclarationKind::Array(arr) => {
+                assert_eq!(arr.body.modifiers.len(), 1);
+                assert_eq!(arr.body.shared_properties.len(), 1);
+                assert_eq!(arr.body.items.len(), 1);
+            }
+            other => panic!("expected array declaration, got {other:?}"),
         }
     }
 

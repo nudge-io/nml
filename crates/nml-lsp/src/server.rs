@@ -280,6 +280,83 @@ impl NmlLanguageServer {
         None
     }
 
+    fn find_role_ref_definition(&self, role_ref: &str) -> Option<Location> {
+        let stripped = role_ref.strip_prefix('@')?;
+        let (keyword, name) = stripped.split_once('/')?;
+
+        let docs: HashMap<Url, String> = self
+            .documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        for (uri, source) in &docs {
+            if let Ok(file) = nml_core::parse(source) {
+                let source_map = SourceMap::new(source);
+                for decl in &file.declarations {
+                    if let DeclarationKind::Block(block) = &decl.kind {
+                        if block.keyword.name == keyword && block.name.name == name {
+                            return Some(Location {
+                                uri: uri.clone(),
+                                range: span_to_range(block.name.span, &source_map),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn find_role_ref_hover(&self, keyword: &str, name: &str) -> Option<String> {
+        let docs: HashMap<Url, String> = self
+            .documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        for (uri, source) in &docs {
+            if let Ok(file) = nml_core::parse(source) {
+                for decl in &file.declarations {
+                    if let DeclarationKind::Block(block) = &decl.kind {
+                        if block.keyword.name == keyword && block.name.name == name {
+                            let mut text = format!("**{keyword}** `{name}`");
+
+                            let desc = block.body.entries.iter().find_map(|e| {
+                                if let BodyEntryKind::Property(prop) = &e.kind {
+                                    if prop.name.name == "description" {
+                                        if let Value::String(s) = &prop.value.value {
+                                            return Some(s.clone());
+                                        }
+                                    }
+                                }
+                                None
+                            });
+                            if let Some(d) = desc {
+                                text.push_str(&format!("\n\n{d}"));
+                            }
+
+                            let summary = summarize_body(&block.body);
+                            if !summary.is_empty() {
+                                text.push_str("\n\n");
+                                text.push_str(&summary);
+                            }
+
+                            let file_name = uri
+                                .path_segments()
+                                .and_then(|s| s.last())
+                                .unwrap_or("unknown");
+                            text.push_str(&format!("\n\n*Source: {file_name}*"));
+
+                            return Some(text);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn collect_declaration_names(&self) -> Vec<(String, String)> {
         let docs = self
             .documents
@@ -468,7 +545,7 @@ fn find_schema_block_definition(
 ) -> Option<Range> {
     for decl in &file.declarations {
         if let DeclarationKind::Block(block) = &decl.kind {
-            if matches!(block.keyword.name.as_str(), "model" | "trait" | "enum")
+            if matches!(block.keyword.name.as_str(), "model" | "enum")
                 && block.name.name == name
             {
                 return Some(span_to_range(block.name.span, source_map));
@@ -481,7 +558,7 @@ fn find_schema_block_definition(
 fn find_field_definition(file: &File, name: &str, source_map: &SourceMap) -> Option<Range> {
     for decl in &file.declarations {
         if let DeclarationKind::Block(block) = &decl.kind {
-            if matches!(block.keyword.name.as_str(), "model" | "trait") {
+            if block.keyword.name.as_str() == "model" {
                 for entry in &block.body.entries {
                     if let BodyEntryKind::FieldDefinition(fd) = &entry.kind {
                         if fd.name.name == name {
@@ -503,7 +580,7 @@ fn find_field_definition_in_model(
 ) -> Option<Range> {
     for decl in &file.declarations {
         if let DeclarationKind::Block(block) = &decl.kind {
-            if matches!(block.keyword.name.as_str(), "model" | "trait")
+            if block.keyword.name.as_str() == "model"
                 && block.name.name == model_name
             {
                 for entry in &block.body.entries {
@@ -647,19 +724,23 @@ fn find_name_by_text(source: &str, name: &str) -> Option<Range> {
     None
 }
 
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '-' || c == '_' || c == '@' || c == '/' || c == '.'
+}
+
 fn extract_word_at(line: &str, col: usize) -> String {
     let chars: Vec<char> = line.chars().collect();
     let col = col.min(chars.len());
 
     let start = chars[..col]
         .iter()
-        .rposition(|c| !c.is_alphanumeric() && *c != '_' && *c != '-')
+        .rposition(|c| !is_word_char(*c))
         .map(|p| p + 1)
         .unwrap_or(0);
 
     let end = chars[col..]
         .iter()
-        .position(|c| !c.is_alphanumeric() && *c != '_' && *c != '-')
+        .position(|c| !is_word_char(*c))
         .map(|p| col + p)
         .unwrap_or(chars.len());
 
@@ -1007,7 +1088,6 @@ fn format_field_type(field_type: &FieldType) -> String {
         FieldType::ModelRef(name) => name.clone(),
         FieldType::Modifier(name) => format!("|{}", name),
         FieldType::RefOnly(inner) => format!("&{}", format_field_type(inner)),
-        FieldType::RoleRef => "roleRef".to_string(),
         FieldType::InlineObject(_) => "object".to_string(),
         FieldType::SharedProperty(_) => "shared".to_string(),
         FieldType::Union(variants) => {
@@ -1015,6 +1095,81 @@ fn format_field_type(field_type: &FieldType) -> String {
             format!("({})", names.join(" | "))
         }
     }
+}
+
+/// Determine if the cursor is in a value position for a ModelRef field.
+/// Returns the target model name (e.g. "step", "tool") if applicable.
+fn find_model_ref_type_at(
+    source: &str,
+    pos: Position,
+    models: &[ModelDef],
+) -> Option<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    let line = lines.get(pos.line as usize)?;
+    let end = (pos.character as usize).min(line.len());
+
+    let eq_pos = line[..end].find('=')?;
+    let prop_name = line[..eq_pos].trim();
+    if prop_name.is_empty() {
+        return None;
+    }
+
+    let file = nml_core::parse(source).ok()?;
+    let source_map = SourceMap::new(source);
+    let keyword = find_enclosing_block_keyword(&file, pos, &source_map)?;
+
+    let model = models.iter().find(|m| m.name == keyword)?;
+    let field = model.fields.iter().find(|f| f.name == prop_name)?;
+
+    match &field.field_type {
+        FieldType::ModelRef(ref_name) => Some(ref_name.clone()),
+        FieldType::List(inner) => match inner.as_ref() {
+            FieldType::ModelRef(ref_name) => Some(ref_name.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Collect declaration names matching a specific keyword from all loaded docs.
+fn collect_declarations_by_keyword(
+    docs: &HashMap<Url, String>,
+    keyword: &str,
+) -> Vec<(String, String, String)> {
+    let mut results = Vec::new();
+    for (uri, source) in docs.iter() {
+        if let Ok(file) = nml_core::parse(source) {
+            let file_name = uri
+                .path_segments()
+                .and_then(|s| s.last())
+                .unwrap_or("unknown")
+                .to_string();
+            for decl in &file.declarations {
+                match &decl.kind {
+                    DeclarationKind::Block(block) if block.keyword.name == keyword => {
+                        results.push((
+                            block.name.name.clone(),
+                            block.keyword.name.clone(),
+                            file_name.clone(),
+                        ));
+                    }
+                    DeclarationKind::Array(arr) if arr.item_keyword.name == keyword => {
+                        for item in &arr.body.items {
+                            if let ListItemKind::Named { name, .. } = &item.kind {
+                                results.push((
+                                    name.name.clone(),
+                                    arr.item_keyword.name.clone(),
+                                    file_name.clone(),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    results
 }
 
 fn is_property_name_position(line: &str, word: &str, col: usize) -> bool {
@@ -1047,7 +1202,7 @@ fn format_value(value: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Reference(r) => r.clone(),
         Value::Secret(s) => s.clone(),
-        Value::RoleRef(r) => r.clone(),
+        Value::Role(r) => r.clone(),
         Value::Duration(d) => format!("\"{}\"", d),
         Value::Path(p) => format!("\"{}\"", p),
         _ => "...".to_string(),
@@ -1428,6 +1583,28 @@ impl LanguageServer for NmlLanguageServer {
                 return Ok(Some(CompletionResponse::Array(items)));
             }
 
+            let model_ref_type = {
+                let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+                docs.get(&uri).and_then(|source| {
+                    let (models, _) = self.models_for_file(&uri);
+                    find_model_ref_type_at(source, pos, &models)
+                })
+            };
+
+            if let Some(ref ref_type) = model_ref_type {
+                let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+                let matches = collect_declarations_by_keyword(&docs, ref_type);
+                for (name, kw, file_name) in matches {
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        kind: Some(CompletionItemKind::REFERENCE),
+                        detail: Some(format!("{kw} (from {file_name})")),
+                        sort_text: Some(format!("0_{name}")),
+                        ..Default::default()
+                    });
+                }
+            }
+
             let names = self.collect_declaration_names();
             for (name, keyword) in names {
                 items.push(CompletionItem {
@@ -1439,7 +1616,7 @@ impl LanguageServer for NmlLanguageServer {
             }
         }
 
-        let language_keywords = ["model", "trait", "enum", "const", "template"];
+        let language_keywords = ["model", "enum", "const", "template"];
         for kw in language_keywords {
             items.push(CompletionItem {
                 label: kw.to_string(),
@@ -1497,13 +1674,55 @@ impl LanguageServer for NmlLanguageServer {
             });
         }
 
-        let built_in_roles = ["@public", "@private", "@anyone", "@loggedIn", "@admin"];
-        for role in built_in_roles {
+        let built_in_roles = [
+            ("@public", "Built-in: allows access without authentication"),
+            ("@authenticated", "Built-in: requires authenticated user"),
+        ];
+        for (role, desc) in built_in_roles {
             items.push(CompletionItem {
                 label: role.to_string(),
                 kind: Some(CompletionItemKind::CONSTANT),
+                detail: Some(desc.to_string()),
                 ..Default::default()
             });
+        }
+
+        items.push(CompletionItem {
+            label: "@user/".to_string(),
+            kind: Some(CompletionItemKind::REFERENCE),
+            detail: Some("user identity ref".to_string()),
+            ..Default::default()
+        });
+
+        {
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            let mut seen_roles = HashSet::new();
+            for source in docs.values() {
+                if let Ok(file) = nml_core::parse(source) {
+                    for decl in &file.declarations {
+                        if let DeclarationKind::Block(block) = &decl.kind {
+                            let kw = &block.keyword.name;
+                            let name = &block.name.name;
+                            let is_role_like = kw == "role"
+                                || block
+                                    .extends
+                                    .iter()
+                                    .any(|e| e.name == "role");
+                            if is_role_like {
+                                let label = format!("@{kw}/{name}");
+                                if seen_roles.insert(label.clone()) {
+                                    items.push(CompletionItem {
+                                        label,
+                                        kind: Some(CompletionItemKind::ENUM_MEMBER),
+                                        detail: Some(format!("{kw} instance")),
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         let constraints = [
@@ -1563,6 +1782,35 @@ impl LanguageServer for NmlLanguageServer {
         }
 
         let word = extract_word_at(line, pos.character as usize);
+
+        if word.starts_with('@') {
+            let hover_text = match word.as_str() {
+                "@public" => Some("**@public** -- Built-in: allows access without authentication".to_string()),
+                "@authenticated" => Some("**@authenticated** -- Built-in: requires authenticated user".to_string()),
+                _ => {
+                    if let Some(stripped) = word.strip_prefix('@') {
+                        if let Some((keyword, name)) = stripped.split_once('/') {
+                            self.find_role_ref_hover(keyword, name)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(text) = hover_text {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: text,
+                    }),
+                    range: None,
+                }));
+            }
+            return Ok(None);
+        }
+
         let is_prop = is_property_name_position(line, &word, pos.character as usize);
 
         if is_prop && !word.is_empty() {
@@ -1609,7 +1857,6 @@ impl LanguageServer for NmlLanguageServer {
                     Some("**secret** -- Value resolved from environment (`$ENV.X`)")
                 }
                 "model" => Some("**model** -- Define a custom object type"),
-                "trait" => Some("**trait** -- Define a reusable group of fields"),
                 "enum" => {
                     Some("**enum** -- Define a restricted set of allowed values")
                 }
@@ -1628,11 +1875,18 @@ impl LanguageServer for NmlLanguageServer {
         }
 
         if !word.is_empty() {
+            let model_ref_type = if !is_prop {
+                let (models, _) = self.models_for_file(&uri);
+                find_model_ref_type_at(&source_clone, pos, &models)
+            } else {
+                None
+            };
+
             let docs = self
                 .documents
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            for (_, source) in docs.iter() {
+            for (doc_uri, source) in docs.iter() {
                 if let Ok(file) = nml_core::parse(source) {
                     for decl in &file.declarations {
                         let (kw, decl_name, body_summary) = match &decl.kind {
@@ -1661,10 +1915,20 @@ impl LanguageServer for NmlLanguageServer {
                         };
 
                         let mut text = format!("**{kw}** `{decl_name}`");
+                        if let Some(ref ref_type) = model_ref_type {
+                            text.push_str(&format!(" *(referenced as {ref_type})*"));
+                        }
                         if !body_summary.is_empty() {
                             text.push_str("\n\n");
                             text.push_str(&body_summary);
                         }
+
+                        let file_name = doc_uri
+                            .path_segments()
+                            .and_then(|s| s.last())
+                            .unwrap_or("unknown");
+                        text.push_str(&format!("\n\n*Source: {file_name}*"));
+
                         return Ok(Some(Hover {
                             contents: HoverContents::Markup(MarkupContent {
                                 kind: MarkupKind::Markdown,
@@ -1713,6 +1977,13 @@ impl LanguageServer for NmlLanguageServer {
         };
 
         if word.is_empty() {
+            return Ok(None);
+        }
+
+        if word.starts_with('@') {
+            if let Some(result) = self.find_role_ref_definition(&word) {
+                return Ok(Some(GotoDefinitionResponse::Scalar(result)));
+            }
             return Ok(None);
         }
 
@@ -2108,6 +2379,34 @@ mod tests {
         assert_eq!(extract_word_at("foo", 100), "foo");
     }
 
+    #[test]
+    fn extract_word_role_ref() {
+        assert_eq!(extract_word_at("access = @role/admin", 12), "@role/admin");
+    }
+
+    #[test]
+    fn extract_word_role_ref_cursor_at_start() {
+        assert_eq!(extract_word_at("@public", 0), "@public");
+    }
+
+    #[test]
+    fn extract_word_role_ref_with_dot() {
+        assert_eq!(
+            extract_word_at("user = @user/test@example.com", 10),
+            "@user/test@example.com"
+        );
+    }
+
+    #[test]
+    fn extract_word_role_ref_at_keyword() {
+        assert_eq!(extract_word_at("@role/admin", 3), "@role/admin");
+    }
+
+    #[test]
+    fn extract_word_role_ref_at_name() {
+        assert_eq!(extract_word_at("@role/admin", 8), "@role/admin");
+    }
+
     // ── find_name_by_text ─────────────────────────────────────
 
     #[test]
@@ -2201,14 +2500,6 @@ mod tests {
         let file = nml_core::parse(source).unwrap();
         let source_map = SourceMap::new(source);
         assert!(find_field_definition(&file, "email", &source_map).is_some());
-    }
-
-    #[test]
-    fn find_field_in_trait() {
-        let source = "trait timestamped:\n    createdAt string\n";
-        let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
-        assert!(find_field_definition(&file, "createdAt", &source_map).is_some());
     }
 
     #[test]
@@ -2853,5 +3144,96 @@ workflow VoiceAgent:
     fn indent_at_top_level() {
         let lines = vec!["workflow RecipeAssistant:"];
         assert_eq!(compute_indent_after_line(&lines, 0), 4);
+    }
+
+    // ── ModelRef helpers ──────────────────────────────────────────
+
+    #[test]
+    fn model_ref_type_detected_for_step_field() {
+        let schema_source = "model step:\n    provider string?\n\nmodel workflow:\n    next step?\n    entrypoint step\n";
+        let schema = nml_core::model_extract::extract(&nml_core::parse(schema_source).unwrap());
+
+        let source = "workflow W:\n    next = classify\n";
+        let pos = Position::new(1, 14);
+        let result = find_model_ref_type_at(source, pos, &schema.models);
+        assert_eq!(result, Some("step".to_string()));
+    }
+
+    #[test]
+    fn model_ref_type_none_for_primitive_field() {
+        let schema_source = "model workflow:\n    entrypoint string\n";
+        let schema = nml_core::model_extract::extract(&nml_core::parse(schema_source).unwrap());
+
+        let source = "workflow W:\n    entrypoint = \"start\"\n";
+        let pos = Position::new(1, 18);
+        let result = find_model_ref_type_at(source, pos, &schema.models);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn model_ref_type_detected_for_list_field() {
+        let schema_source = "model tool:\n    wasm string?\n\nmodel workflow:\n    tools []tool?\n";
+        let schema = nml_core::model_extract::extract(&nml_core::parse(schema_source).unwrap());
+
+        let source = "workflow W:\n    tools = [myTool]\n";
+        let pos = Position::new(1, 14);
+        let result = find_model_ref_type_at(source, pos, &schema.models);
+        assert_eq!(result, Some("tool".to_string()));
+    }
+
+    #[test]
+    fn collect_declarations_by_keyword_finds_steps() {
+        let mut docs = HashMap::new();
+        let uri = make_uri("voice-agent.workflow.nml");
+        docs.insert(
+            uri,
+            concat!(
+                "step classify:\n",
+                "    provider = \"groq\"\n",
+                "\n",
+                "step respond:\n",
+                "    provider = \"openai\"\n",
+            ).to_string(),
+        );
+
+        let results = collect_declarations_by_keyword(&docs, "step");
+        let names: Vec<&str> = results.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(names.contains(&"classify"), "should find step classify");
+        assert!(names.contains(&"respond"), "should find step respond");
+    }
+
+    #[test]
+    fn collect_declarations_by_keyword_filters_keyword() {
+        let mut docs = HashMap::new();
+        let uri = make_uri("app.nml");
+        docs.insert(
+            uri,
+            concat!(
+                "step classify:\n",
+                "    provider = \"groq\"\n",
+                "\n",
+                "provider Groq:\n",
+                "    type = \"groq\"\n",
+            ).to_string(),
+        );
+
+        let results = collect_declarations_by_keyword(&docs, "step");
+        assert_eq!(results.len(), 1, "should only find step declarations");
+        assert_eq!(results[0].0, "classify");
+    }
+
+    #[test]
+    fn collect_declarations_by_keyword_finds_array_items() {
+        let mut docs = HashMap::new();
+        let uri = make_uri("workflow.nml");
+        docs.insert(
+            uri,
+            "[]step steps:\n    - classify:\n        provider = \"groq\"\n    - respond:\n        provider = \"openai\"\n".to_string(),
+        );
+
+        let results = collect_declarations_by_keyword(&docs, "step");
+        let names: Vec<&str> = results.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(names.contains(&"classify"));
+        assert!(names.contains(&"respond"));
     }
 }

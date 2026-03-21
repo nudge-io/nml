@@ -1,6 +1,6 @@
-trait accessControlled:
-    |allow []@roleRef
-    |deny []@roleRef
+model accessControlled:
+    |allow []role
+    |deny []role
 
 enum httpMethod:
     - "GET"
@@ -9,22 +9,22 @@ enum httpMethod:
     - "DELETE"
     - "PATCH"
 
-model resource (accessControlled):
+model resource is accessControlled:
     path path <shorthand>
     method httpMethod = "GET"
 
-model endpoint (accessControlled):
+model endpoint is accessControlled:
     address string
 
     .healthCheck:
         path path
 
-model service (accessControlled):
+model service is accessControlled:
     localMount path
     resources []resource
     endpoints []endpoint
 
-model roleTemplate:
+model role:
     label string
     description string?
-    members []@roleRef?
+    members []role?

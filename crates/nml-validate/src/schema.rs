@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef};
 use nml_core::types::{PrimitiveType, Value};
@@ -57,14 +59,31 @@ impl SchemaValidator {
             }
         }
 
+        self.validate_member_cycles(file, &mut diagnostics);
+
         diagnostics
     }
 
     fn validate_block(&self, block: &BlockDecl, diags: &mut Vec<Diagnostic>) {
         let keyword = &block.keyword.name;
-        let is_schema_def = matches!(keyword.as_str(), "model" | "trait" | "enum");
+        let is_schema_def = matches!(keyword.as_str(), "model" | "enum");
+
+        if keyword == "model" {
+            for parent in &block.extends {
+                if self.find_model(&parent.name).is_none() {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "unknown parent model '{}' in extends clause",
+                            parent.name
+                        ))
+                        .with_span(parent.span),
+                    );
+                }
+            }
+        }
 
         self.validate_body(&block.body, is_schema_def, keyword, diags);
+        self.validate_members_builtin_refs(&block.body, keyword, diags);
 
         if !is_schema_def {
             if let Some(model) = self.find_model(keyword) {
@@ -76,14 +95,16 @@ impl SchemaValidator {
     fn validate_array(&self, arr: &ArrayDecl, diags: &mut Vec<Diagnostic>) {
         for modifier in &arr.body.modifiers {
             self.validate_modifier_name(modifier, diags);
+            self.validate_modifier_content(modifier, diags);
         }
 
         for item in &arr.body.items {
             if let ListItemKind::Named { body, .. } = &item.kind {
                 let keyword = &arr.item_keyword.name;
-                let is_schema_def = matches!(keyword.as_str(), "model" | "trait" | "enum");
+                let is_schema_def = matches!(keyword.as_str(), "model" | "enum");
 
                 self.validate_body(body, is_schema_def, keyword, diags);
+                self.validate_members_builtin_refs(body, keyword, diags);
 
                 if !is_schema_def {
                     if let Some(model) = self.find_model(keyword) {
@@ -105,11 +126,12 @@ impl SchemaValidator {
             match &entry.kind {
                 BodyEntryKind::Modifier(m) => {
                     self.validate_modifier_name(m, diags);
+                    self.validate_modifier_content(m, diags);
                 }
                 BodyEntryKind::FieldDefinition(_) if !is_schema_def => {
                     diags.push(
                         Diagnostic::error(format!(
-                            "field definitions are only allowed in model or trait declarations, not '{keyword}'"
+                            "field definitions are only allowed in model declarations, not '{keyword}'"
                         ))
                         .with_span(entry.span),
                     );
@@ -283,6 +305,23 @@ impl SchemaValidator {
         match &field.field_type {
             FieldType::Primitive(prim) => {
                 if !value_matches_primitive(value, prim) {
+                    if *prim == PrimitiveType::Role {
+                        if let Value::String(s) = value {
+                            let msg = if s.starts_with('@') {
+                                format!(
+                                    "role field '{}': use {} instead of \"{}\"",
+                                    field.name, s, s
+                                )
+                            } else {
+                                format!(
+                                    "role field '{}': use @{} instead of \"{}\"",
+                                    field.name, s, s
+                                )
+                            };
+                            diags.push(Diagnostic::warning(msg).with_span(span));
+                            return;
+                        }
+                    }
                     let expected = if *prim == PrimitiveType::Secret {
                         "environment variable ($ENV.VARIABLE_NAME)".to_string()
                     } else {
@@ -302,6 +341,8 @@ impl SchemaValidator {
             FieldType::ModelRef(ref_name) => {
                 if let Some(enum_def) = self.find_enum(ref_name) {
                     self.validate_enum_value(value, enum_def, &field.name, span, diags);
+                } else {
+                    self.validate_model_ref_value(value, ref_name, &field.name, span, diags);
                 }
             }
             FieldType::List(inner) => {
@@ -326,6 +367,23 @@ impl SchemaValidator {
         match field_type {
             FieldType::Primitive(prim) => {
                 if !value_matches_primitive(value, prim) {
+                    if *prim == PrimitiveType::Role {
+                        if let Value::String(s) = value {
+                            let msg = if s.starts_with('@') {
+                                format!(
+                                    "role field '{}': use {} instead of \"{}\"",
+                                    field_name, s, s
+                                )
+                            } else {
+                                format!(
+                                    "role field '{}': use @{} instead of \"{}\"",
+                                    field_name, s, s
+                                )
+                            };
+                            diags.push(Diagnostic::warning(msg).with_span(span));
+                            return;
+                        }
+                    }
                     diags.push(
                         Diagnostic::error(format!(
                             "type mismatch in array '{}': expected {}, got {}",
@@ -340,6 +398,8 @@ impl SchemaValidator {
             FieldType::ModelRef(ref_name) => {
                 if let Some(enum_def) = self.find_enum(ref_name) {
                     self.validate_enum_value(value, enum_def, field_name, span, diags);
+                } else {
+                    self.validate_model_ref_value(value, ref_name, field_name, span, diags);
                 }
             }
             _ => {}
@@ -377,6 +437,208 @@ impl SchemaValidator {
             }
         }
     }
+
+    fn validate_model_ref_value(
+        &self,
+        value: &Value,
+        ref_name: &str,
+        field_name: &str,
+        span: nml_core::span::Span,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        match value {
+            Value::Reference(_) | Value::String(_) | Value::TemplateString(_) | Value::Secret(_) => {}
+            _ => {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "type mismatch for '{}': expected {} reference, got {}",
+                        field_name,
+                        ref_name,
+                        value_type_name(value)
+                    ))
+                    .with_span(span),
+                );
+            }
+        }
+    }
+
+    fn validate_modifier_content(&self, m: &Modifier, diags: &mut Vec<Diagnostic>) {
+        let name = &m.name.name;
+        if name != "allow" && name != "deny" {
+            return;
+        }
+        match &m.value {
+            ModifierValue::Inline(sv) => {
+                self.check_user_ref_in_value(&sv.value, sv.span, diags);
+            }
+            ModifierValue::Block(items) => {
+                for item in items {
+                    if let ListItemKind::Role(role_ref) = &item.kind {
+                        if role_ref.starts_with("@user/") {
+                            diags.push(
+                                Diagnostic::warning(
+                                    "@user/ references are intended for members lists, not access control rules"
+                                )
+                                .with_span(item.span),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_user_ref_in_value(
+        &self,
+        value: &Value,
+        span: nml_core::span::Span,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        match value {
+            Value::Role(r) if r.starts_with("@user/") => {
+                diags.push(
+                    Diagnostic::warning(
+                        "@user/ references are intended for members lists, not access control rules",
+                    )
+                    .with_span(span),
+                );
+            }
+            Value::Array(items) => {
+                for item in items {
+                    self.check_user_ref_in_value(&item.value, item.span, diags);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn validate_members_builtin_refs(
+        &self,
+        body: &Body,
+        keyword: &str,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        if !matches!(keyword, "role" | "plan") {
+            return;
+        }
+        for entry in &body.entries {
+            if let BodyEntryKind::NestedBlock(nb) = &entry.kind {
+                self.check_builtin_in_nested_members(&nb.body, diags);
+            }
+        }
+    }
+
+    fn check_builtin_in_nested_members(&self, body: &Body, diags: &mut Vec<Diagnostic>) {
+        for entry in &body.entries {
+            match &entry.kind {
+                BodyEntryKind::ListItem(item) => {
+                    if let ListItemKind::Role(role_ref) = &item.kind {
+                        if role_ref == "@public" || role_ref == "@authenticated" {
+                            diags.push(
+                                Diagnostic::warning(
+                                    "built-in access levels should not appear in members lists",
+                                )
+                                .with_span(item.span),
+                            );
+                        }
+                    }
+                }
+                BodyEntryKind::NestedBlock(nb) => {
+                    self.check_builtin_in_nested_members(&nb.body, diags);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn validate_member_cycles(&self, file: &File, diags: &mut Vec<Diagnostic>) {
+        let mut membership: HashMap<String, Vec<String>> = HashMap::new();
+
+        for decl in &file.declarations {
+            match &decl.kind {
+                DeclarationKind::Block(block) => {
+                    if matches!(block.keyword.name.as_str(), "role" | "plan") {
+                        let refs = collect_role_refs(&block.body);
+                        membership.insert(block.name.name.clone(), refs);
+                    }
+                }
+                DeclarationKind::Array(arr) => {
+                    if matches!(arr.item_keyword.name.as_str(), "role" | "plan") {
+                        for item in &arr.body.items {
+                            if let ListItemKind::Named { name, body } = &item.kind {
+                                let refs = collect_role_refs(body);
+                                membership.insert(name.name.clone(), refs);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut globally_visited = HashSet::new();
+        let keys: Vec<String> = membership.keys().cloned().collect();
+        for name in &keys {
+            if globally_visited.contains(name.as_str()) {
+                continue;
+            }
+            let mut path = Vec::new();
+            detect_member_cycle(name, &membership, &mut path, &mut globally_visited, diags);
+        }
+    }
+}
+
+fn collect_role_refs(body: &Body) -> Vec<String> {
+    let mut refs = Vec::new();
+    for entry in &body.entries {
+        match &entry.kind {
+            BodyEntryKind::ListItem(item) => {
+                if let ListItemKind::Role(role_ref) = &item.kind {
+                    if let Some(name) = role_ref.strip_prefix("@role/") {
+                        refs.push(name.to_string());
+                    }
+                }
+            }
+            BodyEntryKind::NestedBlock(nb) => {
+                refs.extend(collect_role_refs(&nb.body));
+            }
+            _ => {}
+        }
+    }
+    refs
+}
+
+fn detect_member_cycle(
+    name: &str,
+    membership: &HashMap<String, Vec<String>>,
+    path: &mut Vec<String>,
+    globally_visited: &mut HashSet<String>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    if let Some(pos) = path.iter().position(|n| n == name) {
+        let cycle: Vec<&str> = path[pos..].iter().map(|s| s.as_str()).collect();
+        let mut cycle_desc: Vec<&str> = cycle.to_vec();
+        cycle_desc.push(cycle[0]);
+        diags.push(Diagnostic::warning(format!(
+            "circular membership detected: {}",
+            cycle_desc.join(" -> ")
+        )));
+        return;
+    }
+
+    if globally_visited.contains(name) {
+        return;
+    }
+
+    path.push(name.to_string());
+    if let Some(members) = membership.get(name) {
+        for member in members {
+            detect_member_cycle(member, membership, path, globally_visited, diags);
+        }
+    }
+    path.pop();
+    globally_visited.insert(name.to_string());
 }
 
 fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
@@ -392,6 +654,7 @@ fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
         PrimitiveType::Path => matches!(value, Value::String(_) | Value::TemplateString(_)),
         PrimitiveType::Secret => false,
         PrimitiveType::Object => false,
+        PrimitiveType::Role => matches!(value, Value::Role(_)),
     }
 }
 
@@ -405,7 +668,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Duration(_) => "duration",
         Value::Path(_) => "path",
         Value::Secret(_) => "secret",
-        Value::RoleRef(_) => "role reference",
+        Value::Role(_) => "role reference",
         Value::Reference(_) => "reference",
         Value::Array(_) => "array",
         Value::Fallback(_, _) => "fallback",
@@ -449,7 +712,7 @@ mod tests {
         let source = "service Svc:\n    name string\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags.iter().any(|d| d.message.contains("field definitions are only allowed in model")));
+        assert!(diags.iter().any(|d| d.message.contains("field definitions are only allowed in model declarations")));
     }
 
     #[test]
@@ -1016,6 +1279,336 @@ workflow W:
             elapsed.as_millis() < 1000,
             "validation with 30-model circular schema should complete in <1s; took {:?}",
             elapsed
+        );
+    }
+
+    // --- Role type validation tests ---
+
+    #[test]
+    fn test_role_type_quoted_string_warning() {
+        let schema = "model service:\n    access role?\n";
+        let validator = make_validator(schema);
+
+        let source = "service Svc:\n    access = \"@public\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("use @public instead of \"@public\"")),
+            "should suggest removing quotes for role field; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_role_type_unquoted_string_warning() {
+        let schema = "model service:\n    access role?\n";
+        let validator = make_validator(schema);
+
+        let source = "service Svc:\n    access = \"admin\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("use @admin instead of \"admin\"")),
+            "should suggest adding @ prefix for role field; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_role_type_valid_role_ref_ok() {
+        let schema = "model service:\n    access role?\n";
+        let validator = make_validator(schema);
+
+        let source = "service Svc:\n    access = @public\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let role_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("role field")).collect();
+        assert!(role_diags.is_empty(), "valid role ref should not warn; diags: {:?}", role_diags);
+    }
+
+    #[test]
+    fn test_role_type_in_array_string_warning() {
+        let schema = "model service:\n    roles []role?\n";
+        let validator = make_validator(schema);
+
+        let source = "service Svc:\n    roles = [\"@admin\"]\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("use @admin instead of \"@admin\"")),
+            "should warn about quoted string in role array; diags: {:?}",
+            diags
+        );
+    }
+
+    // --- Unknown parent model tests ---
+
+    #[test]
+    fn test_unknown_parent_model() {
+        let schema = "model base:\n    name string\n";
+        let validator = make_validator(schema);
+
+        let source = "model child is nonexistent:\n    value string\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unknown parent model 'nonexistent'")),
+            "should detect unknown parent model; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_known_parent_model_ok() {
+        let schema = "model base:\n    name string\n";
+        let validator = make_validator(schema);
+
+        let source = "model child is base:\n    value string\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let extends_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("unknown parent")).collect();
+        assert!(extends_diags.is_empty(), "known parent should not produce errors; diags: {:?}", extends_diags);
+    }
+
+    #[test]
+    fn test_multiple_unknown_parents() {
+        let schema = "model base:\n    name string\n";
+        let validator = make_validator(schema);
+
+        let source = "model child is foo, bar:\n    value string\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unknown parent model 'foo'")),
+            "should detect 'foo' as unknown; diags: {:?}",
+            diags
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("unknown parent model 'bar'")),
+            "should detect 'bar' as unknown; diags: {:?}",
+            diags
+        );
+    }
+
+    // --- Circular member detection tests ---
+
+    #[test]
+    fn test_circular_member_detection() {
+        let validator = make_validator("");
+
+        let source = "role Admin:\n    members:\n        - @role/Editor\n\nrole Editor:\n    members:\n        - @role/Admin\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("circular membership")),
+            "should detect circular membership; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_no_circular_members_ok() {
+        let validator = make_validator("");
+
+        let source = "role Admin:\n    members:\n        - @role/Editor\n\nrole Editor:\n    members:\n        - @role/Viewer\n\nrole Viewer:\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let cycle_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("circular membership")).collect();
+        assert!(cycle_diags.is_empty(), "non-circular members should not warn; diags: {:?}", cycle_diags);
+    }
+
+    #[test]
+    fn test_circular_member_in_array_decl() {
+        let validator = make_validator("");
+
+        let source = "[]role roles:\n    - Admin:\n        members:\n            - @role/Editor\n    - Editor:\n        members:\n            - @role/Admin\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("circular membership")),
+            "should detect circular membership in array declarations; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_self_referencing_member() {
+        let validator = make_validator("");
+
+        let source = "role Admin:\n    members:\n        - @role/Admin\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("circular membership")),
+            "should detect self-referencing membership; diags: {:?}",
+            diags
+        );
+    }
+
+    // --- @user/ in access control tests ---
+
+    #[test]
+    fn test_user_ref_in_allow_inline_warning() {
+        let validator = make_validator("");
+
+        let source = "service Svc:\n    |allow = [@user/john]\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("@user/ references are intended for members lists")),
+            "should warn about @user/ in allow; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_user_ref_in_deny_block_warning() {
+        let validator = make_validator("");
+
+        let source = "service Svc:\n    |deny:\n        - @user/john\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("@user/ references are intended for members lists")),
+            "should warn about @user/ in deny block; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_role_ref_in_allow_no_user_warning() {
+        let validator = make_validator("");
+
+        let source = "service Svc:\n    |allow = [@role/admin]\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("@user/")),
+            "@role/ in allow should not trigger @user/ warning; diags: {:?}",
+            diags
+        );
+    }
+
+    // --- @public/@authenticated in members tests ---
+
+    #[test]
+    fn test_public_in_members_warning() {
+        let validator = make_validator("");
+
+        let source = "role Admin:\n    members:\n        - @public\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("built-in access levels should not appear in members lists")),
+            "should warn about @public in members; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_authenticated_in_members_warning() {
+        let validator = make_validator("");
+
+        let source = "role Admin:\n    members:\n        - @authenticated\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("built-in access levels should not appear in members lists")),
+            "should warn about @authenticated in members; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_public_in_allow_no_builtin_warning() {
+        let validator = make_validator("");
+
+        let source = "service Svc:\n    |allow = [@public]\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("built-in access levels")),
+            "@public in allow should not trigger members warning; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_builtin_in_plan_includes_warning() {
+        let validator = make_validator("");
+
+        let source = "plan Pro:\n    includes:\n        - @public\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("built-in access levels should not appear in members lists")),
+            "should warn about @public in plan includes; diags: {:?}",
+            diags
+        );
+    }
+
+    // --- ModelRef bare identifier / string tests ---
+
+    #[test]
+    fn test_model_ref_accepts_bare_identifier() {
+        let schema = "model step:\n    provider string?\n\nmodel workflow:\n    next step?\n    entrypoint step?\n";
+        let validator = make_validator(schema);
+
+        let source = "workflow W:\n    next = classify\n    entrypoint = start\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
+        assert!(
+            type_diags.is_empty(),
+            "bare identifier should be accepted for ModelRef field; diags: {:?}",
+            type_diags
+        );
+    }
+
+    #[test]
+    fn test_model_ref_accepts_string() {
+        let schema = "model step:\n    provider string?\n\nmodel workflow:\n    next step?\n    entrypoint step?\n";
+        let validator = make_validator(schema);
+
+        let source = "workflow W:\n    next = \"classify\"\n    entrypoint = \"start\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
+        assert!(
+            type_diags.is_empty(),
+            "string should be accepted for ModelRef field; diags: {:?}",
+            type_diags
+        );
+    }
+
+    #[test]
+    fn test_model_ref_rejects_number() {
+        let schema = "model step:\n    provider string?\n\nmodel workflow:\n    next step?\n";
+        let validator = make_validator(schema);
+
+        let source = "workflow W:\n    next = 42\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d.message.contains("expected step reference")),
+            "number should be rejected for ModelRef field; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_model_ref_list_accepts_bare_identifiers() {
+        let schema = "model tool:\n    wasm string?\n\nmodel workflow:\n    tools []tool?\n";
+        let validator = make_validator(schema);
+
+        let source = "workflow W:\n    tools = [myTool, anotherTool]\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
+        assert!(
+            type_diags.is_empty(),
+            "bare identifiers in array should be accepted for ModelRef list; diags: {:?}",
+            type_diags
         );
     }
 }

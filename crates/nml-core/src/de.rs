@@ -371,7 +371,7 @@ impl<'de> SeqAccess<'de> for ListItemSeqAccess<'de> {
             ListItemKind::Reference(ident) => seed
                 .deserialize(de::value::StrDeserializer::<Error>::new(&ident.name))
                 .map(Some),
-            ListItemKind::RoleRef(s) => seed
+            ListItemKind::Role(s) => seed
                 .deserialize(de::value::StrDeserializer::<Error>::new(s))
                 .map(Some),
         }
@@ -541,7 +541,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
                 }
             }
             Value::Bool(b) => visitor.visit_bool(*b),
-            Value::Duration(s) | Value::Path(s) | Value::Secret(s) | Value::RoleRef(s) => {
+            Value::Duration(s) | Value::Path(s) | Value::Secret(s) | Value::Role(s) => {
                 visitor.visit_str(s)
             }
             Value::Reference(s) => visitor.visit_str(s),
@@ -708,7 +708,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
                 visitor.visit_string(template::segments_to_string(segs))
             }
             Value::Path(s) | Value::Duration(s) | Value::Secret(s) => visitor.visit_str(s),
-            Value::Reference(s) | Value::RoleRef(s) => visitor.visit_str(s),
+            Value::Reference(s) | Value::Role(s) => visitor.visit_str(s),
             Value::Money(m) => visitor.visit_string(m.format_display()),
             _ => Err(Error(format!(
                 "expected string, got {}",

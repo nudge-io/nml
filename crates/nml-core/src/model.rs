@@ -2,19 +2,11 @@ use crate::span::Span;
 use crate::types::PrimitiveType;
 use serde::Serialize;
 
-/// A model definition parsed from `model name:`.
+/// A model definition parsed from `model name:` or `model name is parent:`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelDef {
     pub name: String,
-    pub traits: Vec<String>,
-    pub fields: Vec<FieldDef>,
-    pub span: Span,
-}
-
-/// A trait definition parsed from `trait name:`.
-#[derive(Debug, Clone, Serialize)]
-pub struct TraitDef {
-    pub name: String,
+    pub extends: Vec<String>,
     pub fields: Vec<FieldDef>,
     pub span: Span,
 }
@@ -27,7 +19,7 @@ pub struct EnumDef {
     pub span: Span,
 }
 
-/// A field definition within a model or trait.
+/// A field definition within a model.
 #[derive(Debug, Clone, Serialize)]
 pub struct FieldDef {
     pub name: String,
@@ -44,7 +36,6 @@ pub enum FieldType {
     Primitive(PrimitiveType),
     List(Box<FieldType>),
     RefOnly(Box<FieldType>),
-    RoleRef,
     ModelRef(String),
     Modifier(String),
     InlineObject(Vec<FieldDef>),

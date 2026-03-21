@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::error::NmlError;
-use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, TraitDef};
+use crate::model::{EnumDef, FieldDef, FieldType, ModelDef};
 use crate::types::PrimitiveType;
 
 /// Results of extracting schema definitions from a parsed NML file.
@@ -10,10 +10,9 @@ use crate::types::PrimitiveType;
 pub struct ExtractedSchema {
     pub models: Vec<ModelDef>,
     pub enums: Vec<EnumDef>,
-    pub traits: Vec<TraitDef>,
 }
 
-/// Extract model, enum, and trait definitions from a parsed AST.
+/// Extract model and enum definitions from a parsed AST.
 pub fn extract(file: &File) -> ExtractedSchema {
     let mut schema = ExtractedSchema::default();
 
@@ -23,11 +22,6 @@ pub fn extract(file: &File) -> ExtractedSchema {
                 "model" => {
                     if let Some(model) = extract_model(block, decl.span) {
                         schema.models.push(model);
-                    }
-                }
-                "trait" => {
-                    if let Some(trait_def) = extract_trait(block, decl.span) {
-                        schema.traits.push(trait_def);
                     }
                 }
                 "enum" => {
@@ -153,6 +147,159 @@ fn detect_cycle<'a>(
     globally_visited.insert(name);
 }
 
+/// Resolve parent model fields into child models via the `extends` relation.
+///
+/// For each model that has `extends`, recursively collects ancestor fields and
+/// prepends them before the child's own fields. Parents are processed
+/// left-to-right; duplicate field names are skipped (first occurrence wins).
+/// Child fields shadow/override any ancestor field with the same name.
+pub fn resolve_model_inheritance(schema: &mut ExtractedSchema) {
+    let index: HashMap<String, usize> = schema
+        .models
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.name.clone(), i))
+        .collect();
+
+    let models_snapshot: Vec<ModelDef> = schema.models.clone();
+
+    for model in &mut schema.models {
+        if model.extends.is_empty() {
+            continue;
+        }
+
+        let child_field_names: HashSet<String> =
+            model.fields.iter().map(|f| f.name.clone()).collect();
+
+        let mut seen = HashSet::new();
+        for name in &child_field_names {
+            seen.insert(name.clone());
+        }
+
+        let mut inherited = Vec::new();
+        collect_ancestor_fields(
+            &model.extends,
+            &index,
+            &models_snapshot,
+            &mut seen,
+            &mut inherited,
+            &mut HashSet::new(),
+        );
+
+        inherited.extend(model.fields.drain(..));
+        model.fields = inherited;
+    }
+}
+
+fn collect_ancestor_fields(
+    parents: &[String],
+    index: &HashMap<String, usize>,
+    models: &[ModelDef],
+    seen_fields: &mut HashSet<String>,
+    out: &mut Vec<FieldDef>,
+    visited: &mut HashSet<String>,
+) {
+    for parent_name in parents {
+        if visited.contains(parent_name) {
+            continue;
+        }
+        let Some(&idx) = index.get(parent_name) else {
+            continue;
+        };
+        visited.insert(parent_name.clone());
+        let parent = &models[idx];
+
+        // Recurse into grandparents first so ancestor fields appear before parent fields.
+        collect_ancestor_fields(&parent.extends, index, models, seen_fields, out, visited);
+
+        for field in &parent.fields {
+            if seen_fields.insert(field.name.clone()) {
+                out.push(field.clone());
+            }
+        }
+    }
+}
+
+/// Detect cycles in the model `extends` (inheritance) graph.
+///
+/// Returns one error per model participating in a cycle.
+pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<NmlError> {
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for model in &schema.models {
+        edges.insert(
+            model.name.as_str(),
+            model.extends.iter().map(|s| s.as_str()).collect(),
+        );
+    }
+
+    let mut errors = Vec::new();
+    let mut globally_visited = HashSet::new();
+
+    for model in &schema.models {
+        if globally_visited.contains(model.name.as_str()) {
+            continue;
+        }
+        let mut path = Vec::new();
+        detect_extends_cycle(
+            model.name.as_str(),
+            &edges,
+            &mut path,
+            &mut globally_visited,
+            schema,
+            &mut errors,
+        );
+    }
+
+    errors
+}
+
+fn detect_extends_cycle<'a>(
+    name: &'a str,
+    edges: &HashMap<&'a str, Vec<&'a str>>,
+    path: &mut Vec<&'a str>,
+    globally_visited: &mut HashSet<&'a str>,
+    schema: &ExtractedSchema,
+    errors: &mut Vec<NmlError>,
+) {
+    if let Some(pos) = path.iter().position(|n| *n == name) {
+        let cycle: Vec<&str> = path[pos..].to_vec();
+        for member in &cycle {
+            let span = schema
+                .models
+                .iter()
+                .find(|m| m.name == *member)
+                .map(|m| m.span)
+                .unwrap_or(crate::span::Span::empty(0));
+            let cycle_desc: Vec<_> = cycle
+                .iter()
+                .chain(std::iter::once(&cycle[0]))
+                .copied()
+                .collect();
+            errors.push(NmlError::Validation {
+                message: format!(
+                    "circular inheritance in model definitions: {}",
+                    cycle_desc.join(" -> ")
+                ),
+                span,
+            });
+        }
+        return;
+    }
+
+    if globally_visited.contains(name) {
+        return;
+    }
+
+    path.push(name);
+    if let Some(neighbors) = edges.get(name) {
+        for neighbor in neighbors {
+            detect_extends_cycle(neighbor, edges, path, globally_visited, schema, errors);
+        }
+    }
+    path.pop();
+    globally_visited.insert(name);
+}
+
 fn extract_model(block: &BlockDecl, span: crate::span::Span) -> Option<ModelDef> {
     let mut fields = Vec::new();
 
@@ -183,23 +330,7 @@ fn extract_model(block: &BlockDecl, span: crate::span::Span) -> Option<ModelDef>
 
     Some(ModelDef {
         name: block.name.name.clone(),
-        traits: Vec::new(),
-        fields,
-        span,
-    })
-}
-
-fn extract_trait(block: &BlockDecl, span: crate::span::Span) -> Option<TraitDef> {
-    let mut fields = Vec::new();
-
-    for entry in &block.body.entries {
-        if let BodyEntryKind::FieldDefinition(fd) = &entry.kind {
-            fields.push(convert_field_def(fd, entry.span));
-        }
-    }
-
-    Some(TraitDef {
-        name: block.name.name.clone(),
+        extends: block.extends.iter().map(|id| id.name.clone()).collect(),
         fields,
         span,
     })
@@ -387,29 +518,15 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_trait() {
-        let source = "trait auditable:\n    createdAt string\n    updatedAt string?\n";
-        let file = parser::parse(source).unwrap();
-        let schema = extract(&file);
-
-        assert_eq!(schema.traits.len(), 1);
-        let t = &schema.traits[0];
-        assert_eq!(t.name, "auditable");
-        assert_eq!(t.fields.len(), 2);
-    }
-
-    #[test]
     fn test_extract_mixed() {
         let source = "\
 enum status:\n    - \"active\"\n    - \"inactive\"\n\n\
-model user:\n    name string\n    status status\n\n\
-trait timestamped:\n    createdAt string\n";
+model user:\n    name string\n    status status\n";
         let file = parser::parse(source).unwrap();
         let schema = extract(&file);
 
         assert_eq!(schema.enums.len(), 1);
         assert_eq!(schema.models.len(), 1);
-        assert_eq!(schema.traits.len(), 1);
     }
 
     #[test]
@@ -603,6 +720,111 @@ trait timestamped:\n    createdAt string\n";
             elapsed.as_millis() < 1000,
             "cycle detection on 100-node graph should complete in <1s; took {:?}",
             elapsed
+        );
+    }
+
+    // --- resolve_model_inheritance tests ---
+
+    #[test]
+    fn test_resolve_single_parent() {
+        let source = "model A:\n    x string\n    y number\n\nmodel B is A:\n    z string\n";
+        let file = parser::parse(source).unwrap();
+        let mut schema = extract(&file);
+        resolve_model_inheritance(&mut schema);
+
+        let b = schema.models.iter().find(|m| m.name == "B").unwrap();
+        let names: Vec<&str> = b.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn test_resolve_multi_parent() {
+        let source = "model A:\n    x string\n\nmodel B:\n    y number\n\nmodel C is A, B:\n    z string\n";
+        let file = parser::parse(source).unwrap();
+        let mut schema = extract(&file);
+        resolve_model_inheritance(&mut schema);
+
+        let c = schema.models.iter().find(|m| m.name == "C").unwrap();
+        let names: Vec<&str> = c.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn test_resolve_diamond() {
+        let source = "\
+model A:\n    a string\n\n\
+model B is A:\n    b string\n\n\
+model C is A:\n    c string\n\n\
+model D is B, C:\n    d string\n";
+        let file = parser::parse(source).unwrap();
+        let mut schema = extract(&file);
+        resolve_model_inheritance(&mut schema);
+
+        let d = schema.models.iter().find(|m| m.name == "D").unwrap();
+        let names: Vec<&str> = d.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c", "d"], "A's field should appear only once");
+    }
+
+    #[test]
+    fn test_resolve_child_override() {
+        let source = "model A:\n    x string\n    y number\n\nmodel B is A:\n    x number\n    z string\n";
+        let file = parser::parse(source).unwrap();
+        let mut schema = extract(&file);
+        resolve_model_inheritance(&mut schema);
+
+        let b = schema.models.iter().find(|m| m.name == "B").unwrap();
+        let names: Vec<&str> = b.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["y", "x", "z"], "parent field 'y' prepended, 'x' kept as child's version");
+        assert!(
+            matches!(b.fields.iter().find(|f| f.name == "x").unwrap().field_type,
+                     FieldType::Primitive(PrimitiveType::Number)),
+            "child's 'x' should be number, not string"
+        );
+    }
+
+    // --- find_extends_cycles tests ---
+
+    #[test]
+    fn test_extends_cycle_direct() {
+        let source = "model A is B:\n    x string\n\nmodel B is A:\n    y string\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_extends_cycles(&schema);
+        assert!(!errors.is_empty(), "should detect cycle between A and B");
+        assert!(
+            errors.iter().any(|e| e.message().contains("circular inheritance")),
+            "error should mention circular inheritance; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_extends_cycle_self() {
+        let source = "model A is A:\n    x string\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_extends_cycles(&schema);
+        assert!(!errors.is_empty(), "should detect self-referencing extends");
+        assert!(
+            errors.iter().any(|e| e.message().contains("circular inheritance")),
+            "error should mention circular inheritance; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_extends_no_cycle() {
+        let source = "model A:\n    x string\n\nmodel B is A:\n    y string\n";
+        let file = parser::parse(source).unwrap();
+        let schema = extract(&file);
+
+        let errors = find_extends_cycles(&schema);
+        assert!(
+            errors.is_empty(),
+            "should not detect cycle in acyclic inheritance; errors: {:?}",
+            errors
         );
     }
 }

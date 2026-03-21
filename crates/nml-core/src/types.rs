@@ -25,7 +25,7 @@ pub enum Value {
     Duration(String),
     Path(String),
     Secret(String),
-    RoleRef(String),
+    Role(String),
     Reference(String),
     Array(Vec<SpannedValue>),
     Fallback(Box<SpannedValue>, Box<SpannedValue>),
@@ -56,6 +56,8 @@ pub enum PrimitiveType {
     Secret,
     /// Flexible key-value nested block; accepts any keys with scalar values.
     Object,
+    /// Role reference type; values use `@keyword/name` syntax.
+    Role,
 }
 
 impl PrimitiveType {
@@ -69,6 +71,7 @@ impl PrimitiveType {
             "path" => Some(PrimitiveType::Path),
             "secret" => Some(PrimitiveType::Secret),
             "object" => Some(PrimitiveType::Object),
+            "role" => Some(PrimitiveType::Role),
             _ => None,
         }
     }
@@ -83,6 +86,7 @@ impl PrimitiveType {
             PrimitiveType::Path => "path",
             PrimitiveType::Secret => "secret",
             PrimitiveType::Object => "object",
+            PrimitiveType::Role => "role",
         }
     }
 }
@@ -106,14 +110,14 @@ impl Value {
             Value::Duration(_) => "duration",
             Value::Path(_) => "path",
             Value::Secret(_) => "secret",
-            Value::RoleRef(_) => "role reference",
+            Value::Role(_) => "role",
             Value::Reference(_) => "reference",
             Value::Array(_) => "array",
             Value::Fallback(_, _) => "fallback",
         }
     }
 
-    /// Extract as a string slice (String, Path, Duration, Secret, Reference, RoleRef).
+    /// Extract as a string slice (String, Path, Duration, Secret, Reference, Role).
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(s)
@@ -121,7 +125,7 @@ impl Value {
             | Value::Duration(s)
             | Value::Secret(s)
             | Value::Reference(s)
-            | Value::RoleRef(s) => Some(s.as_str()),
+            | Value::Role(s) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -159,7 +163,7 @@ impl TryFrom<&Value> for String {
             Value::String(s) => Ok(s.clone()),
             Value::TemplateString(segs) => Ok(crate::template::segments_to_string(segs)),
             Value::Path(s) | Value::Duration(s) | Value::Secret(s) => Ok(s.clone()),
-            Value::Reference(s) | Value::RoleRef(s) => Ok(s.clone()),
+            Value::Reference(s) | Value::Role(s) => Ok(s.clone()),
             _ => Err(ValueTypeError {
                 expected: "string",
                 actual: value.type_name(),
@@ -274,7 +278,7 @@ mod tests {
 
     #[test]
     fn try_from_role_ref() {
-        let v = Value::RoleRef("admin".into());
+        let v = Value::Role("admin".into());
         assert_eq!(String::try_from(&v).unwrap(), "admin");
     }
 
@@ -441,7 +445,7 @@ mod tests {
         assert_eq!(Value::Duration("1s".into()).type_name(), "duration");
         assert_eq!(Value::Path("/x".into()).type_name(), "path");
         assert_eq!(Value::Secret("$ENV.X".into()).type_name(), "secret");
-        assert_eq!(Value::RoleRef("admin".into()).type_name(), "role reference");
+        assert_eq!(Value::Role("admin".into()).type_name(), "role");
         assert_eq!(Value::Reference("Ref".into()).type_name(), "reference");
         assert_eq!(Value::Array(vec![]).type_name(), "array");
     }
