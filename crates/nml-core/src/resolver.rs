@@ -96,26 +96,28 @@ impl Resolver {
     }
 
     /// Find all unresolved references in the file.
-    /// Walks property values looking for `Value::Reference` that don't match
-    /// any registered declaration name.
+    /// Uses scope-aware resolution: named list items within a block (e.g. workflow
+    /// steps) are valid targets only within that same block, not globally.
     pub fn find_unresolved_references(&self, file: &File) -> Vec<NmlError> {
         let mut errors = Vec::new();
         for decl in &file.declarations {
             match &decl.kind {
                 DeclarationKind::Block(block) => {
                     let is_schema_def =
-                        matches!(block.keyword.name.as_str(), "model" | "trait" | "enum");
+                        matches!(block.keyword.name.as_str(), "model" | "enum");
                     if !is_schema_def {
-                        self.check_body_refs(&block.body, &mut errors);
+                        let local_names = collect_local_names(&block.body);
+                        self.check_body_refs(&block.body, &local_names, &mut errors);
                     }
                 }
                 DeclarationKind::Array(arr) => {
                     let is_schema_def =
-                        matches!(arr.item_keyword.name.as_str(), "model" | "trait" | "enum");
+                        matches!(arr.item_keyword.name.as_str(), "model" | "enum");
                     if !is_schema_def {
                         for item in &arr.body.items {
-                            if let ListItemKind::Named { body, .. } = &item.kind {
-                                self.check_body_refs(body, &mut errors);
+                            if let ListItemKind::Named { name: _, body } = &item.kind {
+                                let local_names = collect_local_names(body);
+                                self.check_body_refs(body, &local_names, &mut errors);
                             }
                         }
                     }
@@ -188,12 +190,17 @@ impl Resolver {
         globally_visited.insert(name.to_string());
     }
 
-    fn check_body_refs(&self, body: &Body, errors: &mut Vec<NmlError>) {
+    fn check_body_refs(
+        &self,
+        body: &Body,
+        local_names: &HashSet<String>,
+        errors: &mut Vec<NmlError>,
+    ) {
         for entry in &body.entries {
             match &entry.kind {
                 BodyEntryKind::Property(prop) => {
                     if let Value::Reference(name) = &prop.value.value {
-                        if self.resolve(name).is_none() {
+                        if self.resolve(name).is_none() && !local_names.contains(name.as_str()) {
                             errors.push(NmlError::Validation {
                                 message: format!("unresolved reference '{name}'"),
                                 span: prop.value.span,
@@ -202,15 +209,40 @@ impl Resolver {
                     }
                 }
                 BodyEntryKind::NestedBlock(nb) => {
-                    self.check_body_refs(&nb.body, errors);
+                    self.check_body_refs(&nb.body, local_names, errors);
                 }
                 BodyEntryKind::ListItem(item) => {
                     if let ListItemKind::Named { body, .. } = &item.kind {
-                        self.check_body_refs(body, errors);
+                        self.check_body_refs(body, local_names, errors);
                     }
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+/// Collect all named list item names from a body tree recursively.
+/// These serve as locally-scoped references within the enclosing block.
+fn collect_local_names(body: &Body) -> HashSet<String> {
+    let mut names = HashSet::new();
+    collect_local_names_recursive(body, &mut names);
+    names
+}
+
+fn collect_local_names_recursive(body: &Body, names: &mut HashSet<String>) {
+    for entry in &body.entries {
+        match &entry.kind {
+            BodyEntryKind::ListItem(item) => {
+                if let ListItemKind::Named { name, body } = &item.kind {
+                    names.insert(name.name.clone());
+                    collect_local_names_recursive(body, names);
+                }
+            }
+            BodyEntryKind::NestedBlock(nb) => {
+                collect_local_names_recursive(&nb.body, names);
+            }
+            _ => {}
         }
     }
 }
@@ -273,6 +305,51 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.message().contains("unresolved reference 'NonExistent'")),
             "should flag unresolved reference inside list item; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_local_step_ref_resolves() {
+        let source = "workflow W:\n    entrypoint = classify\n    steps:\n        - classify:\n            next = respond\n        - respond:\n            provider = \"groq\"\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_unresolved_references(&file);
+        assert!(
+            errors.is_empty(),
+            "step refs within same workflow should resolve; errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_step_ref_not_in_other_workflow() {
+        let source = "workflow A:\n    entrypoint = respond\n    steps:\n        - start:\n            next = respond\n\nworkflow B:\n    entrypoint = respond\n    steps:\n        - respond:\n            provider = \"groq\"\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_unresolved_references(&file);
+        assert!(
+            errors.iter().any(|e| e.message().contains("unresolved reference 'respond'")),
+            "step 'respond' in workflow A should be unresolved (only exists in B); errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_top_level_ref_resolves_from_any_workflow() {
+        let source = "provider Groq:\n    type = \"groq\"\n\nworkflow W:\n    steps:\n        - s1:\n            provider = Groq\n";
+        let file = parser::parse(source).unwrap();
+        let mut resolver = Resolver::new();
+        resolver.register_file(&file);
+
+        let errors = resolver.find_unresolved_references(&file);
+        assert!(
+            errors.is_empty(),
+            "top-level provider ref should resolve from any workflow; errors: {:?}",
             errors
         );
     }
