@@ -86,6 +86,23 @@ pub fn compute(
     diagnostics
 }
 
+fn validate_shared_property_templates(
+    sp: &SharedProperty,
+    step_names: &HashSet<String>,
+    valid_ns: &[&str],
+    source_map: &SourceMap,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match &sp.kind {
+        SharedPropertyKind::Block(body) => {
+            validate_body_templates(body, step_names, valid_ns, source_map, diags);
+        }
+        SharedPropertyKind::Scalar(sv) => {
+            validate_value_templates(&sv.value, step_names, valid_ns, source_map, diags);
+        }
+    }
+}
+
 fn validate_templates(
     file: &File,
     valid_ns: &[&str],
@@ -105,6 +122,15 @@ fn validate_templates(
                 validate_value_templates(&c.value.value, &step_names, valid_ns, source_map, diags);
             }
             DeclarationKind::Array(arr) => {
+                for sp in &arr.body.shared_properties {
+                    validate_shared_property_templates(
+                        sp,
+                        &step_names,
+                        valid_ns,
+                        source_map,
+                        diags,
+                    );
+                }
                 for prop in &arr.body.properties {
                     validate_value_templates(
                         &prop.value.value,
@@ -204,7 +230,7 @@ fn validate_body_templates(
                 validate_list_item_templates(item, step_names, valid_ns, source_map, diags);
             }
             BodyEntryKind::SharedProperty(shared) => {
-                validate_body_templates(&shared.body, step_names, valid_ns, source_map, diags);
+                validate_shared_property_templates(shared, step_names, valid_ns, source_map, diags);
             }
             _ => {}
         }

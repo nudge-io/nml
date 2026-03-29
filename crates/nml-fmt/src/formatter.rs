@@ -116,11 +116,7 @@ fn format_body_entry(out: &mut String, entry: &BodyEntry, depth: usize) {
             format_modifier(out, m, depth);
         }
         BodyEntryKind::SharedProperty(sp) => {
-            write_indent(out, depth);
-            out.push('.');
-            out.push_str(&sp.name.name);
-            out.push_str(":\n");
-            format_body(out, &sp.body, depth + 1);
+            format_shared_property(out, sp, depth);
         }
         BodyEntryKind::ListItem(item) => {
             format_list_item(out, item, depth);
@@ -175,11 +171,7 @@ fn format_array_body(out: &mut String, body: &ArrayBody, depth: usize) {
         format_modifier(out, m, depth);
     }
     for sp in &body.shared_properties {
-        write_indent(out, depth);
-        out.push('.');
-        out.push_str(&sp.name.name);
-        out.push_str(":\n");
-        format_body(out, &sp.body, depth + 1);
+        format_shared_property(out, sp, depth);
     }
     for prop in &body.properties {
         write_indent(out, depth);
@@ -332,6 +324,23 @@ fn format_value(out: &mut String, value: &Value, depth: usize) {
     }
 }
 
+fn format_shared_property(out: &mut String, sp: &SharedProperty, depth: usize) {
+    write_indent(out, depth);
+    out.push('.');
+    out.push_str(&sp.name.name);
+    match &sp.kind {
+        SharedPropertyKind::Block(body) => {
+            out.push_str(":\n");
+            format_body(out, body, depth + 1);
+        }
+        SharedPropertyKind::Scalar(val) => {
+            out.push_str(" = ");
+            format_value(out, &val.value, depth);
+            out.push('\n');
+        }
+    }
+}
+
 fn write_indent(out: &mut String, depth: usize) {
     for _ in 0..depth {
         out.push_str(INDENT);
@@ -450,6 +459,21 @@ mod tests {
     #[test]
     fn roundtrip_shared_property() {
         roundtrip("workflow W:\n    .defaults:\n        retries = 3\n    - step1:\n        x = 1\n");
+    }
+
+    #[test]
+    fn roundtrip_scalar_shared_property() {
+        roundtrip("workflow W:\n    .interval = 7200\n    - step1:\n        x = 1\n");
+    }
+
+    #[test]
+    fn roundtrip_scalar_and_block_shared_property() {
+        roundtrip("workflow W:\n    .interval = 900\n    .defaults:\n        retries = 3\n    - step1:\n        x = 1\n");
+    }
+
+    #[test]
+    fn roundtrip_array_scalar_shared_property() {
+        roundtrip("[]mount mounts:\n    .interval = 300\n    - Main:\n        path = \"/\"\n");
     }
 
     #[test]

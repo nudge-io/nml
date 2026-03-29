@@ -40,11 +40,11 @@ fn print_usage() {
         "nml - NML configuration language toolkit
 
 USAGE:
-    nml <command> [options] <file|dir>
+    nml <command> [options] <file>
 
 COMMANDS:
     parse                           Parse an NML file and dump the AST as JSON
-    validate                        Validate NML files against model definitions
+    validate                        Validate an NML file for duplicates and unresolved references
     fmt                             Format NML files in canonical style
     check [--schema <dir>] <file>   Parse + validate + schema check (CI-friendly)
     help                            Show this help message
@@ -84,7 +84,8 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
     let mut resolver = nml_core::resolver::Resolver::new();
     resolver.register_file(&file);
 
-    let errors = resolver.find_duplicates();
+    let mut errors = resolver.find_duplicates();
+    errors.extend(resolver.find_unresolved_references(&file));
     if errors.is_empty() {
         println!("{}: ok", path.display());
         Ok(())
@@ -109,8 +110,7 @@ fn cmd_fmt(args: &[String]) -> Result<(), String> {
     })?;
 
     let formatted = nml_fmt::formatter::format(&file);
-    std::fs::write(&path, &formatted)
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    write_file_atomically(&path, &formatted)?;
 
     println!("formatted {}", path.display());
     Ok(())
@@ -137,6 +137,12 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     if file_args.is_empty() {
         return Err("usage: nml check [--schema <dir>] <file>".to_string());
     }
+    if file_args.len() > 1 {
+        return Err(format!(
+            "usage: nml check [--schema <dir>] <file> (got {} files)",
+            file_args.len()
+        ));
+    }
     let path = PathBuf::from(file_args[0]);
     let source = read_file(&path)?;
 
@@ -157,6 +163,11 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
         eprintln!("{}:{}:{}: {}", path.display(), loc.line, loc.column, err);
         error_count += 1;
     }
+    for err in resolver.find_unresolved_references(&file) {
+        let loc = source_map.location(err.span().start);
+        eprintln!("{}:{}:{}: {}", path.display(), loc.line, loc.column, err);
+        error_count += 1;
+    }
 
     if let Some(sd) = schema_dir {
         let (models, enums) = load_schema_dir(&sd)?;
@@ -170,7 +181,18 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
                         nml_validate::diagnostics::Severity::Warning => "warning",
                     };
                     eprintln!("{}:{}:{}: {}: {}", path.display(), loc.line, loc.column, prefix, diag.message);
-                    error_count += 1;
+                    if matches!(diag.severity, nml_validate::diagnostics::Severity::Error) {
+                        error_count += 1;
+                    }
+                } else {
+                    let prefix = match diag.severity {
+                        nml_validate::diagnostics::Severity::Error => "error",
+                        nml_validate::diagnostics::Severity::Warning => "warning",
+                    };
+                    eprintln!("{}:0:0: {}: {}", path.display(), prefix, diag.message);
+                    if matches!(diag.severity, nml_validate::diagnostics::Severity::Error) {
+                        error_count += 1;
+                    }
                 }
             }
         }
@@ -220,4 +242,28 @@ fn require_file_arg(args: &[String], cmd: &str) -> Result<PathBuf, String> {
 
 fn read_file(path: &PathBuf) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))
+}
+
+fn write_file_atomically(path: &PathBuf, contents: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("failed to determine parent directory for {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("invalid file name for {}", path.display()))?;
+    let tmp_name = format!(".{}.tmp-{}", file_name, std::process::id());
+    let tmp_path = parent.join(tmp_name);
+
+    std::fs::write(&tmp_path, contents)
+        .map_err(|e| format!("failed to write temp file {}: {e}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!(
+            "failed to replace {} with {}: {e}",
+            path.display(),
+            tmp_path.display()
+        )
+    })?;
+    Ok(())
 }

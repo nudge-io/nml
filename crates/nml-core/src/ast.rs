@@ -96,7 +96,7 @@ pub enum BodyEntryKind {
     NestedBlock(NestedBlock),
     /// An access control modifier: `|allow = [...]` or `|allow: ...`
     Modifier(Modifier),
-    /// A shared property: `.key: ...`
+    /// A shared property: `.key: ...` or `.key = value`
     SharedProperty(SharedProperty),
     /// A list item within a body (when the body is used inline in a service, etc.)
     ListItem(ListItem),
@@ -135,11 +135,20 @@ pub enum ModifierValue {
     },
 }
 
-/// A shared/inherited property: `.key: <body>`.
+/// Payload for a shared property after `.name`.
+#[derive(Debug, Clone, Serialize)]
+pub enum SharedPropertyKind {
+    /// `.name: <indented body>` — merged into each named list item as a nested block.
+    Block(Body),
+    /// `.name = <value>` — merged into each named list item as a property (item wins on name clash).
+    Scalar(SpannedValue),
+}
+
+/// A shared/inherited default for named list items: `.key: ...` or `.key = value`.
 #[derive(Debug, Clone, Serialize)]
 pub struct SharedProperty {
     pub name: Identifier,
-    pub body: Body,
+    pub kind: SharedPropertyKind,
 }
 
 /// The body of an array declaration.

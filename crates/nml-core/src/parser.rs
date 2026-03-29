@@ -211,7 +211,7 @@ impl Parser {
             });
         }
 
-        // Shared property: .name: ...
+        // Shared property: .name: <body> or .name = <value>
         if self.check(TokenKind::Dot) {
             let shared = self.parse_shared_property()?;
             let end = self.prev_span();
@@ -387,10 +387,26 @@ impl Parser {
     fn parse_shared_property(&mut self) -> NmlResult<SharedProperty> {
         self.expect_kind(TokenKind::Dot)?;
         let name = self.expect_identifier()?;
-        self.expect_kind(TokenKind::Colon)?;
-        self.skip_newlines();
-        let body = self.parse_body()?;
-        Ok(SharedProperty { name, body })
+        if self.check(TokenKind::Colon) {
+            self.advance();
+            self.skip_newlines();
+            let body = self.parse_body()?;
+            Ok(SharedProperty {
+                name,
+                kind: SharedPropertyKind::Block(body),
+            })
+        } else if self.check(TokenKind::Equals) {
+            let prop = self.parse_property_rest(name)?;
+            Ok(SharedProperty {
+                name: prop.name,
+                kind: SharedPropertyKind::Scalar(prop.value),
+            })
+        } else {
+            Err(NmlError::parse(
+                format!("expected '=' or ':' after '.{}'", name.name),
+                name.span,
+            ))
+        }
     }
 
     fn parse_array_body(&mut self) -> NmlResult<ArrayBody> {
@@ -1897,6 +1913,60 @@ workflow W:
             });
             assert!(has_shared, "expected a SharedProperty entry");
         }
+    }
+
+    #[test]
+    fn test_parse_scalar_shared_property_in_block() {
+        let source = "workflow W:\n    .interval = 7200\n    - step1:\n        x = 1\n";
+        let file = parse(source).unwrap();
+        if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+            let sp = b
+                .body
+                .entries
+                .iter()
+                .find_map(|e| match &e.kind {
+                    BodyEntryKind::SharedProperty(sp) => Some(sp),
+                    _ => None,
+                })
+                .expect("shared property");
+            assert_eq!(sp.name.name, "interval");
+            match &sp.kind {
+                SharedPropertyKind::Scalar(sv) => {
+                    assert_eq!(sv.value, Value::Number(7200.0));
+                }
+                other => panic!("expected scalar shared property, got {other:?}"),
+            }
+        } else {
+            panic!("expected block");
+        }
+    }
+
+    #[test]
+    fn test_parse_scalar_shared_property_in_array() {
+        let source = "[]mount mounts:\n    .interval = 300\n    - Main:\n        path = \"/\"\n";
+        let file = parse(source).unwrap();
+        match &file.declarations[0].kind {
+            DeclarationKind::Array(arr) => {
+                assert_eq!(arr.body.shared_properties.len(), 1);
+                let sp = &arr.body.shared_properties[0];
+                assert_eq!(sp.name.name, "interval");
+                assert!(matches!(
+                    &sp.kind,
+                    SharedPropertyKind::Scalar(sv) if sv.value == Value::Number(300.0)
+                ));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_shared_property_requires_colon_or_equals() {
+        let err = parse("workflow W:\n    .onlyname\n    - s:\n        x = 1\n").unwrap_err();
+        assert!(
+            err.message().contains("expected '=' or ':'"),
+            "got: {}",
+            err.message()
+        );
     }
 
     #[test]

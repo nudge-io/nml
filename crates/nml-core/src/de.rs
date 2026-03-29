@@ -2,7 +2,7 @@
 //!
 //! Converts NML block bodies into Rust structs via serde deserialization.
 //! Supports flat properties, nested blocks (recursive), named list items
-//! with label injection, and shared property inheritance.
+//! with label injection, and shared property inheritance (`.key:` blocks and `.key = value` scalars).
 //!
 //! # Example
 //!
@@ -209,9 +209,15 @@ impl<'de> de::Deserializer<'de> for BodyDeserializer<'de> {
 enum BodyMapEntry<'a> {
     Property(&'a Property),
     Block(&'a Body, &'a str),
+    /// `.name = value` shared property (deserializes like a normal property value).
+    SharedScalar {
+        key: &'a str,
+        value: &'a crate::types::SpannedValue,
+    },
 }
 
 fn collect_body_map_entries<'a>(body: &'a Body) -> Vec<BodyMapEntry<'a>> {
+    use crate::ast::SharedPropertyKind;
     body.entries
         .iter()
         .filter_map(|e| match &e.kind {
@@ -219,9 +225,15 @@ fn collect_body_map_entries<'a>(body: &'a Body) -> Vec<BodyMapEntry<'a>> {
             BodyEntryKind::NestedBlock(nb) => {
                 Some(BodyMapEntry::Block(&nb.body, nb.name.name.as_str()))
             }
-            BodyEntryKind::SharedProperty(sp) => {
-                Some(BodyMapEntry::Block(&sp.body, sp.name.name.as_str()))
-            }
+            BodyEntryKind::SharedProperty(sp) => match &sp.kind {
+                SharedPropertyKind::Block(b) => {
+                    Some(BodyMapEntry::Block(b, sp.name.name.as_str()))
+                }
+                SharedPropertyKind::Scalar(sv) => Some(BodyMapEntry::SharedScalar {
+                    key: sp.name.name.as_str(),
+                    value: sv,
+                }),
+            },
             _ => None,
         })
         .collect()
@@ -245,6 +257,7 @@ impl<'de> MapAccess<'de> for BodyMapAccess<'de> {
         let key = match &self.entries[self.index] {
             BodyMapEntry::Property(p) => p.name.name.as_str(),
             BodyMapEntry::Block(_, name) => name,
+            BodyMapEntry::SharedScalar { key, .. } => key,
         };
         seed.deserialize(de::value::StrDeserializer::new(key))
             .map(Some)
@@ -263,6 +276,9 @@ impl<'de> MapAccess<'de> for BodyMapAccess<'de> {
             BodyMapEntry::Block(body, _) => {
                 seed.deserialize(NestedBlockDeserializer { body })
             }
+            BodyMapEntry::SharedScalar { value, .. } => seed.deserialize(ValueDeserializer {
+                value: &value.value,
+            }),
         }
     }
 }
@@ -464,6 +480,7 @@ impl<'de> MapAccess<'de> for NamedItemMapAccess<'de> {
         let key = match &self.body_entries[self.body_index] {
             BodyMapEntry::Property(p) => p.name.name.as_str(),
             BodyMapEntry::Block(_, name) => name,
+            BodyMapEntry::SharedScalar { key, .. } => key,
         };
         seed.deserialize(de::value::StrDeserializer::new(key))
             .map(Some)
@@ -487,6 +504,9 @@ impl<'de> MapAccess<'de> for NamedItemMapAccess<'de> {
             BodyMapEntry::Block(body, _) => {
                 seed.deserialize(NestedBlockDeserializer { body })
             }
+            BodyMapEntry::SharedScalar { value, .. } => seed.deserialize(ValueDeserializer {
+                value: &value.value,
+            }),
         }
     }
 }
@@ -1133,6 +1153,46 @@ auth MyAuth:
         let config: Config = from_body_resolved(body, &resolver).unwrap();
         assert_eq!(config.host, "localhost");
         assert_eq!(config.port, 3000);
+    }
+
+    #[test]
+    fn deserialize_named_item_after_scalar_shared_merge() {
+        #[derive(Deserialize, Debug, PartialEq, Eq)]
+        #[serde(rename_all = "camelCase")]
+        struct Step {
+            interval: u64,
+            name: String,
+        }
+
+        let source = "workflow W:\n    .interval = 42\n    - S:\n        name = \"x\"\n";
+        let file = parser::parse(source).unwrap();
+        let body = match &file.declarations[0].kind {
+            DeclarationKind::Block(b) => &b.body,
+            _ => panic!("expected block"),
+        };
+        let resolver = ValueResolver::env();
+        let resolved = resolver.resolve_body(body).unwrap();
+        let merged = resolve::apply_shared_properties(&resolved);
+        let item = merged
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::ListItem(li) => Some(li),
+                _ => None,
+            })
+            .expect("list item");
+        if let ListItemKind::Named { body, .. } = &item.kind {
+            let step: Step = from_block(body).unwrap();
+            assert_eq!(
+                step,
+                Step {
+                    interval: 42,
+                    name: "x".into(),
+                }
+            );
+        } else {
+            panic!("expected named item");
+        }
     }
 
     // -------------------------------------------------------------------

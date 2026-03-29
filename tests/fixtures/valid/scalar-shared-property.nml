@@ -1,0 +1,10 @@
+// Scalar shared properties: `.name = value` merged into each named list item.
+workflow ExampleScalarShared:
+    .revalidationInterval = 7200
+    .defaults:
+        retries = 3
+    - ProviderA:
+        name = "a"
+    - ProviderB:
+        name = "b"
+        revalidationInterval = 300

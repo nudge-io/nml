@@ -11,7 +11,7 @@ a built-in type system, model definitions, and composable traits.
 - **Enums** -- restricted sets of allowed values
 - **Access control** -- built-in `|allow` and `|deny` modifiers
 - **Money type** -- exact currency values with ISO 4217 codes, stored as integer minor units
-- **Secret references** -- `$ENV.MY_SECRET` resolved at runtime, with fallback chains
+- **Secret references** -- `$ENV.MY_SECRET` represented in parsed output and resolved by the host runtime, with fallback chains
 - **Template expressions** -- `{{namespace.key}}` for dynamic value interpolation
 - **Serde integration** -- deserialize NML blocks directly into Rust structs
 - **Constants** -- `const Name = value` for reusable values across a file
@@ -47,9 +47,9 @@ model service:
 
 ```bash
 nml parse <file>       # Parse and dump AST as JSON
-nml validate <file>    # Validate against model definitions
+nml validate <file>    # Validate duplicate declarations and unresolved references
 nml fmt <file>         # Format in canonical style
-nml check <file>       # Parse + validate + report
+nml check <file>       # Parse + validate + optional schema checks
 ```
 
 ## Documentation

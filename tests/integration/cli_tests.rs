@@ -30,6 +30,7 @@ fn test_check_valid_files() {
         "tests/fixtures/valid/role-templates.nml",
         "tests/fixtures/valid/web-server.nml",
         "tests/fixtures/valid/pricing.nml",
+        "tests/fixtures/valid/scalar-shared-property.nml",
     ];
 
     for file in files {

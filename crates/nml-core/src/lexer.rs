@@ -845,6 +845,21 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_shared_property_scalar() {
+        let tokens = lex(".revalidationInterval = 7200");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Dot,
+                TokenKind::Identifier("revalidationInterval".into()),
+                TokenKind::Equals,
+                TokenKind::NumberLiteral(7200.0),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
     fn test_multiline_string() {
         let input = "x = \"\"\"\n    hello\n    world\n    \"\"\"";
         let mut lexer = Lexer::new(input);

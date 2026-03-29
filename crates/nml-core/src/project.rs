@@ -1,9 +1,9 @@
 //! Project configuration parsed from `nml-project.nml`.
 //!
 //! The project file is an NML file that configures language tooling behavior
-//! for a workspace. It controls which schema files to load, which template
-//! namespaces are valid, which modifiers are allowed, and which keywords
-//! to suggest in completions.
+//! for a workspace. It declares preferred schema paths, valid template
+//! namespaces, allowed modifiers, and extra keywords to suggest in completions.
+//! Individual tools may choose which fields to enforce.
 
 use crate::ast::*;
 use crate::types::Value;
@@ -12,6 +12,7 @@ use crate::types::Value;
 #[derive(Debug, Clone, Default)]
 pub struct ProjectConfig {
     /// Glob patterns or paths to schema (`.model.nml`) files.
+    /// Tooling that supports explicit schema selection can use this list.
     pub schema_files: Vec<String>,
     /// Valid template expression namespaces (e.g., `["args", "input", "steps"]`).
     /// If empty, any namespace is accepted without warnings.

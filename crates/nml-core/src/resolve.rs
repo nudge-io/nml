@@ -2,7 +2,7 @@
 //!
 //! Provides [`ValueResolver`] for resolving `$ENV.KEY` secrets and fallback chains,
 //! and [`apply_shared_properties`] / [`apply_array_shared_properties`] for merging
-//! `.key:` shared defaults into list items.
+//! `.key:` (block) and `.key = value` (scalar) shared defaults into list items.
 
 use crate::ast::*;
 use crate::types::{SpannedValue, Value};
@@ -79,12 +79,7 @@ impl ValueResolver {
         let shared_properties = ab
             .shared_properties
             .iter()
-            .map(|sp| {
-                Ok(SharedProperty {
-                    name: sp.name.clone(),
-                    body: self.resolve_body(&sp.body)?,
-                })
-            })
+            .map(|sp| self.resolve_shared_property(sp))
             .collect::<Result<Vec<_>, ResolveError>>()?;
 
         let properties = ab
@@ -119,10 +114,7 @@ impl ValueResolver {
                 })
             }
             BodyEntryKind::SharedProperty(sp) => {
-                BodyEntryKind::SharedProperty(SharedProperty {
-                    name: sp.name.clone(),
-                    body: self.resolve_body(&sp.body)?,
-                })
+                BodyEntryKind::SharedProperty(self.resolve_shared_property(sp)?)
             }
             BodyEntryKind::ListItem(item) => {
                 BodyEntryKind::ListItem(self.resolve_list_item(item)?)
@@ -134,6 +126,20 @@ impl ValueResolver {
         Ok(BodyEntry {
             kind,
             span: entry.span,
+        })
+    }
+
+    fn resolve_shared_property(&self, sp: &SharedProperty) -> Result<SharedProperty, ResolveError> {
+        Ok(SharedProperty {
+            name: sp.name.clone(),
+            kind: match &sp.kind {
+                SharedPropertyKind::Block(body) => {
+                    SharedPropertyKind::Block(self.resolve_body(body)?)
+                }
+                SharedPropertyKind::Scalar(sv) => {
+                    SharedPropertyKind::Scalar(self.resolve_spanned(sv)?)
+                }
+            },
         })
     }
 
@@ -185,10 +191,12 @@ pub enum ResolveError {
 // SharedProperty inheritance merging
 // ---------------------------------------------------------------------------
 
-/// Merge `.key:` shared property defaults into `ListItem::Named` entries within a `Body`.
+/// Merge shared property defaults (`.key:` block or `.key = value`) into `ListItem::Named`
+/// entries within a `Body`.
 ///
-/// Each shared property's body entries become defaults for every named list item.
-/// If a list item already has an entry with the same name, the item's entry wins.
+/// Block shared properties inject a nested block; scalar ones inject a property. If a list item
+/// already has an entry with the same name, the item's entry wins (for blocks, shallow merge
+/// into an existing nested block of that name).
 /// SharedProperty entries are removed from the output (consumed by the merge).
 pub fn apply_shared_properties(body: &Body) -> Body {
     let shared: Vec<&SharedProperty> = body
@@ -223,7 +231,7 @@ pub fn apply_shared_properties(body: &Body) -> Body {
     Body { entries }
 }
 
-/// Merge `.key:` shared property defaults from an `ArrayBody` into its list items.
+/// Merge shared property defaults from an `ArrayBody` into its list items.
 ///
 /// Same semantics as [`apply_shared_properties`] but operates on `ArrayBody`'s
 /// dedicated `shared_properties` field.
@@ -272,30 +280,47 @@ fn merge_shared_into_body(body: &Body, shared: &[&SharedProperty]) -> Body {
 
     for sp in shared {
         let sp_name = sp.name.name.as_str();
-        if existing_names.contains(&sp_name) {
-            // Item already has this entry -- merge nested bodies if both are blocks
-            merge_nested_entry(&mut entries, sp);
-        } else {
-            // Item doesn't have this -- inject shared property as a NestedBlock
-            entries.push(BodyEntry {
-                kind: BodyEntryKind::NestedBlock(NestedBlock {
-                    name: sp.name.clone(),
-                    body: sp.body.clone(),
-                }),
-                span: sp.name.span,
-            });
+        match &sp.kind {
+            SharedPropertyKind::Scalar(value) => {
+                if !existing_names.contains(&sp_name) {
+                    entries.push(BodyEntry {
+                        kind: BodyEntryKind::Property(Property {
+                            name: sp.name.clone(),
+                            value: value.clone(),
+                        }),
+                        span: sp.name.span,
+                    });
+                }
+            }
+            SharedPropertyKind::Block(shared_body) => {
+                if existing_names.contains(&sp_name) {
+                    merge_shared_block_into_nested(&mut entries, &sp.name, shared_body);
+                } else {
+                    entries.push(BodyEntry {
+                        kind: BodyEntryKind::NestedBlock(NestedBlock {
+                            name: sp.name.clone(),
+                            body: shared_body.clone(),
+                        }),
+                        span: sp.name.span,
+                    });
+                }
+            }
         }
     }
 
     Body { entries }
 }
 
-/// When both the item and the shared property have the same name, and both are
-/// block-like, do a shallow merge of their body entries (item wins on collision).
-fn merge_nested_entry(entries: &mut [BodyEntry], sp: &SharedProperty) {
+/// When the item already has a nested block with the same name as the shared block, shallow-merge
+/// shared body entries into it (item wins on child name collision).
+fn merge_shared_block_into_nested(
+    entries: &mut [BodyEntry],
+    block_name: &Identifier,
+    shared_body: &Body,
+) {
     for entry in entries.iter_mut() {
         let entry_body = match &mut entry.kind {
-            BodyEntryKind::NestedBlock(nb) if nb.name.name == sp.name.name => &mut nb.body,
+            BodyEntryKind::NestedBlock(nb) if nb.name.name == block_name.name => &mut nb.body,
             _ => continue,
         };
 
@@ -309,7 +334,7 @@ fn merge_nested_entry(entries: &mut [BodyEntry], sp: &SharedProperty) {
             })
             .collect();
 
-        for sp_entry in &sp.body.entries {
+        for sp_entry in &shared_body.entries {
             let sp_entry_name = match &sp_entry.kind {
                 BodyEntryKind::Property(p) => Some(p.name.name.as_str()),
                 BodyEntryKind::NestedBlock(nb) => Some(nb.name.name.as_str()),
@@ -677,6 +702,155 @@ workflow W:
                 assert!(has_config, "StepA should inherit .config");
                 assert!(has_limits, "StepA should inherit .limits");
             }
+        }
+    }
+
+    #[test]
+    fn shared_property_scalar_merge_in_body() {
+        let nml = r#"workflow W:
+    .interval = 7200
+    - StepA:
+        name = "a"
+"#;
+        let file = parser::parse(nml).unwrap();
+        let body = match &file.declarations[0].kind {
+            DeclarationKind::Block(b) => &b.body,
+            _ => panic!("expected block"),
+        };
+        let merged = apply_shared_properties(body);
+        if let BodyEntryKind::ListItem(item) = &merged.entries[0].kind {
+            if let ListItemKind::Named { body, .. } = &item.kind {
+                let interval = body.entries.iter().find_map(|e| match &e.kind {
+                    BodyEntryKind::Property(p) if p.name.name == "interval" => Some(p),
+                    _ => None,
+                });
+                let interval = interval.expect("interval property");
+                assert_eq!(interval.value.value, Value::Number(7200.0));
+            }
+        } else {
+            panic!("expected list item");
+        }
+    }
+
+    #[test]
+    fn shared_property_scalar_item_wins() {
+        let nml = r#"workflow W:
+    .interval = 7200
+    - StepA:
+        interval = 100
+        name = "a"
+"#;
+        let file = parser::parse(nml).unwrap();
+        let body = match &file.declarations[0].kind {
+            DeclarationKind::Block(b) => &b.body,
+            _ => panic!("expected block"),
+        };
+        let merged = apply_shared_properties(body);
+        if let BodyEntryKind::ListItem(item) = &merged.entries[0].kind {
+            if let ListItemKind::Named { body, .. } = &item.kind {
+                let props: Vec<_> = body
+                    .entries
+                    .iter()
+                    .filter_map(|e| match &e.kind {
+                        BodyEntryKind::Property(p) if p.name.name == "interval" => {
+                            Some(p.value.value.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(props.len(), 1);
+                assert_eq!(props[0], Value::Number(100.0));
+            }
+        } else {
+            panic!("expected list item");
+        }
+    }
+
+    #[test]
+    fn shared_property_scalar_and_block_together() {
+        let nml = r#"workflow W:
+    .interval = 900
+    .defaults:
+        retries = 3
+    - StepA:
+        name = "a"
+"#;
+        let file = parser::parse(nml).unwrap();
+        let body = match &file.declarations[0].kind {
+            DeclarationKind::Block(b) => &b.body,
+            _ => panic!("expected block"),
+        };
+        let merged = apply_shared_properties(body);
+        if let BodyEntryKind::ListItem(item) = &merged.entries[0].kind {
+            if let ListItemKind::Named { body, .. } = &item.kind {
+                let interval = body.entries.iter().find_map(|e| match &e.kind {
+                    BodyEntryKind::Property(p) if p.name.name == "interval" => Some(&p.value.value),
+                    _ => None,
+                });
+                assert_eq!(interval, Some(&Value::Number(900.0)));
+                let has_defaults = body.entries.iter().any(|e| matches!(
+                    &e.kind,
+                    BodyEntryKind::NestedBlock(nb) if nb.name.name == "defaults"
+                ));
+                assert!(has_defaults);
+            }
+        } else {
+            panic!("expected list item");
+        }
+    }
+
+    #[test]
+    fn shared_property_scalar_merge_array_body() {
+        let nml = r#"[]item items:
+    .interval = 500
+    - Row:
+        key = "k"
+"#;
+        let file = parser::parse(nml).unwrap();
+        let arr = match &file.declarations[0].kind {
+            DeclarationKind::Array(a) => a,
+            _ => panic!("expected array"),
+        };
+        let items = apply_array_shared_properties(&arr.body);
+        assert_eq!(items.len(), 1);
+        if let ListItemKind::Named { body, .. } = &items[0].kind {
+            let interval = body.entries.iter().find_map(|e| match &e.kind {
+                BodyEntryKind::Property(p) if p.name.name == "interval" => Some(&p.value.value),
+                _ => None,
+            });
+            assert_eq!(interval, Some(&Value::Number(500.0)));
+        } else {
+            panic!("expected named item");
+        }
+    }
+
+    #[test]
+    fn resolve_shared_scalar_in_shared_property() {
+        let r = ValueResolver::new(|k| {
+            if k == "PORT" {
+                Some("9090".into())
+            } else {
+                None
+            }
+        });
+        let nml = "workflow W:\n    .port = $ENV.PORT\n    - S:\n        host = \"h\"\n";
+        let file = parser::parse(nml).unwrap();
+        let body = match &file.declarations[0].kind {
+            DeclarationKind::Block(b) => &b.body,
+            _ => panic!("expected block"),
+        };
+        let resolved = r.resolve_body(body).expect("resolve");
+        let merged = apply_shared_properties(&resolved);
+        if let BodyEntryKind::ListItem(item) = &merged.entries[0].kind {
+            if let ListItemKind::Named { body, .. } = &item.kind {
+                let port = body.entries.iter().find_map(|e| match &e.kind {
+                    BodyEntryKind::Property(p) if p.name.name == "port" => Some(&p.value.value),
+                    _ => None,
+                });
+                assert_eq!(port, Some(&Value::String("9090".into())));
+            }
+        } else {
+            panic!("expected list item");
         }
     }
 
