@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -11,8 +11,9 @@ use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldType, ModelDef};
 use nml_core::span::SourceMap;
 use nml_core::types::Value;
+use nml_validate::schema::MembershipSemantics;
 
-use crate::diagnostics;
+use crate::diagnostics::{self, LanguageExtension};
 
 const MAX_DIR_DEPTH: usize = 20;
 const MAX_FILE_COUNT: usize = 10_000;
@@ -24,6 +25,8 @@ pub struct NmlLanguageServer {
     scoped_models: Mutex<HashMap<String, Vec<ModelDef>>>,
     scoped_enums: Mutex<HashMap<String, Vec<EnumDef>>>,
     project_config: Mutex<nml_core::ProjectConfig>,
+    language_extension: Option<Arc<dyn LanguageExtension>>,
+    membership: MembershipSemantics,
 }
 
 impl NmlLanguageServer {
@@ -35,6 +38,21 @@ impl NmlLanguageServer {
             scoped_models: Mutex::new(HashMap::new()),
             scoped_enums: Mutex::new(HashMap::new()),
             project_config: Mutex::new(nml_core::ProjectConfig::default()),
+            language_extension: None,
+            membership: MembershipSemantics::default(),
+        }
+    }
+
+    /// Create a server with an embedder-supplied language extension.
+    pub fn with_extension(
+        client: Client,
+        extension: Arc<dyn LanguageExtension>,
+        membership: MembershipSemantics,
+    ) -> Self {
+        Self {
+            language_extension: Some(extension),
+            membership,
+            ..Self::new(client)
         }
     }
 
@@ -80,7 +98,10 @@ impl NmlLanguageServer {
                 if let Ok(content) = fs::read_to_string(&project_file) {
                     if let Ok(file) = nml_core::parse(&content) {
                         let config = nml_core::ProjectConfig::from_file(&file);
-                        *self.project_config.lock().unwrap_or_else(|e| e.into_inner()) = config;
+                        *self
+                            .project_config
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = config;
                     }
                     if let Ok(uri) = Url::from_file_path(&project_file) {
                         docs.insert(uri.clone(), content);
@@ -114,7 +135,10 @@ impl NmlLanguageServer {
             let scope = extract_schema_scope(uri.as_str());
             if let Ok(file) = nml_core::parse(source) {
                 let schema = nml_core::model_extract::extract(&file);
-                scoped_models.entry(scope.clone()).or_default().extend(schema.models);
+                scoped_models
+                    .entry(scope.clone())
+                    .or_default()
+                    .extend(schema.models);
                 scoped_enums.entry(scope).or_default().extend(schema.enums);
             }
         }
@@ -173,10 +197,29 @@ impl NmlLanguageServer {
     }
 
     fn diagnostic_config(&self) -> diagnostics::DiagnosticConfig {
-        let pc = self.project_config.lock().unwrap_or_else(|e| e.into_inner());
+        let pc = self
+            .project_config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let membership = if pc.member_keywords.is_empty()
+            && pc.builtin_refs.is_empty()
+            && pc.user_ref_prefix.is_none()
+        {
+            self.membership.clone()
+        } else {
+            MembershipSemantics {
+                member_keywords: pc.member_keywords.clone(),
+                builtin_refs: pc.builtin_refs.clone(),
+                user_ref_prefix: pc.user_ref_prefix.clone(),
+            }
+        };
+
         diagnostics::DiagnosticConfig {
             template_namespaces: pc.template_namespaces.clone(),
             modifiers: pc.modifiers.clone(),
+            membership,
+            language_extension: self.language_extension.clone(),
         }
     }
 
@@ -189,7 +232,10 @@ impl NmlLanguageServer {
         if uri.as_str().ends_with("nml-project.nml") {
             if let Ok(file) = nml_core::parse(&text) {
                 let config = nml_core::ProjectConfig::from_file(&file);
-                *self.project_config.lock().unwrap_or_else(|e| e.into_inner()) = config;
+                *self
+                    .project_config
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = config;
             }
             self.revalidate_all_documents().await;
             return;
@@ -215,10 +261,7 @@ impl NmlLanguageServer {
 
     async fn revalidate_all_documents(&self) {
         let docs: Vec<(Url, String)> = {
-            let d = self
-                .documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let d = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             d.iter().map(|(u, s)| (u.clone(), s.clone())).collect()
         };
 
@@ -233,7 +276,12 @@ impl NmlLanguageServer {
         }
     }
 
-    fn find_definition(&self, name: &str, current_uri: &Url, enclosing_keyword: Option<&str>) -> Option<(Url, Range)> {
+    fn find_definition(
+        &self,
+        name: &str,
+        current_uri: &Url,
+        enclosing_keyword: Option<&str>,
+    ) -> Option<(Url, Range)> {
         let docs: HashMap<Url, String> = self
             .documents
             .lock()
@@ -280,39 +328,33 @@ impl NmlLanguageServer {
         None
     }
 
-    fn find_role_ref_definition(&self, role_ref: &str) -> Option<Location> {
+    fn find_tagged_ref_definition(&self, role_ref: &str) -> Option<Location> {
         let docs: HashMap<Url, String> = self
             .documents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        find_role_ref_definition_in_docs(&docs, role_ref)
+        find_tagged_ref_definition_in_docs(&docs, role_ref)
     }
 
-    fn find_role_ref_hover(&self, keyword: &str, name: &str) -> Option<String> {
+    fn find_tagged_ref_hover(&self, keyword: &str, name: &str) -> Option<String> {
         let docs: HashMap<Url, String> = self
             .documents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        find_role_ref_hover_in_docs(&docs, keyword, name)
+        find_tagged_ref_hover_in_docs(&docs, keyword, name)
     }
 
     fn collect_declaration_names(&self) -> Vec<(String, String)> {
-        let docs = self
-            .documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         let mut names = Vec::new();
         for (_, source) in docs.iter() {
             if let Ok(file) = nml_core::parse(source) {
                 for decl in &file.declarations {
                     match &decl.kind {
                         DeclarationKind::Block(block) => {
-                            names.push((
-                                block.name.name.clone(),
-                                block.keyword.name.clone(),
-                            ));
+                            names.push((block.name.name.clone(), block.keyword.name.clone()));
                         }
                         DeclarationKind::Array(arr) => {
                             names.push((
@@ -336,7 +378,7 @@ impl NmlLanguageServer {
 
 // ── Role ref resolution (free functions for testability) ──────
 
-fn find_role_ref_definition_in_docs(
+fn find_tagged_ref_definition_in_docs(
     docs: &HashMap<Url, String>,
     role_ref: &str,
 ) -> Option<Location> {
@@ -361,7 +403,7 @@ fn find_role_ref_definition_in_docs(
     None
 }
 
-fn find_role_ref_hover_in_docs(
+fn find_tagged_ref_hover_in_docs(
     docs: &HashMap<Url, String>,
     keyword: &str,
     name: &str,
@@ -553,16 +595,10 @@ fn span_to_range(span: nml_core::span::Span, source_map: &SourceMap) -> Range {
     }
 }
 
-fn find_schema_block_definition(
-    file: &File,
-    name: &str,
-    source_map: &SourceMap,
-) -> Option<Range> {
+fn find_schema_block_definition(file: &File, name: &str, source_map: &SourceMap) -> Option<Range> {
     for decl in &file.declarations {
         if let DeclarationKind::Block(block) = &decl.kind {
-            if matches!(block.keyword.name.as_str(), "model" | "enum")
-                && block.name.name == name
-            {
+            if matches!(block.keyword.name.as_str(), "model" | "enum") && block.name.name == name {
                 return Some(span_to_range(block.name.span, source_map));
             }
         }
@@ -595,9 +631,7 @@ fn find_field_definition_in_model(
 ) -> Option<Range> {
     for decl in &file.declarations {
         if let DeclarationKind::Block(block) = &decl.kind {
-            if block.keyword.name.as_str() == "model"
-                && block.name.name == model_name
-            {
+            if block.keyword.name.as_str() == "model" && block.name.name == model_name {
                 for entry in &block.body.entries {
                     if let BodyEntryKind::FieldDefinition(fd) = &entry.kind {
                         if fd.name.name == name {
@@ -963,12 +997,7 @@ fn find_references_in_source(source: &str, name: &str, source_map: &SourceMap) -
     ranges
 }
 
-fn collect_references(
-    file: &File,
-    name: &str,
-    source_map: &SourceMap,
-    ranges: &mut Vec<Range>,
-) {
+fn collect_references(file: &File, name: &str, source_map: &SourceMap, ranges: &mut Vec<Range>) {
     for decl in &file.declarations {
         match &decl.kind {
             DeclarationKind::Block(block) => {
@@ -1102,9 +1131,6 @@ fn format_field_type(field_type: &FieldType) -> String {
         FieldType::List(inner) => format!("[]{}", format_field_type(inner)),
         FieldType::ModelRef(name) => name.clone(),
         FieldType::Modifier(name) => format!("|{}", name),
-        FieldType::RefOnly(inner) => format!("&{}", format_field_type(inner)),
-        FieldType::InlineObject(_) => "object".to_string(),
-        FieldType::SharedProperty(_) => "shared".to_string(),
         FieldType::Union(variants) => {
             let names: Vec<_> = variants.iter().map(|v| format_field_type(v)).collect();
             format!("({})", names.join(" | "))
@@ -1114,11 +1140,7 @@ fn format_field_type(field_type: &FieldType) -> String {
 
 /// Determine if the cursor is in a value position for a ModelRef field.
 /// Returns the target model name (e.g. "step", "tool") if applicable.
-fn find_model_ref_type_at(
-    source: &str,
-    pos: Position,
-    models: &[ModelDef],
-) -> Option<String> {
+fn find_model_ref_type_at(source: &str, pos: Position, models: &[ModelDef]) -> Option<String> {
     let lines: Vec<&str> = source.lines().collect();
     let line = lines.get(pos.line as usize)?;
     let end = (pos.character as usize).min(line.len());
@@ -1224,52 +1246,23 @@ fn format_value(value: &Value) -> String {
     }
 }
 
-enum TemplateCompletionContext {
-    Namespace,
-    StepName(Vec<String>),
-}
-
-fn detect_template_context(before_cursor: &str, source: &str) -> Option<TemplateCompletionContext> {
-    let last_open = before_cursor.rfind("{{")?;
-    let after_open = &before_cursor[last_open + 2..];
-    if after_open.contains("}}") {
-        return None;
-    }
-    let typed = after_open.trim();
-    if typed.is_empty() {
-        return Some(TemplateCompletionContext::Namespace);
-    }
-    if typed == "steps." || typed.starts_with("steps.") && !typed[6..].contains('.') {
-        if let Ok(file) = nml_core::parse(source) {
-            let mut step_names = Vec::new();
-            for decl in &file.declarations {
-                if let DeclarationKind::Block(block) = &decl.kind {
-                    if block.keyword.name == "workflow" {
-                        for entry in &block.body.entries {
-                            if let BodyEntryKind::NestedBlock(nested) = &entry.kind {
-                                if nested.name.name == "steps" {
-                                    for step_entry in &nested.body.entries {
-                                        if let BodyEntryKind::ListItem(item) = &step_entry.kind {
-                                            if let ListItemKind::Named { name, .. } = &item.kind {
-                                                step_names.push(name.name.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if !step_names.is_empty() {
-                return Some(TemplateCompletionContext::StepName(step_names));
-            }
+fn is_template_namespace_position(before_cursor: &str) -> bool {
+    if let Some(last_open) = before_cursor.rfind("{{") {
+        let after_open = &before_cursor[last_open + 2..];
+        if after_open.contains("}}") {
+            return false;
         }
+        after_open.trim().is_empty()
+    } else {
+        false
     }
-    None
 }
 
-fn detect_template_hover(line: &str, col: usize) -> Option<String> {
+fn detect_template_hover(
+    line: &str,
+    col: usize,
+    ext: Option<&dyn LanguageExtension>,
+) -> Option<String> {
     let bytes = line.as_bytes();
     let mut start = None;
     let mut i = col.min(line.len());
@@ -1293,45 +1286,7 @@ fn detect_template_hover(line: &str, col: usize) -> Option<String> {
         (parts[0], "")
     };
 
-    let hover = match namespace {
-        "args" => {
-            if path_str.is_empty() {
-                "**args** -- LLM tool call arguments".to_string()
-            } else {
-                format!("**args.{path_str}** -- Tool argument `{path_str}` (resolved from LLM tool call)")
-            }
-        }
-        "steps" => {
-            let step_parts: Vec<&str> = path_str.splitn(2, '.').collect();
-            if step_parts.len() == 2 {
-                format!(
-                    "**steps.{}** -- Output field `{}` from step `{}`",
-                    path_str, step_parts[1], step_parts[0]
-                )
-            } else if !path_str.is_empty() {
-                format!("**steps.{path_str}** -- Output of step `{path_str}`")
-            } else {
-                "**steps** -- Workflow step outputs".to_string()
-            }
-        }
-        "input" => {
-            if path_str.is_empty() {
-                "**input** -- Workflow input data".to_string()
-            } else {
-                format!("**input.{path_str}** -- Workflow input field `{path_str}`")
-            }
-        }
-        "artifacts" => {
-            if path_str.is_empty() {
-                "**artifacts** -- Workflow artifacts".to_string()
-            } else {
-                format!("**artifacts.{path_str}** -- Workflow artifact `{path_str}`")
-            }
-        }
-        _ => return None,
-    };
-
-    Some(hover)
+    ext?.template_hover(namespace, path_str)
 }
 
 // ── On-type indent computation ───────────────────────────────
@@ -1432,12 +1387,10 @@ impl LanguageServer for NmlLanguageServer {
                     work_done_progress_options: Default::default(),
                 })),
                 document_formatting_provider: Some(OneOf::Left(true)),
-                document_on_type_formatting_provider: Some(
-                    DocumentOnTypeFormattingOptions {
-                        first_trigger_character: "\n".to_string(),
-                        more_trigger_character: None,
-                    },
-                ),
+                document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
+                    first_trigger_character: "\n".to_string(),
+                    more_trigger_character: None,
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -1535,10 +1488,7 @@ impl LanguageServer for NmlLanguageServer {
         let uri = params.text_document_position.text_document.uri;
 
         let is_value_position = {
-            let docs = self
-                .documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             docs.get(&uri)
                 .and_then(|source| {
                     let lines: Vec<&str> = source.lines().collect();
@@ -1551,49 +1501,35 @@ impl LanguageServer for NmlLanguageServer {
 
         if is_value_position {
             let template_context = {
-                let docs = self
-                    .documents
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
                 docs.get(&uri).and_then(|source| {
                     let lines: Vec<&str> = source.lines().collect();
                     let line = lines.get(pos.line as usize)?;
                     let end = (pos.character as usize).min(line.len());
                     let before_cursor = &line[..end];
-                    detect_template_context(before_cursor, source)
+                    if is_template_namespace_position(before_cursor) {
+                        Some(true)
+                    } else {
+                        None
+                    }
                 })
             };
 
-            if let Some(ctx) = template_context {
-                match ctx {
-                    TemplateCompletionContext::Namespace => {
-                        let namespaces: Vec<String> = {
-                            let pc = self.project_config.lock().unwrap_or_else(|e| e.into_inner());
-                            if pc.template_namespaces.is_empty() {
-                                nml_core::template::VALID_NAMESPACES.iter().map(|s| s.to_string()).collect()
-                            } else {
-                                pc.template_namespaces.clone()
-                            }
-                        };
-                        for ns in &namespaces {
-                            items.push(CompletionItem {
-                                label: format!("{ns}."),
-                                kind: Some(CompletionItemKind::MODULE),
-                                detail: Some("template namespace".to_string()),
-                                ..Default::default()
-                            });
-                        }
-                    }
-                    TemplateCompletionContext::StepName(step_names) => {
-                        for name in step_names {
-                            items.push(CompletionItem {
-                                label: format!("{name}."),
-                                kind: Some(CompletionItemKind::FIELD),
-                                detail: Some("workflow step".to_string()),
-                                ..Default::default()
-                            });
-                        }
-                    }
+            if template_context.is_some() {
+                let namespaces: Vec<String> = {
+                    let pc = self
+                        .project_config
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    pc.template_namespaces.clone()
+                };
+                for ns in &namespaces {
+                    items.push(CompletionItem {
+                        label: format!("{ns}."),
+                        kind: Some(CompletionItemKind::MODULE),
+                        detail: Some("template namespace".to_string()),
+                        ..Default::default()
+                    });
                 }
                 return Ok(Some(CompletionResponse::Array(items)));
             }
@@ -1645,7 +1581,10 @@ impl LanguageServer for NmlLanguageServer {
             let mut seen: HashSet<String> =
                 language_keywords.iter().map(|s| s.to_string()).collect();
 
-            let pc = self.project_config.lock().unwrap_or_else(|e| e.into_inner());
+            let pc = self
+                .project_config
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for kw in &pc.keywords {
                 if seen.insert(kw.clone()) {
                     items.push(CompletionItem {
@@ -1689,43 +1628,32 @@ impl LanguageServer for NmlLanguageServer {
             });
         }
 
-        let built_in_roles = [
-            ("@public", "Built-in: allows access without authentication"),
-            ("@authenticated", "Built-in: requires authenticated user"),
-        ];
-        for (role, desc) in built_in_roles {
-            items.push(CompletionItem {
-                label: role.to_string(),
-                kind: Some(CompletionItemKind::CONSTANT),
-                detail: Some(desc.to_string()),
-                ..Default::default()
-            });
+        if let Some(ext) = &self.language_extension {
+            for (label, desc) in ext.builtin_reference_completions() {
+                items.push(CompletionItem {
+                    label,
+                    kind: Some(CompletionItemKind::CONSTANT),
+                    detail: Some(desc),
+                    ..Default::default()
+                });
+            }
         }
 
-        items.push(CompletionItem {
-            label: "@user/".to_string(),
-            kind: Some(CompletionItemKind::REFERENCE),
-            detail: Some("user identity ref".to_string()),
-            ..Default::default()
-        });
-
         {
+            let member_kws = &self.membership.member_keywords;
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-            let mut seen_roles = HashSet::new();
+            let mut seen_refs = HashSet::new();
             for source in docs.values() {
                 if let Ok(file) = nml_core::parse(source) {
                     for decl in &file.declarations {
                         if let DeclarationKind::Block(block) = &decl.kind {
                             let kw = &block.keyword.name;
                             let name = &block.name.name;
-                            let is_role_like = kw == "role"
-                                || block
-                                    .extends
-                                    .iter()
-                                    .any(|e| e.name == "role");
-                            if is_role_like {
+                            let is_tagged = member_kws.iter().any(|mk| mk == kw)
+                                || block.extends.iter().any(|e| member_kws.iter().any(|mk| mk == &e.name));
+                            if is_tagged {
                                 let label = format!("@{kw}/{name}");
-                                if seen_roles.insert(label.clone()) {
+                                if seen_refs.insert(label.clone()) {
                                     items.push(CompletionItem {
                                         label,
                                         kind: Some(CompletionItemKind::ENUM_MEMBER),
@@ -1740,29 +1668,6 @@ impl LanguageServer for NmlLanguageServer {
             }
         }
 
-        let constraints = [
-            "unique",
-            "secret",
-            "token",
-            "distinct",
-            "shorthand",
-            "integer",
-            "min",
-            "max",
-            "minLength",
-            "maxLength",
-            "pattern",
-            "currency",
-        ];
-        for c in constraints {
-            items.push(CompletionItem {
-                label: c.to_string(),
-                kind: Some(CompletionItemKind::PROPERTY),
-                detail: Some("constraint".to_string()),
-                ..Default::default()
-            });
-        }
-
         Ok(Some(CompletionResponse::Array(items)))
     }
 
@@ -1771,10 +1676,7 @@ impl LanguageServer for NmlLanguageServer {
         let pos = params.text_document_position_params.position;
 
         let source_clone = {
-            let docs = self
-                .documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             match docs.get(&uri) {
                 Some(s) => s.clone(),
                 None => return Ok(None),
@@ -1786,7 +1688,11 @@ impl LanguageServer for NmlLanguageServer {
             return Ok(None);
         };
 
-        if let Some(template_hover) = detect_template_hover(line, pos.character as usize) {
+        if let Some(template_hover) = detect_template_hover(
+            line,
+            pos.character as usize,
+            self.language_extension.as_deref(),
+        ) {
             return Ok(Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
@@ -1799,21 +1705,19 @@ impl LanguageServer for NmlLanguageServer {
         let word = extract_word_at(line, pos.character as usize);
 
         if word.starts_with('@') {
-            let hover_text = match word.as_str() {
-                "@public" => Some("**@public** -- Built-in: allows access without authentication".to_string()),
-                "@authenticated" => Some("**@authenticated** -- Built-in: requires authenticated user".to_string()),
-                _ => {
-                    if let Some(stripped) = word.strip_prefix('@') {
-                        if let Some((keyword, name)) = stripped.split_once('/') {
-                            self.find_role_ref_hover(keyword, name)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                }
-            };
+            let hover_text = if let Some(ext) = &self.language_extension {
+                ext.builtin_reference_completions()
+                    .iter()
+                    .find(|(label, _)| label == &word)
+                    .map(|(label, desc)| format!("**{label}** -- {desc}"))
+            } else {
+                None
+            }
+            .or_else(|| {
+                let stripped = word.strip_prefix('@')?;
+                let (keyword, name) = stripped.split_once('/')?;
+                self.find_tagged_ref_hover(keyword, name)
+            });
             if let Some(text) = hover_text {
                 return Ok(Some(Hover {
                     contents: HoverContents::Markup(MarkupContent {
@@ -1857,24 +1761,16 @@ impl LanguageServer for NmlLanguageServer {
         if !is_prop {
             let builtin_info = match word.as_str() {
                 "string" => Some("**string** -- Quoted text value"),
-                "number" => {
-                    Some("**number** -- General-purpose numeric (integer or decimal)")
+                "number" => Some("**number** -- General-purpose numeric (integer or decimal)"),
+                "money" => {
+                    Some("**money** -- Exact currency value with ISO 4217 code (e.g., `19.99 USD`)")
                 }
-                "money" => Some(
-                    "**money** -- Exact currency value with ISO 4217 code (e.g., `19.99 USD`)",
-                ),
                 "bool" => Some("**bool** -- Boolean value (`true` or `false`)"),
-                "duration" => {
-                    Some("**duration** -- Time duration (e.g., `\"72h\"`, `\"30s\"`)")
-                }
+                "duration" => Some("**duration** -- Time duration (e.g., `\"72h\"`, `\"30s\"`)"),
                 "path" => Some("**path** -- URL path with variables and wildcards"),
-                "secret" => {
-                    Some("**secret** -- Value resolved from environment (`$ENV.X`)")
-                }
+                "secret" => Some("**secret** -- Value resolved from environment (`$ENV.X`)"),
                 "model" => Some("**model** -- Define a custom object type"),
-                "enum" => {
-                    Some("**enum** -- Define a restricted set of allowed values")
-                }
+                "enum" => Some("**enum** -- Define a restricted set of allowed values"),
                 _ => None,
             };
 
@@ -1897,21 +1793,14 @@ impl LanguageServer for NmlLanguageServer {
                 None
             };
 
-            let docs = self
-                .documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             for (doc_uri, source) in docs.iter() {
                 if let Ok(file) = nml_core::parse(source) {
                     for decl in &file.declarations {
                         let (kw, decl_name, body_summary) = match &decl.kind {
                             DeclarationKind::Block(block) if block.name.name == word => {
                                 let summary = summarize_body(&block.body);
-                                (
-                                    block.keyword.name.clone(),
-                                    block.name.name.clone(),
-                                    summary,
-                                )
+                                (block.keyword.name.clone(), block.name.name.clone(), summary)
                             }
                             DeclarationKind::Array(arr) if arr.name.name == word => (
                                 format!("[]{}", arr.item_keyword.name),
@@ -1967,10 +1856,7 @@ impl LanguageServer for NmlLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
 
         let (word, enclosing_keyword, is_prop) = {
-            let docs = self
-                .documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             let Some(source) = docs.get(&uri) else {
                 return Ok(None);
             };
@@ -1996,7 +1882,7 @@ impl LanguageServer for NmlLanguageServer {
         }
 
         if word.starts_with('@') {
-            if let Some(result) = self.find_role_ref_definition(&word) {
+            if let Some(result) = self.find_tagged_ref_definition(&word) {
                 return Ok(Some(GotoDefinitionResponse::Scalar(result)));
             }
             return Ok(None);
@@ -2015,7 +1901,9 @@ impl LanguageServer for NmlLanguageServer {
             }
         }
 
-        if let Some((target_uri, range)) = self.find_definition(&word, &uri, enclosing_keyword.as_deref()) {
+        if let Some((target_uri, range)) =
+            self.find_definition(&word, &uri, enclosing_keyword.as_deref())
+        {
             Ok(Some(GotoDefinitionResponse::Scalar(Location {
                 uri: target_uri,
                 range,
@@ -2030,10 +1918,7 @@ impl LanguageServer for NmlLanguageServer {
         let uri = params.text_document_position.text_document.uri;
 
         let word = {
-            let docs = self
-                .documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             let Some(source) = docs.get(&uri) else {
                 return Ok(None);
             };
@@ -2078,10 +1963,7 @@ impl LanguageServer for NmlLanguageServer {
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
         let source_clone = {
-            let docs = self
-                .documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             match docs.get(&uri) {
                 Some(s) => s.clone(),
                 None => return Ok(None),
@@ -2106,10 +1988,7 @@ impl LanguageServer for NmlLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
 
         let (word, source_clone) = {
-            let docs = self
-                .documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             let Some(source) = docs.get(&uri) else {
                 return Ok(None);
             };
@@ -2144,16 +2023,10 @@ impl LanguageServer for NmlLanguageServer {
         }
     }
 
-    async fn formatting(
-        &self,
-        params: DocumentFormattingParams,
-    ) -> Result<Option<Vec<TextEdit>>> {
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
         let uri = params.text_document.uri;
         let source_clone = {
-            let docs = self
-                .documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             match docs.get(&uri) {
                 Some(s) => s.clone(),
                 None => return Ok(None),
@@ -2199,10 +2072,7 @@ impl LanguageServer for NmlLanguageServer {
         let pos = params.text_document_position.position;
 
         let source = {
-            let docs = self
-                .documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             match docs.get(&uri) {
                 Some(s) => s.clone(),
                 None => return Ok(None),
@@ -2250,10 +2120,7 @@ impl LanguageServer for NmlLanguageServer {
         let new_name = params.new_name;
 
         let word = {
-            let docs = self
-                .documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             let Some(source) = docs.get(&uri) else {
                 return Ok(None);
             };
@@ -2308,10 +2175,7 @@ impl LanguageServer for NmlLanguageServer {
         let pos = params.position;
         let uri = params.text_document.uri;
 
-        let docs = self
-            .documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         let Some(source) = docs.get(&uri) else {
             return Ok(None);
         };
@@ -2727,13 +2591,15 @@ mod tests {
             "pipeline P:\n    transport = TelnyxCall\n".to_string(),
         );
 
-        let result =
-            find_definition_in_docs(&docs, "transport", &current, Some("pipeline"));
+        let result = find_definition_in_docs(&docs, "transport", &current, Some("pipeline"));
         assert!(result.is_some());
         let (uri, range) = result.unwrap();
         assert_eq!(uri, model_uri);
         // Should resolve to transport in model pipeline (line 4), not model mount (line 1)
-        assert_eq!(range.start.line, 4, "should resolve to pipeline's transport field");
+        assert_eq!(
+            range.start.line, 4,
+            "should resolve to pipeline's transport field"
+        );
     }
 
     #[test]
@@ -2756,8 +2622,7 @@ mod tests {
             "pipeline P:\n    transport = TelnyxCall\n".to_string(),
         );
 
-        let result =
-            find_definition_in_docs(&docs, "transport", &current, Some("pipeline"));
+        let result = find_definition_in_docs(&docs, "transport", &current, Some("pipeline"));
         assert!(result.is_some());
         let (uri, _) = result.unwrap();
         assert_eq!(
@@ -2789,8 +2654,14 @@ mod tests {
         let result = find_definition_in_docs(&docs, "provider", &current, Some("provider"));
         assert!(result.is_some());
         let (uri, range) = result.unwrap();
-        assert_eq!(uri, model_uri, "should resolve to model definition, not to a field");
-        assert_eq!(range.start.line, 3, "should point to 'model provider:' declaration");
+        assert_eq!(
+            uri, model_uri,
+            "should resolve to model definition, not to a field"
+        );
+        assert_eq!(
+            range.start.line, 3,
+            "should point to 'model provider:' declaration"
+        );
     }
 
     #[test]
@@ -2801,7 +2672,11 @@ mod tests {
 
         let result = find_schema_block_definition(&file, "workflow", &source_map);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().start.line, 3, "should find model workflow on line 3");
+        assert_eq!(
+            result.unwrap().start.line,
+            3,
+            "should find model workflow on line 3"
+        );
     }
 
     #[test]
@@ -2843,7 +2718,8 @@ mod tests {
         );
         docs.insert(
             workflow_model.clone(),
-            "model workflow:\n    entrypoint string\n\nmodel provider:\n    type string\n".to_string(),
+            "model workflow:\n    entrypoint string\n\nmodel provider:\n    type string\n"
+                .to_string(),
         );
         docs.insert(
             current.clone(),
@@ -2855,21 +2731,31 @@ mod tests {
         assert!(result.is_some());
         let (uri, _) = result.unwrap();
         // Must NOT go to "workflow string?" in model mount (config.model.nml)
-        assert_ne!(uri, config_model, "should not resolve to field 'workflow' in model mount");
+        assert_ne!(
+            uri, config_model,
+            "should not resolve to field 'workflow' in model mount"
+        );
 
         // "provider" with enclosing_keyword="provider" should skip field lookups
         let result = find_definition_in_docs(&docs, "provider", &current, Some("provider"));
         assert!(result.is_some());
         let (uri, _) = result.unwrap();
         // Must NOT go to "provider string" in model auth (server.model.nml)
-        assert_ne!(uri, server_model, "should not resolve to field 'provider' in model auth");
+        assert_ne!(
+            uri, server_model,
+            "should not resolve to field 'provider' in model auth"
+        );
     }
 
     // ── is_property_name_position ─────────────────────────────
 
     #[test]
     fn property_position_before_equals() {
-        assert!(is_property_name_position("    model = \"llama\"", "model", 6));
+        assert!(is_property_name_position(
+            "    model = \"llama\"",
+            "model",
+            6
+        ));
     }
 
     #[test]
@@ -2879,17 +2765,29 @@ mod tests {
 
     #[test]
     fn not_property_position_keyword() {
-        assert!(!is_property_name_position("workflow VoiceAgent:", "workflow", 3));
+        assert!(!is_property_name_position(
+            "workflow VoiceAgent:",
+            "workflow",
+            3
+        ));
     }
 
     #[test]
     fn not_property_position_value() {
-        assert!(!is_property_name_position("    transport = TelnyxCall", "TelnyxCall", 18));
+        assert!(!is_property_name_position(
+            "    transport = TelnyxCall",
+            "TelnyxCall",
+            18
+        ));
     }
 
     #[test]
     fn not_property_position_top_level_block() {
-        assert!(!is_property_name_position("provider GroqFast:", "provider", 3));
+        assert!(!is_property_name_position(
+            "provider GroqFast:",
+            "provider",
+            3
+        ));
     }
 
     // ── find_enclosing_block_keyword ─────────────────────────────
@@ -2918,12 +2816,20 @@ workflow VoiceAgent:
         // "workflow" keyword is on line 11 (0-indexed)
         let pos = Position::new(11, 3);
         let result = find_enclosing_block_keyword(&file, pos, &source_map);
-        assert_eq!(result, Some("workflow".to_string()), "cursor on 'workflow' should return 'workflow'");
+        assert_eq!(
+            result,
+            Some("workflow".to_string()),
+            "cursor on 'workflow' should return 'workflow'"
+        );
 
         // "provider" keyword is on line 5 (0-indexed)
         let pos = Position::new(5, 3);
         let result = find_enclosing_block_keyword(&file, pos, &source_map);
-        assert_eq!(result, Some("provider".to_string()), "cursor on 'provider' should return 'provider'");
+        assert_eq!(
+            result,
+            Some("provider".to_string()),
+            "cursor on 'provider' should return 'provider'"
+        );
     }
 
     #[test]
@@ -2956,7 +2862,11 @@ workflow VoiceAgent:
         // "tool" keyword is on line 9 (0-indexed) - must return "tool" not "workflow" or "stage"
         let pos = Position::new(9, 3);
         let result = find_enclosing_block_keyword(&file, pos, &source_map);
-        assert_eq!(result, Some("tool".to_string()), "cursor on 'tool' in tool DialViaTelnyx: should return 'tool'");
+        assert_eq!(
+            result,
+            Some("tool".to_string()),
+            "cursor on 'tool' in tool DialViaTelnyx: should return 'tool'"
+        );
     }
 
     #[test]
@@ -2990,14 +2900,12 @@ workflow VoiceAgent:
                 "model tool:\n",
                 "    wasm string?\n",
                 "    pipeline string?\n",
-            ).to_string(),
+            )
+            .to_string(),
         );
         docs.insert(
             current.clone(),
-            concat!(
-                "tool DialViaTelnyx:\n",
-                "    pipeline = TelnyxVoice\n",
-            ).to_string(),
+            concat!("tool DialViaTelnyx:\n", "    pipeline = TelnyxVoice\n",).to_string(),
         );
 
         // Clicking on "tool" in "tool DialViaTelnyx:" should go to model tool: (line 5),
@@ -3006,7 +2914,10 @@ workflow VoiceAgent:
         assert!(result.is_some());
         let (uri, range) = result.unwrap();
         assert_eq!(uri, model_uri);
-        assert_eq!(range.start.line, 5, "should point to model tool:, not tool string? field");
+        assert_eq!(
+            range.start.line, 5,
+            "should point to model tool:, not tool string? field"
+        );
     }
 
     #[test]
@@ -3028,7 +2939,8 @@ workflow VoiceAgent:
                 "model workflow:\n",
                 "    entrypoint string\n",
                 "    steps []step\n",
-            ).to_string(),
+            )
+            .to_string(),
         );
         docs.insert(
             current.clone(),
@@ -3038,7 +2950,8 @@ workflow VoiceAgent:
                 "\n",
                 "workflow VoiceAgent:\n",
                 "    entrypoint = \"conversation\"\n",
-            ).to_string(),
+            )
+            .to_string(),
         );
 
         // Test 1: "workflow" with enclosing="workflow" (cursor on keyword)
@@ -3049,9 +2962,15 @@ workflow VoiceAgent:
             let file = nml_core::parse(source).unwrap();
             let source_map = SourceMap::new(source);
             let result = find_schema_block_definition(&file, "workflow", &source_map);
-            assert!(result.is_some(), "find_schema_block_definition should find model workflow:");
+            assert!(
+                result.is_some(),
+                "find_schema_block_definition should find model workflow:"
+            );
             let range = result.unwrap();
-            assert_eq!(range.start.line, 7, "model workflow: is on line 7 (0-indexed)");
+            assert_eq!(
+                range.start.line, 7,
+                "model workflow: is on line 7 (0-indexed)"
+            );
         }
 
         // Test 2: "provider" with enclosing="provider" (cursor on keyword)
@@ -3060,9 +2979,15 @@ workflow VoiceAgent:
             let file = nml_core::parse(source).unwrap();
             let source_map = SourceMap::new(source);
             let result = find_schema_block_definition(&file, "provider", &source_map);
-            assert!(result.is_some(), "find_schema_block_definition should find model provider:");
+            assert!(
+                result.is_some(),
+                "find_schema_block_definition should find model provider:"
+            );
             let range = result.unwrap();
-            assert_eq!(range.start.line, 0, "model provider: is on line 0 (0-indexed)");
+            assert_eq!(
+                range.start.line, 0,
+                "model provider: is on line 0 (0-indexed)"
+            );
         }
 
         // Test 3: find_definition_in_docs with is_on_keyword=true should NOT return field definitions
@@ -3118,10 +3043,7 @@ workflow VoiceAgent:
 
     #[test]
     fn indent_after_nested_block_colon() {
-        let lines = vec![
-            "        - router:",
-            "            routes:",
-        ];
+        let lines = vec!["        - router:", "            routes:"];
         assert_eq!(compute_indent_after_line(&lines, 1), 16);
     }
 
@@ -3136,10 +3058,7 @@ workflow VoiceAgent:
 
     #[test]
     fn indent_after_scalar_list_item() {
-        let lines = vec![
-            "enum providerType:",
-            "    - \"anthropic\"",
-        ];
+        let lines = vec!["enum providerType:", "    - \"anthropic\""];
         assert_eq!(compute_indent_after_line(&lines, 1), 4);
     }
 
@@ -3208,7 +3127,8 @@ workflow VoiceAgent:
                 "\n",
                 "step respond:\n",
                 "    provider = \"openai\"\n",
-            ).to_string(),
+            )
+            .to_string(),
         );
 
         let results = collect_declarations_by_keyword(&docs, "step");
@@ -3229,7 +3149,8 @@ workflow VoiceAgent:
                 "\n",
                 "provider Groq:\n",
                 "    type = \"groq\"\n",
-            ).to_string(),
+            )
+            .to_string(),
         );
 
         let results = collect_declarations_by_keyword(&docs, "step");
@@ -3263,7 +3184,7 @@ workflow VoiceAgent:
             "role admin:\n    description = \"Full admin\"\n".to_string(),
         );
 
-        let result = find_role_ref_definition_in_docs(&docs, "@role/admin");
+        let result = find_tagged_ref_definition_in_docs(&docs, "@role/admin");
         assert!(result.is_some(), "should find role admin definition");
         assert_eq!(result.unwrap().uri, uri);
     }
@@ -3277,7 +3198,7 @@ workflow VoiceAgent:
             "plan Pro:\n    description = \"Pro tier\"\n".to_string(),
         );
 
-        let result = find_role_ref_definition_in_docs(&docs, "@plan/Pro");
+        let result = find_tagged_ref_definition_in_docs(&docs, "@plan/Pro");
         assert!(result.is_some(), "should find plan Pro definition");
         assert_eq!(result.unwrap().uri, uri);
     }
@@ -3285,8 +3206,8 @@ workflow VoiceAgent:
     #[test]
     fn definition_role_ref_builtin_returns_none() {
         let docs = HashMap::new();
-        assert!(find_role_ref_definition_in_docs(&docs, "@public").is_none());
-        assert!(find_role_ref_definition_in_docs(&docs, "@authenticated").is_none());
+        assert!(find_tagged_ref_definition_in_docs(&docs, "@public").is_none());
+        assert!(find_tagged_ref_definition_in_docs(&docs, "@authenticated").is_none());
     }
 
     #[test]
@@ -3296,7 +3217,7 @@ workflow VoiceAgent:
             make_uri("nudge.nml"),
             "role admin:\n    description = \"Admin\"\n".to_string(),
         );
-        assert!(find_role_ref_definition_in_docs(&docs, "@role/nonexistent").is_none());
+        assert!(find_tagged_ref_definition_in_docs(&docs, "@role/nonexistent").is_none());
     }
 
     // ── Role ref hover ───────────────────────────────────────────
@@ -3309,12 +3230,21 @@ workflow VoiceAgent:
             "role admin:\n    description = \"Full administrative access\"\n".to_string(),
         );
 
-        let result = find_role_ref_hover_in_docs(&docs, "role", "admin");
+        let result = find_tagged_ref_hover_in_docs(&docs, "role", "admin");
         assert!(result.is_some());
         let text = result.unwrap();
-        assert!(text.contains("**role** `admin`"), "should contain role name");
-        assert!(text.contains("Full administrative access"), "should contain description");
-        assert!(text.contains("Source: nudge.nml"), "should contain source file");
+        assert!(
+            text.contains("**role** `admin`"),
+            "should contain role name"
+        );
+        assert!(
+            text.contains("Full administrative access"),
+            "should contain description"
+        );
+        assert!(
+            text.contains("Source: nudge.nml"),
+            "should contain source file"
+        );
     }
 
     #[test]
@@ -3325,7 +3255,7 @@ workflow VoiceAgent:
             "role editor:\n    label = \"Editor\"\n".to_string(),
         );
 
-        let result = find_role_ref_hover_in_docs(&docs, "role", "editor");
+        let result = find_tagged_ref_hover_in_docs(&docs, "role", "editor");
         assert!(result.is_some());
         let text = result.unwrap();
         assert!(text.contains("**role** `editor`"));
@@ -3335,7 +3265,7 @@ workflow VoiceAgent:
     #[test]
     fn hover_role_ref_nonexistent() {
         let docs = HashMap::new();
-        assert!(find_role_ref_hover_in_docs(&docs, "role", "ghost").is_none());
+        assert!(find_tagged_ref_hover_in_docs(&docs, "role", "ghost").is_none());
     }
 
     // ── Role ref completion via collect_declarations_by_keyword ───
@@ -3379,6 +3309,9 @@ workflow VoiceAgent:
         let roles = collect_declarations_by_keyword(&docs, "role");
         let role_names: Vec<&str> = roles.iter().map(|(n, _, _)| n.as_str()).collect();
         assert!(role_names.contains(&"admin"));
-        assert!(!role_names.contains(&"classify"), "steps should not appear in role results");
+        assert!(
+            !role_names.contains(&"classify"),
+            "steps should not appear in role results"
+        );
     }
 }

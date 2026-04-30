@@ -85,7 +85,10 @@ fn f64_to_u32(n: f64) -> Result<u32, Error> {
         return Err(Error(format!("u32 value {} has a fractional part", n)));
     }
     if n < 0.0 || n > u32::MAX as f64 {
-        return Err(Error(format!("u32 value {} out of range (0..=4294967295)", n)));
+        return Err(Error(format!(
+            "u32 value {} out of range (0..=4294967295)",
+            n
+        )));
     }
     Ok(n as u32)
 }
@@ -95,7 +98,11 @@ fn f64_to_u64(n: f64) -> Result<u64, Error> {
         return Err(Error(format!("u64 value {} has a fractional part", n)));
     }
     if n < 0.0 || n > u64::MAX as f64 {
-        return Err(Error(format!("u64 value {} out of range (0..={})", n, u64::MAX)));
+        return Err(Error(format!(
+            "u64 value {} out of range (0..={})",
+            n,
+            u64::MAX
+        )));
     }
     Ok(n as u64)
 }
@@ -115,7 +122,10 @@ fn f64_to_i16(n: f64) -> Result<i16, Error> {
         return Err(Error(format!("i16 value {} has a fractional part", n)));
     }
     if n < i16::MIN as f64 || n > i16::MAX as f64 {
-        return Err(Error(format!("i16 value {} out of range (-32768..=32767)", n)));
+        return Err(Error(format!(
+            "i16 value {} out of range (-32768..=32767)",
+            n
+        )));
     }
     Ok(n as i16)
 }
@@ -125,7 +135,10 @@ fn f64_to_i32(n: f64) -> Result<i32, Error> {
         return Err(Error(format!("i32 value {} has a fractional part", n)));
     }
     if n < i32::MIN as f64 || n > i32::MAX as f64 {
-        return Err(Error(format!("i32 value {} out of range (-2147483648..=2147483647)", n)));
+        return Err(Error(format!(
+            "i32 value {} out of range (-2147483648..=2147483647)",
+            n
+        )));
     }
     Ok(n as i32)
 }
@@ -135,7 +148,12 @@ fn f64_to_i64(n: f64) -> Result<i64, Error> {
         return Err(Error(format!("i64 value {} has a fractional part", n)));
     }
     if n < i64::MIN as f64 || n > i64::MAX as f64 {
-        return Err(Error(format!("i64 value {} out of range ({}..={})", n, i64::MIN, i64::MAX)));
+        return Err(Error(format!(
+            "i64 value {} out of range ({}..={})",
+            n,
+            i64::MIN,
+            i64::MAX
+        )));
     }
     Ok(n as i64)
 }
@@ -226,9 +244,7 @@ fn collect_body_map_entries<'a>(body: &'a Body) -> Vec<BodyMapEntry<'a>> {
                 Some(BodyMapEntry::Block(&nb.body, nb.name.name.as_str()))
             }
             BodyEntryKind::SharedProperty(sp) => match &sp.kind {
-                SharedPropertyKind::Block(b) => {
-                    Some(BodyMapEntry::Block(b, sp.name.name.as_str()))
-                }
+                SharedPropertyKind::Block(b) => Some(BodyMapEntry::Block(b, sp.name.name.as_str())),
                 SharedPropertyKind::Scalar(sv) => Some(BodyMapEntry::SharedScalar {
                     key: sp.name.name.as_str(),
                     value: sv,
@@ -273,9 +289,7 @@ impl<'de> MapAccess<'de> for BodyMapAccess<'de> {
             BodyMapEntry::Property(prop) => seed.deserialize(ValueDeserializer {
                 value: &prop.value.value,
             }),
-            BodyMapEntry::Block(body, _) => {
-                seed.deserialize(NestedBlockDeserializer { body })
-            }
+            BodyMapEntry::Block(body, _) => seed.deserialize(NestedBlockDeserializer { body }),
             BodyMapEntry::SharedScalar { value, .. } => seed.deserialize(ValueDeserializer {
                 value: &value.value,
             }),
@@ -372,17 +386,14 @@ impl<'de> SeqAccess<'de> for ListItemSeqAccess<'de> {
         self.index += 1;
 
         match &item.kind {
-            ListItemKind::Named { name, body } => {
-                seed.deserialize(NamedItemDeserializer {
+            ListItemKind::Named { name, body } => seed
+                .deserialize(NamedItemDeserializer {
                     label: &name.name,
                     body,
                 })
-                .map(Some)
-            }
+                .map(Some),
             ListItemKind::Shorthand(val) => seed
-                .deserialize(ValueDeserializer {
-                    value: &val.value,
-                })
+                .deserialize(ValueDeserializer { value: &val.value })
                 .map(Some),
             ListItemKind::Reference(ident) => seed
                 .deserialize(de::value::StrDeserializer::<Error>::new(&ident.name))
@@ -411,10 +422,12 @@ impl<'de> de::Deserializer<'de> for NamedItemDeserializer<'de> {
     }
 
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        let has_explicit_name = self.body.entries.iter().any(|e| matches!(
-            &e.kind,
-            BodyEntryKind::Property(p) if p.name.name == "name"
-        ));
+        let has_explicit_name = self.body.entries.iter().any(|e| {
+            matches!(
+                &e.kind,
+                BodyEntryKind::Property(p) if p.name.name == "name"
+            )
+        });
 
         let body_entries = collect_body_map_entries(self.body);
 
@@ -501,9 +514,7 @@ impl<'de> MapAccess<'de> for NamedItemMapAccess<'de> {
             BodyMapEntry::Property(prop) => seed.deserialize(ValueDeserializer {
                 value: &prop.value.value,
             }),
-            BodyMapEntry::Block(body, _) => {
-                seed.deserialize(NestedBlockDeserializer { body })
-            }
+            BodyMapEntry::Block(body, _) => seed.deserialize(NestedBlockDeserializer { body }),
             BodyMapEntry::SharedScalar { value, .. } => seed.deserialize(ValueDeserializer {
                 value: &value.value,
             }),
@@ -566,15 +577,11 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
             }
             Value::Reference(s) => visitor.visit_str(s),
             Value::Money(m) => visitor.visit_string(m.format_display()),
-            Value::Array(items) => {
-                visitor.visit_seq(ArraySeqAccess { items, index: 0 })
+            Value::Array(items) => visitor.visit_seq(ArraySeqAccess { items, index: 0 }),
+            Value::Fallback(primary, _) => ValueDeserializer {
+                value: &primary.value,
             }
-            Value::Fallback(primary, _) => {
-                ValueDeserializer {
-                    value: &primary.value,
-                }
-                .deserialize_any(visitor)
-            }
+            .deserialize_any(visitor),
         }
     }
 
@@ -724,9 +731,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::String(s) => visitor.visit_str(s),
-            Value::TemplateString(segs) => {
-                visitor.visit_string(template::segments_to_string(segs))
-            }
+            Value::TemplateString(segs) => visitor.visit_string(template::segments_to_string(segs)),
             Value::Path(s) | Value::Duration(s) | Value::Secret(s) => visitor.visit_str(s),
             Value::Reference(s) | Value::Role(s) => visitor.visit_str(s),
             Value::Money(m) => visitor.visit_string(m.format_display()),
@@ -786,10 +791,8 @@ impl<'de> SeqAccess<'de> for ArraySeqAccess<'de> {
         }
         let item = &self.items[self.index];
         self.index += 1;
-        seed.deserialize(ValueDeserializer {
-            value: &item.value,
-        })
-        .map(Some)
+        seed.deserialize(ValueDeserializer { value: &item.value })
+            .map(Some)
     }
 }
 
@@ -1128,7 +1131,10 @@ auth MyAuth:
         assert_eq!(config.provider, "oidc");
         assert_eq!(config.oidc_providers.len(), 2);
         assert_eq!(config.oidc_providers[0].name, "Google");
-        assert_eq!(config.oidc_providers[0].issuer, "https://accounts.google.com");
+        assert_eq!(
+            config.oidc_providers[0].issuer,
+            "https://accounts.google.com"
+        );
         assert_eq!(config.oidc_providers[0].client_id, "abc123");
         assert_eq!(config.oidc_providers[0].scopes, vec!["openid", "email"]);
         assert_eq!(config.oidc_providers[1].name, "GitHub");
@@ -1212,7 +1218,10 @@ auth MyAuth:
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let result: Result<Config, _> = from_block(body);
-        assert!(result.is_err(), "missing required field 'port' should error");
+        assert!(
+            result.is_err(),
+            "missing required field 'port' should error"
+        );
     }
 
     #[test]
@@ -1327,7 +1336,10 @@ auth MyAuth:
 
         let resolver = ValueResolver::env();
         let result: Result<Config, _> = from_body_resolved(body, &resolver);
-        assert!(result.is_err(), "unresolvable env var should propagate error");
+        assert!(
+            result.is_err(),
+            "unresolvable env var should propagate error"
+        );
     }
 
     #[test]
@@ -1597,7 +1609,10 @@ workflow W:
         let doc = crate::query::Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
         let result: Result<Config, _> = from_block(body);
-        assert!(result.is_err(), "fractional values should not be valid for u16");
+        assert!(
+            result.is_err(),
+            "fractional values should not be valid for u16"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("fractional"), "got: {}", msg);
     }

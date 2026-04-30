@@ -2,7 +2,7 @@
 
 **Status:** Draft (v0.1-alpha)
 
-NML (Nudge Markup Language) is an indentation-based configuration language designed for
+NML is a typed, indentation-based configuration language designed for
 defining services, access control, infrastructure, and structured data with a built-in
 type system, model definitions, and composable traits.
 

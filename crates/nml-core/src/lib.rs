@@ -1,4 +1,4 @@
-//! NML (Nudge Modeling Language) - A typed configuration language.
+//! NML -- A typed configuration language.
 //!
 //! `nml-core` provides parsing, AST representation, and value extraction
 //! for NML configuration files. It is designed to be used as a library

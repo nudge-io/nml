@@ -1,9 +1,6 @@
 use crate::span::Span;
 use crate::types::TemplateSegment;
 
-/// Known template expression namespaces.
-pub const VALID_NAMESPACES: &[&str] = &["args", "input", "steps", "artifacts", "item"];
-
 /// Parse a string containing `{{...}}` template expressions into segments.
 ///
 /// The `string_start` byte offset is the position of the opening quote in the
@@ -84,7 +81,9 @@ mod tests {
         let segs = parse_template_string("{{args.instructions}}", 0);
         assert_eq!(segs.len(), 1);
         match &segs[0] {
-            TemplateSegment::Expression { namespace, path, .. } => {
+            TemplateSegment::Expression {
+                namespace, path, ..
+            } => {
                 assert_eq!(namespace, "args");
                 assert_eq!(path, &["instructions"]);
             }
@@ -105,7 +104,9 @@ mod tests {
         assert_eq!(segs.len(), 3);
         assert!(matches!(&segs[0], TemplateSegment::Literal(s) if s == "Hello "));
         match &segs[1] {
-            TemplateSegment::Expression { namespace, path, .. } => {
+            TemplateSegment::Expression {
+                namespace, path, ..
+            } => {
                 assert_eq!(namespace, "args");
                 assert_eq!(path, &["name"]);
             }
@@ -119,7 +120,9 @@ mod tests {
         let segs = parse_template_string("{{args.a}} and {{steps.classify.intent}}", 0);
         assert_eq!(segs.len(), 3);
         match &segs[0] {
-            TemplateSegment::Expression { namespace, path, .. } => {
+            TemplateSegment::Expression {
+                namespace, path, ..
+            } => {
                 assert_eq!(namespace, "args");
                 assert_eq!(path, &["a"]);
             }
@@ -127,7 +130,9 @@ mod tests {
         }
         assert!(matches!(&segs[1], TemplateSegment::Literal(s) if s == " and "));
         match &segs[2] {
-            TemplateSegment::Expression { namespace, path, .. } => {
+            TemplateSegment::Expression {
+                namespace, path, ..
+            } => {
                 assert_eq!(namespace, "steps");
                 assert_eq!(path, &["classify", "intent"]);
             }
@@ -148,7 +153,9 @@ mod tests {
         let segs = parse_template_string("{{ args.instructions }}", 0);
         assert_eq!(segs.len(), 1);
         match &segs[0] {
-            TemplateSegment::Expression { namespace, path, .. } => {
+            TemplateSegment::Expression {
+                namespace, path, ..
+            } => {
                 assert_eq!(namespace, "args");
                 assert_eq!(path, &["instructions"]);
             }
@@ -161,7 +168,9 @@ mod tests {
         let segs = parse_template_string("{{input}}", 0);
         assert_eq!(segs.len(), 1);
         match &segs[0] {
-            TemplateSegment::Expression { namespace, path, .. } => {
+            TemplateSegment::Expression {
+                namespace, path, ..
+            } => {
                 assert_eq!(namespace, "input");
                 assert!(path.is_empty());
             }
@@ -194,7 +203,9 @@ mod tests {
         let segs = parse_template_string("{{steps.generate.items.0.name}}", 0);
         assert_eq!(segs.len(), 1);
         match &segs[0] {
-            TemplateSegment::Expression { namespace, path, .. } => {
+            TemplateSegment::Expression {
+                namespace, path, ..
+            } => {
                 assert_eq!(namespace, "steps");
                 assert_eq!(path, &["generate", "items", "0", "name"]);
             }
@@ -213,8 +224,12 @@ mod tests {
     fn adjacent_expressions() {
         let segs = parse_template_string("{{a.b}}{{c.d}}", 0);
         assert_eq!(segs.len(), 2);
-        assert!(matches!(&segs[0], TemplateSegment::Expression { namespace, .. } if namespace == "a"));
-        assert!(matches!(&segs[1], TemplateSegment::Expression { namespace, .. } if namespace == "c"));
+        assert!(
+            matches!(&segs[0], TemplateSegment::Expression { namespace, .. } if namespace == "a")
+        );
+        assert!(
+            matches!(&segs[1], TemplateSegment::Expression { namespace, .. } if namespace == "c")
+        );
     }
 
     #[test]
@@ -260,7 +275,11 @@ mod tests {
     #[test]
     fn empty_string_input() {
         let segs = parse_template_string("", 0);
-        assert!(segs.is_empty() || (segs.len() == 1 && matches!(&segs[0], TemplateSegment::Literal(s) if s.is_empty())));
+        assert!(
+            segs.is_empty()
+                || (segs.len() == 1
+                    && matches!(&segs[0], TemplateSegment::Literal(s) if s.is_empty()))
+        );
     }
 
     #[test]
@@ -274,7 +293,9 @@ mod tests {
     fn expression_with_single_segment_path() {
         let segs = parse_template_string("{{args.name}}", 0);
         match &segs[0] {
-            TemplateSegment::Expression { namespace, path, .. } => {
+            TemplateSegment::Expression {
+                namespace, path, ..
+            } => {
                 assert_eq!(namespace, "args");
                 assert_eq!(path, &["name"]);
             }
@@ -284,7 +305,8 @@ mod tests {
 
     #[test]
     fn round_trip_complex() {
-        let original = "Hello {{args.name}}, your order {{steps.order.id}} is {{steps.status.value}}.";
+        let original =
+            "Hello {{args.name}}, your order {{steps.order.id}} is {{steps.status.value}}.";
         let segs = parse_template_string(original, 0);
         let reconstructed = segments_to_string(&segs);
         assert_eq!(reconstructed, original);

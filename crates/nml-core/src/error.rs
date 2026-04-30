@@ -11,31 +11,19 @@ use thiserror::Error;
 pub enum NmlError {
     /// A syntax error during parsing.
     #[error("{message}")]
-    Parse {
-        message: String,
-        span: Span,
-    },
+    Parse { message: String, span: Span },
 
     /// A tokenization error during lexing.
     #[error("{message}")]
-    Lex {
-        message: String,
-        span: Span,
-    },
+    Lex { message: String, span: Span },
 
     /// A semantic validation error (e.g., duplicate declarations).
     #[error("{message}")]
-    Validation {
-        message: String,
-        span: Span,
-    },
+    Validation { message: String, span: Span },
 
     /// An invalid money literal (e.g., bad currency code).
     #[error("invalid money value: {message}")]
-    InvalidMoney {
-        message: String,
-        span: Span,
-    },
+    InvalidMoney { message: String, span: Span },
 }
 
 impl NmlError {

@@ -21,7 +21,11 @@ impl Money {
         let divisor = 10i64.pow(self.exponent as u32);
         let whole = self.amount / divisor;
         let frac = (self.amount % divisor).abs();
-        let sign = if self.amount < 0 && whole == 0 { "-" } else { "" };
+        let sign = if self.amount < 0 && whole == 0 {
+            "-"
+        } else {
+            ""
+        };
         format!(
             "{sign}{whole}.{frac:0>width$} {currency}",
             currency = self.currency,
@@ -105,8 +109,8 @@ fn parse_minor_units(
 pub fn currency_exponent(code: &str) -> Option<u8> {
     match code {
         // Exponent 0 (no minor unit)
-        "BIF" | "CLP" | "DJF" | "GNF" | "ISK" | "JPY" | "KMF" | "KRW" | "PYG" | "RWF"
-        | "UGX" | "UYI" | "VND" | "VUV" | "XAF" | "XOF" | "XPF" => Some(0),
+        "BIF" | "CLP" | "DJF" | "GNF" | "ISK" | "JPY" | "KMF" | "KRW" | "PYG" | "RWF" | "UGX"
+        | "UYI" | "VND" | "VUV" | "XAF" | "XOF" | "XPF" => Some(0),
 
         // Exponent 3
         "BHD" | "IQD" | "JOD" | "KWD" | "LYD" | "OMR" | "TND" => Some(3),
@@ -115,21 +119,18 @@ pub fn currency_exponent(code: &str) -> Option<u8> {
         "CLF" | "UYW" => Some(4),
 
         // Exponent 2 (the vast majority of currencies)
-        "AED" | "AFN" | "ALL" | "AMD" | "ANG" | "AOA" | "ARS" | "AUD" | "AWG" | "AZN"
-        | "BAM" | "BBD" | "BDT" | "BGN" | "BMD" | "BND" | "BOB" | "BRL" | "BSD" | "BTN"
-        | "BWP" | "BYN" | "BZD" | "CAD" | "CDF" | "CHF" | "CNY" | "COP" | "CRC" | "CUP"
-        | "CVE" | "CZK" | "DKK" | "DOP" | "DZD" | "EGP" | "ERN" | "ETB" | "EUR" | "FJD"
-        | "FKP" | "GBP" | "GEL" | "GHS" | "GIP" | "GMD" | "GTQ" | "GYD" | "HKD" | "HNL"
-        | "HTG" | "HUF" | "IDR" | "ILS" | "INR" | "IRR" | "JMD" | "KES" | "KGS" | "KHR"
-        | "KYD" | "KZT" | "LAK" | "LBP" | "LKR" | "LRD" | "LSL" | "MAD" | "MDL" | "MGA"
-        | "MKD" | "MMK" | "MNT" | "MOP" | "MRU" | "MUR" | "MVR" | "MWK" | "MXN" | "MYR"
-        | "MZN" | "NAD" | "NGN" | "NIO" | "NOK" | "NPR" | "NZD" | "PAB" | "PEN" | "PGK"
-        | "PHP" | "PKR" | "PLN" | "QAR" | "RON" | "RSD" | "RUB" | "SAR" | "SBD" | "SCR"
-        | "SDG" | "SEK" | "SGD" | "SHP" | "SLE" | "SOS" | "SRD" | "SSP" | "STN" | "SYP"
-        | "SZL" | "THB" | "TJS" | "TMT" | "TOP" | "TRY" | "TTD" | "TWD" | "TZS" | "UAH"
-        | "USD" | "UYU" | "UZS" | "VES" | "WST" | "XCD" | "YER" | "ZAR" | "ZMW" | "ZWL" => {
-            Some(2)
-        }
+        "AED" | "AFN" | "ALL" | "AMD" | "ANG" | "AOA" | "ARS" | "AUD" | "AWG" | "AZN" | "BAM"
+        | "BBD" | "BDT" | "BGN" | "BMD" | "BND" | "BOB" | "BRL" | "BSD" | "BTN" | "BWP" | "BYN"
+        | "BZD" | "CAD" | "CDF" | "CHF" | "CNY" | "COP" | "CRC" | "CUP" | "CVE" | "CZK" | "DKK"
+        | "DOP" | "DZD" | "EGP" | "ERN" | "ETB" | "EUR" | "FJD" | "FKP" | "GBP" | "GEL" | "GHS"
+        | "GIP" | "GMD" | "GTQ" | "GYD" | "HKD" | "HNL" | "HTG" | "HUF" | "IDR" | "ILS" | "INR"
+        | "IRR" | "JMD" | "KES" | "KGS" | "KHR" | "KYD" | "KZT" | "LAK" | "LBP" | "LKR" | "LRD"
+        | "LSL" | "MAD" | "MDL" | "MGA" | "MKD" | "MMK" | "MNT" | "MOP" | "MRU" | "MUR" | "MVR"
+        | "MWK" | "MXN" | "MYR" | "MZN" | "NAD" | "NGN" | "NIO" | "NOK" | "NPR" | "NZD" | "PAB"
+        | "PEN" | "PGK" | "PHP" | "PKR" | "PLN" | "QAR" | "RON" | "RSD" | "RUB" | "SAR" | "SBD"
+        | "SCR" | "SDG" | "SEK" | "SGD" | "SHP" | "SLE" | "SOS" | "SRD" | "SSP" | "STN" | "SYP"
+        | "SZL" | "THB" | "TJS" | "TMT" | "TOP" | "TRY" | "TTD" | "TWD" | "TZS" | "UAH" | "USD"
+        | "UYU" | "UZS" | "VES" | "WST" | "XCD" | "YER" | "ZAR" | "ZMW" | "ZWL" => Some(2),
 
         _ => None,
     }

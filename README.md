@@ -1,12 +1,12 @@
 # NML
 
-**NML** (Nudge Markup Language) is an indentation-based configuration language with
+**NML** is a typed, indentation-based configuration language with
 a built-in type system, model definitions, and composable traits.
 
 ## Features
 
 - **7 primitive types** -- `string`, `number`, `money`, `bool`, `duration`, `path`, `secret`
-- **Model definitions** -- define custom object types with typed fields and constraints
+- **Model definitions** -- define custom object types with typed fields
 - **Traits** -- reusable field groups (mixins) across models
 - **Enums** -- restricted sets of allowed values
 - **Access control** -- built-in `|allow` and `|deny` modifiers

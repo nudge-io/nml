@@ -26,7 +26,6 @@ pub struct FieldDef {
     pub field_type: FieldType,
     pub optional: bool,
     pub default_value: Option<String>,
-    pub constraints: Vec<Constraint>,
     pub span: Span,
 }
 
@@ -35,46 +34,7 @@ pub struct FieldDef {
 pub enum FieldType {
     Primitive(PrimitiveType),
     List(Box<FieldType>),
-    RefOnly(Box<FieldType>),
     ModelRef(String),
     Modifier(String),
-    InlineObject(Vec<FieldDef>),
-    SharedProperty(Vec<FieldDef>),
     Union(Vec<FieldType>),
-}
-
-/// A constraint on a field.
-#[derive(Debug, Clone, Serialize)]
-pub enum Constraint {
-    Unique,
-    Secret,
-    Token,
-    Distinct,
-    Shorthand,
-    Integer,
-    Min(f64),
-    Max(f64),
-    MinLength(usize),
-    MaxLength(usize),
-    Pattern(String),
-    Currency(Vec<String>),
-}
-
-impl Constraint {
-    pub fn name(&self) -> &str {
-        match self {
-            Constraint::Unique => "unique",
-            Constraint::Secret => "secret",
-            Constraint::Token => "token",
-            Constraint::Distinct => "distinct",
-            Constraint::Shorthand => "shorthand",
-            Constraint::Integer => "integer",
-            Constraint::Min(_) => "min",
-            Constraint::Max(_) => "max",
-            Constraint::MinLength(_) => "minLength",
-            Constraint::MaxLength(_) => "maxLength",
-            Constraint::Pattern(_) => "pattern",
-            Constraint::Currency(_) => "currency",
-        }
-    }
 }

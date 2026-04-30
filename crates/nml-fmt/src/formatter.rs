@@ -155,7 +155,10 @@ fn format_modifier(out: &mut String, m: &Modifier, depth: usize) {
                 format_list_item(out, item, depth + 1);
             }
         }
-        ModifierValue::TypeAnnotation { field_type, optional } => {
+        ModifierValue::TypeAnnotation {
+            field_type,
+            optional,
+        } => {
             out.push(' ');
             format_field_type_expr_out(out, field_type);
             if *optional {
@@ -180,7 +183,9 @@ fn format_array_body(out: &mut String, body: &ArrayBody, depth: usize) {
         format_value(out, &prop.value.value, depth);
         out.push('\n');
     }
-    if (!body.modifiers.is_empty() || !body.shared_properties.is_empty() || !body.properties.is_empty())
+    if (!body.modifiers.is_empty()
+        || !body.shared_properties.is_empty()
+        || !body.properties.is_empty())
         && !body.items.is_empty()
     {
         out.push('\n');
@@ -458,7 +463,9 @@ mod tests {
 
     #[test]
     fn roundtrip_shared_property() {
-        roundtrip("workflow W:\n    .defaults:\n        retries = 3\n    - step1:\n        x = 1\n");
+        roundtrip(
+            "workflow W:\n    .defaults:\n        retries = 3\n    - step1:\n        x = 1\n",
+        );
     }
 
     #[test]
@@ -483,7 +490,9 @@ mod tests {
 
     #[test]
     fn roundtrip_array_with_modifier() {
-        roundtrip("[]mount mounts:\n    |allow = [@authenticated]\n    - Main:\n        path = \"/\"\n");
+        roundtrip(
+            "[]mount mounts:\n    |allow = [@authenticated]\n    - Main:\n        path = \"/\"\n",
+        );
     }
 
     #[test]
@@ -498,7 +507,9 @@ mod tests {
 
     #[test]
     fn idempotent_array_with_modifier() {
-        idempotent("[]mount mounts:\n    |allow = [@authenticated]\n\n    - Main:\n        path = \"/\"\n");
+        idempotent(
+            "[]mount mounts:\n    |allow = [@authenticated]\n\n    - Main:\n        path = \"/\"\n",
+        );
     }
 
     // -------------------------------------------------------------------
@@ -557,63 +568,77 @@ mod tests {
 
     #[test]
     fn roundtrip_fixture_minimal_service() {
-        let source = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/minimal-service.nml")
-        ).unwrap();
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/valid/minimal-service.nml"
+        ))
+        .unwrap();
         roundtrip(&source);
         idempotent(&source);
     }
 
     #[test]
     fn roundtrip_fixture_full_service() {
-        let source = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/full-service.nml")
-        ).unwrap();
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/valid/full-service.nml"
+        ))
+        .unwrap();
         roundtrip(&source);
         idempotent(&source);
     }
 
     #[test]
     fn roundtrip_fixture_web_server() {
-        let source = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/web-server.nml")
-        ).unwrap();
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/valid/web-server.nml"
+        ))
+        .unwrap();
         roundtrip(&source);
         idempotent(&source);
     }
 
     #[test]
     fn roundtrip_fixture_role_templates() {
-        let source = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/role-templates.nml")
-        ).unwrap();
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/valid/role-templates.nml"
+        ))
+        .unwrap();
         roundtrip(&source);
         idempotent(&source);
     }
 
     #[test]
     fn roundtrip_fixture_secret_values() {
-        let source = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/secret-values.nml")
-        ).unwrap();
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/valid/secret-values.nml"
+        ))
+        .unwrap();
         roundtrip(&source);
         idempotent(&source);
     }
 
     #[test]
     fn roundtrip_fixture_money_values() {
-        let source = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/money-values.nml")
-        ).unwrap();
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/valid/money-values.nml"
+        ))
+        .unwrap();
         roundtrip(&source);
         idempotent(&source);
     }
 
     #[test]
     fn roundtrip_fixture_pricing() {
-        let source = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/valid/pricing.nml")
-        ).unwrap();
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/valid/pricing.nml"
+        ))
+        .unwrap();
         roundtrip(&source);
         idempotent(&source);
     }
@@ -625,7 +650,9 @@ mod tests {
 
     #[test]
     fn roundtrip_block_role_ref_list() {
-        roundtrip("role admin:\n    members:\n        - @role/editor\n        - @user/test@example.com\n");
+        roundtrip(
+            "role admin:\n    members:\n        - @role/editor\n        - @user/test@example.com\n",
+        );
     }
 
     #[test]

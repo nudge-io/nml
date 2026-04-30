@@ -18,10 +18,19 @@ pub struct ProjectConfig {
     /// If empty, any namespace is accepted without warnings.
     pub template_namespaces: Vec<String>,
     /// Valid modifier names (e.g., `["allow", "deny"]`).
-    /// If empty, the default set is used.
+    /// If empty, all modifier names are accepted without warnings.
     pub modifiers: Vec<String>,
     /// Additional block keywords to suggest in completions.
     pub keywords: Vec<String>,
+    /// Block keywords whose bodies participate in membership cycle detection
+    /// (e.g., `["role", "plan"]`).  If empty, no cycle detection is performed.
+    pub member_keywords: Vec<String>,
+    /// Reserved built-in references that should not appear in member lists
+    /// (e.g., `["@public", "@authenticated"]`).
+    pub builtin_refs: Vec<String>,
+    /// Prefix for references targeting individual principals, warned about
+    /// when used in access-control modifier rules (e.g., `"@user/"`).
+    pub user_ref_prefix: Option<String>,
 }
 
 impl ProjectConfig {
@@ -36,6 +45,9 @@ impl ProjectConfig {
     ///     templateNamespaces = ["args", "input", "steps", "artifacts"]
     ///     modifiers = ["allow", "deny", "grant"]
     ///     keywords = ["service", "workflow", "database"]
+    ///     memberKeywords = ["role", "plan"]
+    ///     builtinRefs = ["@public", "@authenticated"]
+    ///     userRefPrefix = "@user/"
     /// ```
     pub fn from_file(file: &File) -> Self {
         let mut config = Self::default();
@@ -65,6 +77,17 @@ impl ProjectConfig {
                         }
                         "keywords" => {
                             config.keywords = extract_string_array(&prop.value.value);
+                        }
+                        "memberKeywords" => {
+                            config.member_keywords = extract_string_array(&prop.value.value);
+                        }
+                        "builtinRefs" => {
+                            config.builtin_refs = extract_string_array(&prop.value.value);
+                        }
+                        "userRefPrefix" => {
+                            if let Value::String(s) = &prop.value.value {
+                                config.user_ref_prefix = Some(s.clone());
+                            }
                         }
                         _ => {}
                     }
@@ -116,16 +139,25 @@ project MyProject:
     templateNamespaces = ["args", "input", "steps", "env"]
     modifiers = ["allow", "deny"]
     keywords = ["service", "workflow", "database"]
+    memberKeywords = ["role", "plan"]
+    builtinRefs = ["@public", "@authenticated"]
+    userRefPrefix = "@user/"
 "#;
         let file = parser::parse(source).unwrap();
         let config = ProjectConfig::from_file(&file);
-        assert_eq!(config.schema_files, vec![
-            "schemas/core.model.nml",
-            "schemas/api.model.nml",
-        ]);
-        assert_eq!(config.template_namespaces, vec!["args", "input", "steps", "env"]);
+        assert_eq!(
+            config.schema_files,
+            vec!["schemas/core.model.nml", "schemas/api.model.nml",]
+        );
+        assert_eq!(
+            config.template_namespaces,
+            vec!["args", "input", "steps", "env"]
+        );
         assert_eq!(config.modifiers, vec!["allow", "deny"]);
         assert_eq!(config.keywords, vec!["service", "workflow", "database"]);
+        assert_eq!(config.member_keywords, vec!["role", "plan"]);
+        assert_eq!(config.builtin_refs, vec!["@public", "@authenticated"]);
+        assert_eq!(config.user_ref_prefix, Some("@user/".to_string()));
     }
 
     #[test]

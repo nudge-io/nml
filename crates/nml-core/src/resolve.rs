@@ -104,21 +104,15 @@ impl ValueResolver {
 
     fn resolve_body_entry(&self, entry: &BodyEntry) -> Result<BodyEntry, ResolveError> {
         let kind = match &entry.kind {
-            BodyEntryKind::Property(p) => {
-                BodyEntryKind::Property(self.resolve_property(p)?)
-            }
-            BodyEntryKind::NestedBlock(nb) => {
-                BodyEntryKind::NestedBlock(NestedBlock {
-                    name: nb.name.clone(),
-                    body: self.resolve_body(&nb.body)?,
-                })
-            }
+            BodyEntryKind::Property(p) => BodyEntryKind::Property(self.resolve_property(p)?),
+            BodyEntryKind::NestedBlock(nb) => BodyEntryKind::NestedBlock(NestedBlock {
+                name: nb.name.clone(),
+                body: self.resolve_body(&nb.body)?,
+            }),
             BodyEntryKind::SharedProperty(sp) => {
                 BodyEntryKind::SharedProperty(self.resolve_shared_property(sp)?)
             }
-            BodyEntryKind::ListItem(item) => {
-                BodyEntryKind::ListItem(self.resolve_list_item(item)?)
-            }
+            BodyEntryKind::ListItem(item) => BodyEntryKind::ListItem(self.resolve_list_item(item)?),
             BodyEntryKind::Modifier(_) | BodyEntryKind::FieldDefinition(_) => {
                 return Ok(entry.clone());
             }
@@ -164,9 +158,7 @@ impl ValueResolver {
                 name: name.clone(),
                 body: self.resolve_body(body)?,
             },
-            ListItemKind::Shorthand(sv) => {
-                ListItemKind::Shorthand(self.resolve_spanned(sv)?)
-            }
+            ListItemKind::Shorthand(sv) => ListItemKind::Shorthand(self.resolve_spanned(sv)?),
             ListItemKind::Reference(_) | ListItemKind::Role(_) => {
                 return Ok(item.clone());
             }
@@ -367,10 +359,7 @@ mod tests {
             r.resolve(&Value::Number(42.0)).unwrap(),
             Value::Number(42.0)
         );
-        assert_eq!(
-            r.resolve(&Value::Bool(true)).unwrap(),
-            Value::Bool(true)
-        );
+        assert_eq!(r.resolve(&Value::Bool(true)).unwrap(), Value::Bool(true));
     }
 
     #[test]
@@ -396,7 +385,11 @@ mod tests {
     #[test]
     fn resolve_fallback_primary() {
         let r = ValueResolver::new(|key| {
-            if key == "PORT" { Some("8080".into()) } else { None }
+            if key == "PORT" {
+                Some("8080".into())
+            } else {
+                None
+            }
         });
         let val = Value::Fallback(
             Box::new(SpannedValue::new(
@@ -432,13 +425,20 @@ mod tests {
         let r = ValueResolver::env();
         let result = r.resolve(&Value::Secret("$FOOBAR.KEY".into()));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown variable source"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unknown variable source"));
     }
 
     #[test]
     fn resolve_body_deep() {
         let r = ValueResolver::new(|key| {
-            if key == "HOST" { Some("localhost".into()) } else { None }
+            if key == "HOST" {
+                Some("localhost".into())
+            } else {
+                None
+            }
         });
         let nml = "server App:\n    host = $ENV.HOST\n    port = 8080\n    db:\n        url = $ENV.DB_URL | \"postgres://localhost/dev\"\n";
         let file = parser::parse(nml).unwrap();
@@ -489,18 +489,20 @@ workflow W:
         let merged = apply_shared_properties(body);
 
         // SharedProperty should be removed
-        assert!(merged.entries.iter().all(|e| !matches!(
-            &e.kind,
-            BodyEntryKind::SharedProperty(_)
-        )));
+        assert!(merged
+            .entries
+            .iter()
+            .all(|e| !matches!(&e.kind, BodyEntryKind::SharedProperty(_))));
 
         // StepA should have defaults injected as a NestedBlock
         if let BodyEntryKind::ListItem(item) = &merged.entries[0].kind {
             if let ListItemKind::Named { body, .. } = &item.kind {
-                let has_defaults = body.entries.iter().any(|e| matches!(
-                    &e.kind,
-                    BodyEntryKind::NestedBlock(nb) if nb.name.name == "defaults"
-                ));
+                let has_defaults = body.entries.iter().any(|e| {
+                    matches!(
+                        &e.kind,
+                        BodyEntryKind::NestedBlock(nb) if nb.name.name == "defaults"
+                    )
+                });
                 assert!(has_defaults, "StepA should have inherited .defaults");
             }
         }
@@ -508,10 +510,12 @@ workflow W:
         // StepB already has defaults -- should keep its own retries=5
         if let BodyEntryKind::ListItem(item) = &merged.entries[1].kind {
             if let ListItemKind::Named { body, .. } = &item.kind {
-                if let Some(entry) = body.entries.iter().find(|e| matches!(
-                    &e.kind,
-                    BodyEntryKind::NestedBlock(nb) if nb.name.name == "defaults"
-                )) {
+                if let Some(entry) = body.entries.iter().find(|e| {
+                    matches!(
+                        &e.kind,
+                        BodyEntryKind::NestedBlock(nb) if nb.name.name == "defaults"
+                    )
+                }) {
                     if let BodyEntryKind::NestedBlock(nb) = &entry.kind {
                         // Should have retries=5 (from item) and timeout="30s" (from shared)
                         assert_eq!(nb.body.entries.len(), 2);
@@ -595,7 +599,10 @@ workflow W:
             _ => panic!("expected block"),
         };
         let result = r.resolve_body(body);
-        assert!(result.is_err(), "unresolvable secret should fail entire body");
+        assert!(
+            result.is_err(),
+            "unresolvable secret should fail entire body"
+        );
     }
 
     #[test]
@@ -618,23 +625,27 @@ workflow W:
         if let BodyEntryKind::ListItem(item) = &merged.entries[0].kind {
             if let ListItemKind::Named { body, .. } = &item.kind {
                 // Should have retries=10 from item, not retries=3 from shared
-                let retries_prop = body.entries.iter().find(|e| matches!(
-                    &e.kind,
-                    BodyEntryKind::Property(p) if p.name.name == "retries"
-                ));
+                let retries_prop = body.entries.iter().find(|e| {
+                    matches!(
+                        &e.kind,
+                        BodyEntryKind::Property(p) if p.name.name == "retries"
+                    )
+                });
                 if let Some(entry) = retries_prop {
                     if let BodyEntryKind::Property(p) = &entry.kind {
                         assert_eq!(p.value.value, Value::Number(10.0));
                     }
                 }
                 // Should also have timeout from shared
-                let has_timeout = body.entries.iter().any(|e| matches!(
-                    &e.kind,
-                    BodyEntryKind::NestedBlock(nb) if nb.name.name == "defaults"
-                ) || matches!(
-                    &e.kind,
-                    BodyEntryKind::Property(p) if p.name.name == "timeout"
-                ));
+                let has_timeout = body.entries.iter().any(|e| {
+                    matches!(
+                        &e.kind,
+                        BodyEntryKind::NestedBlock(nb) if nb.name.name == "defaults"
+                    ) || matches!(
+                        &e.kind,
+                        BodyEntryKind::Property(p) if p.name.name == "timeout"
+                    )
+                });
                 assert!(has_timeout || true); // timeout injected via NestedBlock
             }
         }
@@ -656,9 +667,11 @@ workflow W:
 
         let merged = apply_shared_properties(body);
         // Shorthand items should pass through unchanged
-        let items: Vec<_> = merged.entries.iter().filter(|e| {
-            matches!(&e.kind, BodyEntryKind::ListItem(_))
-        }).collect();
+        let items: Vec<_> = merged
+            .entries
+            .iter()
+            .filter(|e| matches!(&e.kind, BodyEntryKind::ListItem(_)))
+            .collect();
         assert_eq!(items.len(), 1);
         if let BodyEntryKind::ListItem(item) = &items[0].kind {
             assert!(matches!(&item.kind, ListItemKind::Shorthand(_)));
@@ -684,21 +697,25 @@ workflow W:
 
         let merged = apply_shared_properties(body);
         // Both shared properties should be consumed
-        assert!(merged.entries.iter().all(|e| !matches!(
-            &e.kind,
-            BodyEntryKind::SharedProperty(_)
-        )));
+        assert!(merged
+            .entries
+            .iter()
+            .all(|e| !matches!(&e.kind, BodyEntryKind::SharedProperty(_))));
         // StepA should have config and limits injected
         if let BodyEntryKind::ListItem(item) = &merged.entries[0].kind {
             if let ListItemKind::Named { body, .. } = &item.kind {
-                let has_config = body.entries.iter().any(|e| matches!(
-                    &e.kind,
-                    BodyEntryKind::NestedBlock(nb) if nb.name.name == "config"
-                ));
-                let has_limits = body.entries.iter().any(|e| matches!(
-                    &e.kind,
-                    BodyEntryKind::NestedBlock(nb) if nb.name.name == "limits"
-                ));
+                let has_config = body.entries.iter().any(|e| {
+                    matches!(
+                        &e.kind,
+                        BodyEntryKind::NestedBlock(nb) if nb.name.name == "config"
+                    )
+                });
+                let has_limits = body.entries.iter().any(|e| {
+                    matches!(
+                        &e.kind,
+                        BodyEntryKind::NestedBlock(nb) if nb.name.name == "limits"
+                    )
+                });
                 assert!(has_config, "StepA should inherit .config");
                 assert!(has_limits, "StepA should inherit .limits");
             }
@@ -788,10 +805,12 @@ workflow W:
                     _ => None,
                 });
                 assert_eq!(interval, Some(&Value::Number(900.0)));
-                let has_defaults = body.entries.iter().any(|e| matches!(
-                    &e.kind,
-                    BodyEntryKind::NestedBlock(nb) if nb.name.name == "defaults"
-                ));
+                let has_defaults = body.entries.iter().any(|e| {
+                    matches!(
+                        &e.kind,
+                        BodyEntryKind::NestedBlock(nb) if nb.name.name == "defaults"
+                    )
+                });
                 assert!(has_defaults);
             }
         } else {
@@ -857,7 +876,11 @@ workflow W:
     #[test]
     fn resolve_deeply_nested() {
         let r = ValueResolver::new(|key| {
-            if key == "HOST" { Some("localhost".into()) } else { None }
+            if key == "HOST" {
+                Some("localhost".into())
+            } else {
+                None
+            }
         });
         let nml = "server App:\n    a:\n        b:\n            host = $ENV.HOST\n";
         let file = parser::parse(nml).unwrap();

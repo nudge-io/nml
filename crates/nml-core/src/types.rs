@@ -49,14 +49,23 @@ impl SpannedValue {
 pub enum PrimitiveType {
     String,
     Number,
+    /// Exact currency value with ISO 4217 code (e.g. `19.99 USD`).
+    /// The parser recognises currency literal syntax and stores values as
+    /// integer minor units for precision.
     Money,
     Bool,
+    /// Tooling hint for values representing time durations.
+    /// No parser-level coercion -- treated as a string at runtime.
     Duration,
+    /// Tooling hint for values representing filesystem paths.
+    /// No parser-level coercion -- treated as a string at runtime.
     Path,
     Secret,
     /// Flexible key-value nested block; accepts any keys with scalar values.
     Object,
-    /// Role reference type; values use `@keyword/name` syntax.
+    /// Typed reference using `@kind/name` syntax (e.g. `@role/admin`).
+    /// Despite the name, the underlying syntax is a generic tagged-reference
+    /// pattern usable for any `@namespace/identifier` value.
     Role,
 }
 
@@ -241,7 +250,10 @@ mod tests {
 
     #[test]
     fn test_primitive_type_object() {
-        assert_eq!(PrimitiveType::from_str("object"), Some(PrimitiveType::Object));
+        assert_eq!(
+            PrimitiveType::from_str("object"),
+            Some(PrimitiveType::Object)
+        );
         assert_eq!(PrimitiveType::Object.as_str(), "object");
     }
 
@@ -405,14 +417,12 @@ mod tests {
 
     #[test]
     fn as_str_template_string_returns_none() {
-        let v = Value::TemplateString(vec![
-            crate::types::TemplateSegment::Expression {
-                namespace: "args".into(),
-                path: vec!["name".into()],
-                raw: "args.name".into(),
-                span: Span::empty(0),
-            },
-        ]);
+        let v = Value::TemplateString(vec![crate::types::TemplateSegment::Expression {
+            namespace: "args".into(),
+            path: vec!["name".into()],
+            raw: "args.name".into(),
+            span: Span::empty(0),
+        }]);
         assert!(v.as_str().is_none());
     }
 

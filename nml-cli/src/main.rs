@@ -66,7 +66,13 @@ fn cmd_parse(args: &[String]) -> Result<(), String> {
         Err(e) => {
             let source_map = nml_core::span::SourceMap::new(&source);
             let loc = source_map.location(e.span().start);
-            Err(format!("{}:{}:{}: {}", path.display(), loc.line, loc.column, e))
+            Err(format!(
+                "{}:{}:{}: {}",
+                path.display(),
+                loc.line,
+                loc.column,
+                e
+            ))
         }
     }
 }
@@ -180,7 +186,14 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
                         nml_validate::diagnostics::Severity::Error => "error",
                         nml_validate::diagnostics::Severity::Warning => "warning",
                     };
-                    eprintln!("{}:{}:{}: {}: {}", path.display(), loc.line, loc.column, prefix, diag.message);
+                    eprintln!(
+                        "{}:{}:{}: {}: {}",
+                        path.display(),
+                        loc.line,
+                        loc.column,
+                        prefix,
+                        diag.message
+                    );
                     if matches!(diag.severity, nml_validate::diagnostics::Severity::Error) {
                         error_count += 1;
                     }
@@ -207,7 +220,15 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn load_schema_dir(dir: &PathBuf) -> Result<(Vec<nml_core::model::ModelDef>, Vec<nml_core::model::EnumDef>), String> {
+fn load_schema_dir(
+    dir: &PathBuf,
+) -> Result<
+    (
+        Vec<nml_core::model::ModelDef>,
+        Vec<nml_core::model::EnumDef>,
+    ),
+    String,
+> {
     let mut models = Vec::new();
     let mut enums = Vec::new();
 
@@ -220,9 +241,8 @@ fn load_schema_dir(dir: &PathBuf) -> Result<(Vec<nml_core::model::ModelDef>, Vec
             let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if filename.ends_with(".model.nml") {
                 let source = read_file(&path)?;
-                let file = nml_core::parse(&source).map_err(|e| {
-                    format!("failed to parse schema {}: {e}", path.display())
-                })?;
+                let file = nml_core::parse(&source)
+                    .map_err(|e| format!("failed to parse schema {}: {e}", path.display()))?;
                 let schema = nml_core::model_extract::extract(&file);
                 models.extend(schema.models);
                 enums.extend(schema.enums);
@@ -245,9 +265,12 @@ fn read_file(path: &PathBuf) -> Result<String, String> {
 }
 
 fn write_file_atomically(path: &PathBuf, contents: &str) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("failed to determine parent directory for {}", path.display()))?;
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "failed to determine parent directory for {}",
+            path.display()
+        )
+    })?;
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())

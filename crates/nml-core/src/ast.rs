@@ -58,7 +58,7 @@ pub struct TemplateDecl {
     pub value: SpannedValue,
 }
 
-/// A block declaration like `service NudgeService:` or `model plan is role:`.
+/// A block declaration like `service MyService:` or `model plan is role:`.
 #[derive(Debug, Clone, Serialize)]
 pub struct BlockDecl {
     pub keyword: Identifier,

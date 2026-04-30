@@ -205,6 +205,6 @@ when models are present, the parser validates instances against them.
 ## File Conventions
 
 - Model definitions: `*.model.nml` or `*.schema.nml`
-- Instance declarations: named by purpose (e.g., `nudge.service.nml`)
+- Instance declarations: named by purpose (e.g., `myapp.service.nml`)
 - Models are loaded first from a known location, then instance files are
   validated against them

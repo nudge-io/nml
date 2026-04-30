@@ -103,16 +103,14 @@ impl Resolver {
         for decl in &file.declarations {
             match &decl.kind {
                 DeclarationKind::Block(block) => {
-                    let is_schema_def =
-                        matches!(block.keyword.name.as_str(), "model" | "enum");
+                    let is_schema_def = matches!(block.keyword.name.as_str(), "model" | "enum");
                     if !is_schema_def {
                         let local_names = collect_local_names(&block.body);
                         self.check_body_refs(&block.body, &local_names, &mut errors);
                     }
                 }
                 DeclarationKind::Array(arr) => {
-                    let is_schema_def =
-                        matches!(arr.item_keyword.name.as_str(), "model" | "enum");
+                    let is_schema_def = matches!(arr.item_keyword.name.as_str(), "model" | "enum");
                     if !is_schema_def {
                         for item in &arr.body.items {
                             if let ListItemKind::Named { name: _, body } = &item.kind {
@@ -165,7 +163,12 @@ impl Resolver {
                 errors.push(NmlError::Validation {
                     message: format!(
                         "circular reference in const/template chain: {}",
-                        cycle.iter().chain(std::iter::once(&cycle[0])).cloned().collect::<Vec<_>>().join(" -> ")
+                        cycle
+                            .iter()
+                            .chain(std::iter::once(&cycle[0]))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
                     ),
                     span,
                 });
@@ -273,7 +276,9 @@ mod tests {
 
         let errors = resolver.find_unresolved_references(&file);
         assert!(
-            errors.iter().any(|e| e.message().contains("unresolved reference 'lasda'")),
+            errors
+                .iter()
+                .any(|e| e.message().contains("unresolved reference 'lasda'")),
             "should flag unresolved reference; errors: {:?}",
             errors
         );
@@ -303,7 +308,9 @@ mod tests {
 
         let errors = resolver.find_unresolved_references(&file);
         assert!(
-            errors.iter().any(|e| e.message().contains("unresolved reference 'NonExistent'")),
+            errors
+                .iter()
+                .any(|e| e.message().contains("unresolved reference 'NonExistent'")),
             "should flag unresolved reference inside list item; errors: {:?}",
             errors
         );
@@ -333,7 +340,9 @@ mod tests {
 
         let errors = resolver.find_unresolved_references(&file);
         assert!(
-            errors.iter().any(|e| e.message().contains("unresolved reference 'respond'")),
+            errors
+                .iter()
+                .any(|e| e.message().contains("unresolved reference 'respond'")),
             "step 'respond' in workflow A should be unresolved (only exists in B); errors: {:?}",
             errors
         );
@@ -395,7 +404,9 @@ mod tests {
             errors
         );
         assert!(
-            errors.iter().any(|e| e.message().contains("circular reference")),
+            errors
+                .iter()
+                .any(|e| e.message().contains("circular reference")),
             "error should mention circular reference; errors: {:?}",
             errors
         );

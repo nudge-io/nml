@@ -16,7 +16,11 @@ pub struct Parser {
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0, depth: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            depth: 0,
+        }
     }
 
     pub fn parse(&mut self) -> NmlResult<File> {
@@ -132,7 +136,9 @@ impl Parser {
                     keyword,
                     name,
                     extends,
-                    body: Body { entries: Vec::new() },
+                    body: Body {
+                        entries: Vec::new(),
+                    },
                 }),
                 span: start_span.merge(end_span),
             })
@@ -374,7 +380,10 @@ impl Parser {
             self.skip_newlines();
             Ok(Modifier {
                 name,
-                value: ModifierValue::TypeAnnotation { field_type, optional },
+                value: ModifierValue::TypeAnnotation {
+                    field_type,
+                    optional,
+                },
             })
         } else {
             Err(NmlError::parse(
@@ -528,10 +537,7 @@ impl Parser {
             let body = self.parse_body()?;
             let span = dash_span.merge(self.prev_span());
             Ok(ListItem {
-                kind: ListItemKind::Named {
-                    name: ident,
-                    body,
-                },
+                kind: ListItemKind::Named { name: ident, body },
                 span,
             })
         } else {
@@ -608,9 +614,7 @@ impl Parser {
                 self.advance();
                 Ok(SpannedValue::new(Value::Role(r), span))
             }
-            Some(TokenKind::BracketOpen) => {
-                self.parse_array_literal()
-            }
+            Some(TokenKind::BracketOpen) => self.parse_array_literal(),
             Some(TokenKind::Identifier(name)) => {
                 let name = name.clone();
                 self.advance();
@@ -638,10 +642,7 @@ impl Parser {
         let end = self.current_span();
         self.expect_kind(TokenKind::BracketClose)?;
 
-        Ok(SpannedValue::new(
-            Value::Array(values),
-            start.merge(end),
-        ))
+        Ok(SpannedValue::new(Value::Array(values), start.merge(end)))
     }
 
     // --- Token helpers ---
@@ -655,8 +656,9 @@ impl Parser {
     }
 
     fn check(&self, kind: TokenKind) -> bool {
-        self.peek_kind()
-            .map_or(false, |k| std::mem::discriminant(k) == std::mem::discriminant(&kind))
+        self.peek_kind().map_or(false, |k| {
+            std::mem::discriminant(k) == std::mem::discriminant(&kind)
+        })
     }
 
     fn advance(&mut self) -> &Token {
@@ -666,8 +668,7 @@ impl Parser {
     }
 
     fn at_eof(&self) -> bool {
-        self.pos >= self.tokens.len()
-            || matches!(self.tokens[self.pos].kind, TokenKind::Eof)
+        self.pos >= self.tokens.len() || matches!(self.tokens[self.pos].kind, TokenKind::Eof)
     }
 
     fn current_span(&self) -> Span {
@@ -809,21 +810,21 @@ mod tests {
             _ => panic!("expected block"),
         };
         match &block.body.entries[0].kind {
-            BodyEntryKind::Property(p) => {
-                match &p.value.value {
-                    Value::TemplateString(segs) => {
-                        assert_eq!(segs.len(), 2);
-                        match &segs[0] {
-                            crate::types::TemplateSegment::Expression { namespace, path, .. } => {
-                                assert_eq!(namespace, "args");
-                                assert_eq!(path, &["instructions"]);
-                            }
-                            _ => panic!("expected expression segment"),
+            BodyEntryKind::Property(p) => match &p.value.value {
+                Value::TemplateString(segs) => {
+                    assert_eq!(segs.len(), 2);
+                    match &segs[0] {
+                        crate::types::TemplateSegment::Expression {
+                            namespace, path, ..
+                        } => {
+                            assert_eq!(namespace, "args");
+                            assert_eq!(path, &["instructions"]);
                         }
+                        _ => panic!("expected expression segment"),
                     }
-                    _ => panic!("expected TemplateString, got {:?}", p.value.value),
                 }
-            }
+                _ => panic!("expected TemplateString, got {:?}", p.value.value),
+            },
             _ => panic!("expected property"),
         }
     }
@@ -1019,24 +1020,33 @@ workflow W:
 "#;
         let file = parse(source).unwrap();
         match &file.declarations[0].kind {
-            DeclarationKind::Block(b) => {
-                match &b.body.entries[0].kind {
-                    BodyEntryKind::NestedBlock(nb) => {
-                        let items: Vec<_> = nb.body.entries.iter()
-                            .filter_map(|e| match &e.kind {
-                                BodyEntryKind::ListItem(item) => Some(item),
-                                _ => None,
-                            })
-                            .collect();
-                        assert_eq!(items.len(), 4);
-                        assert!(matches!(&items[0].kind, ListItemKind::Named { name, .. } if name.name == "classify"));
-                        assert!(matches!(&items[1].kind, ListItemKind::Shorthand(v) if v.value == Value::String("/fallback/path".into())));
-                        assert!(matches!(&items[2].kind, ListItemKind::Reference(id) if id.name == "DefaultHandler"));
-                        assert!(matches!(&items[3].kind, ListItemKind::Named { name, .. } if name.name == "respond"));
-                    }
-                    other => panic!("expected NestedBlock, got {other:?}"),
+            DeclarationKind::Block(b) => match &b.body.entries[0].kind {
+                BodyEntryKind::NestedBlock(nb) => {
+                    let items: Vec<_> = nb
+                        .body
+                        .entries
+                        .iter()
+                        .filter_map(|e| match &e.kind {
+                            BodyEntryKind::ListItem(item) => Some(item),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(items.len(), 4);
+                    assert!(
+                        matches!(&items[0].kind, ListItemKind::Named { name, .. } if name.name == "classify")
+                    );
+                    assert!(
+                        matches!(&items[1].kind, ListItemKind::Shorthand(v) if v.value == Value::String("/fallback/path".into()))
+                    );
+                    assert!(
+                        matches!(&items[2].kind, ListItemKind::Reference(id) if id.name == "DefaultHandler")
+                    );
+                    assert!(
+                        matches!(&items[3].kind, ListItemKind::Named { name, .. } if name.name == "respond")
+                    );
                 }
-            }
+                other => panic!("expected NestedBlock, got {other:?}"),
+            },
             other => panic!("expected Block, got {other:?}"),
         }
     }
@@ -1093,21 +1103,17 @@ workflow W:
         let file = parse(source).unwrap();
 
         match &file.declarations[0].kind {
-            DeclarationKind::Block(block) => {
-                match &block.body.entries[0].kind {
-                    BodyEntryKind::Property(prop) => {
-                        match &prop.value.value {
-                            Value::Money(m) => {
-                                assert_eq!(m.amount, 1299);
-                                assert_eq!(m.currency, "JPY");
-                                assert_eq!(m.exponent, 0);
-                            }
-                            other => panic!("expected Money, got {other:?}"),
-                        }
+            DeclarationKind::Block(block) => match &block.body.entries[0].kind {
+                BodyEntryKind::Property(prop) => match &prop.value.value {
+                    Value::Money(m) => {
+                        assert_eq!(m.amount, 1299);
+                        assert_eq!(m.currency, "JPY");
+                        assert_eq!(m.exponent, 0);
                     }
-                    other => panic!("expected property, got {other:?}"),
-                }
-            }
+                    other => panic!("expected Money, got {other:?}"),
+                },
+                other => panic!("expected property, got {other:?}"),
+            },
             _ => panic!("expected block"),
         }
     }
@@ -1146,7 +1152,8 @@ workflow W:
 
     #[test]
     fn test_parse_multiple_secrets() {
-        let source = "provider Email:\n    apiKey = $ENV.API_KEY\n    apiSecret = $ENV.API_SECRET\n";
+        let source =
+            "provider Email:\n    apiKey = $ENV.API_KEY\n    apiSecret = $ENV.API_SECRET\n";
         let file = parse(source).unwrap();
 
         match &file.declarations[0].kind {
@@ -1198,7 +1205,9 @@ workflow W:
                 match &block.body.entries[0].kind {
                     BodyEntryKind::FieldDefinition(f) => {
                         assert_eq!(f.name.name, "path");
-                        assert!(matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "path"));
+                        assert!(
+                            matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "path")
+                        );
                         assert!(!f.optional);
                         assert!(f.default_value.is_none());
                     }
@@ -1208,7 +1217,9 @@ workflow W:
                 match &block.body.entries[1].kind {
                     BodyEntryKind::FieldDefinition(f) => {
                         assert_eq!(f.name.name, "wasm");
-                        assert!(matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "string"));
+                        assert!(
+                            matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "string")
+                        );
                     }
                     other => panic!("expected field definition, got {other:?}"),
                 }
@@ -1223,16 +1234,16 @@ workflow W:
         let file = parse(source).unwrap();
 
         match &file.declarations[0].kind {
-            DeclarationKind::Block(block) => {
-                match &block.body.entries[0].kind {
-                    BodyEntryKind::FieldDefinition(f) => {
-                        assert_eq!(f.name.name, "baseUrl");
-                        assert!(matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "string"));
-                        assert!(f.optional);
-                    }
-                    other => panic!("expected field definition, got {other:?}"),
+            DeclarationKind::Block(block) => match &block.body.entries[0].kind {
+                BodyEntryKind::FieldDefinition(f) => {
+                    assert_eq!(f.name.name, "baseUrl");
+                    assert!(
+                        matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "string")
+                    );
+                    assert!(f.optional);
                 }
-            }
+                other => panic!("expected field definition, got {other:?}"),
+            },
             _ => panic!("expected block"),
         }
     }
@@ -1243,19 +1254,17 @@ workflow W:
         let file = parse(source).unwrap();
 
         match &file.declarations[0].kind {
-            DeclarationKind::Block(block) => {
-                match &block.body.entries[0].kind {
-                    BodyEntryKind::FieldDefinition(f) => {
-                        assert_eq!(f.name.name, "outputFormat");
-                        assert!(!f.optional);
-                        match &f.default_value {
-                            Some(v) => assert_eq!(v.value, Value::String("text".into())),
-                            None => panic!("expected default value"),
-                        }
+            DeclarationKind::Block(block) => match &block.body.entries[0].kind {
+                BodyEntryKind::FieldDefinition(f) => {
+                    assert_eq!(f.name.name, "outputFormat");
+                    assert!(!f.optional);
+                    match &f.default_value {
+                        Some(v) => assert_eq!(v.value, Value::String("text".into())),
+                        None => panic!("expected default value"),
                     }
-                    other => panic!("expected field definition, got {other:?}"),
                 }
-            }
+                other => panic!("expected field definition, got {other:?}"),
+            },
             _ => panic!("expected block"),
         }
     }
@@ -1272,7 +1281,9 @@ workflow W:
                 match &block.body.entries[0].kind {
                     BodyEntryKind::FieldDefinition(f) => {
                         assert_eq!(f.name.name, "steps");
-                        assert!(matches!(&f.field_type, FieldTypeExpr::Array(inner) if matches!(inner.as_ref(), FieldTypeExpr::Named(id) if id.name == "step")));
+                        assert!(
+                            matches!(&f.field_type, FieldTypeExpr::Array(inner) if matches!(inner.as_ref(), FieldTypeExpr::Named(id) if id.name == "step"))
+                        );
                         assert!(!f.optional);
                     }
                     other => panic!("expected field definition, got {other:?}"),
@@ -1281,7 +1292,9 @@ workflow W:
                 match &block.body.entries[1].kind {
                     BodyEntryKind::FieldDefinition(f) => {
                         assert_eq!(f.name.name, "extensions");
-                        assert!(matches!(&f.field_type, FieldTypeExpr::Array(inner) if matches!(inner.as_ref(), FieldTypeExpr::Named(id) if id.name == "extensionPoint")));
+                        assert!(
+                            matches!(&f.field_type, FieldTypeExpr::Array(inner) if matches!(inner.as_ref(), FieldTypeExpr::Named(id) if id.name == "extensionPoint"))
+                        );
                         assert!(f.optional);
                     }
                     other => panic!("expected field definition, got {other:?}"),
@@ -1304,8 +1317,12 @@ workflow W:
                     if let FieldTypeExpr::Array(inner) = &f.field_type {
                         if let FieldTypeExpr::Union(variants) = inner.as_ref() {
                             assert_eq!(variants.len(), 2);
-                            assert!(matches!(&variants[0], FieldTypeExpr::Named(id) if id.name == "step"));
-                            assert!(matches!(&variants[1], FieldTypeExpr::Array(inner) if matches!(inner.as_ref(), FieldTypeExpr::Named(id) if id.name == "step")));
+                            assert!(
+                                matches!(&variants[0], FieldTypeExpr::Named(id) if id.name == "step")
+                            );
+                            assert!(
+                                matches!(&variants[1], FieldTypeExpr::Array(inner) if matches!(inner.as_ref(), FieldTypeExpr::Named(id) if id.name == "step"))
+                            );
                         } else {
                             panic!("expected Union, got {:?}", inner);
                         }
@@ -1331,7 +1348,9 @@ workflow W:
                 match &block.body.entries[0].kind {
                     BodyEntryKind::FieldDefinition(f) => {
                         assert_eq!(f.name.name, "type");
-                        assert!(matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "providerType"));
+                        assert!(
+                            matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "providerType")
+                        );
                     }
                     other => panic!("expected field definition, got {other:?}"),
                 }
@@ -1346,21 +1365,19 @@ workflow W:
         let file = parse(source).unwrap();
 
         match &file.declarations[0].kind {
-            DeclarationKind::Block(block) => {
-                match &block.body.entries[0].kind {
-                    BodyEntryKind::Property(prop) => {
-                        assert_eq!(prop.name.name, "port");
-                        match &prop.value.value {
-                            Value::Fallback(primary, fallback) => {
-                                assert!(matches!(&primary.value, Value::Secret(s) if s == "$ENV.PORT"));
-                                assert!(matches!(&fallback.value, Value::Number(n) if *n == 3000.0));
-                            }
-                            other => panic!("expected Fallback, got {other:?}"),
+            DeclarationKind::Block(block) => match &block.body.entries[0].kind {
+                BodyEntryKind::Property(prop) => {
+                    assert_eq!(prop.name.name, "port");
+                    match &prop.value.value {
+                        Value::Fallback(primary, fallback) => {
+                            assert!(matches!(&primary.value, Value::Secret(s) if s == "$ENV.PORT"));
+                            assert!(matches!(&fallback.value, Value::Number(n) if *n == 3000.0));
                         }
+                        other => panic!("expected Fallback, got {other:?}"),
                     }
-                    other => panic!("expected property, got {other:?}"),
                 }
-            }
+                other => panic!("expected property, got {other:?}"),
+            },
             _ => panic!("expected block"),
         }
     }
@@ -1371,26 +1388,26 @@ workflow W:
         let file = parse(source).unwrap();
 
         match &file.declarations[0].kind {
-            DeclarationKind::Block(block) => {
-                match &block.body.entries[0].kind {
-                    BodyEntryKind::Property(prop) => {
-                        match &prop.value.value {
-                            Value::Fallback(primary, middle) => {
-                                assert!(matches!(&primary.value, Value::Secret(s) if s == "$ENV.PORT"));
-                                match &middle.value {
-                                    Value::Fallback(mid_primary, final_val) => {
-                                        assert!(matches!(&mid_primary.value, Value::Secret(s) if s == "$ENV.DEFAULT_PORT"));
-                                        assert!(matches!(&final_val.value, Value::Number(n) if *n == 8080.0));
-                                    }
-                                    other => panic!("expected nested Fallback, got {other:?}"),
-                                }
+            DeclarationKind::Block(block) => match &block.body.entries[0].kind {
+                BodyEntryKind::Property(prop) => match &prop.value.value {
+                    Value::Fallback(primary, middle) => {
+                        assert!(matches!(&primary.value, Value::Secret(s) if s == "$ENV.PORT"));
+                        match &middle.value {
+                            Value::Fallback(mid_primary, final_val) => {
+                                assert!(
+                                    matches!(&mid_primary.value, Value::Secret(s) if s == "$ENV.DEFAULT_PORT")
+                                );
+                                assert!(
+                                    matches!(&final_val.value, Value::Number(n) if *n == 8080.0)
+                                );
                             }
-                            other => panic!("expected Fallback, got {other:?}"),
+                            other => panic!("expected nested Fallback, got {other:?}"),
                         }
                     }
-                    other => panic!("expected property, got {other:?}"),
-                }
-            }
+                    other => panic!("expected Fallback, got {other:?}"),
+                },
+                other => panic!("expected property, got {other:?}"),
+            },
             _ => panic!("expected block"),
         }
     }
@@ -1401,14 +1418,12 @@ workflow W:
         let file = parse(source).unwrap();
 
         match &file.declarations[0].kind {
-            DeclarationKind::Block(block) => {
-                match &block.body.entries[0].kind {
-                    BodyEntryKind::Property(prop) => {
-                        assert!(matches!(&prop.value.value, Value::Secret(s) if s == "$ENV.API_KEY"));
-                    }
-                    other => panic!("expected property, got {other:?}"),
+            DeclarationKind::Block(block) => match &block.body.entries[0].kind {
+                BodyEntryKind::Property(prop) => {
+                    assert!(matches!(&prop.value.value, Value::Secret(s) if s == "$ENV.API_KEY"));
                 }
-            }
+                other => panic!("expected property, got {other:?}"),
+            },
             _ => panic!("expected block"),
         }
     }
@@ -1419,20 +1434,18 @@ workflow W:
         let file = parse(source).unwrap();
 
         match &file.declarations[0].kind {
-            DeclarationKind::Block(block) => {
-                match &block.body.entries[0].kind {
-                    BodyEntryKind::Property(prop) => {
-                        match &prop.value.value {
-                            Value::Fallback(primary, fallback) => {
-                                assert!(matches!(&primary.value, Value::Secret(s) if s == "$ENV.AUTH_SECRET"));
-                                assert!(matches!(&fallback.value, Value::String(s) if s == "dev-secret"));
-                            }
-                            other => panic!("expected Fallback, got {other:?}"),
-                        }
+            DeclarationKind::Block(block) => match &block.body.entries[0].kind {
+                BodyEntryKind::Property(prop) => match &prop.value.value {
+                    Value::Fallback(primary, fallback) => {
+                        assert!(
+                            matches!(&primary.value, Value::Secret(s) if s == "$ENV.AUTH_SECRET")
+                        );
+                        assert!(matches!(&fallback.value, Value::String(s) if s == "dev-secret"));
                     }
-                    other => panic!("expected property, got {other:?}"),
-                }
-            }
+                    other => panic!("expected Fallback, got {other:?}"),
+                },
+                other => panic!("expected property, got {other:?}"),
+            },
             _ => panic!("expected block"),
         }
     }
@@ -1445,8 +1458,12 @@ workflow W:
         match &file.declarations[0].kind {
             DeclarationKind::Block(block) => {
                 assert_eq!(block.body.entries.len(), 2);
-                assert!(matches!(&block.body.entries[0].kind, BodyEntryKind::Property(p) if p.name.name == "port"));
-                assert!(matches!(&block.body.entries[1].kind, BodyEntryKind::Modifier(m) if m.name.name == "allow"));
+                assert!(
+                    matches!(&block.body.entries[0].kind, BodyEntryKind::Property(p) if p.name.name == "port")
+                );
+                assert!(
+                    matches!(&block.body.entries[1].kind, BodyEntryKind::Modifier(m) if m.name.name == "allow")
+                );
             }
             _ => panic!("expected block"),
         }
@@ -1675,7 +1692,10 @@ workflow W:
             source.push_str(&format!("{}level{}:\n", indent, i));
         }
         let result = parse(&source);
-        assert!(result.is_ok(), "60 levels of nesting should be within limit");
+        assert!(
+            result.is_ok(),
+            "60 levels of nesting should be within limit"
+        );
     }
 
     #[test]
@@ -1690,7 +1710,10 @@ workflow W:
         let deepest_indent = "    ".repeat(64);
         source.push_str(&format!("{}value = \"leaf\"\n", deepest_indent));
         let result = parse(&source);
-        assert!(result.is_ok(), "exactly at MAX_NESTING_DEPTH should succeed");
+        assert!(
+            result.is_ok(),
+            "exactly at MAX_NESTING_DEPTH should succeed"
+        );
     }
 
     #[test]
@@ -1742,7 +1765,10 @@ workflow W:
             source.push_str(&format!("    prop{} = {}\n", i, i));
         }
         let result = parse(&source);
-        assert!(result.is_ok(), "wide shallow nesting should not hit depth limit");
+        assert!(
+            result.is_ok(),
+            "wide shallow nesting should not hit depth limit"
+        );
     }
 
     #[test]
@@ -1761,7 +1787,10 @@ workflow W:
         }
         let result = parse(&source);
         // 1 (top body) + 40 * 2 (list item body + nested block body) = 81 > 64
-        assert!(result.is_err(), "deep nesting through list items should be caught");
+        assert!(
+            result.is_err(),
+            "deep nesting through list items should be caught"
+        );
     }
 
     #[test]
@@ -1801,7 +1830,10 @@ workflow W:
         let file = parse(&source).unwrap();
         if let DeclarationKind::Block(b) = &file.declarations[0].kind {
             if let BodyEntryKind::NestedBlock(nb) = &b.body.entries[0].kind {
-                let items: Vec<_> = nb.body.entries.iter()
+                let items: Vec<_> = nb
+                    .body
+                    .entries
+                    .iter()
                     .filter(|e| matches!(&e.kind, BodyEntryKind::ListItem(_)))
                     .collect();
                 assert_eq!(items.len(), 200);
@@ -1827,14 +1859,18 @@ workflow W:
                 match &b.body.entries[0].kind {
                     BodyEntryKind::FieldDefinition(f) => {
                         assert_eq!(f.name.name, "createdAt");
-                        assert!(matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "string"));
+                        assert!(
+                            matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "string")
+                        );
                     }
                     other => panic!("expected FieldDefinition, got {other:?}"),
                 }
                 match &b.body.entries[1].kind {
                     BodyEntryKind::FieldDefinition(f) => {
                         assert_eq!(f.name.name, "updatedAt");
-                        assert!(matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "string"));
+                        assert!(
+                            matches!(&f.field_type, FieldTypeExpr::Named(id) if id.name == "string")
+                        );
                     }
                     other => panic!("expected FieldDefinition, got {other:?}"),
                 }
@@ -1860,8 +1896,16 @@ workflow W:
             _ => panic!("expected Block"),
         };
 
-        assert_eq!(model_block.body.entries.len(), trait_block.body.entries.len());
-        for (m, t) in model_block.body.entries.iter().zip(trait_block.body.entries.iter()) {
+        assert_eq!(
+            model_block.body.entries.len(),
+            trait_block.body.entries.len()
+        );
+        for (m, t) in model_block
+            .body
+            .entries
+            .iter()
+            .zip(trait_block.body.entries.iter())
+        {
             match (&m.kind, &t.kind) {
                 (BodyEntryKind::FieldDefinition(mf), BodyEntryKind::FieldDefinition(tf)) => {
                     assert_eq!(mf.name.name, tf.name.name);
@@ -1876,7 +1920,10 @@ workflow W:
     fn test_colon_after_field_name_parses_as_nested_block() {
         let source = "model Foo:\n    bar: string\n";
         let result = parse(source);
-        assert!(result.is_err(), "name: type should fail -- colon starts a nested block, not a type annotation");
+        assert!(
+            result.is_err(),
+            "name: type should fail -- colon starts a nested block, not a type annotation"
+        );
     }
 
     #[test]
@@ -1905,12 +1952,15 @@ workflow W:
 
     #[test]
     fn test_parse_shared_property() {
-        let source = "workflow W:\n    .defaults:\n        retries = 3\n    - step1:\n        x = 1\n";
+        let source =
+            "workflow W:\n    .defaults:\n        retries = 3\n    - step1:\n        x = 1\n";
         let file = parse(source).unwrap();
         if let DeclarationKind::Block(b) = &file.declarations[0].kind {
-            let has_shared = b.body.entries.iter().any(|e| {
-                matches!(&e.kind, BodyEntryKind::SharedProperty(_))
-            });
+            let has_shared = b
+                .body
+                .entries
+                .iter()
+                .any(|e| matches!(&e.kind, BodyEntryKind::SharedProperty(_)));
             assert!(has_shared, "expected a SharedProperty entry");
         }
     }
@@ -2013,7 +2063,8 @@ workflow W:
 
     #[test]
     fn test_parse_array_with_modifiers() {
-        let source = "[]mount mounts:\n    |allow = [@authenticated]\n    - Main:\n        path = \"/\"\n";
+        let source =
+            "[]mount mounts:\n    |allow = [@authenticated]\n    - Main:\n        path = \"/\"\n";
         let file = parse(source).unwrap();
         assert_eq!(file.declarations.len(), 1);
 
@@ -2111,12 +2162,13 @@ workflow W:
 
     #[test]
     fn test_parse_list_item_role_refs() {
-        let source = "role admin:\n    members:\n        - @role/editor\n        - @user/test@example.com\n";
+        let source =
+            "role admin:\n    members:\n        - @role/editor\n        - @user/test@example.com\n";
         let file = parse(source).unwrap();
         if let DeclarationKind::Block(block) = &file.declarations[0].kind {
-            let members_entry = block.body.entries.iter().find(|e| {
-                matches!(&e.kind, BodyEntryKind::NestedBlock(nb) if nb.name.name == "members")
-            });
+            let members_entry = block.body.entries.iter().find(
+                |e| matches!(&e.kind, BodyEntryKind::NestedBlock(nb) if nb.name.name == "members"),
+            );
             assert!(members_entry.is_some(), "should find members block");
             if let BodyEntryKind::NestedBlock(nb) = &members_entry.unwrap().kind {
                 assert_eq!(nb.body.entries.len(), 2);

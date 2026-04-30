@@ -90,7 +90,10 @@ fn test_parse_money_values() {
         .output()
         .expect("failed to run nml");
 
-    assert!(output.status.success(), "parse should succeed for money values");
+    assert!(
+        output.status.success(),
+        "parse should succeed for money values"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("FreePlan"));
     assert!(stdout.contains("ProPlan"));
@@ -107,7 +110,10 @@ fn test_parse_secret_values() {
         .output()
         .expect("failed to run nml");
 
-    assert!(output.status.success(), "parse should succeed for secret values");
+    assert!(
+        output.status.success(),
+        "parse should succeed for secret values"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Postmark"));
     assert!(stdout.contains("Stripe"));
@@ -124,7 +130,10 @@ fn test_check_bad_money_precision() {
         .output()
         .expect("failed to run nml");
 
-    assert!(!output.status.success(), "check should fail for bad money precision");
+    assert!(
+        !output.status.success(),
+        "check should fail for bad money precision"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("decimal") || stderr.contains("precision") || stderr.contains("error"),

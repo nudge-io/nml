@@ -10,6 +10,14 @@ keywords.workspace = true
 categories.workspace = true
 readme = "../../README.md"
 
+[lib]
+name = "nml_lsp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nml-lsp"
+path = "src/main.rs"
+
 [dependencies]
 nml-core = { workspace = true }
 nml-validate = { workspace = true }

@@ -20,23 +20,23 @@ pub enum TokenKind {
     NumberLiteral(f64),
     BoolLiteral(bool),
     Identifier(String),
-    Role(String),       // @role/admin, @public, etc.
-    SecretRef(String),     // $ENV.MY_SECRET
-    CurrencyCode(String),  // USD, GBP, etc.
+    Role(String),         // @role/admin, @public, etc.
+    SecretRef(String),    // $ENV.MY_SECRET
+    CurrencyCode(String), // USD, GBP, etc.
 
     // Punctuation
-    Colon,          // :
-    Equals,         // =
-    Dash,           // -
-    Pipe,           // |
-    Dot,            // .
-    BracketOpen,    // [
-    BracketClose,   // ]
-    ArrayPrefix,    // []
-    Comma,          // ,
-    Question,       // ?
-    ParenOpen,      // (
-    ParenClose,     // )
+    Colon,        // :
+    Equals,       // =
+    Dash,         // -
+    Pipe,         // |
+    Dot,          // .
+    BracketOpen,  // [
+    BracketClose, // ]
+    ArrayPrefix,  // []
+    Comma,        // ,
+    Question,     // ?
+    ParenOpen,    // (
+    ParenClose,   // )
 }
 
 /// A single token with its source location.
@@ -154,11 +154,15 @@ impl<'a> Lexer<'a> {
                 }
                 '-' => {
                     if self.peek_char().map_or(false, |c| c.is_ascii_digit()) {
-                        let prev_meaningful = tokens.iter().rev().find(|t| {
-                            !matches!(t.kind, TokenKind::Newline | TokenKind::Indent)
-                        });
+                        let prev_meaningful = tokens
+                            .iter()
+                            .rev()
+                            .find(|t| !matches!(t.kind, TokenKind::Newline | TokenKind::Indent));
                         if prev_meaningful.map_or(false, |t| {
-                            matches!(t.kind, TokenKind::Equals | TokenKind::BracketOpen | TokenKind::Comma)
+                            matches!(
+                                t.kind,
+                                TokenKind::Equals | TokenKind::BracketOpen | TokenKind::Comma
+                            )
                         }) {
                             tokens.push(self.read_number()?);
                         } else {
@@ -200,7 +204,9 @@ impl<'a> Lexer<'a> {
                         } else {
                             None
                         };
-                        if after_bracket.map_or(false, |c| c.is_alphabetic() || c == '_' || c == '(') {
+                        if after_bracket
+                            .map_or(false, |c| c.is_alphabetic() || c == '_' || c == '(')
+                        {
                             tokens.push(Token::new(TokenKind::ArrayPrefix, span));
                         } else {
                             let bp = self.byte_pos();

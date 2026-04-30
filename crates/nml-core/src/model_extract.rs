@@ -319,7 +319,6 @@ fn extract_model(block: &BlockDecl, span: crate::span::Span) -> Option<ModelDef>
                         field_type: FieldType::Modifier(resolve_type_name(field_type)),
                         optional: *optional,
                         default_value: None,
-                        constraints: Vec::new(),
                         span: entry.span,
                     });
                 }
@@ -371,7 +370,6 @@ fn convert_field_def(fd: &FieldDefinition, span: crate::span::Span) -> FieldDef 
         field_type,
         optional: fd.optional,
         default_value,
-        constraints: Vec::new(),
         span,
     }
 }
@@ -385,9 +383,7 @@ fn resolve_field_type(expr: &FieldTypeExpr) -> FieldType {
                 FieldType::ModelRef(id.name.clone())
             }
         }
-        FieldTypeExpr::Array(inner) => {
-            FieldType::List(Box::new(resolve_field_type(inner)))
-        }
+        FieldTypeExpr::Array(inner) => FieldType::List(Box::new(resolve_field_type(inner))),
         FieldTypeExpr::Union(variants) => {
             FieldType::Union(variants.iter().map(resolve_field_type).collect())
         }
@@ -432,11 +428,16 @@ mod tests {
         assert_eq!(model.fields.len(), 4);
 
         assert_eq!(model.fields[0].name, "type");
-        assert!(matches!(model.fields[0].field_type, FieldType::ModelRef(ref s) if s == "providerType"));
+        assert!(
+            matches!(model.fields[0].field_type, FieldType::ModelRef(ref s) if s == "providerType")
+        );
         assert!(!model.fields[0].optional);
 
         assert_eq!(model.fields[1].name, "model");
-        assert!(matches!(model.fields[1].field_type, FieldType::Primitive(PrimitiveType::String)));
+        assert!(matches!(
+            model.fields[1].field_type,
+            FieldType::Primitive(PrimitiveType::String)
+        ));
 
         assert_eq!(model.fields[2].name, "temperature");
         assert!(model.fields[2].optional);
@@ -542,7 +543,9 @@ model user:\n    name string\n    status status\n";
             errors
         );
         assert!(
-            errors.iter().any(|e| e.message().contains("circular dependency")),
+            errors
+                .iter()
+                .any(|e| e.message().contains("circular dependency")),
             "error should mention circular dependency; errors: {:?}",
             errors
         );
@@ -683,7 +686,11 @@ model user:\n    name string\n    status status\n";
     fn test_large_acyclic_model_graph_no_false_positive() {
         let mut source = String::new();
         for i in 0..50 {
-            source.push_str(&format!("model m{}:\n    value string\n    child m{}?\n\n", i, i + 1));
+            source.push_str(&format!(
+                "model m{}:\n    value string\n    child m{}?\n\n",
+                i,
+                i + 1
+            ));
         }
         source.push_str("model m50:\n    value string\n");
         let file = parser::parse(&source).unwrap();
@@ -739,7 +746,8 @@ model user:\n    name string\n    status status\n";
 
     #[test]
     fn test_resolve_multi_parent() {
-        let source = "model A:\n    x string\n\nmodel B:\n    y number\n\nmodel C is A, B:\n    z string\n";
+        let source =
+            "model A:\n    x string\n\nmodel B:\n    y number\n\nmodel C is A, B:\n    z string\n";
         let file = parser::parse(source).unwrap();
         let mut schema = extract(&file);
         resolve_model_inheritance(&mut schema);
@@ -762,22 +770,33 @@ model D is B, C:\n    d string\n";
 
         let d = schema.models.iter().find(|m| m.name == "D").unwrap();
         let names: Vec<&str> = d.fields.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["a", "b", "c", "d"], "A's field should appear only once");
+        assert_eq!(
+            names,
+            vec!["a", "b", "c", "d"],
+            "A's field should appear only once"
+        );
     }
 
     #[test]
     fn test_resolve_child_override() {
-        let source = "model A:\n    x string\n    y number\n\nmodel B is A:\n    x number\n    z string\n";
+        let source =
+            "model A:\n    x string\n    y number\n\nmodel B is A:\n    x number\n    z string\n";
         let file = parser::parse(source).unwrap();
         let mut schema = extract(&file);
         resolve_model_inheritance(&mut schema);
 
         let b = schema.models.iter().find(|m| m.name == "B").unwrap();
         let names: Vec<&str> = b.fields.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["y", "x", "z"], "parent field 'y' prepended, 'x' kept as child's version");
+        assert_eq!(
+            names,
+            vec!["y", "x", "z"],
+            "parent field 'y' prepended, 'x' kept as child's version"
+        );
         assert!(
-            matches!(b.fields.iter().find(|f| f.name == "x").unwrap().field_type,
-                     FieldType::Primitive(PrimitiveType::Number)),
+            matches!(
+                b.fields.iter().find(|f| f.name == "x").unwrap().field_type,
+                FieldType::Primitive(PrimitiveType::Number)
+            ),
             "child's 'x' should be number, not string"
         );
     }
@@ -793,7 +812,9 @@ model D is B, C:\n    d string\n";
         let errors = find_extends_cycles(&schema);
         assert!(!errors.is_empty(), "should detect cycle between A and B");
         assert!(
-            errors.iter().any(|e| e.message().contains("circular inheritance")),
+            errors
+                .iter()
+                .any(|e| e.message().contains("circular inheritance")),
             "error should mention circular inheritance; errors: {:?}",
             errors
         );
@@ -808,7 +829,9 @@ model D is B, C:\n    d string\n";
         let errors = find_extends_cycles(&schema);
         assert!(!errors.is_empty(), "should detect self-referencing extends");
         assert!(
-            errors.iter().any(|e| e.message().contains("circular inheritance")),
+            errors
+                .iter()
+                .any(|e| e.message().contains("circular inheritance")),
             "error should mention circular inheritance; errors: {:?}",
             errors
         );

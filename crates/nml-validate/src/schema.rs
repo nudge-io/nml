@@ -5,17 +5,43 @@ use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef};
 use nml_core::types::{PrimitiveType, Value};
 
 use crate::diagnostics::Diagnostic;
-
-/// Default modifier names accepted when no custom set is configured.
-pub const DEFAULT_MODIFIERS: &[&str] = &["allow", "deny", "grant"];
+#[cfg(test)]
+use crate::diagnostics::Severity;
 
 const MAX_VALIDATION_DEPTH: u32 = 64;
 
 /// Validates instance declarations against model definitions.
+///
+/// In default mode, unknown properties are reported as warnings and blocks
+/// with no matching model are silently skipped.  Call [`Self::strict`] to
+/// promote unknown-property diagnostics to errors and to detect blocks /
+/// arrays whose keyword has no model definition.
+///
+/// By default, the validator is **domain-neutral**: no modifiers, membership
+/// keywords, or built-in references are assumed.  Embedders opt in to
+/// domain-specific checks via builder methods.
 pub struct SchemaValidator {
     models: Vec<ModelDef>,
     enums: Vec<EnumDef>,
     valid_modifiers: Vec<String>,
+    strict_unknown_fields: bool,
+    membership: MembershipSemantics,
+}
+
+/// Opt-in configuration for embedders that model membership / access-control
+/// relationships (e.g. RBAC roles, ACL groups).  When all fields are at
+/// defaults (empty / `None`), the validator performs purely structural checks.
+#[derive(Debug, Clone, Default)]
+pub struct MembershipSemantics {
+    /// Block keywords whose bodies contain membership references and should
+    /// participate in cycle detection (e.g. `["role", "plan"]`).
+    pub member_keywords: Vec<String>,
+    /// Reference values that are reserved built-ins and should NOT appear
+    /// inside member lists (e.g. `["@public", "@authenticated"]`).
+    pub builtin_refs: Vec<String>,
+    /// Prefix for references that target individual principals.  Warned about
+    /// when it appears inside access-control modifier rules (e.g. `"@user/"`).
+    pub user_ref_prefix: Option<String>,
 }
 
 impl SchemaValidator {
@@ -23,16 +49,41 @@ impl SchemaValidator {
         Self {
             models,
             enums,
-            valid_modifiers: DEFAULT_MODIFIERS.iter().map(|s| s.to_string()).collect(),
+            valid_modifiers: Vec::new(),
+            strict_unknown_fields: false,
+            membership: MembershipSemantics::default(),
         }
     }
 
-    /// Set custom valid modifier names.
-    pub fn with_modifiers(mut self, modifiers: Vec<String>) -> Self {
-        if !modifiers.is_empty() {
-            self.valid_modifiers = modifiers;
-        }
+    /// Promote unknown-property diagnostics to errors and reject blocks /
+    /// arrays whose keyword has no matching model definition.
+    pub fn strict(mut self) -> Self {
+        self.strict_unknown_fields = true;
         self
+    }
+
+    /// Set valid modifier names. When non-empty, unknown modifiers produce
+    /// warnings. When empty (the default), all modifier names are accepted.
+    pub fn with_modifiers(mut self, modifiers: Vec<String>) -> Self {
+        self.valid_modifiers = modifiers;
+        self
+    }
+
+    /// Configure membership / access-control semantics.  When set, the
+    /// validator checks for cycles among `member_keywords`, warns about
+    /// `builtin_refs` in member lists, and warns about `user_ref_prefix`
+    /// references inside modifier rules.
+    pub fn with_membership_semantics(mut self, membership: MembershipSemantics) -> Self {
+        self.membership = membership;
+        self
+    }
+
+    fn unknown_property_diagnostic(&self, message: String) -> Diagnostic {
+        if self.strict_unknown_fields {
+            Diagnostic::error(message)
+        } else {
+            Diagnostic::warning(message)
+        }
     }
 
     pub fn find_model(&self, name: &str) -> Option<&ModelDef> {
@@ -88,6 +139,13 @@ impl SchemaValidator {
         if !is_schema_def {
             if let Some(model) = self.find_model(keyword) {
                 self.validate_instance_against_model(&block.body, model, 0, diags);
+            } else if self.strict_unknown_fields {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "block keyword '{keyword}' has no model definition"
+                    ))
+                    .with_span(block.keyword.span),
+                );
             }
         }
     }
@@ -98,18 +156,36 @@ impl SchemaValidator {
             self.validate_modifier_content(modifier, diags);
         }
 
+        let keyword = &arr.item_keyword.name;
+        let is_schema_def = matches!(keyword.as_str(), "model" | "enum");
+        let model = if !is_schema_def {
+            self.find_model(keyword)
+        } else {
+            None
+        };
+
+        let has_named_items = arr
+            .body
+            .items
+            .iter()
+            .any(|i| matches!(&i.kind, ListItemKind::Named { .. }));
+
+        if !is_schema_def && model.is_none() && has_named_items && self.strict_unknown_fields {
+            diags.push(
+                Diagnostic::error(format!(
+                    "array item keyword '{keyword}' has no model definition"
+                ))
+                .with_span(arr.item_keyword.span),
+            );
+        }
+
         for item in &arr.body.items {
             if let ListItemKind::Named { body, .. } = &item.kind {
-                let keyword = &arr.item_keyword.name;
-                let is_schema_def = matches!(keyword.as_str(), "model" | "enum");
-
                 self.validate_body(body, is_schema_def, keyword, diags);
                 self.validate_members_builtin_refs(body, keyword, diags);
 
-                if !is_schema_def {
-                    if let Some(model) = self.find_model(keyword) {
-                        self.validate_instance_against_model(body, model, 0, diags);
-                    }
+                if let Some(model) = model {
+                    self.validate_instance_against_model(body, model, 0, diags);
                 }
             }
         }
@@ -145,6 +221,9 @@ impl SchemaValidator {
     }
 
     fn validate_modifier_name(&self, m: &Modifier, diags: &mut Vec<Diagnostic>) {
+        if self.valid_modifiers.is_empty() {
+            return;
+        }
         if !self.valid_modifiers.iter().any(|v| v == &m.name.name) {
             diags.push(
                 Diagnostic::warning(format!(
@@ -181,10 +260,15 @@ impl SchemaValidator {
                     seen_fields.push(name);
 
                     if let Some(field_def) = model.fields.iter().find(|f| f.name == *name) {
-                        self.validate_value_type(&prop.value.value, field_def, prop.value.span, diags);
+                        self.validate_value_type(
+                            &prop.value.value,
+                            field_def,
+                            prop.value.span,
+                            diags,
+                        );
                     } else {
                         diags.push(
-                            Diagnostic::warning(format!(
+                            self.unknown_property_diagnostic(format!(
                                 "unknown property '{name}' (not defined in model '{}')",
                                 model.name
                             ))
@@ -213,26 +297,50 @@ impl SchemaValidator {
                                         if let ListItemKind::Named { body, .. } = &item.kind {
                                             match inner.as_ref() {
                                                 FieldType::ModelRef(ref_name) => {
-                                                    if let Some(inner_model) = self.find_model(ref_name) {
-                                                        self.validate_instance_against_model(body, inner_model, depth + 1, diags);
+                                                    if let Some(inner_model) =
+                                                        self.find_model(ref_name)
+                                                    {
+                                                        self.validate_instance_against_model(
+                                                            body,
+                                                            inner_model,
+                                                            depth + 1,
+                                                            diags,
+                                                        );
                                                     }
                                                 }
                                                 FieldType::Union(variants) => {
-                                                    let has_list_items = body.entries.iter().any(|e|
-                                                        matches!(&e.kind, BodyEntryKind::ListItem(_))
-                                                    );
+                                                    let has_list_items =
+                                                        body.entries.iter().any(|e| {
+                                                            matches!(
+                                                                &e.kind,
+                                                                BodyEntryKind::ListItem(_)
+                                                            )
+                                                        });
                                                     for variant in variants {
                                                         match variant {
-                                                            FieldType::ModelRef(ref_name) if !has_list_items => {
-                                                                if let Some(m) = self.find_model(ref_name) {
+                                                            FieldType::ModelRef(ref_name)
+                                                                if !has_list_items =>
+                                                            {
+                                                                if let Some(m) =
+                                                                    self.find_model(ref_name)
+                                                                {
                                                                     self.validate_instance_against_model(body, m, depth + 1, diags);
                                                                 }
                                                                 break;
                                                             }
-                                                            FieldType::List(list_inner) if has_list_items => {
-                                                                if let FieldType::ModelRef(ref_name) = list_inner.as_ref() {
-                                                                    if let Some(m) = self.find_model(ref_name) {
-                                                                        for sub_entry in &body.entries {
+                                                            FieldType::List(list_inner)
+                                                                if has_list_items =>
+                                                            {
+                                                                if let FieldType::ModelRef(
+                                                                    ref_name,
+                                                                ) = list_inner.as_ref()
+                                                                {
+                                                                    if let Some(m) =
+                                                                        self.find_model(ref_name)
+                                                                    {
+                                                                        for sub_entry in
+                                                                            &body.entries
+                                                                        {
                                                                             if let BodyEntryKind::ListItem(sub_item) = &sub_entry.kind {
                                                                                 if let ListItemKind::Named { body: sub_body, .. } = &sub_item.kind {
                                                                                     self.validate_instance_against_model(sub_body, m, depth + 1, diags);
@@ -258,7 +366,7 @@ impl SchemaValidator {
                         }
                     } else {
                         diags.push(
-                            Diagnostic::warning(format!(
+                            self.unknown_property_diagnostic(format!(
                                 "unknown property '{name}' (not defined in model '{model_name}')",
                                 name = nb.name.name,
                                 model_name = model.name
@@ -304,39 +412,7 @@ impl SchemaValidator {
 
         match &field.field_type {
             FieldType::Primitive(prim) => {
-                if !value_matches_primitive(value, prim) {
-                    if *prim == PrimitiveType::Role {
-                        if let Value::String(s) = value {
-                            let msg = if s.starts_with('@') {
-                                format!(
-                                    "role field '{}': use {} instead of \"{}\"",
-                                    field.name, s, s
-                                )
-                            } else {
-                                format!(
-                                    "role field '{}': use @{} instead of \"{}\"",
-                                    field.name, s, s
-                                )
-                            };
-                            diags.push(Diagnostic::warning(msg).with_span(span));
-                            return;
-                        }
-                    }
-                    let expected = if *prim == PrimitiveType::Secret {
-                        "environment variable ($ENV.VARIABLE_NAME)".to_string()
-                    } else {
-                        prim.as_str().to_string()
-                    };
-                    diags.push(
-                        Diagnostic::error(format!(
-                            "type mismatch for '{}': expected {}, got {}",
-                            field.name,
-                            expected,
-                            value_type_name(value)
-                        ))
-                        .with_span(span),
-                    );
-                }
+                self.validate_primitive_value(value, prim, &field.name, "for", span, diags);
             }
             FieldType::ModelRef(ref_name) => {
                 if let Some(enum_def) = self.find_enum(ref_name) {
@@ -348,7 +424,13 @@ impl SchemaValidator {
             FieldType::List(inner) => {
                 if let Value::Array(items) = value {
                     for item in items {
-                        self.validate_value_against_type(&item.value, inner, &field.name, item.span, diags);
+                        self.validate_value_against_type(
+                            &item.value,
+                            inner,
+                            &field.name,
+                            item.span,
+                            diags,
+                        );
                     }
                 }
             }
@@ -366,34 +448,7 @@ impl SchemaValidator {
     ) {
         match field_type {
             FieldType::Primitive(prim) => {
-                if !value_matches_primitive(value, prim) {
-                    if *prim == PrimitiveType::Role {
-                        if let Value::String(s) = value {
-                            let msg = if s.starts_with('@') {
-                                format!(
-                                    "role field '{}': use {} instead of \"{}\"",
-                                    field_name, s, s
-                                )
-                            } else {
-                                format!(
-                                    "role field '{}': use @{} instead of \"{}\"",
-                                    field_name, s, s
-                                )
-                            };
-                            diags.push(Diagnostic::warning(msg).with_span(span));
-                            return;
-                        }
-                    }
-                    diags.push(
-                        Diagnostic::error(format!(
-                            "type mismatch in array '{}': expected {}, got {}",
-                            field_name,
-                            prim.as_str(),
-                            value_type_name(value)
-                        ))
-                        .with_span(span),
-                    );
-                }
+                self.validate_primitive_value(value, prim, field_name, "in array", span, diags);
             }
             FieldType::ModelRef(ref_name) => {
                 if let Some(enum_def) = self.find_enum(ref_name) {
@@ -404,6 +459,43 @@ impl SchemaValidator {
             }
             _ => {}
         }
+    }
+
+    fn validate_primitive_value(
+        &self,
+        value: &Value,
+        prim: &PrimitiveType,
+        field_name: &str,
+        context: &str,
+        span: nml_core::span::Span,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        if value_matches_primitive(value, prim) {
+            return;
+        }
+        if *prim == PrimitiveType::Role {
+            if let Value::String(s) = value {
+                let msg = if s.starts_with('@') {
+                    format!("role field '{field_name}': use {s} instead of \"{s}\"")
+                } else {
+                    format!("role field '{field_name}': use @{s} instead of \"{s}\"")
+                };
+                diags.push(Diagnostic::warning(msg).with_span(span));
+                return;
+            }
+        }
+        let expected = if *prim == PrimitiveType::Secret {
+            "environment variable ($ENV.VARIABLE_NAME)".to_string()
+        } else {
+            prim.as_str().to_string()
+        };
+        diags.push(
+            Diagnostic::error(format!(
+                "type mismatch {context} '{field_name}': expected {expected}, got {}",
+                value_type_name(value)
+            ))
+            .with_span(span),
+        );
     }
 
     fn validate_enum_value(
@@ -447,7 +539,10 @@ impl SchemaValidator {
         diags: &mut Vec<Diagnostic>,
     ) {
         match value {
-            Value::Reference(_) | Value::String(_) | Value::TemplateString(_) | Value::Secret(_) => {}
+            Value::Reference(_)
+            | Value::String(_)
+            | Value::TemplateString(_)
+            | Value::Secret(_) => {}
             _ => {
                 diags.push(
                     Diagnostic::error(format!(
@@ -463,22 +558,22 @@ impl SchemaValidator {
     }
 
     fn validate_modifier_content(&self, m: &Modifier, diags: &mut Vec<Diagnostic>) {
-        let name = &m.name.name;
-        if name != "allow" && name != "deny" {
-            return;
-        }
+        let prefix = match &self.membership.user_ref_prefix {
+            Some(p) => p,
+            None => return,
+        };
         match &m.value {
             ModifierValue::Inline(sv) => {
-                self.check_user_ref_in_value(&sv.value, sv.span, diags);
+                self.check_user_ref_in_value(&sv.value, sv.span, prefix, diags);
             }
             ModifierValue::Block(items) => {
                 for item in items {
                     if let ListItemKind::Role(role_ref) = &item.kind {
-                        if role_ref.starts_with("@user/") {
+                        if role_ref.starts_with(prefix.as_str()) {
                             diags.push(
-                                Diagnostic::warning(
-                                    "@user/ references are intended for members lists, not access control rules"
-                                )
+                                Diagnostic::warning(format!(
+                                    "{prefix} references are intended for members lists, not access control rules"
+                                ))
                                 .with_span(item.span),
                             );
                         }
@@ -493,20 +588,21 @@ impl SchemaValidator {
         &self,
         value: &Value,
         span: nml_core::span::Span,
+        prefix: &str,
         diags: &mut Vec<Diagnostic>,
     ) {
         match value {
-            Value::Role(r) if r.starts_with("@user/") => {
+            Value::Role(r) if r.starts_with(prefix) => {
                 diags.push(
-                    Diagnostic::warning(
-                        "@user/ references are intended for members lists, not access control rules",
-                    )
+                    Diagnostic::warning(format!(
+                        "{prefix} references are intended for members lists, not access control rules",
+                    ))
                     .with_span(span),
                 );
             }
             Value::Array(items) => {
                 for item in items {
-                    self.check_user_ref_in_value(&item.value, item.span, diags);
+                    self.check_user_ref_in_value(&item.value, item.span, prefix, diags);
                 }
             }
             _ => {}
@@ -519,7 +615,9 @@ impl SchemaValidator {
         keyword: &str,
         diags: &mut Vec<Diagnostic>,
     ) {
-        if !matches!(keyword, "role" | "plan") {
+        if self.membership.member_keywords.is_empty()
+            || !self.membership.member_keywords.iter().any(|k| k == keyword)
+        {
             return;
         }
         for entry in &body.entries {
@@ -530,11 +628,14 @@ impl SchemaValidator {
     }
 
     fn check_builtin_in_nested_members(&self, body: &Body, diags: &mut Vec<Diagnostic>) {
+        if self.membership.builtin_refs.is_empty() {
+            return;
+        }
         for entry in &body.entries {
             match &entry.kind {
                 BodyEntryKind::ListItem(item) => {
                     if let ListItemKind::Role(role_ref) = &item.kind {
-                        if role_ref == "@public" || role_ref == "@authenticated" {
+                        if self.membership.builtin_refs.iter().any(|r| r == role_ref) {
                             diags.push(
                                 Diagnostic::warning(
                                     "built-in access levels should not appear in members lists",
@@ -553,21 +654,30 @@ impl SchemaValidator {
     }
 
     fn validate_member_cycles(&self, file: &File, diags: &mut Vec<Diagnostic>) {
+        if self.membership.member_keywords.is_empty() {
+            return;
+        }
+        let prefixes: Vec<String> = self
+            .membership
+            .member_keywords
+            .iter()
+            .map(|kw| format!("@{kw}/"))
+            .collect();
         let mut membership: HashMap<String, Vec<String>> = HashMap::new();
 
         for decl in &file.declarations {
             match &decl.kind {
                 DeclarationKind::Block(block) => {
-                    if matches!(block.keyword.name.as_str(), "role" | "plan") {
-                        let refs = collect_role_refs(&block.body);
+                    if self.membership.member_keywords.iter().any(|k| k == &block.keyword.name) {
+                        let refs = collect_member_refs(&block.body, &prefixes);
                         membership.insert(block.name.name.clone(), refs);
                     }
                 }
                 DeclarationKind::Array(arr) => {
-                    if matches!(arr.item_keyword.name.as_str(), "role" | "plan") {
+                    if self.membership.member_keywords.iter().any(|k| k == &arr.item_keyword.name) {
                         for item in &arr.body.items {
                             if let ListItemKind::Named { name, body } = &item.kind {
-                                let refs = collect_role_refs(body);
+                                let refs = collect_member_refs(body, &prefixes);
                                 membership.insert(name.name.clone(), refs);
                             }
                         }
@@ -589,19 +699,22 @@ impl SchemaValidator {
     }
 }
 
-fn collect_role_refs(body: &Body) -> Vec<String> {
+fn collect_member_refs(body: &Body, prefixes: &[String]) -> Vec<String> {
     let mut refs = Vec::new();
     for entry in &body.entries {
         match &entry.kind {
             BodyEntryKind::ListItem(item) => {
                 if let ListItemKind::Role(role_ref) = &item.kind {
-                    if let Some(name) = role_ref.strip_prefix("@role/") {
-                        refs.push(name.to_string());
+                    for prefix in prefixes {
+                        if let Some(name) = role_ref.strip_prefix(prefix.as_str()) {
+                            refs.push(name.to_string());
+                            break;
+                        }
                     }
                 }
             }
             BodyEntryKind::NestedBlock(nb) => {
-                refs.extend(collect_role_refs(&nb.body));
+                refs.extend(collect_member_refs(&nb.body, prefixes));
             }
             _ => {}
         }
@@ -650,7 +763,10 @@ fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
         PrimitiveType::Number => matches!(value, Value::Number(_)),
         PrimitiveType::Bool => matches!(value, Value::Bool(_)),
         PrimitiveType::Money => matches!(value, Value::Money(_)),
-        PrimitiveType::Duration => matches!(value, Value::String(_) | Value::TemplateString(_) | Value::Duration(_)),
+        PrimitiveType::Duration => matches!(
+            value,
+            Value::String(_) | Value::TemplateString(_) | Value::Duration(_)
+        ),
         PrimitiveType::Path => matches!(value, Value::String(_) | Value::TemplateString(_)),
         PrimitiveType::Secret => false,
         PrimitiveType::Object => false,
@@ -687,23 +803,49 @@ mod tests {
         SchemaValidator::new(schema.models, schema.enums)
     }
 
+    fn make_validator_with_modifiers(schema_source: &str, modifiers: &[&str]) -> SchemaValidator {
+        let file = parser::parse(schema_source).unwrap();
+        let schema = model_extract::extract(&file);
+        SchemaValidator::new(schema.models, schema.enums)
+            .with_modifiers(modifiers.iter().map(|s| s.to_string()).collect())
+    }
+
     #[test]
-    fn test_valid_modifiers() {
+    fn test_empty_modifiers_accepts_all() {
         let validator = make_validator("");
-        let source = "service Svc:\n    |allow = [@public]\n    |deny = []\n    localMount = \"/\"\n";
+        let source = "service Svc:\n    |anything = [@public]\n    localMount = \"/\"\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let modifier_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("modifier")).collect();
+        let modifier_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("modifier"))
+            .collect();
+        assert!(modifier_diags.is_empty());
+    }
+
+    #[test]
+    fn test_valid_modifiers() {
+        let validator = make_validator_with_modifiers("", &["allow", "deny"]);
+        let source =
+            "service Svc:\n    |allow = [@public]\n    |deny = []\n    localMount = \"/\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let modifier_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("modifier"))
+            .collect();
         assert!(modifier_diags.is_empty());
     }
 
     #[test]
     fn test_invalid_modifier_name() {
-        let validator = make_validator("");
+        let validator = make_validator_with_modifiers("", &["allow", "deny"]);
         let source = "service Svc:\n    |forbid = [@public]\n    localMount = \"/\"\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags.iter().any(|d| d.message.contains("unknown modifier '|forbid'")));
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains("unknown modifier '|forbid'")));
     }
 
     #[test]
@@ -712,7 +854,9 @@ mod tests {
         let source = "service Svc:\n    name string\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags.iter().any(|d| d.message.contains("field definitions are only allowed in model declarations")));
+        assert!(diags.iter().any(|d| d
+            .message
+            .contains("field definitions are only allowed in model declarations")));
     }
 
     #[test]
@@ -721,7 +865,10 @@ mod tests {
         let source = "model provider:\n    name string\n    url string?\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let field_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("field definitions")).collect();
+        let field_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("field definitions"))
+            .collect();
         assert!(field_diags.is_empty());
     }
 
@@ -733,7 +880,9 @@ mod tests {
         let source = "mount Test:\n    path = \"/\"\n    unknown = \"value\"\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags.iter().any(|d| d.message.contains("unknown property 'unknown'")));
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains("unknown property 'unknown'")));
     }
 
     #[test]
@@ -744,7 +893,9 @@ mod tests {
         let source = "mount Test:\n    wasm = \"handler.wasm\"\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags.iter().any(|d| d.message.contains("missing required field 'path'")));
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains("missing required field 'path'")));
     }
 
     #[test]
@@ -755,7 +906,10 @@ mod tests {
         let source = "prompt MyPrompt:\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let required_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("missing required")).collect();
+        let required_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("missing required"))
+            .collect();
         assert!(required_diags.is_empty());
     }
 
@@ -767,7 +921,9 @@ mod tests {
         let source = "mount Test:\n    path = 42\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags.iter().any(|d| d.message.contains("type mismatch") && d.message.contains("expected string")));
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains("type mismatch") && d.message.contains("expected string")));
     }
 
     #[test]
@@ -778,7 +934,10 @@ mod tests {
         let source = "mount Test:\n    path = \"/api\"\n    port = 8080\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
+        let type_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("type mismatch"))
+            .collect();
         assert!(type_diags.is_empty());
     }
 
@@ -790,7 +949,10 @@ mod tests {
         let source = "provider Groq:\n    type = \"groq\"\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let enum_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("invalid value")).collect();
+        let enum_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("invalid value"))
+            .collect();
         assert!(enum_diags.is_empty());
     }
 
@@ -802,16 +964,21 @@ mod tests {
         let source = "provider Groq:\n    type = \"gemini\"\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags.iter().any(|d| d.message.contains("invalid value 'gemini'")));
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains("invalid value 'gemini'")));
     }
 
     #[test]
     fn test_array_declaration_modifier_validation() {
-        let validator = make_validator("");
-        let source = "[]mount mounts:\n    |restrict = [@admin]\n    - Test:\n        path = \"/\"\n";
+        let validator = make_validator_with_modifiers("", &["allow", "deny"]);
+        let source =
+            "[]mount mounts:\n    |restrict = [@admin]\n    - Test:\n        path = \"/\"\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags.iter().any(|d| d.message.contains("unknown modifier '|restrict'")));
+        assert!(diags
+            .iter()
+            .any(|d| d.message.contains("unknown modifier '|restrict'")));
     }
 
     #[test]
@@ -833,7 +1000,10 @@ mod tests {
         let source = "provider P:\n    apiKey = $ENV.MY_KEY\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
+        let type_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("type mismatch"))
+            .collect();
         assert!(type_diags.is_empty());
     }
 
@@ -861,7 +1031,9 @@ mod tests {
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("unknown property 'systm'")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown property 'systm'")),
             "nested validation should catch typo; diags: {:?}",
             diags
         );
@@ -891,7 +1063,9 @@ mod tests {
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("missing required field 'required'")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("missing required field 'required'")),
             "nested validation should catch missing required; diags: {:?}",
             diags
         );
@@ -906,7 +1080,9 @@ mod tests {
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("unknown property 'provder'")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown property 'provder'")),
             "should catch typo inside list item; diags: {:?}",
             diags
         );
@@ -1013,7 +1189,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("unknown property 'blaasdsa'")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown property 'blaasdsa'")),
             "should catch blaasdsa; diags: {:?}",
             diags
         );
@@ -1028,7 +1206,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("unknown property 'blaasdsa'")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown property 'blaasdsa'")),
             "should catch unknown prop with no-space equals; diags: {:?}",
             diags
         );
@@ -1043,7 +1223,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("expected environment variable ($ENV.VARIABLE_NAME)")),
+            diags.iter().any(|d| d
+                .message
+                .contains("expected environment variable ($ENV.VARIABLE_NAME)")),
             "should show helpful secret error message; diags: {:?}",
             diags
         );
@@ -1058,7 +1240,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("type mismatch") && d.message.contains("got string")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("type mismatch") && d.message.contains("got string")),
             "should flag string fallback in secret field; diags: {:?}",
             diags
         );
@@ -1072,8 +1256,15 @@ workflow W:
         let source = "auth A:\n    secret = $ENV.AUTH_SECRET\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
-        assert!(type_diags.is_empty(), "env var should match secret type; diags: {:?}", type_diags);
+        let type_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("type mismatch"))
+            .collect();
+        assert!(
+            type_diags.is_empty(),
+            "env var should match secret type; diags: {:?}",
+            type_diags
+        );
     }
 
     #[test]
@@ -1084,8 +1275,15 @@ workflow W:
         let source = "server S:\n    port = $ENV.PORT | 3000\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
-        assert!(type_diags.is_empty(), "env var + number fallback should be valid for number field; diags: {:?}", type_diags);
+        let type_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("type mismatch"))
+            .collect();
+        assert!(
+            type_diags.is_empty(),
+            "env var + number fallback should be valid for number field; diags: {:?}",
+            type_diags
+        );
     }
 
     #[test]
@@ -1097,7 +1295,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("type mismatch") && d.message.contains("got string")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("type mismatch") && d.message.contains("got string")),
             "string fallback should be flagged for number field; diags: {:?}",
             diags
         );
@@ -1111,8 +1311,15 @@ workflow W:
         let source = "auth A:\n    secret = $ENV.PRIMARY | $ENV.FALLBACK\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
-        assert!(type_diags.is_empty(), "two env vars should both be valid; diags: {:?}", type_diags);
+        let type_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("type mismatch"))
+            .collect();
+        assert!(
+            type_diags.is_empty(),
+            "two env vars should both be valid; diags: {:?}",
+            type_diags
+        );
     }
 
     #[test]
@@ -1124,7 +1331,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("unknown property 'systm'")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown property 'systm'")),
             "should catch typo in nested model inside list item; diags: {:?}",
             diags
         );
@@ -1138,7 +1347,10 @@ workflow W:
         let source = "step Fork:\n    parallel:\n        - branchA:\n            emit = \"hello\"\n        - branchB:\n            provider = \"fast\"\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let warnings: Vec<_> = diags.iter().filter(|d| d.message.contains("unknown property")).collect();
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("unknown property"))
+            .collect();
         assert!(warnings.is_empty(), "unexpected warnings: {:?}", warnings);
     }
 
@@ -1150,7 +1362,10 @@ workflow W:
         let source = "step Fork:\n    parallel:\n        - pipeline:\n            - stepA:\n                emit = \"starting\"\n            - stepB:\n                emit = \"done\"\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let warnings: Vec<_> = diags.iter().filter(|d| d.message.contains("unknown property")).collect();
+        let warnings: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("unknown property"))
+            .collect();
         assert!(warnings.is_empty(), "unexpected warnings: {:?}", warnings);
     }
 
@@ -1162,7 +1377,13 @@ workflow W:
         let source = "step Fork:\n    parallel:\n        - pipeline:\n            - stepA:\n                emit = \"hello\"\n                bogus = \"bad\"\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags.iter().any(|d| d.message.contains("unknown property 'bogus'")), "expected warning about 'bogus', got: {:?}", diags);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown property 'bogus'")),
+            "expected warning about 'bogus', got: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -1174,7 +1395,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            !diags.iter().any(|d| d.message.contains("unknown property 'name'")),
+            !diags
+                .iter()
+                .any(|d| d.message.contains("unknown property 'name'")),
             "circular models should validate without infinite recursion; diags: {:?}",
             diags
         );
@@ -1237,7 +1460,9 @@ workflow W:
         let diags = validator.validate(&file);
         // Should validate without crashing or hanging
         assert!(
-            !diags.iter().any(|d| d.message.contains("unknown property 'value'")),
+            !diags
+                .iter()
+                .any(|d| d.message.contains("unknown property 'value'")),
             "mixed circular + self-ref models should validate correctly; diags: {:?}",
             diags
         );
@@ -1252,7 +1477,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("unknown property 'typo_field'")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown property 'typo_field'")),
             "should still catch errors inside circular model instances; diags: {:?}",
             diags
         );
@@ -1293,7 +1520,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("use @public instead of \"@public\"")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("use @public instead of \"@public\"")),
             "should suggest removing quotes for role field; diags: {:?}",
             diags
         );
@@ -1308,7 +1537,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("use @admin instead of \"admin\"")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("use @admin instead of \"admin\"")),
             "should suggest adding @ prefix for role field; diags: {:?}",
             diags
         );
@@ -1322,8 +1553,15 @@ workflow W:
         let source = "service Svc:\n    access = @public\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let role_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("role field")).collect();
-        assert!(role_diags.is_empty(), "valid role ref should not warn; diags: {:?}", role_diags);
+        let role_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("role field"))
+            .collect();
+        assert!(
+            role_diags.is_empty(),
+            "valid role ref should not warn; diags: {:?}",
+            role_diags
+        );
     }
 
     #[test]
@@ -1335,7 +1573,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("use @admin instead of \"@admin\"")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("use @admin instead of \"@admin\"")),
             "should warn about quoted string in role array; diags: {:?}",
             diags
         );
@@ -1352,7 +1592,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("unknown parent model 'nonexistent'")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown parent model 'nonexistent'")),
             "should detect unknown parent model; diags: {:?}",
             diags
         );
@@ -1366,8 +1608,15 @@ workflow W:
         let source = "model child is base:\n    value string\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let extends_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("unknown parent")).collect();
-        assert!(extends_diags.is_empty(), "known parent should not produce errors; diags: {:?}", extends_diags);
+        let extends_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("unknown parent"))
+            .collect();
+        assert!(
+            extends_diags.is_empty(),
+            "known parent should not produce errors; diags: {:?}",
+            extends_diags
+        );
     }
 
     #[test]
@@ -1379,12 +1628,16 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("unknown parent model 'foo'")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown parent model 'foo'")),
             "should detect 'foo' as unknown; diags: {:?}",
             diags
         );
         assert!(
-            diags.iter().any(|d| d.message.contains("unknown parent model 'bar'")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown parent model 'bar'")),
             "should detect 'bar' as unknown; diags: {:?}",
             diags
         );
@@ -1394,13 +1647,15 @@ workflow W:
 
     #[test]
     fn test_circular_member_detection() {
-        let validator = make_validator("");
+        let validator = make_validator_with_membership("");
 
         let source = "role Admin:\n    members:\n        - @role/Editor\n\nrole Editor:\n    members:\n        - @role/Admin\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("circular membership")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("circular membership")),
             "should detect circular membership; diags: {:?}",
             diags
         );
@@ -1408,24 +1663,33 @@ workflow W:
 
     #[test]
     fn test_no_circular_members_ok() {
-        let validator = make_validator("");
+        let validator = make_validator_with_membership("");
 
         let source = "role Admin:\n    members:\n        - @role/Editor\n\nrole Editor:\n    members:\n        - @role/Viewer\n\nrole Viewer:\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let cycle_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("circular membership")).collect();
-        assert!(cycle_diags.is_empty(), "non-circular members should not warn; diags: {:?}", cycle_diags);
+        let cycle_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("circular membership"))
+            .collect();
+        assert!(
+            cycle_diags.is_empty(),
+            "non-circular members should not warn; diags: {:?}",
+            cycle_diags
+        );
     }
 
     #[test]
     fn test_circular_member_in_array_decl() {
-        let validator = make_validator("");
+        let validator = make_validator_with_membership("");
 
         let source = "[]role roles:\n    - Admin:\n        members:\n            - @role/Editor\n    - Editor:\n        members:\n            - @role/Admin\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("circular membership")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("circular membership")),
             "should detect circular membership in array declarations; diags: {:?}",
             diags
         );
@@ -1433,29 +1697,80 @@ workflow W:
 
     #[test]
     fn test_self_referencing_member() {
-        let validator = make_validator("");
+        let validator = make_validator_with_membership("");
 
         let source = "role Admin:\n    members:\n        - @role/Admin\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("circular membership")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("circular membership")),
             "should detect self-referencing membership; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_no_membership_no_cycle_check() {
+        let validator = make_validator("");
+
+        let source = "role Admin:\n    members:\n        - @role/Editor\n\nrole Editor:\n    members:\n        - @role/Admin\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("circular membership")),
+            "without membership semantics, cycle detection should be off; diags: {:?}",
             diags
         );
     }
 
     // --- @user/ in access control tests ---
 
+    fn nudge_membership() -> MembershipSemantics {
+        MembershipSemantics {
+            member_keywords: vec!["role".into(), "plan".into()],
+            builtin_refs: vec!["@public".into(), "@authenticated".into()],
+            user_ref_prefix: Some("@user/".into()),
+        }
+    }
+
+    fn make_validator_with_membership(schema_source: &str) -> SchemaValidator {
+        let file = parser::parse(schema_source).unwrap();
+        let schema = model_extract::extract(&file);
+        SchemaValidator::new(schema.models, schema.enums)
+            .with_membership_semantics(nudge_membership())
+    }
+
     #[test]
-    fn test_user_ref_in_allow_inline_warning() {
+    fn test_no_membership_semantics_accepts_all() {
         let validator = make_validator("");
 
         let source = "service Svc:\n    |allow = [@user/john]\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("@user/ references are intended for members lists")),
+            !diags
+                .iter()
+                .any(|d| d.message.contains("@user/")),
+            "without membership semantics, @user/ should not be warned: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_user_ref_in_allow_inline_warning() {
+        let validator = make_validator_with_membership("");
+
+        let source = "service Svc:\n    |allow = [@user/john]\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d
+                .message
+                .contains("@user/ references are intended for members lists")),
             "should warn about @user/ in allow; diags: {:?}",
             diags
         );
@@ -1463,13 +1778,15 @@ workflow W:
 
     #[test]
     fn test_user_ref_in_deny_block_warning() {
-        let validator = make_validator("");
+        let validator = make_validator_with_membership("");
 
         let source = "service Svc:\n    |deny:\n        - @user/john\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("@user/ references are intended for members lists")),
+            diags.iter().any(|d| d
+                .message
+                .contains("@user/ references are intended for members lists")),
             "should warn about @user/ in deny block; diags: {:?}",
             diags
         );
@@ -1477,7 +1794,7 @@ workflow W:
 
     #[test]
     fn test_role_ref_in_allow_no_user_warning() {
-        let validator = make_validator("");
+        let validator = make_validator_with_membership("");
 
         let source = "service Svc:\n    |allow = [@role/admin]\n";
         let file = parser::parse(source).unwrap();
@@ -1493,13 +1810,15 @@ workflow W:
 
     #[test]
     fn test_public_in_members_warning() {
-        let validator = make_validator("");
+        let validator = make_validator_with_membership("");
 
         let source = "role Admin:\n    members:\n        - @public\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("built-in access levels should not appear in members lists")),
+            diags.iter().any(|d| d
+                .message
+                .contains("built-in access levels should not appear in members lists")),
             "should warn about @public in members; diags: {:?}",
             diags
         );
@@ -1507,13 +1826,15 @@ workflow W:
 
     #[test]
     fn test_authenticated_in_members_warning() {
-        let validator = make_validator("");
+        let validator = make_validator_with_membership("");
 
         let source = "role Admin:\n    members:\n        - @authenticated\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("built-in access levels should not appear in members lists")),
+            diags.iter().any(|d| d
+                .message
+                .contains("built-in access levels should not appear in members lists")),
             "should warn about @authenticated in members; diags: {:?}",
             diags
         );
@@ -1521,13 +1842,15 @@ workflow W:
 
     #[test]
     fn test_public_in_allow_no_builtin_warning() {
-        let validator = make_validator("");
+        let validator = make_validator_with_membership("");
 
         let source = "service Svc:\n    |allow = [@public]\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            !diags.iter().any(|d| d.message.contains("built-in access levels")),
+            !diags
+                .iter()
+                .any(|d| d.message.contains("built-in access levels")),
             "@public in allow should not trigger members warning; diags: {:?}",
             diags
         );
@@ -1535,13 +1858,15 @@ workflow W:
 
     #[test]
     fn test_builtin_in_plan_includes_warning() {
-        let validator = make_validator("");
+        let validator = make_validator_with_membership("");
 
         let source = "plan Pro:\n    includes:\n        - @public\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("built-in access levels should not appear in members lists")),
+            diags.iter().any(|d| d
+                .message
+                .contains("built-in access levels should not appear in members lists")),
             "should warn about @public in plan includes; diags: {:?}",
             diags
         );
@@ -1557,7 +1882,10 @@ workflow W:
         let source = "workflow W:\n    next = classify\n    entrypoint = start\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
+        let type_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("type mismatch"))
+            .collect();
         assert!(
             type_diags.is_empty(),
             "bare identifier should be accepted for ModelRef field; diags: {:?}",
@@ -1573,7 +1901,10 @@ workflow W:
         let source = "workflow W:\n    next = \"classify\"\n    entrypoint = \"start\"\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
+        let type_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("type mismatch"))
+            .collect();
         assert!(
             type_diags.is_empty(),
             "string should be accepted for ModelRef field; diags: {:?}",
@@ -1590,7 +1921,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags.iter().any(|d| d.message.contains("expected step reference")),
+            diags
+                .iter()
+                .any(|d| d.message.contains("expected step reference")),
             "number should be rejected for ModelRef field; diags: {:?}",
             diags
         );
@@ -1604,11 +1937,160 @@ workflow W:
         let source = "workflow W:\n    tools = [myTool, anotherTool]\n";
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
-        let type_diags: Vec<_> = diags.iter().filter(|d| d.message.contains("type mismatch")).collect();
+        let type_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("type mismatch"))
+            .collect();
         assert!(
             type_diags.is_empty(),
             "bare identifiers in array should be accepted for ModelRef list; diags: {:?}",
             type_diags
+        );
+    }
+
+    // --- Strict mode tests ---
+
+    fn make_strict_validator(schema_source: &str) -> SchemaValidator {
+        let file = parser::parse(schema_source).unwrap();
+        let schema = model_extract::extract(&file);
+        SchemaValidator::new(schema.models, schema.enums).strict()
+    }
+
+    #[test]
+    fn test_strict_unknown_property_is_error() {
+        let schema = "model server:\n    port number?\n";
+        let validator = make_strict_validator(schema);
+
+        let source = "server S:\n    port = 3000\n    bogus = true\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let unknown = diags
+            .iter()
+            .find(|d| d.message.contains("unknown property 'bogus'"))
+            .expect("should detect unknown property");
+        assert!(
+            matches!(unknown.severity, Severity::Error),
+            "strict mode should emit Error, not Warning"
+        );
+    }
+
+    #[test]
+    fn test_default_unknown_property_is_warning() {
+        let schema = "model server:\n    port number?\n";
+        let validator = make_validator(schema);
+
+        let source = "server S:\n    port = 3000\n    bogus = true\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let unknown = diags
+            .iter()
+            .find(|d| d.message.contains("unknown property 'bogus'"))
+            .expect("should detect unknown property");
+        assert!(
+            matches!(unknown.severity, Severity::Warning),
+            "default mode should emit Warning"
+        );
+    }
+
+    #[test]
+    fn test_strict_unmodeled_block_keyword_is_error() {
+        let schema = "model server:\n    port number?\n";
+        let validator = make_strict_validator(schema);
+
+        let source = "bogusBlock Thing:\n    key = \"value\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("block keyword 'bogusBlock' has no model definition")),
+            "strict mode should reject unmodeled block keyword; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_default_unmodeled_block_keyword_silent() {
+        let schema = "model server:\n    port number?\n";
+        let validator = make_validator(schema);
+
+        let source = "bogusBlock Thing:\n    key = \"value\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("has no model definition")),
+            "default mode should not flag unmodeled block; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_strict_unmodeled_array_keyword_with_named_items() {
+        let schema = "model server:\n    port number?\n";
+        let validator = make_strict_validator(schema);
+
+        let source = "[]bogus items:\n    - Item1:\n        key = \"value\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.iter().any(|d| d
+                .message
+                .contains("array item keyword 'bogus' has no model definition")),
+            "strict mode should reject unmodeled array with named items; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_strict_shorthand_array_no_false_positive() {
+        let schema = "model server:\n    port number?\n";
+        let validator = make_strict_validator(schema);
+
+        let source = "[]plugin plugins:\n    - \"echo\"\n    - \"telnyx\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("has no model definition")),
+            "shorthand-only arrays should not trigger unmodeled diagnostic; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_strict_object_field_stays_permissive() {
+        let schema = "model plugin:\n    wasm string\n    config object?\n";
+        let validator = make_strict_validator(schema);
+
+        let source = "plugin P:\n    wasm = \"echo.wasm\"\n    config:\n        anyKey = \"value\"\n        nested:\n            deep = true\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.is_empty(),
+            "object? fields should accept arbitrary keys even in strict mode; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_strict_nested_unknown_property_is_error() {
+        let schema =
+            "model prompt:\n    system string?\n\nmodel step:\n    prompt prompt?\n";
+        let validator = make_strict_validator(schema);
+
+        let source = "step S:\n    prompt:\n        systm = \"typo\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let unknown = diags
+            .iter()
+            .find(|d| d.message.contains("unknown property 'systm'"))
+            .expect("should detect unknown nested property");
+        assert!(
+            matches!(unknown.severity, Severity::Error),
+            "strict mode should emit Error for nested unknown properties"
         );
     }
 }
