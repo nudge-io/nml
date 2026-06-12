@@ -17,7 +17,7 @@ pub enum TokenKind {
 
     // Literals
     StringLiteral(String),
-    NumberLiteral(f64),
+    NumberLiteral(crate::types::Number),
     BoolLiteral(bool),
     Identifier(String),
     Role(String),         // @role/admin, @public, etc.
@@ -52,6 +52,24 @@ impl Token {
     }
 }
 
+/// A source comment captured during lexing.
+///
+/// Comments are not part of the token stream or the AST; they are exposed
+/// as a side channel (see [`crate::parser::parse_with_comments`]) so that
+/// tools like the formatter can preserve them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comment {
+    /// Comment text after the leading `//`, verbatim except for trailing
+    /// whitespace (so `////` dividers and deliberate spacing survive).
+    pub text: String,
+    /// Span covering the comment from `//` to end of line (exclusive of
+    /// the newline).
+    pub span: Span,
+    /// True when the comment is alone on its line (only whitespace before
+    /// it); false when it trails code on the same line.
+    pub own_line: bool,
+}
+
 /// Indent-aware tokenizer for NML source text.
 pub struct Lexer<'a> {
     source: &'a str,
@@ -59,8 +77,8 @@ pub struct Lexer<'a> {
     byte_offsets: Vec<usize>,
     pos: usize,
     indent_stack: Vec<usize>,
-    pending_tokens: Vec<Token>,
     at_line_start: bool,
+    comments: Vec<Comment>,
 }
 
 impl<'a> Lexer<'a> {
@@ -77,9 +95,15 @@ impl<'a> Lexer<'a> {
             byte_offsets,
             pos: 0,
             indent_stack: vec![0],
-            pending_tokens: Vec::new(),
             at_line_start: true,
+            comments: Vec::new(),
         }
+    }
+
+    /// Consume the comments recorded during [`Lexer::tokenize`], in source
+    /// order.
+    pub fn take_comments(&mut self) -> Vec<Comment> {
+        std::mem::take(&mut self.comments)
     }
 
     fn byte_pos(&self) -> usize {
@@ -100,11 +124,6 @@ impl<'a> Lexer<'a> {
         let mut tokens = Vec::new();
 
         loop {
-            if let Some(tok) = self.pending_tokens.pop() {
-                tokens.push(tok);
-                continue;
-            }
-
             if self.pos >= self.chars.len() {
                 while self.indent_stack.len() > 1 {
                     self.indent_stack.pop();
@@ -133,7 +152,7 @@ impl<'a> Lexer<'a> {
                     self.at_line_start = true;
                 }
                 '/' if self.peek_char() == Some('/') => {
-                    self.skip_comment();
+                    self.consume_comment(false);
                 }
                 '"' => {
                     if self.peek_char() == Some('"') && self.chars.get(self.pos + 2) == Some(&'"') {
@@ -153,12 +172,12 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 '-' => {
-                    if self.peek_char().map_or(false, |c| c.is_ascii_digit()) {
+                    if self.peek_char().is_some_and(|c| c.is_ascii_digit()) {
                         let prev_meaningful = tokens
                             .iter()
                             .rev()
                             .find(|t| !matches!(t.kind, TokenKind::Newline | TokenKind::Indent));
-                        if prev_meaningful.map_or(false, |t| {
+                        if prev_meaningful.is_some_and(|t| {
                             matches!(
                                 t.kind,
                                 TokenKind::Equals | TokenKind::BracketOpen | TokenKind::Comma
@@ -204,8 +223,7 @@ impl<'a> Lexer<'a> {
                         } else {
                             None
                         };
-                        if after_bracket
-                            .map_or(false, |c| c.is_alphabetic() || c == '_' || c == '(')
+                        if after_bracket.is_some_and(|c| c.is_alphabetic() || c == '_' || c == '(')
                         {
                             tokens.push(Token::new(TokenKind::ArrayPrefix, span));
                         } else {
@@ -275,12 +293,24 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
 
+        // Per spec, tabs are not permitted in indentation. Without this
+        // check a leading tab would be silently consumed as inter-token
+        // whitespace and the line treated as indent level `indent`,
+        // misinterpreting the document's structure.
+        if self.pos < self.chars.len() && self.chars[self.pos] == '\t' {
+            let bp = self.byte_pos();
+            return Err(NmlError::lex(
+                "tabs are not permitted in indentation; use spaces",
+                Span::new(bp, bp + 1),
+            ));
+        }
+
         if self.pos >= self.chars.len()
             || self.chars[self.pos] == '\n'
             || (self.chars[self.pos] == '/' && self.peek_char() == Some('/'))
         {
             if self.pos < self.chars.len() && self.chars[self.pos] != '\n' {
-                self.skip_comment();
+                self.consume_comment(true);
             }
             return Ok(());
         }
@@ -312,10 +342,21 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    fn skip_comment(&mut self) {
+    /// Consume a `//` comment through end of line, recording it for the
+    /// comment side channel. `self.pos` must be at the first `/`.
+    fn consume_comment(&mut self, own_line: bool) {
+        let start = self.byte_pos();
         while self.pos < self.chars.len() && self.chars[self.pos] != '\n' {
             self.pos += 1;
         }
+        let end = self.byte_pos();
+        let raw = &self.source[start..end];
+        let text = raw.strip_prefix("//").unwrap_or(raw).trim_end();
+        self.comments.push(Comment {
+            text: text.to_string(),
+            span: Span::new(start, end),
+            own_line,
+        });
     }
 
     fn read_string(&mut self) -> NmlResult<Token> {
@@ -490,7 +531,9 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
 
+        let mut is_float = false;
         if self.pos < self.chars.len() && self.chars[self.pos] == '.' {
+            is_float = true;
             s.push('.');
             self.pos += 1;
             while self.pos < self.chars.len() && self.chars[self.pos].is_ascii_digit() {
@@ -499,17 +542,26 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        let value: f64 = s.parse().map_err(|_| {
-            NmlError::lex(
-                format!("invalid number: \"{s}\""),
-                Span::new(start, self.byte_pos()),
+        let span = Span::new(start, self.byte_pos());
+        // Literals without a decimal point are exact 64-bit integers; a
+        // round-trip through f64 would silently corrupt values above 2^53.
+        // Integers that do not fit in i64 are an explicit error rather
+        // than a silently rounded float.
+        let value = if is_float {
+            crate::types::Number::Float(
+                s.parse()
+                    .map_err(|_| NmlError::lex(format!("invalid number: \"{s}\""), span))?,
             )
-        })?;
+        } else {
+            crate::types::Number::Int(s.parse().map_err(|_| {
+                NmlError::lex(
+                    format!("integer \"{s}\" out of range for 64-bit integer"),
+                    span,
+                )
+            })?)
+        };
 
-        Ok(Token::new(
-            TokenKind::NumberLiteral(value),
-            Span::new(start, self.byte_pos()),
-        ))
+        Ok(Token::new(TokenKind::NumberLiteral(value), span))
     }
 
     fn read_role(&mut self) -> Token {
@@ -538,7 +590,7 @@ impl<'a> Lexer<'a> {
         }
 
         if value.ends_with(':') {
-            let next = self.chars.get(self.pos).map(|&c| c);
+            let next = self.chars.get(self.pos).copied();
             if next.is_none() || next == Some('\n') || next == Some(' ') || next == Some('\t') {
                 value.pop();
                 self.pos -= 1;
@@ -662,6 +714,70 @@ mod tests {
     }
 
     #[test]
+    fn comments_captured_with_placement() {
+        let source =
+            "// header\nservice App: // trailing\n    // indented\n    port = 8080 // why\n";
+        let mut lexer = Lexer::new(source);
+        lexer.tokenize().unwrap();
+        let comments = lexer.take_comments();
+
+        assert_eq!(comments.len(), 4);
+        assert_eq!(comments[0].text, " header");
+        assert!(comments[0].own_line);
+        assert_eq!(comments[1].text, " trailing");
+        assert!(!comments[1].own_line);
+        assert_eq!(comments[2].text, " indented");
+        assert!(comments[2].own_line);
+        assert_eq!(comments[3].text, " why");
+        assert!(!comments[3].own_line);
+        // Spans must cover the full `// ...` text.
+        assert_eq!(
+            &source[comments[0].span.start..comments[0].span.end],
+            "// header"
+        );
+    }
+
+    #[test]
+    fn comment_like_text_inside_string_not_captured() {
+        let mut lexer = Lexer::new("url = \"https://example.com\"\n");
+        lexer.tokenize().unwrap();
+        assert!(lexer.take_comments().is_empty());
+    }
+
+    #[test]
+    fn divider_comment_text_verbatim() {
+        let mut lexer = Lexer::new("//// section ////\nx = 1\n");
+        lexer.tokenize().unwrap();
+        let comments = lexer.take_comments();
+        assert_eq!(comments[0].text, "// section ////");
+    }
+
+    #[test]
+    fn tab_indentation_rejected() {
+        let mut lexer = Lexer::new("service App:\n\tport = 8080\n");
+        let err = lexer.tokenize().unwrap_err();
+        assert!(
+            err.message().contains("tabs are not permitted"),
+            "expected tab error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn tab_after_spaces_in_indentation_rejected() {
+        let mut lexer = Lexer::new("service App:\n  \tport = 8080\n");
+        assert!(lexer.tokenize().is_err());
+    }
+
+    #[test]
+    fn tab_inside_string_literal_ok() {
+        let kinds = lex("name = \"a\tb\"");
+        assert!(kinds
+            .iter()
+            .any(|k| matches!(k, TokenKind::StringLiteral(s) if s == "a\tb")));
+    }
+
+    #[test]
     fn test_simple_property() {
         let tokens = lex("name = \"hello\"");
         assert_eq!(
@@ -727,6 +843,48 @@ mod tests {
     }
 
     #[test]
+    fn test_integer_literal_exact_above_2_pow_53() {
+        let tokens = lex("id = 9007199254740993");
+        assert!(
+            tokens.contains(&TokenKind::NumberLiteral(crate::types::Number::Int(
+                9_007_199_254_740_993
+            )))
+        );
+    }
+
+    #[test]
+    fn test_integer_literal_i64_bounds() {
+        let tokens = lex("max = 9223372036854775807");
+        assert!(
+            tokens.contains(&TokenKind::NumberLiteral(crate::types::Number::Int(
+                i64::MAX
+            )))
+        );
+        let tokens = lex("min = -9223372036854775808");
+        assert!(
+            tokens.contains(&TokenKind::NumberLiteral(crate::types::Number::Int(
+                i64::MIN
+            )))
+        );
+    }
+
+    #[test]
+    fn test_integer_literal_overflow_rejected() {
+        let mut lexer = Lexer::new("big = 9223372036854775808");
+        let err = lexer.tokenize().unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_decimal_literal_lexes_as_float() {
+        let tokens = lex("rate = 0.75");
+        assert!(tokens.contains(&TokenKind::NumberLiteral(crate::types::Number::Float(0.75))));
+    }
+
+    #[test]
     fn test_money_literal() {
         let tokens = lex("price = 19.99 USD");
         assert_eq!(
@@ -734,7 +892,7 @@ mod tests {
             vec![
                 TokenKind::Identifier("price".into()),
                 TokenKind::Equals,
-                TokenKind::NumberLiteral(19.99),
+                TokenKind::NumberLiteral(crate::types::Number::Float(19.99)),
                 TokenKind::CurrencyCode("USD".into()),
                 TokenKind::Eof,
             ]
@@ -859,7 +1017,7 @@ mod tests {
                 TokenKind::Dot,
                 TokenKind::Identifier("revalidationInterval".into()),
                 TokenKind::Equals,
-                TokenKind::NumberLiteral(7200.0),
+                TokenKind::NumberLiteral(crate::types::Number::Int(7200)),
                 TokenKind::Eof,
             ]
         );
@@ -983,7 +1141,7 @@ mod tests {
                 TokenKind::Equals,
                 TokenKind::SecretRef("$ENV.PORT".into()),
                 TokenKind::Pipe,
-                TokenKind::NumberLiteral(3000.0),
+                TokenKind::NumberLiteral(crate::types::Number::Int(3000)),
                 TokenKind::Eof,
             ]
         );

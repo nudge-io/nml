@@ -186,7 +186,7 @@ pub fn resolve_model_inheritance(schema: &mut ExtractedSchema) {
             &mut HashSet::new(),
         );
 
-        inherited.extend(model.fields.drain(..));
+        inherited.append(&mut model.fields);
         model.fields = inherited;
     }
 }
@@ -316,7 +316,7 @@ fn extract_model(block: &BlockDecl, span: crate::span::Span) -> Option<ModelDef>
                 {
                     fields.push(FieldDef {
                         name: m.name.name.clone(),
-                        field_type: FieldType::Modifier(resolve_type_name(field_type)),
+                        field_type: FieldType::Modifier(Box::new(resolve_field_type(field_type))),
                         optional: *optional,
                         default_value: None,
                         span: entry.span,
@@ -376,27 +376,13 @@ fn convert_field_def(fd: &FieldDefinition, span: crate::span::Span) -> FieldDef 
 
 fn resolve_field_type(expr: &FieldTypeExpr) -> FieldType {
     match expr {
-        FieldTypeExpr::Named(id) => {
-            if let Some(prim) = PrimitiveType::from_str(&id.name) {
-                FieldType::Primitive(prim)
-            } else {
-                FieldType::ModelRef(id.name.clone())
-            }
-        }
+        FieldTypeExpr::Named(id) => match id.name.parse::<PrimitiveType>() {
+            Ok(prim) => FieldType::Primitive(prim),
+            Err(_) => FieldType::ModelRef(id.name.clone()),
+        },
         FieldTypeExpr::Array(inner) => FieldType::List(Box::new(resolve_field_type(inner))),
         FieldTypeExpr::Union(variants) => {
             FieldType::Union(variants.iter().map(resolve_field_type).collect())
-        }
-    }
-}
-
-fn resolve_type_name(expr: &FieldTypeExpr) -> String {
-    match expr {
-        FieldTypeExpr::Named(id) => id.name.clone(),
-        FieldTypeExpr::Array(inner) => format!("[]{}", resolve_type_name(inner)),
-        FieldTypeExpr::Union(variants) => {
-            let names: Vec<_> = variants.iter().map(resolve_type_name).collect();
-            format!("({})", names.join(" | "))
         }
     }
 }

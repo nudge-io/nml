@@ -202,9 +202,13 @@ impl<'a> ValueQuery<'a> {
         }
     }
 
-    /// Extract as an integer (truncates fractional part).
+    /// Extract as an integer. Returns `None` for fractional or
+    /// out-of-range numbers rather than silently truncating.
     pub fn as_i64(&self) -> Option<i64> {
-        self.as_f64().map(|n| n as i64)
+        match self {
+            ValueQuery::Found(v) => i64::try_from(*v).ok(),
+            _ => None,
+        }
     }
 
     /// Extract as a boolean.

@@ -28,6 +28,12 @@ There is no separate `int` or `float` type. The int/float distinction is an
 implementation detail that does not belong in a configuration language. Constraints
 handle validation:
 
+**Precision guarantee:** a literal without a decimal point is an exact 64-bit
+signed integer — every value in `-2^63 .. 2^63 - 1` survives parsing,
+formatting, and deserialization bit-for-bit. Whole-number literals outside
+that range are a parse error (never silently rounded). Literals with a
+decimal point are IEEE 754 double-precision floats.
+
 ```
 // In a model definition
 port number <integer, min = 1, max = 65535>

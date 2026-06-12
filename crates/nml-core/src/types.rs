@@ -14,12 +14,102 @@ pub enum TemplateSegment {
     },
 }
 
+/// A numeric value: an exact 64-bit integer or an IEEE 754 double.
+///
+/// NML's `number` type covers whole numbers and decimals with a single
+/// surface type. Internally, literals without a decimal point lex as
+/// [`Number::Int`] so 64-bit integers survive exactly (a bare `f64`
+/// silently corrupts integers above 2^53); literals with a decimal point
+/// lex as [`Number::Float`].
+///
+/// Equality is numeric, not representational: `Int(3) == Float(3.0)`.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(untagged)]
+pub enum Number {
+    Int(i64),
+    Float(f64),
+}
+
+impl Number {
+    /// The value as an `f64`. Lossy for integers above 2^53; use
+    /// [`Number::as_i64`] when exactness matters.
+    pub fn as_f64(self) -> f64 {
+        match self {
+            Number::Int(i) => i as f64,
+            Number::Float(f) => f,
+        }
+    }
+
+    /// The value as an exact `i64`. `Float`s convert only when they are
+    /// whole and within range; fractional or out-of-range values yield
+    /// `None` (never truncation).
+    pub fn as_i64(self) -> Option<i64> {
+        match self {
+            Number::Int(i) => Some(i),
+            Number::Float(f) => float_to_exact_i64(f),
+        }
+    }
+}
+
+/// Exact `f64` -> `i64` conversion: whole values within `i64` range only.
+/// The upper bound is strict because `i64::MAX as f64` rounds up to 2^63,
+/// which is one past `i64::MAX`.
+fn float_to_exact_i64(f: f64) -> Option<i64> {
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+    (f.fract() == 0.0 && (-TWO_POW_63..TWO_POW_63).contains(&f)).then_some(f as i64)
+}
+
+impl PartialEq for Number {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Number::Int(a), Number::Int(b)) => a == b,
+            (Number::Float(a), Number::Float(b)) => a == b,
+            (Number::Int(a), Number::Float(b)) | (Number::Float(b), Number::Int(a)) => {
+                float_to_exact_i64(*b) == Some(*a)
+            }
+        }
+    }
+}
+
+impl PartialEq<f64> for Number {
+    fn eq(&self, other: &f64) -> bool {
+        *self == Number::Float(*other)
+    }
+}
+
+impl PartialEq<i64> for Number {
+    fn eq(&self, other: &i64) -> bool {
+        *self == Number::Int(*other)
+    }
+}
+
+impl From<i64> for Number {
+    fn from(i: i64) -> Self {
+        Number::Int(i)
+    }
+}
+
+impl From<f64> for Number {
+    fn from(f: f64) -> Self {
+        Number::Float(f)
+    }
+}
+
+impl std::fmt::Display for Number {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Number::Int(i) => write!(f, "{i}"),
+            Number::Float(n) => write!(f, "{n}"),
+        }
+    }
+}
+
 /// A parsed value in NML.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Value {
     String(String),
     TemplateString(Vec<TemplateSegment>),
-    Number(f64),
+    Number(Number),
     Money(Money),
     Bool(bool),
     Duration(String),
@@ -69,22 +159,31 @@ pub enum PrimitiveType {
     Role,
 }
 
-impl PrimitiveType {
-    pub fn from_str(s: &str) -> Option<Self> {
+/// Error returned when a string is not a recognized primitive type name.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown primitive type `{0}` (expected one of: string, number, money, bool, duration, path, secret, object, role)")]
+pub struct UnknownPrimitiveType(pub String);
+
+impl std::str::FromStr for PrimitiveType {
+    type Err = UnknownPrimitiveType;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "string" => Some(PrimitiveType::String),
-            "number" => Some(PrimitiveType::Number),
-            "money" => Some(PrimitiveType::Money),
-            "bool" => Some(PrimitiveType::Bool),
-            "duration" => Some(PrimitiveType::Duration),
-            "path" => Some(PrimitiveType::Path),
-            "secret" => Some(PrimitiveType::Secret),
-            "object" => Some(PrimitiveType::Object),
-            "role" => Some(PrimitiveType::Role),
-            _ => None,
+            "string" => Ok(PrimitiveType::String),
+            "number" => Ok(PrimitiveType::Number),
+            "money" => Ok(PrimitiveType::Money),
+            "bool" => Ok(PrimitiveType::Bool),
+            "duration" => Ok(PrimitiveType::Duration),
+            "path" => Ok(PrimitiveType::Path),
+            "secret" => Ok(PrimitiveType::Secret),
+            "object" => Ok(PrimitiveType::Object),
+            "role" => Ok(PrimitiveType::Role),
+            other => Err(UnknownPrimitiveType(other.to_string())),
         }
     }
+}
 
+impl PrimitiveType {
     pub fn as_str(&self) -> &'static str {
         match self {
             PrimitiveType::String => "string",
@@ -109,6 +208,11 @@ pub struct ValueTypeError {
 }
 
 impl Value {
+    /// Construct a numeric value from any integer or float.
+    pub fn number(n: impl Into<Number>) -> Value {
+        Value::Number(n.into())
+    }
+
     /// Returns a human-readable name for the value's variant.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -139,10 +243,20 @@ impl Value {
         }
     }
 
-    /// Extract as a number.
+    /// Extract as a number (lossy for integers above 2^53; see
+    /// [`Value::as_i64`] for exact integer extraction).
     pub fn as_f64(&self) -> Option<f64> {
         match self {
-            Value::Number(n) => Some(*n),
+            Value::Number(n) => Some(n.as_f64()),
+            _ => None,
+        }
+    }
+
+    /// Extract as an exact integer. Fractional or out-of-range numbers
+    /// yield `None` (never truncation).
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::Number(n) => n.as_i64(),
             _ => None,
         }
     }
@@ -186,7 +300,7 @@ impl TryFrom<&Value> for f64 {
 
     fn try_from(value: &Value) -> Result<f64, Self::Error> {
         match value {
-            Value::Number(n) => Ok(*n),
+            Value::Number(n) => Ok(n.as_f64()),
             _ => Err(ValueTypeError {
                 expected: "number",
                 actual: value.type_name(),
@@ -200,7 +314,12 @@ impl TryFrom<&Value> for i64 {
 
     fn try_from(value: &Value) -> Result<i64, Self::Error> {
         match value {
-            Value::Number(n) => Ok(*n as i64),
+            // Reject fractional and out-of-range numbers rather than
+            // silently truncating (e.g. 3.7 must not become 3).
+            Value::Number(n) => n.as_i64().ok_or(ValueTypeError {
+                expected: "integer",
+                actual: "fractional or out-of-range number",
+            }),
             _ => Err(ValueTypeError {
                 expected: "number",
                 actual: value.type_name(),
@@ -250,11 +369,12 @@ mod tests {
 
     #[test]
     fn test_primitive_type_object() {
-        assert_eq!(
-            PrimitiveType::from_str("object"),
-            Some(PrimitiveType::Object)
-        );
+        assert_eq!("object".parse(), Ok(PrimitiveType::Object));
         assert_eq!(PrimitiveType::Object.as_str(), "object");
+        assert_eq!(
+            "blob".parse::<PrimitiveType>(),
+            Err(UnknownPrimitiveType("blob".to_string()))
+        );
     }
 
     #[test]
@@ -265,7 +385,7 @@ mod tests {
 
     #[test]
     fn try_from_number() {
-        let v = Value::Number(42.0);
+        let v = Value::number(42.0);
         assert_eq!(f64::try_from(&v).unwrap(), 42.0);
         assert_eq!(i64::try_from(&v).unwrap(), 42);
     }
@@ -273,7 +393,7 @@ mod tests {
     #[test]
     fn try_from_bool() {
         let v = Value::Bool(true);
-        assert_eq!(bool::try_from(&v).unwrap(), true);
+        assert!(bool::try_from(&v).unwrap());
     }
 
     #[test]
@@ -299,19 +419,19 @@ mod tests {
         assert_eq!(Value::String("hi".into()).as_str(), Some("hi"));
         assert_eq!(Value::Path("/tmp".into()).as_str(), Some("/tmp"));
         assert_eq!(Value::Reference("Ref".into()).as_str(), Some("Ref"));
-        assert_eq!(Value::Number(1.0).as_str(), None);
+        assert_eq!(Value::number(1.0).as_str(), None);
     }
 
     #[test]
     fn as_f64_accessor() {
-        assert_eq!(Value::Number(3.14).as_f64(), Some(3.14));
+        assert_eq!(Value::number(2.5).as_f64(), Some(2.5));
         assert_eq!(Value::String("x".into()).as_f64(), None);
     }
 
     #[test]
     fn as_bool_accessor() {
         assert_eq!(Value::Bool(true).as_bool(), Some(true));
-        assert_eq!(Value::Number(1.0).as_bool(), None);
+        assert_eq!(Value::number(1.0).as_bool(), None);
     }
 
     #[test]
@@ -323,6 +443,59 @@ mod tests {
         assert!(arr.as_array().is_some());
         assert_eq!(arr.as_array().unwrap().len(), 1);
         assert!(Value::String("x".into()).as_array().is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Number: exactness, equality, display
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn number_int_exact_above_2_pow_53() {
+        // 2^53 + 1 is the smallest integer f64 cannot represent.
+        let n = Number::Int(9_007_199_254_740_993);
+        assert_eq!(n.as_i64(), Some(9_007_199_254_740_993));
+        assert_eq!(Number::Int(i64::MAX).as_i64(), Some(i64::MAX));
+        assert_eq!(Number::Int(i64::MIN).as_i64(), Some(i64::MIN));
+    }
+
+    #[test]
+    fn number_equality_is_numeric() {
+        assert_eq!(Number::Int(3), Number::Float(3.0));
+        assert_eq!(Number::Float(3.0), Number::Int(3));
+        assert_ne!(Number::Int(3), Number::Float(3.5));
+        // i64::MAX as f64 rounds up to 2^63, which is NOT i64::MAX.
+        assert_ne!(Number::Int(i64::MAX), Number::Float(i64::MAX as f64));
+        // i64::MIN is exactly -2^63, which f64 represents exactly.
+        assert_eq!(Number::Int(i64::MIN), Number::Float(i64::MIN as f64));
+        assert_ne!(Number::Float(f64::NAN), Number::Float(f64::NAN));
+    }
+
+    #[test]
+    fn number_float_to_i64_is_exact_or_none() {
+        assert_eq!(Number::Float(3.5).as_i64(), None);
+        assert_eq!(Number::Float(f64::NAN).as_i64(), None);
+        assert_eq!(Number::Float(f64::INFINITY).as_i64(), None);
+        // 2^63 is one past i64::MAX; must not wrap or saturate silently.
+        assert_eq!(Number::Float(9_223_372_036_854_775_808.0).as_i64(), None);
+        assert_eq!(
+            Number::Float(-9_223_372_036_854_775_808.0).as_i64(),
+            Some(i64::MIN)
+        );
+    }
+
+    #[test]
+    fn number_display() {
+        assert_eq!(Number::Int(42).to_string(), "42");
+        assert_eq!(Number::Int(i64::MAX).to_string(), "9223372036854775807");
+        assert_eq!(Number::Float(2.5).to_string(), "2.5");
+        assert_eq!(Number::Float(2.0).to_string(), "2");
+    }
+
+    #[test]
+    fn value_as_i64_accessor() {
+        assert_eq!(Value::number(42).as_i64(), Some(42));
+        assert_eq!(Value::number(2.5).as_i64(), None);
+        assert_eq!(Value::String("42".into()).as_i64(), None);
     }
 
     // -------------------------------------------------------------------
@@ -381,20 +554,21 @@ mod tests {
 
     #[test]
     fn try_from_number_to_bool_fails() {
-        let v = Value::Number(1.0);
+        let v = Value::number(1.0);
         let result = bool::try_from(&v);
         assert!(result.is_err());
     }
 
     #[test]
-    fn i64_truncation() {
-        let v = Value::Number(3.14);
-        assert_eq!(i64::try_from(&v).unwrap(), 3);
+    fn i64_rejects_fractional() {
+        // 3.7 is not an integer; conversion must fail rather than truncate.
+        let v = Value::number(3.7);
+        assert!(i64::try_from(&v).is_err());
     }
 
     #[test]
     fn i64_negative() {
-        let v = Value::Number(-100.0);
+        let v = Value::number(-100.0);
         assert_eq!(i64::try_from(&v).unwrap(), -100);
     }
 
@@ -402,7 +576,7 @@ mod tests {
     fn vec_string_from_mixed_array_fails() {
         let v = Value::Array(vec![
             SpannedValue::new(Value::String("a".into()), Span::empty(0)),
-            SpannedValue::new(Value::Number(42.0), Span::empty(0)),
+            SpannedValue::new(Value::number(42.0), Span::empty(0)),
         ]);
         let result = Vec::<String>::try_from(&v);
         assert!(result.is_err());
@@ -450,7 +624,7 @@ mod tests {
     fn type_name_all_variants() {
         assert_eq!(Value::String("".into()).type_name(), "string");
         assert_eq!(Value::TemplateString(vec![]).type_name(), "string");
-        assert_eq!(Value::Number(0.0).type_name(), "number");
+        assert_eq!(Value::number(0.0).type_name(), "number");
         assert_eq!(Value::Bool(false).type_name(), "bool");
         assert_eq!(Value::Duration("1s".into()).type_name(), "duration");
         assert_eq!(Value::Path("/x".into()).type_name(), "path");

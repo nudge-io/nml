@@ -7,7 +7,6 @@ use nml_core::{parse, Document};
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
 struct ServiceConfig {
     host: String,
     port: f64,
@@ -36,6 +35,9 @@ service Worker:
     for (name, block) in doc.blocks("service") {
         let body = block.body().expect("block should have body");
         let config: ServiceConfig = from_block(body).expect("failed to deserialize");
-        println!("{name}: {config:#?}");
+        println!(
+            "{name}: listening on {}:{} (debug={}, tags={:?})",
+            config.host, config.port, config.debug, config.tags
+        );
     }
 }

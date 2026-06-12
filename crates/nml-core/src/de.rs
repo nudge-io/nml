@@ -40,7 +40,23 @@ use serde::Deserialize;
 use crate::ast::*;
 use crate::resolve::{self, ValueResolver};
 use crate::template;
-use crate::types::Value;
+use crate::types::{Number, Value};
+
+/// Generates the integer `deserialize_*` methods: coerce to [`Number`],
+/// convert exactly via [`number_to_int`], and visit the target width.
+macro_rules! deserialize_int {
+    ($method:ident, $visit:ident, $ty:ty, $name:literal) => {
+        fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            match coerce_to_number(self.value) {
+                Some(n) => visitor.$visit(number_to_int::<$ty>(n, $name)?),
+                None => Err(Error(format!(
+                    "expected number, got {}",
+                    self.value.type_name()
+                ))),
+            }
+        }
+    };
+}
 
 /// Errors that can occur during NML deserialization.
 #[derive(Debug)]
@@ -60,105 +76,29 @@ impl de::Error for Error {
     }
 }
 
-fn f64_to_u8(n: f64) -> Result<u8, Error> {
-    if n.fract() != 0.0 {
-        return Err(Error(format!("u8 value {} has a fractional part", n)));
+/// Convert a [`Number`] to any Rust integer type, rejecting fractional
+/// and out-of-range values with a precise error. Integers flow through
+/// exactly (no f64 round-trip), so the full `i64` range is preserved.
+fn number_to_int<T: TryFrom<i64>>(n: Number, type_name: &'static str) -> Result<T, Error> {
+    if let Number::Float(f) = n {
+        if f.fract() != 0.0 {
+            return Err(Error(format!(
+                "{type_name} value {f} has a fractional part"
+            )));
+        }
     }
-    if n < 0.0 || n > u8::MAX as f64 {
-        return Err(Error(format!("u8 value {} out of range (0..=255)", n)));
-    }
-    Ok(n as u8)
-}
-
-fn f64_to_u16(n: f64) -> Result<u16, Error> {
-    if n.fract() != 0.0 {
-        return Err(Error(format!("u16 value {} has a fractional part", n)));
-    }
-    if n < 0.0 || n > u16::MAX as f64 {
-        return Err(Error(format!("u16 value {} out of range (0..=65535)", n)));
-    }
-    Ok(n as u16)
-}
-
-fn f64_to_u32(n: f64) -> Result<u32, Error> {
-    if n.fract() != 0.0 {
-        return Err(Error(format!("u32 value {} has a fractional part", n)));
-    }
-    if n < 0.0 || n > u32::MAX as f64 {
-        return Err(Error(format!(
-            "u32 value {} out of range (0..=4294967295)",
-            n
-        )));
-    }
-    Ok(n as u32)
-}
-
-fn f64_to_u64(n: f64) -> Result<u64, Error> {
-    if n.fract() != 0.0 {
-        return Err(Error(format!("u64 value {} has a fractional part", n)));
-    }
-    if n < 0.0 || n > u64::MAX as f64 {
-        return Err(Error(format!(
-            "u64 value {} out of range (0..={})",
-            n,
-            u64::MAX
-        )));
-    }
-    Ok(n as u64)
-}
-
-fn f64_to_i8(n: f64) -> Result<i8, Error> {
-    if n.fract() != 0.0 {
-        return Err(Error(format!("i8 value {} has a fractional part", n)));
-    }
-    if n < i8::MIN as f64 || n > i8::MAX as f64 {
-        return Err(Error(format!("i8 value {} out of range (-128..=127)", n)));
-    }
-    Ok(n as i8)
-}
-
-fn f64_to_i16(n: f64) -> Result<i16, Error> {
-    if n.fract() != 0.0 {
-        return Err(Error(format!("i16 value {} has a fractional part", n)));
-    }
-    if n < i16::MIN as f64 || n > i16::MAX as f64 {
-        return Err(Error(format!(
-            "i16 value {} out of range (-32768..=32767)",
-            n
-        )));
-    }
-    Ok(n as i16)
-}
-
-fn f64_to_i32(n: f64) -> Result<i32, Error> {
-    if n.fract() != 0.0 {
-        return Err(Error(format!("i32 value {} has a fractional part", n)));
-    }
-    if n < i32::MIN as f64 || n > i32::MAX as f64 {
-        return Err(Error(format!(
-            "i32 value {} out of range (-2147483648..=2147483647)",
-            n
-        )));
-    }
-    Ok(n as i32)
-}
-
-fn f64_to_i64(n: f64) -> Result<i64, Error> {
-    if n.fract() != 0.0 {
-        return Err(Error(format!("i64 value {} has a fractional part", n)));
-    }
-    if n < i64::MIN as f64 || n > i64::MAX as f64 {
-        return Err(Error(format!(
-            "i64 value {} out of range ({}..={})",
-            n,
-            i64::MIN,
-            i64::MAX
-        )));
-    }
-    Ok(n as i64)
+    n.as_i64()
+        .and_then(|i| T::try_from(i).ok())
+        .ok_or_else(|| Error(format!("{type_name} value {n} out of range")))
 }
 
 /// Deserialize a struct from an NML block body.
+///
+/// This operates on the *raw* AST: `$ENV.KEY` secrets deserialize as their
+/// literal reference text and `a | b` fallback chains deserialize as the
+/// primary value only. Configuration that uses env vars or fallbacks must
+/// go through [`from_body_resolved`], which resolves both before
+/// deserializing.
 pub fn from_block<'de, T: Deserialize<'de>>(body: &'de Body) -> Result<T, Error> {
     let deserializer = BodyDeserializer { body };
     T::deserialize(deserializer)
@@ -526,14 +466,19 @@ impl<'de> MapAccess<'de> for NamedItemMapAccess<'de> {
 // Value deserializer
 // ---------------------------------------------------------------------------
 
-/// Coerce a string-typed Value to f64 if parseable.
-/// Env vars resolve to Value::String, so `$ENV.PORT` = "3000" needs to
-/// deserialize into numeric fields.
-fn coerce_to_f64(value: &Value) -> Option<f64> {
+/// Coerce a Value to a number. Native numbers pass through; string-typed
+/// values parse as exact integers first, then floats. Env vars resolve to
+/// `Value::String`, so `$ENV.PORT` = "3000" needs to deserialize into
+/// numeric fields -- and `"9007199254740993"` must survive exactly rather
+/// than detouring through f64.
+fn coerce_to_number(value: &Value) -> Option<Number> {
     match value {
-        Value::String(s) | Value::Secret(s) | Value::Duration(s) | Value::Path(s) => {
-            s.parse::<f64>().ok()
-        }
+        Value::Number(n) => Some(*n),
+        Value::String(s) | Value::Secret(s) | Value::Duration(s) | Value::Path(s) => s
+            .parse::<i64>()
+            .map(Number::Int)
+            .ok()
+            .or_else(|| s.parse::<f64>().map(Number::Float).ok()),
         _ => None,
     }
 }
@@ -564,13 +509,8 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
                 let s = template::segments_to_string(segs);
                 visitor.visit_string(s)
             }
-            Value::Number(n) => {
-                if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
-                    visitor.visit_i64(*n as i64)
-                } else {
-                    visitor.visit_f64(*n)
-                }
-            }
+            Value::Number(Number::Int(i)) => visitor.visit_i64(*i),
+            Value::Number(Number::Float(f)) => visitor.visit_f64(*f),
             Value::Bool(b) => visitor.visit_bool(*b),
             Value::Duration(s) | Value::Path(s) | Value::Secret(s) | Value::Role(s) => {
                 visitor.visit_str(s)
@@ -599,134 +539,33 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     }
 
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match self.value {
-            Value::Number(n) => visitor.visit_f64(*n),
-            _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_f64(n),
-                None => Err(Error(format!(
-                    "expected number, got {}",
-                    self.value.type_name()
-                ))),
-            },
+        match coerce_to_number(self.value) {
+            Some(n) => visitor.visit_f64(n.as_f64()),
+            None => Err(Error(format!(
+                "expected number, got {}",
+                self.value.type_name()
+            ))),
         }
     }
 
     fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match self.value {
-            Value::Number(n) => visitor.visit_f32(*n as f32),
-            _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_f32(n as f32),
-                None => Err(Error(format!(
-                    "expected number, got {}",
-                    self.value.type_name()
-                ))),
-            },
+        match coerce_to_number(self.value) {
+            Some(n) => visitor.visit_f32(n.as_f64() as f32),
+            None => Err(Error(format!(
+                "expected number, got {}",
+                self.value.type_name()
+            ))),
         }
     }
 
-    fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match self.value {
-            Value::Number(n) => visitor.visit_i64(f64_to_i64(*n)?),
-            _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_i64(f64_to_i64(n)?),
-                None => Err(Error(format!(
-                    "expected number, got {}",
-                    self.value.type_name()
-                ))),
-            },
-        }
-    }
-
-    fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match self.value {
-            Value::Number(n) => visitor.visit_i32(f64_to_i32(*n)?),
-            _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_i32(f64_to_i32(n)?),
-                None => Err(Error(format!(
-                    "expected number, got {}",
-                    self.value.type_name()
-                ))),
-            },
-        }
-    }
-
-    fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match self.value {
-            Value::Number(n) => visitor.visit_i16(f64_to_i16(*n)?),
-            _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_i16(f64_to_i16(n)?),
-                None => Err(Error(format!(
-                    "expected number, got {}",
-                    self.value.type_name()
-                ))),
-            },
-        }
-    }
-
-    fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match self.value {
-            Value::Number(n) => visitor.visit_i8(f64_to_i8(*n)?),
-            _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_i8(f64_to_i8(n)?),
-                None => Err(Error(format!(
-                    "expected number, got {}",
-                    self.value.type_name()
-                ))),
-            },
-        }
-    }
-
-    fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match self.value {
-            Value::Number(n) => visitor.visit_u64(f64_to_u64(*n)?),
-            _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_u64(f64_to_u64(n)?),
-                None => Err(Error(format!(
-                    "expected unsigned number, got {}",
-                    self.value.type_name()
-                ))),
-            },
-        }
-    }
-
-    fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match self.value {
-            Value::Number(n) => visitor.visit_u32(f64_to_u32(*n)?),
-            _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_u32(f64_to_u32(n)?),
-                None => Err(Error(format!(
-                    "expected unsigned number, got {}",
-                    self.value.type_name()
-                ))),
-            },
-        }
-    }
-
-    fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match self.value {
-            Value::Number(n) => visitor.visit_u16(f64_to_u16(*n)?),
-            _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_u16(f64_to_u16(n)?),
-                None => Err(Error(format!(
-                    "expected unsigned number, got {}",
-                    self.value.type_name()
-                ))),
-            },
-        }
-    }
-
-    fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match self.value {
-            Value::Number(n) => visitor.visit_u8(f64_to_u8(*n)?),
-            _ => match coerce_to_f64(self.value) {
-                Some(n) => visitor.visit_u8(f64_to_u8(n)?),
-                None => Err(Error(format!(
-                    "expected unsigned number, got {}",
-                    self.value.type_name()
-                ))),
-            },
-        }
-    }
+    deserialize_int!(deserialize_i64, visit_i64, i64, "i64");
+    deserialize_int!(deserialize_i32, visit_i32, i32, "i32");
+    deserialize_int!(deserialize_i16, visit_i16, i16, "i16");
+    deserialize_int!(deserialize_i8, visit_i8, i8, "i8");
+    deserialize_int!(deserialize_u64, visit_u64, u64, "u64");
+    deserialize_int!(deserialize_u32, visit_u32, u32, "u32");
+    deserialize_int!(deserialize_u16, visit_u16, u16, "u16");
+    deserialize_int!(deserialize_u8, visit_u8, u8, "u8");
 
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
@@ -764,9 +603,44 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
         visitor.visit_unit()
     }
 
+    /// Unit-variant enums deserialize from string-typed values: the
+    /// string is handed to serde's variant resolver via `visit_enum`,
+    /// so `#[serde(rename_all = "...")]` and `#[serde(rename = "...")]`
+    /// on the target enum work exactly as they do for JSON/TOML/YAML.
+    /// Unknown variants surface serde's canonical
+    /// `unknown variant ..., expected ...` error at parse time.
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        name: &'static str,
+        variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self.value {
+            Value::String(s)
+            | Value::Path(s)
+            | Value::Duration(s)
+            | Value::Secret(s)
+            | Value::Role(s)
+            | Value::Reference(s) => {
+                visitor.visit_enum(de::value::StrDeserializer::<Error>::new(s))
+            }
+            Value::TemplateString(segs) => visitor.visit_enum(
+                de::value::StringDeserializer::<Error>::new(template::segments_to_string(segs)),
+            ),
+            Value::Fallback(primary, _) => ValueDeserializer {
+                value: &primary.value,
+            }
+            .deserialize_enum(name, variants, visitor),
+            _ => Err(Error(format!(
+                "expected string for enum {name}, got {}",
+                self.value.type_name()
+            ))),
+        }
+    }
+
     serde::forward_to_deserialize_any! {
         char bytes byte_buf unit unit_struct newtype_struct
-        tuple tuple_struct map struct enum identifier
+        tuple tuple_struct map struct identifier
     }
 }
 
@@ -844,7 +718,7 @@ service MyApp:
 
     #[test]
     fn deserialize_value_directly() {
-        let v = Value::Number(42.0);
+        let v = Value::number(42.0);
         let n: f64 = from_value(&v).unwrap();
         assert_eq!(n, 42.0);
     }
@@ -905,7 +779,7 @@ server App:
         let body = doc.block("server", "App").body().unwrap();
         let config: Server = from_block(body).unwrap();
         assert_eq!(config.port, 3000);
-        assert!(config.db.is_none());
+        assert!(config.db.map(|db| db.url).is_none());
     }
 
     #[test]
@@ -965,6 +839,7 @@ service S:
         }
         let config: S = from_block(body).unwrap();
         assert_eq!(config.items[0].name, "OverriddenName");
+        assert_eq!(config.items[0].url, "/api");
     }
 
     #[test]
@@ -1213,15 +1088,23 @@ auth MyAuth:
             port: u16,
         }
 
+        // Control: the complete source deserializes, proving the struct
+        // shape is right and the failure below is really the missing field.
+        let complete = "service App:\n    host = \"localhost\"\n    port = 8080\n";
+        let file = parser::parse(complete).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert_eq!(config.host, "localhost");
+        assert_eq!(config.port, 8080);
+
         let source = "service App:\n    host = \"localhost\"\n";
         let file = parser::parse(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let result: Result<Config, _> = from_block(body);
-        assert!(
-            result.is_err(),
-            "missing required field 'port' should error"
-        );
+        let err = result.expect_err("missing required field 'port' should error");
+        assert!(err.to_string().contains("port"), "got: {err}");
     }
 
     #[test]
@@ -1241,7 +1124,7 @@ auth MyAuth:
 
     #[test]
     fn type_mismatch_number_as_string() {
-        let v = Value::Number(42.0);
+        let v = Value::number(42.0);
         let result: Result<String, _> = from_value(&v);
         assert!(result.is_err());
     }
@@ -1340,6 +1223,17 @@ auth MyAuth:
             result.is_err(),
             "unresolvable env var should propagate error"
         );
+
+        // Control: with a fallback the same shape resolves cleanly.
+        let with_fallback =
+            "service App:\n    secret = $ENV.NONEXISTENT_NML_TEST_VAR_XYZ | \"fallback\"\n";
+        let file = parser::parse(with_fallback).unwrap();
+        let body = match &file.declarations[0].kind {
+            DeclarationKind::Block(b) => &b.body,
+            _ => panic!("expected block"),
+        };
+        let config: Config = from_body_resolved(body, &resolver).unwrap();
+        assert_eq!(config.secret, "fallback");
     }
 
     #[test]
@@ -1373,26 +1267,28 @@ auth MyAuth:
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
+        assert_eq!(config.host, "localhost");
         assert_eq!(config.port, Some(3000));
     }
 
     #[test]
     fn deserialize_f32() {
-        let v = Value::Number(3.14);
+        // 2.5 is exactly representable in f32, so equality is exact.
+        let v = Value::number(2.5);
         let result: f32 = from_value(&v).unwrap();
-        assert!((result - 3.14f32).abs() < 0.001);
+        assert_eq!(result, 2.5f32);
     }
 
     #[test]
     fn deserialize_negative_integer() {
-        let v = Value::Number(-42.0);
+        let v = Value::number(-42.0);
         let result: i32 = from_value(&v).unwrap();
         assert_eq!(result, -42);
     }
 
     #[test]
     fn deserialize_unsigned_rejects_negative() {
-        let v = Value::Number(-1.0);
+        let v = Value::number(-1.0);
         let result: Result<u16, _> = from_value(&v);
         assert!(result.is_err());
     }
@@ -1440,6 +1336,9 @@ workflow W:
         assert_eq!(config.entrypoint, "step1");
         assert_eq!(config.steps.len(), 2);
         assert_eq!(config.steps[0].name, "step1");
+        assert_eq!(config.steps[0].provider, "fast");
+        assert_eq!(config.steps[1].name, "step2");
+        assert_eq!(config.steps[1].provider, "slow");
     }
 
     #[test]
@@ -1526,59 +1425,41 @@ workflow W:
 
     #[test]
     fn non_numeric_string_rejects_as_number() {
-        #[derive(Deserialize, Debug)]
-        struct Config {
-            port: u16,
-        }
-        let source = "server S:\n    port = \"not-a-number\"\n";
-        let file = parser::parse(source).unwrap();
-        let doc = Document::new(&file);
-        let body = doc.block("server", "S").body().unwrap();
-        let result: Result<Config, _> = from_block(body);
+        let result = parse_port("server App:\n    port = \"not-a-number\"\n");
         assert!(result.is_err());
     }
 
     // --- Numeric range and fractional validation ---
 
-    #[test]
-    fn test_u16_valid_port() {
-        #[derive(Deserialize, Debug)]
-        struct Config {
-            port: u16,
-        }
-        let nml = "server App:\n    port = 8080\n";
+    /// Shared fixture for the u16 range tests below; the success tests
+    /// read `port`, the rejection tests only need the field to exist.
+    #[derive(Deserialize, Debug)]
+    struct PortConfig {
+        port: u16,
+    }
+
+    fn parse_port(nml: &str) -> Result<PortConfig, Error> {
         let file = parser::parse(nml).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        from_block(body)
+    }
+
+    #[test]
+    fn test_u16_valid_port() {
+        let config = parse_port("server App:\n    port = 8080\n").unwrap();
         assert_eq!(config.port, 8080);
     }
 
     #[test]
     fn test_u16_boundary_max() {
-        #[derive(Deserialize, Debug)]
-        struct Config {
-            port: u16,
-        }
-        let nml = "server App:\n    port = 65535\n";
-        let file = parser::parse(nml).unwrap();
-        let doc = crate::query::Document::new(&file);
-        let body = doc.block("server", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config = parse_port("server App:\n    port = 65535\n").unwrap();
         assert_eq!(config.port, 65535);
     }
 
     #[test]
     fn test_u16_overflow_rejected() {
-        #[derive(Deserialize, Debug)]
-        struct Config {
-            port: u16,
-        }
-        let nml = "server App:\n    port = 70000\n";
-        let file = parser::parse(nml).unwrap();
-        let doc = crate::query::Document::new(&file);
-        let body = doc.block("server", "App").body().unwrap();
-        let result: Result<Config, _> = from_block(body);
+        let result = parse_port("server App:\n    port = 70000\n");
         assert!(result.is_err(), "70000 should not fit in u16");
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("out of range"), "got: {}", msg);
@@ -1586,29 +1467,13 @@ workflow W:
 
     #[test]
     fn test_u16_negative_rejected() {
-        #[derive(Deserialize, Debug)]
-        struct Config {
-            port: u16,
-        }
-        let nml = "server App:\n    port = -1\n";
-        let file = parser::parse(nml).unwrap();
-        let doc = crate::query::Document::new(&file);
-        let body = doc.block("server", "App").body().unwrap();
-        let result: Result<Config, _> = from_block(body);
+        let result = parse_port("server App:\n    port = -1\n");
         assert!(result.is_err(), "-1 should not fit in u16");
     }
 
     #[test]
     fn test_u16_fractional_rejected() {
-        #[derive(Deserialize, Debug)]
-        struct Config {
-            port: u16,
-        }
-        let nml = "server App:\n    port = 3000.5\n";
-        let file = parser::parse(nml).unwrap();
-        let doc = crate::query::Document::new(&file);
-        let body = doc.block("server", "App").body().unwrap();
-        let result: Result<Config, _> = from_block(body);
+        let result = parse_port("server App:\n    port = 3000.5\n");
         assert!(
             result.is_err(),
             "fractional values should not be valid for u16"
@@ -1659,65 +1524,110 @@ workflow W:
         assert!(result.is_err(), "128 should not fit in i8");
     }
 
-    #[test]
-    fn test_u64_zero_valid() {
-        #[derive(Deserialize, Debug)]
-        struct Config {
-            count: u64,
-        }
-        let nml = "server App:\n    count = 0\n";
+    /// Shared fixture for the u64 range tests; mirrors [`PortConfig`].
+    #[derive(Deserialize, Debug)]
+    struct CountConfig {
+        count: u64,
+    }
+
+    fn parse_count(nml: &str) -> Result<CountConfig, Error> {
         let file = parser::parse(nml).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        from_block(body)
+    }
+
+    #[test]
+    fn test_u64_zero_valid() {
+        let config = parse_count("server App:\n    count = 0\n").unwrap();
         assert_eq!(config.count, 0);
     }
 
     #[test]
     fn test_u64_negative_rejected() {
-        #[derive(Deserialize, Debug)]
-        struct Config {
-            count: u64,
-        }
-        let nml = "server App:\n    count = -5\n";
-        let file = parser::parse(nml).unwrap();
-        let doc = crate::query::Document::new(&file);
-        let body = doc.block("server", "App").body().unwrap();
-        let result: Result<Config, _> = from_block(body);
+        let result = parse_count("server App:\n    count = -5\n");
         assert!(result.is_err(), "negative should not fit in u64");
     }
 
     // --- Direct conversion function tests ---
 
     #[test]
-    fn test_f64_to_u16_conversions() {
-        assert!(f64_to_u16(0.0).is_ok());
-        assert_eq!(f64_to_u16(3000.0).unwrap(), 3000);
-        assert_eq!(f64_to_u16(65535.0).unwrap(), 65535);
-        assert!(f64_to_u16(65536.0).is_err());
-        assert!(f64_to_u16(-1.0).is_err());
-        assert!(f64_to_u16(3000.5).is_err());
-        assert!(f64_to_u16(f64::NAN).is_err());
-        assert!(f64_to_u16(f64::INFINITY).is_err());
+    fn test_number_to_int_from_int() {
+        assert_eq!(
+            number_to_int::<u16>(Number::Int(3000), "u16").unwrap(),
+            3000
+        );
+        assert_eq!(
+            number_to_int::<u16>(Number::Int(65535), "u16").unwrap(),
+            u16::MAX
+        );
+        assert!(number_to_int::<u16>(Number::Int(65536), "u16").is_err());
+        assert!(number_to_int::<u16>(Number::Int(-1), "u16").is_err());
+        assert_eq!(
+            number_to_int::<i32>(Number::Int(-2147483648), "i32").unwrap(),
+            i32::MIN
+        );
+        assert!(number_to_int::<i32>(Number::Int(2147483648), "i32").is_err());
     }
 
     #[test]
-    fn test_f64_to_u32_conversions() {
-        assert_eq!(f64_to_u32(0.0).unwrap(), 0);
-        assert_eq!(f64_to_u32(4294967295.0).unwrap(), u32::MAX);
-        assert!(f64_to_u32(4294967296.0).is_err());
-        assert!(f64_to_u32(-1.0).is_err());
-        assert!(f64_to_u32(1.1).is_err());
+    fn test_number_to_int_from_float() {
+        assert_eq!(
+            number_to_int::<u32>(Number::Float(4294967295.0), "u32").unwrap(),
+            u32::MAX
+        );
+        assert!(number_to_int::<u32>(Number::Float(4294967296.0), "u32").is_err());
+        assert!(number_to_int::<u32>(Number::Float(1.1), "u32").is_err());
+        assert!(number_to_int::<u16>(Number::Float(f64::NAN), "u16").is_err());
+        assert!(number_to_int::<u16>(Number::Float(f64::INFINITY), "u16").is_err());
     }
 
     #[test]
-    fn test_f64_to_i32_conversions() {
-        assert_eq!(f64_to_i32(0.0).unwrap(), 0);
-        assert_eq!(f64_to_i32(-2147483648.0).unwrap(), i32::MIN);
-        assert_eq!(f64_to_i32(2147483647.0).unwrap(), i32::MAX);
-        assert!(f64_to_i32(2147483648.0).is_err());
-        assert!(f64_to_i32(-2147483649.0).is_err());
-        assert!(f64_to_i32(1.5).is_err());
+    fn test_large_integer_roundtrip_end_to_end() {
+        // 2^53 + 1: the old f64-based pipeline silently turned this
+        // into 9007199254740992.
+        #[derive(Deserialize)]
+        struct Config {
+            id: i64,
+            max: i64,
+        }
+        let source = "service App:\n    id = 9007199254740993\n    max = 9223372036854775807\n";
+        let file = parser::parse(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert_eq!(config.id, 9_007_199_254_740_993);
+        assert_eq!(config.max, i64::MAX);
+    }
+
+    #[test]
+    fn test_large_integer_string_coercion_exact() {
+        // Env vars resolve to strings; the string -> integer path must
+        // also avoid the f64 detour.
+        let v = Value::String("9007199254740993".into());
+        let n: i64 = from_value(&v).unwrap();
+        assert_eq!(n, 9_007_199_254_740_993);
+        let v = Value::String("9223372036854775807".into());
+        let n: u64 = from_value(&v).unwrap();
+        assert_eq!(n, i64::MAX as u64);
+    }
+
+    #[test]
+    fn test_number_to_int_full_i64_range_exact() {
+        // The entire i64 range survives exactly -- the old f64 round-trip
+        // corrupted anything above 2^53.
+        assert_eq!(
+            number_to_int::<i64>(Number::Int(i64::MAX), "i64").unwrap(),
+            i64::MAX
+        );
+        assert_eq!(
+            number_to_int::<i64>(Number::Int(i64::MIN), "i64").unwrap(),
+            i64::MIN
+        );
+        assert_eq!(
+            number_to_int::<i64>(Number::Int(9_007_199_254_740_993), "i64").unwrap(),
+            9_007_199_254_740_993
+        );
     }
 
     #[test]
@@ -1746,5 +1656,80 @@ workflow W:
         let body = doc.block("role", "admin").body().unwrap();
         let config: Config = from_block(body).unwrap();
         assert_eq!(config.members, vec!["@role/editor", "@public"]);
+    }
+
+    // --- Unit-variant enum deserialization ---
+
+    /// Shared fixture for the enum tests below.
+    #[derive(Deserialize, Debug, PartialEq)]
+    #[serde(rename_all = "lowercase")]
+    enum Backend {
+        Memory,
+        Postgres,
+    }
+
+    #[derive(Deserialize, Debug)]
+    struct BackendConfig {
+        backend: Backend,
+    }
+
+    fn parse_backend(nml: &str) -> Result<BackendConfig, Error> {
+        let file = parser::parse(nml).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("server", "App").body().unwrap();
+        from_block(body)
+    }
+
+    #[test]
+    fn deserialize_enum_from_string_value() {
+        let config = parse_backend("server App:\n    backend = \"postgres\"\n").unwrap();
+        assert_eq!(config.backend, Backend::Postgres);
+        let config = parse_backend("server App:\n    backend = \"memory\"\n").unwrap();
+        assert_eq!(config.backend, Backend::Memory);
+    }
+
+    #[test]
+    fn deserialize_enum_unknown_variant_error() {
+        let err = parse_backend("server App:\n    backend = \"redis\"\n")
+            .expect_err("unknown variant 'redis' should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("memory") && msg.contains("postgres"),
+            "error should name the valid variants, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn deserialize_enum_camel_case_rename() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        #[serde(rename_all = "camelCase")]
+        enum Mode {
+            AllInOne,
+            ControlPlane,
+            WorkerOnly,
+        }
+
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            mode: Mode,
+        }
+
+        let source = "server App:\n    mode = \"allInOne\"\n";
+        let file = parser::parse(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("server", "App").body().unwrap();
+        let config: Config = from_block(body).unwrap();
+        assert_eq!(config.mode, Mode::AllInOne);
+    }
+
+    #[test]
+    fn deserialize_enum_number_value_rejected() {
+        let err = parse_backend("server App:\n    backend = 42\n")
+            .expect_err("number should not be accepted as enum");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected string for enum"),
+            "error should explain the type mismatch, got: {msg}"
+        );
     }
 }

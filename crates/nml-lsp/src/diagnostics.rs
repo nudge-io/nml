@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use nml_core::ast::*;
 use nml_core::model::{EnumDef, ModelDef};
-use nml_core::span::SourceMap;
 use nml_core::types::{TemplateSegment, Value};
 use nml_validate::diagnostics::Severity;
 use nml_validate::schema::{MembershipSemantics, SchemaValidator};
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+
+use crate::position::LineIndex;
 
 /// Embedder-supplied semantics for the LSP.  Every method has a default that
 /// returns nothing, so a generic adopter gets a purely structural LSP.
@@ -55,19 +56,23 @@ pub fn compute(
     config: &DiagnosticConfig,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    let source_map = SourceMap::new(source);
+    let line_index = LineIndex::new(source);
 
     match nml_core::parse(source) {
         Ok(file) => {
-            let mut resolver = nml_core::resolver::Resolver::new();
-            resolver.register_file(&file);
+            let mut symbols = nml_core::symbols::SymbolTable::new();
+            symbols.register_file(&file);
 
-            for err in resolver.find_duplicates() {
-                diagnostics.push(nml_error_to_diagnostic(&err, &source_map));
+            for err in symbols.find_duplicates() {
+                diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
             }
 
-            for err in resolver.find_unresolved_references(&file) {
-                diagnostics.push(nml_error_to_diagnostic(&err, &source_map));
+            for err in symbols.find_unresolved_references(&file) {
+                diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
+            }
+
+            for err in symbols.find_const_cycles() {
+                diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
             }
 
             if !models.is_empty() || !enums.is_empty() {
@@ -76,16 +81,8 @@ pub fn compute(
                     .with_membership_semantics(config.membership.clone());
                 for diag in validator.validate(&file) {
                     if let Some(span) = diag.span {
-                        let start = source_map.location(span.start);
-                        let end = source_map.location(span.end);
                         diagnostics.push(Diagnostic {
-                            range: Range {
-                                start: Position::new(
-                                    start.line as u32 - 1,
-                                    start.column as u32 - 1,
-                                ),
-                                end: Position::new(end.line as u32 - 1, end.column as u32 - 1),
-                            },
+                            range: line_index.range(span),
                             severity: Some(match diag.severity {
                                 Severity::Error => DiagnosticSeverity::ERROR,
                                 Severity::Warning => DiagnosticSeverity::WARNING,
@@ -103,10 +100,10 @@ pub fn compute(
                 .iter()
                 .map(|s| s.as_str())
                 .collect();
-            validate_templates(&file, &ns, &config, &source_map, &mut diagnostics);
+            validate_templates(&file, &ns, config, &line_index, &mut diagnostics);
         }
         Err(err) => {
-            diagnostics.push(nml_error_to_diagnostic(&err, &source_map));
+            diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
         }
     }
 
@@ -118,15 +115,15 @@ fn validate_shared_property_templates(
     decl: &Declaration,
     valid_ns: &[&str],
     config: &DiagnosticConfig,
-    source_map: &SourceMap,
+    line_index: &LineIndex,
     diags: &mut Vec<Diagnostic>,
 ) {
     match &sp.kind {
         SharedPropertyKind::Block(body) => {
-            validate_body_templates(body, decl, valid_ns, config, source_map, diags);
+            validate_body_templates(body, decl, valid_ns, config, line_index, diags);
         }
         SharedPropertyKind::Scalar(sv) => {
-            validate_value_templates(&sv.value, decl, valid_ns, config, source_map, diags);
+            validate_value_templates(&sv.value, decl, valid_ns, config, line_index, diags);
         }
     }
 }
@@ -135,38 +132,24 @@ fn validate_templates(
     file: &File,
     valid_ns: &[&str],
     config: &DiagnosticConfig,
-    source_map: &SourceMap,
+    line_index: &LineIndex,
     diags: &mut Vec<Diagnostic>,
 ) {
     for decl in &file.declarations {
         match &decl.kind {
             DeclarationKind::Block(block) => {
-                validate_body_templates(&block.body, decl, valid_ns, config, source_map, diags);
+                validate_body_templates(&block.body, decl, valid_ns, config, line_index, diags);
             }
             DeclarationKind::Template(t) => {
-                validate_value_templates(
-                    &t.value.value,
-                    decl,
-                    valid_ns,
-                    config,
-                    source_map,
-                    diags,
-                );
+                validate_value_templates(&t.value.value, decl, valid_ns, config, line_index, diags);
             }
             DeclarationKind::Const(c) => {
-                validate_value_templates(
-                    &c.value.value,
-                    decl,
-                    valid_ns,
-                    config,
-                    source_map,
-                    diags,
-                );
+                validate_value_templates(&c.value.value, decl, valid_ns, config, line_index, diags);
             }
             DeclarationKind::Array(arr) => {
                 for sp in &arr.body.shared_properties {
                     validate_shared_property_templates(
-                        sp, decl, valid_ns, config, source_map, diags,
+                        sp, decl, valid_ns, config, line_index, diags,
                     );
                 }
                 for prop in &arr.body.properties {
@@ -175,12 +158,12 @@ fn validate_templates(
                         decl,
                         valid_ns,
                         config,
-                        source_map,
+                        line_index,
                         diags,
                     );
                 }
                 for item in &arr.body.items {
-                    validate_list_item_templates(item, decl, valid_ns, config, source_map, diags);
+                    validate_list_item_templates(item, decl, valid_ns, config, line_index, diags);
                 }
             }
         }
@@ -192,7 +175,7 @@ fn validate_body_templates(
     decl: &Declaration,
     valid_ns: &[&str],
     config: &DiagnosticConfig,
-    source_map: &SourceMap,
+    line_index: &LineIndex,
     diags: &mut Vec<Diagnostic>,
 ) {
     for entry in &body.entries {
@@ -203,19 +186,19 @@ fn validate_body_templates(
                     decl,
                     valid_ns,
                     config,
-                    source_map,
+                    line_index,
                     diags,
                 );
             }
             BodyEntryKind::NestedBlock(nested) => {
-                validate_body_templates(&nested.body, decl, valid_ns, config, source_map, diags);
+                validate_body_templates(&nested.body, decl, valid_ns, config, line_index, diags);
             }
             BodyEntryKind::ListItem(item) => {
-                validate_list_item_templates(item, decl, valid_ns, config, source_map, diags);
+                validate_list_item_templates(item, decl, valid_ns, config, line_index, diags);
             }
             BodyEntryKind::SharedProperty(shared) => {
                 validate_shared_property_templates(
-                    shared, decl, valid_ns, config, source_map, diags,
+                    shared, decl, valid_ns, config, line_index, diags,
                 );
             }
             _ => {}
@@ -228,15 +211,15 @@ fn validate_list_item_templates(
     decl: &Declaration,
     valid_ns: &[&str],
     config: &DiagnosticConfig,
-    source_map: &SourceMap,
+    line_index: &LineIndex,
     diags: &mut Vec<Diagnostic>,
 ) {
     match &item.kind {
         ListItemKind::Named { body, .. } => {
-            validate_body_templates(body, decl, valid_ns, config, source_map, diags);
+            validate_body_templates(body, decl, valid_ns, config, line_index, diags);
         }
         ListItemKind::Shorthand(val) => {
-            validate_value_templates(&val.value, decl, valid_ns, config, source_map, diags);
+            validate_value_templates(&val.value, decl, valid_ns, config, line_index, diags);
         }
         _ => {}
     }
@@ -247,7 +230,7 @@ fn validate_value_templates(
     decl: &Declaration,
     valid_ns: &[&str],
     config: &DiagnosticConfig,
-    source_map: &SourceMap,
+    line_index: &LineIndex,
     diags: &mut Vec<Diagnostic>,
 ) {
     if let Value::TemplateString(segments) = value {
@@ -260,13 +243,8 @@ fn validate_value_templates(
             } = seg
             {
                 if !valid_ns.is_empty() && !valid_ns.contains(&namespace.as_str()) {
-                    let start = source_map.location(span.start);
-                    let end = source_map.location(span.end);
                     diags.push(Diagnostic {
-                        range: Range {
-                            start: Position::new(start.line as u32 - 1, start.column as u32 - 1),
-                            end: Position::new(end.line as u32 - 1, end.column as u32 - 1),
-                        },
+                        range: line_index.range(*span),
                         severity: Some(DiagnosticSeverity::WARNING),
                         message: format!("unknown template namespace '{namespace}'"),
                         source: Some("nml".to_string()),
@@ -278,19 +256,8 @@ fn validate_value_templates(
                     if let Some(known_ids) = ext.resolve_identifiers(decl, namespace) {
                         if let Some(id_name) = path.first() {
                             if !known_ids.contains(id_name.as_str()) {
-                                let start = source_map.location(span.start);
-                                let end = source_map.location(span.end);
                                 diags.push(Diagnostic {
-                                    range: Range {
-                                        start: Position::new(
-                                            start.line as u32 - 1,
-                                            start.column as u32 - 1,
-                                        ),
-                                        end: Position::new(
-                                            end.line as u32 - 1,
-                                            end.column as u32 - 1,
-                                        ),
-                                    },
+                                    range: line_index.range(*span),
                                     severity: Some(DiagnosticSeverity::WARNING),
                                     message: format!(
                                         "unknown identifier '{id_name}' in '{namespace}' namespace"
@@ -308,21 +275,14 @@ fn validate_value_templates(
 }
 
 /// Convert a single NML error to an LSP diagnostic.
-fn nml_error_to_diagnostic(err: &nml_core::error::NmlError, source_map: &SourceMap) -> Diagnostic {
-    let span = err.span();
-    let start = source_map.location(span.start);
-    let end = source_map.location(span.end);
-
+fn nml_error_to_diagnostic(err: &nml_core::error::NmlError, line_index: &LineIndex) -> Diagnostic {
     let severity = match err {
         nml_core::error::NmlError::Validation { .. } => DiagnosticSeverity::WARNING,
         _ => DiagnosticSeverity::ERROR,
     };
 
     Diagnostic {
-        range: Range {
-            start: Position::new(start.line as u32 - 1, start.column as u32 - 1),
-            end: Position::new(end.line as u32 - 1, end.column as u32 - 1),
-        },
+        range: line_index.range(err.span()),
         severity: Some(severity),
         message: err.message().to_string(),
         source: Some("nml".to_string()),
@@ -369,6 +329,58 @@ mod tests {
             "duplicate declarations should be flagged: {:?}",
             diags
         );
+    }
+
+    #[test]
+    fn const_cycle_produces_diagnostic() {
+        let source = "const A = B\nconst B = A\n";
+        let diags = compute(source, &[], &[], &default_config());
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("circular reference")),
+            "const cycles should be flagged: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn const_chain_without_cycle_not_flagged() {
+        let source = "const A = 1\nconst B = A\n";
+        let diags = compute(source, &[], &[], &default_config());
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("circular reference")),
+            "acyclic const chains should not be flagged: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn diagnostic_ranges_use_utf16_columns() {
+        // Identical sources except "ab" (2 bytes / 2 chars / 2 UTF-16 units)
+        // is replaced by an emoji (4 bytes / 1 char / 2 UTF-16 units).
+        // Equal ranges prove the conversion is UTF-16, not bytes or chars.
+        let ascii = "service Svc:\n    val = \"ab {{foo.bar}} x\"\n";
+        let emoji = "service Svc:\n    val = \"😀 {{foo.bar}} x\"\n";
+        let config = config_with_namespaces(&["args"]);
+
+        let find_range = |source: &str| {
+            compute(source, &[], &[], &config)
+                .into_iter()
+                .find(|d| d.message.contains("unknown template namespace 'foo'"))
+                .expect("namespace diagnostic expected")
+                .range
+        };
+
+        let ascii_range = find_range(ascii);
+        let emoji_range = find_range(emoji);
+        assert_eq!(
+            ascii_range, emoji_range,
+            "multibyte prefix with equal UTF-16 width must not shift the range"
+        );
+        assert!(ascii_range.start.character > 0);
     }
 
     #[test]

@@ -100,7 +100,13 @@ fn parse_minor_units(
     };
 
     let multiplier = 10i64.pow(exponent as u32);
-    let abs_amount = whole * multiplier + frac;
+    let abs_amount = whole
+        .checked_mul(multiplier)
+        .and_then(|scaled| scaled.checked_add(frac))
+        .ok_or_else(|| NmlError::InvalidMoney {
+            message: format!("amount out of range: \"{amount_str}\""),
+            span,
+        })?;
 
     Ok(if negative { -abs_amount } else { abs_amount })
 }
@@ -262,6 +268,25 @@ mod tests {
     fn test_negative_zero() {
         let m = parse_money("-0.00", "USD", span()).unwrap();
         assert_eq!(m.amount, 0);
+    }
+
+    #[test]
+    fn test_overflow_rejected() {
+        // i64::MAX minor units is ~9.2e18; this whole amount overflows on
+        // scaling by 100 and must produce an error, not a wrapped value.
+        let result = parse_money("9223372036854775807", "USD", span());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_max_representable_succeeds() {
+        // i64::MAX is 9223372036854775807 => max USD whole+frac amount.
+        let m = parse_money("92233720368547758.07", "USD", span()).unwrap();
+        assert_eq!(m.amount, i64::MAX);
     }
 
     #[test]

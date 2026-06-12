@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tower_lsp::jsonrpc::Result;
@@ -9,11 +9,11 @@ use tower_lsp::{Client, LanguageServer};
 
 use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldType, ModelDef};
-use nml_core::span::SourceMap;
 use nml_core::types::Value;
 use nml_validate::schema::MembershipSemantics;
 
 use crate::diagnostics::{self, LanguageExtension};
+use crate::position::{self, LineIndex};
 
 const MAX_DIR_DEPTH: usize = 20;
 const MAX_FILE_COUNT: usize = 10_000;
@@ -25,6 +25,9 @@ pub struct NmlLanguageServer {
     scoped_models: Mutex<HashMap<String, Vec<ModelDef>>>,
     scoped_enums: Mutex<HashMap<String, Vec<EnumDef>>>,
     project_config: Mutex<nml_core::ProjectConfig>,
+    /// Canonicalized workspace roots captured at initialize; watched-file
+    /// events outside these roots are ignored.
+    workspace_roots: Mutex<Vec<PathBuf>>,
     language_extension: Option<Arc<dyn LanguageExtension>>,
     membership: MembershipSemantics,
 }
@@ -38,6 +41,7 @@ impl NmlLanguageServer {
             scoped_models: Mutex::new(HashMap::new()),
             scoped_enums: Mutex::new(HashMap::new()),
             project_config: Mutex::new(nml_core::ProjectConfig::default()),
+            workspace_roots: Mutex::new(Vec::new()),
             language_extension: None,
             membership: MembershipSemantics::default(),
         }
@@ -75,7 +79,7 @@ impl NmlLanguageServer {
                 if name != "node_modules" && name != ".git" && !name.starts_with('.') {
                     Self::find_nml_files(&path, files, depth + 1);
                 }
-            } else if path.extension().map_or(false, |e| e == "nml") {
+            } else if path.extension().is_some_and(|e| e == "nml") {
                 files.push(path);
                 if files.len() >= MAX_FILE_COUNT {
                     return;
@@ -318,8 +322,8 @@ impl NmlLanguageServer {
         for uri in model_uris {
             if let Some(source) = docs.get(uri) {
                 if let Ok(file) = nml_core::parse(source) {
-                    let source_map = SourceMap::new(source);
-                    if let Some(range) = find_schema_block_definition(&file, name, &source_map) {
+                    let line_index = LineIndex::new(source);
+                    if let Some(range) = find_schema_block_definition(&file, name, &line_index) {
                         return Some((uri.clone(), range));
                     }
                 }
@@ -376,6 +380,26 @@ impl NmlLanguageServer {
     }
 }
 
+/// Whether a watched-file event should be honored.
+///
+/// Mirrors the safety rules of `index_workspace`/`find_nml_files`: the path
+/// must not be a symlink, and it must canonicalize to a location inside one
+/// of the (canonicalized) workspace roots. Clients can send arbitrary
+/// `file://` URIs in watched-file notifications, so this is the boundary
+/// check that keeps the server from reading files outside the workspace.
+fn watched_file_is_eligible(path: &Path, roots: &[PathBuf]) -> bool {
+    let is_symlink = fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(true);
+    if is_symlink {
+        return false;
+    }
+    match path.canonicalize() {
+        Ok(canonical) => roots.iter().any(|root| canonical.starts_with(root)),
+        Err(_) => false,
+    }
+}
+
 // ── Role ref resolution (free functions for testability) ──────
 
 fn find_tagged_ref_definition_in_docs(
@@ -387,13 +411,13 @@ fn find_tagged_ref_definition_in_docs(
 
     for (uri, source) in docs {
         if let Ok(file) = nml_core::parse(source) {
-            let source_map = SourceMap::new(source);
+            let line_index = LineIndex::new(source);
             for decl in &file.declarations {
                 if let DeclarationKind::Block(block) = &decl.kind {
                     if block.keyword.name == keyword && block.name.name == name {
                         return Some(Location {
                             uri: uri.clone(),
-                            range: span_to_range(block.name.span, &source_map),
+                            range: span_to_range(block.name.span, &line_index),
                         });
                     }
                 }
@@ -437,7 +461,7 @@ fn find_tagged_ref_hover_in_docs(
 
                         let file_name = uri
                             .path_segments()
-                            .and_then(|s| s.last())
+                            .and_then(|mut s| s.next_back())
                             .unwrap_or("unknown");
                         text.push_str(&format!("\n\n*Source: {file_name}*"));
 
@@ -473,12 +497,12 @@ fn extract_file_scope(uri_str: &str) -> Option<String> {
 fn find_enclosing_block_keyword(
     file: &File,
     pos: Position,
-    source_map: &SourceMap,
+    line_index: &LineIndex,
 ) -> Option<String> {
     let mut best_start: Option<u32> = None;
     let mut result: Option<String> = None;
     for decl in &file.declarations {
-        let range = span_to_range(decl.span, source_map);
+        let range = span_to_range(decl.span, line_index);
         if pos.line >= range.start.line && pos.line <= range.end.line {
             let keyword = match &decl.kind {
                 DeclarationKind::Block(block) => Some(block.keyword.name.clone()),
@@ -486,7 +510,7 @@ fn find_enclosing_block_keyword(
                 _ => None,
             };
             if let Some(kw) = keyword {
-                if best_start.map_or(true, |s| range.start.line > s) {
+                if best_start.is_none_or(|s| range.start.line > s) {
                     best_start = Some(range.start.line);
                     result = Some(kw);
                 }
@@ -530,9 +554,9 @@ fn find_definition_in_docs(
             for uri in &model_uris {
                 if let Some(source) = docs.get(*uri) {
                     if let Ok(file) = nml_core::parse(source) {
-                        let source_map = SourceMap::new(source);
+                        let line_index = LineIndex::new(source);
                         if let Some(range) =
-                            find_field_definition_in_model(&file, name, keyword, &source_map)
+                            find_field_definition_in_model(&file, name, keyword, &line_index)
                         {
                             return Some(((*uri).clone(), range));
                         }
@@ -550,8 +574,8 @@ fn find_definition_in_docs(
                 continue;
             }
             if let Ok(file) = nml_core::parse(source) {
-                let source_map = SourceMap::new(source);
-                if let Some(range) = find_field_definition(&file, name, &source_map) {
+                let line_index = LineIndex::new(source);
+                if let Some(range) = find_field_definition(&file, name, &line_index) {
                     return Some((uri.clone(), range));
                 }
             }
@@ -561,8 +585,8 @@ fn find_definition_in_docs(
     // Priority 3: Names in current file (top-level + nested)
     if let Some(source) = docs.get(current_uri) {
         if let Ok(file) = nml_core::parse(source) {
-            let source_map = SourceMap::new(source);
-            if let Some(range) = find_name_in_file(&file, name, &source_map) {
+            let line_index = LineIndex::new(source);
+            if let Some(range) = find_name_in_file(&file, name, &line_index) {
                 return Some((current_uri.clone(), range));
             }
         } else if let Some(range) = find_name_by_text(source, name) {
@@ -576,8 +600,8 @@ fn find_definition_in_docs(
             continue;
         }
         if let Ok(file) = nml_core::parse(source) {
-            let source_map = SourceMap::new(source);
-            if let Some(range) = find_top_level_decl(&file, name, &source_map) {
+            let line_index = LineIndex::new(source);
+            if let Some(range) = find_top_level_decl(&file, name, &line_index) {
                 return Some((uri.clone(), range));
             }
         }
@@ -586,34 +610,29 @@ fn find_definition_in_docs(
     None
 }
 
-fn span_to_range(span: nml_core::span::Span, source_map: &SourceMap) -> Range {
-    let start = source_map.location(span.start);
-    let end = source_map.location(span.end);
-    Range {
-        start: Position::new(start.line as u32 - 1, start.column as u32 - 1),
-        end: Position::new(end.line as u32 - 1, end.column as u32 - 1),
-    }
+fn span_to_range(span: nml_core::span::Span, line_index: &LineIndex) -> Range {
+    line_index.range(span)
 }
 
-fn find_schema_block_definition(file: &File, name: &str, source_map: &SourceMap) -> Option<Range> {
+fn find_schema_block_definition(file: &File, name: &str, line_index: &LineIndex) -> Option<Range> {
     for decl in &file.declarations {
         if let DeclarationKind::Block(block) = &decl.kind {
             if matches!(block.keyword.name.as_str(), "model" | "enum") && block.name.name == name {
-                return Some(span_to_range(block.name.span, source_map));
+                return Some(span_to_range(block.name.span, line_index));
             }
         }
     }
     None
 }
 
-fn find_field_definition(file: &File, name: &str, source_map: &SourceMap) -> Option<Range> {
+fn find_field_definition(file: &File, name: &str, line_index: &LineIndex) -> Option<Range> {
     for decl in &file.declarations {
         if let DeclarationKind::Block(block) = &decl.kind {
             if block.keyword.name.as_str() == "model" {
                 for entry in &block.body.entries {
                     if let BodyEntryKind::FieldDefinition(fd) = &entry.kind {
                         if fd.name.name == name {
-                            return Some(span_to_range(fd.name.span, source_map));
+                            return Some(span_to_range(fd.name.span, line_index));
                         }
                     }
                 }
@@ -627,7 +646,7 @@ fn find_field_definition_in_model(
     file: &File,
     name: &str,
     model_name: &str,
-    source_map: &SourceMap,
+    line_index: &LineIndex,
 ) -> Option<Range> {
     for decl in &file.declarations {
         if let DeclarationKind::Block(block) = &decl.kind {
@@ -635,7 +654,7 @@ fn find_field_definition_in_model(
                 for entry in &block.body.entries {
                     if let BodyEntryKind::FieldDefinition(fd) = &entry.kind {
                         if fd.name.name == name {
-                            return Some(span_to_range(fd.name.span, source_map));
+                            return Some(span_to_range(fd.name.span, line_index));
                         }
                     }
                 }
@@ -645,27 +664,27 @@ fn find_field_definition_in_model(
     None
 }
 
-fn find_top_level_decl(file: &File, name: &str, source_map: &SourceMap) -> Option<Range> {
+fn find_top_level_decl(file: &File, name: &str, line_index: &LineIndex) -> Option<Range> {
     for decl in &file.declarations {
         match &decl.kind {
             DeclarationKind::Block(block) => {
                 if block.name.name == name {
-                    return Some(span_to_range(block.name.span, source_map));
+                    return Some(span_to_range(block.name.span, line_index));
                 }
             }
             DeclarationKind::Array(arr) => {
                 if arr.name.name == name {
-                    return Some(span_to_range(arr.name.span, source_map));
+                    return Some(span_to_range(arr.name.span, line_index));
                 }
             }
             DeclarationKind::Const(c) => {
                 if c.name.name == name {
-                    return Some(span_to_range(c.name.span, source_map));
+                    return Some(span_to_range(c.name.span, line_index));
                 }
             }
             DeclarationKind::Template(t) => {
                 if t.name.name == name {
-                    return Some(span_to_range(t.name.span, source_map));
+                    return Some(span_to_range(t.name.span, line_index));
                 }
             }
         }
@@ -673,35 +692,35 @@ fn find_top_level_decl(file: &File, name: &str, source_map: &SourceMap) -> Optio
     None
 }
 
-fn find_name_in_file(file: &File, name: &str, source_map: &SourceMap) -> Option<Range> {
+fn find_name_in_file(file: &File, name: &str, line_index: &LineIndex) -> Option<Range> {
     for decl in &file.declarations {
         match &decl.kind {
             DeclarationKind::Block(block) => {
                 if block.name.name == name {
-                    return Some(span_to_range(block.name.span, source_map));
+                    return Some(span_to_range(block.name.span, line_index));
                 }
-                if let Some(r) = find_name_in_body(&block.body, name, source_map) {
+                if let Some(r) = find_name_in_body(&block.body, name, line_index) {
                     return Some(r);
                 }
             }
             DeclarationKind::Array(arr) => {
                 if arr.name.name == name {
-                    return Some(span_to_range(arr.name.span, source_map));
+                    return Some(span_to_range(arr.name.span, line_index));
                 }
                 for item in &arr.body.items {
-                    if let Some(r) = find_name_in_list_item(item, name, source_map) {
+                    if let Some(r) = find_name_in_list_item(item, name, line_index) {
                         return Some(r);
                     }
                 }
             }
             DeclarationKind::Const(c) => {
                 if c.name.name == name {
-                    return Some(span_to_range(c.name.span, source_map));
+                    return Some(span_to_range(c.name.span, line_index));
                 }
             }
             DeclarationKind::Template(t) => {
                 if t.name.name == name {
-                    return Some(span_to_range(t.name.span, source_map));
+                    return Some(span_to_range(t.name.span, line_index));
                 }
             }
         }
@@ -709,19 +728,19 @@ fn find_name_in_file(file: &File, name: &str, source_map: &SourceMap) -> Option<
     None
 }
 
-fn find_name_in_body(body: &Body, name: &str, source_map: &SourceMap) -> Option<Range> {
+fn find_name_in_body(body: &Body, name: &str, line_index: &LineIndex) -> Option<Range> {
     for entry in &body.entries {
         match &entry.kind {
             BodyEntryKind::ListItem(item) => {
-                if let Some(r) = find_name_in_list_item(item, name, source_map) {
+                if let Some(r) = find_name_in_list_item(item, name, line_index) {
                     return Some(r);
                 }
             }
             BodyEntryKind::NestedBlock(nb) => {
                 if nb.name.name == name {
-                    return Some(span_to_range(nb.name.span, source_map));
+                    return Some(span_to_range(nb.name.span, line_index));
                 }
-                if let Some(r) = find_name_in_body(&nb.body, name, source_map) {
+                if let Some(r) = find_name_in_body(&nb.body, name, line_index) {
                     return Some(r);
                 }
             }
@@ -731,42 +750,43 @@ fn find_name_in_body(body: &Body, name: &str, source_map: &SourceMap) -> Option<
     None
 }
 
-fn find_name_in_list_item(item: &ListItem, name: &str, source_map: &SourceMap) -> Option<Range> {
+fn find_name_in_list_item(item: &ListItem, name: &str, line_index: &LineIndex) -> Option<Range> {
     match &item.kind {
         ListItemKind::Named { name: ident, body } => {
             if ident.name == name {
-                return Some(span_to_range(ident.span, source_map));
+                return Some(span_to_range(ident.span, line_index));
             }
-            find_name_in_body(body, name, source_map)
+            find_name_in_body(body, name, line_index)
         }
         _ => None,
     }
 }
 
 fn find_name_by_text(source: &str, name: &str) -> Option<Range> {
+    // `str::find` yields byte offsets; LSP characters are UTF-16 units.
+    let name_range = |line_idx: usize, line: &str| {
+        let byte_start = line.find(name).unwrap_or(0);
+        Some(Range {
+            start: Position::new(line_idx as u32, position::byte_to_utf16(line, byte_start)),
+            end: Position::new(
+                line_idx as u32,
+                position::byte_to_utf16(line, byte_start + name.len()),
+            ),
+        })
+    };
+
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim();
-        if trimmed.ends_with(':') {
-            let before_colon = &trimmed[..trimmed.len() - 1];
+        if let Some(before_colon) = trimmed.strip_suffix(':') {
             let parts: Vec<&str> = before_colon.split_whitespace().collect();
             if parts.len() == 2 && parts[1] == name {
-                let col_start = line.find(name).unwrap_or(0) as u32;
-                let col_end = col_start + name.len() as u32;
-                return Some(Range {
-                    start: Position::new(line_idx as u32, col_start),
-                    end: Position::new(line_idx as u32, col_end),
-                });
+                return name_range(line_idx, line);
             }
         }
         if trimmed.starts_with('-') && trimmed.ends_with(':') {
             let inner = trimmed[1..trimmed.len() - 1].trim();
             if inner == name {
-                let col_start = line.find(name).unwrap_or(0) as u32;
-                let col_end = col_start + name.len() as u32;
-                return Some(Range {
-                    start: Position::new(line_idx as u32, col_start),
-                    end: Position::new(line_idx as u32, col_end),
-                });
+                return name_range(line_idx, line);
             }
         }
     }
@@ -777,181 +797,151 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '-' || c == '_' || c == '@' || c == '/' || c == '.'
 }
 
-fn extract_word_at(line: &str, col: usize) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    let col = col.min(chars.len());
+/// Extract the word around the given *byte* column (see
+/// `position::utf16_to_byte` for converting an LSP character first).
+/// Out-of-range or mid-character columns are clamped to a char boundary.
+fn extract_word_at(line: &str, byte_col: usize) -> String {
+    let mut col = byte_col.min(line.len());
+    while col > 0 && !line.is_char_boundary(col) {
+        col -= 1;
+    }
 
-    let start = chars[..col]
-        .iter()
-        .rposition(|c| !is_word_char(*c))
-        .map(|p| p + 1)
+    let start = line[..col]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_word_char(*c))
+        .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0);
 
-    let end = chars[col..]
-        .iter()
-        .position(|c| !is_word_char(*c))
-        .map(|p| col + p)
-        .unwrap_or(chars.len());
+    let end = line[col..]
+        .char_indices()
+        .find(|(_, c)| !is_word_char(*c))
+        .map(|(i, _)| col + i)
+        .unwrap_or(line.len());
 
-    chars[start..end].iter().collect()
+    line[start..end].to_string()
 }
 
 // ── Document symbols ──────────────────────────────────────────
 
-fn build_document_symbols(file: &File, source_map: &SourceMap) -> Vec<DocumentSymbol> {
+/// Construct a `DocumentSymbol`, isolating the one `#[allow(deprecated)]`
+/// that `lsp_types` forces on us: the deprecated `deprecated` field must
+/// still be initialized in struct literals. Empty `children` collapse to
+/// `None` per the LSP convention.
+fn document_symbol(
+    name: String,
+    detail: Option<String>,
+    kind: SymbolKind,
+    range: Range,
+    selection_range: Range,
+    children: Vec<DocumentSymbol>,
+) -> DocumentSymbol {
+    #[allow(deprecated)]
+    DocumentSymbol {
+        name,
+        detail,
+        kind,
+        tags: None,
+        deprecated: None,
+        range,
+        selection_range,
+        children: (!children.is_empty()).then_some(children),
+    }
+}
+
+fn build_document_symbols(file: &File, line_index: &LineIndex) -> Vec<DocumentSymbol> {
     let mut symbols = Vec::new();
     for decl in &file.declarations {
         match &decl.kind {
             DeclarationKind::Block(block) => {
-                let range = span_to_range(decl.span, source_map);
-                let selection_range = span_to_range(block.name.span, source_map);
-                let children = build_body_symbols(&block.body, source_map);
-                #[allow(deprecated)]
-                symbols.push(DocumentSymbol {
-                    name: block.name.name.clone(),
-                    detail: Some(block.keyword.name.clone()),
-                    kind: SymbolKind::CLASS,
-                    tags: None,
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: if children.is_empty() {
-                        None
-                    } else {
-                        Some(children)
-                    },
-                });
+                symbols.push(document_symbol(
+                    block.name.name.clone(),
+                    Some(block.keyword.name.clone()),
+                    SymbolKind::CLASS,
+                    span_to_range(decl.span, line_index),
+                    span_to_range(block.name.span, line_index),
+                    build_body_symbols(&block.body, line_index),
+                ));
             }
             DeclarationKind::Array(arr) => {
-                let range = span_to_range(decl.span, source_map);
-                let selection_range = span_to_range(arr.name.span, source_map);
-                let children = build_array_body_symbols(&arr.body, source_map);
-                #[allow(deprecated)]
-                symbols.push(DocumentSymbol {
-                    name: arr.name.name.clone(),
-                    detail: Some(format!("[]{}", arr.item_keyword.name)),
-                    kind: SymbolKind::ARRAY,
-                    tags: None,
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: if children.is_empty() {
-                        None
-                    } else {
-                        Some(children)
-                    },
-                });
+                symbols.push(document_symbol(
+                    arr.name.name.clone(),
+                    Some(format!("[]{}", arr.item_keyword.name)),
+                    SymbolKind::ARRAY,
+                    span_to_range(decl.span, line_index),
+                    span_to_range(arr.name.span, line_index),
+                    build_array_body_symbols(&arr.body, line_index),
+                ));
             }
             DeclarationKind::Const(c) => {
-                let range = span_to_range(decl.span, source_map);
-                let selection_range = span_to_range(c.name.span, source_map);
-                #[allow(deprecated)]
-                symbols.push(DocumentSymbol {
-                    name: c.name.name.clone(),
-                    detail: Some("const".into()),
-                    kind: SymbolKind::CONSTANT,
-                    tags: None,
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: None,
-                });
+                symbols.push(document_symbol(
+                    c.name.name.clone(),
+                    Some("const".into()),
+                    SymbolKind::CONSTANT,
+                    span_to_range(decl.span, line_index),
+                    span_to_range(c.name.span, line_index),
+                    Vec::new(),
+                ));
             }
             DeclarationKind::Template(t) => {
-                let range = span_to_range(decl.span, source_map);
-                let selection_range = span_to_range(t.name.span, source_map);
-                #[allow(deprecated)]
-                symbols.push(DocumentSymbol {
-                    name: t.name.name.clone(),
-                    detail: Some("template".into()),
-                    kind: SymbolKind::STRING,
-                    tags: None,
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: None,
-                });
+                symbols.push(document_symbol(
+                    t.name.name.clone(),
+                    Some("template".into()),
+                    SymbolKind::STRING,
+                    span_to_range(decl.span, line_index),
+                    span_to_range(t.name.span, line_index),
+                    Vec::new(),
+                ));
             }
         }
     }
     symbols
 }
 
-fn build_body_symbols(body: &Body, source_map: &SourceMap) -> Vec<DocumentSymbol> {
+fn build_body_symbols(body: &Body, line_index: &LineIndex) -> Vec<DocumentSymbol> {
     let mut symbols = Vec::new();
     for entry in &body.entries {
         match &entry.kind {
             BodyEntryKind::Property(prop) => {
-                let range = span_to_range(entry.span, source_map);
-                let selection_range = span_to_range(prop.name.span, source_map);
-                #[allow(deprecated)]
-                symbols.push(DocumentSymbol {
-                    name: prop.name.name.clone(),
-                    detail: None,
-                    kind: SymbolKind::PROPERTY,
-                    tags: None,
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: None,
-                });
+                symbols.push(document_symbol(
+                    prop.name.name.clone(),
+                    None,
+                    SymbolKind::PROPERTY,
+                    span_to_range(entry.span, line_index),
+                    span_to_range(prop.name.span, line_index),
+                    Vec::new(),
+                ));
             }
             BodyEntryKind::NestedBlock(nb) => {
-                let range = span_to_range(entry.span, source_map);
-                let selection_range = span_to_range(nb.name.span, source_map);
-                let children = build_body_symbols(&nb.body, source_map);
-                #[allow(deprecated)]
-                symbols.push(DocumentSymbol {
-                    name: nb.name.name.clone(),
-                    detail: None,
-                    kind: SymbolKind::FIELD,
-                    tags: None,
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: if children.is_empty() {
-                        None
-                    } else {
-                        Some(children)
-                    },
-                });
+                symbols.push(document_symbol(
+                    nb.name.name.clone(),
+                    None,
+                    SymbolKind::FIELD,
+                    span_to_range(entry.span, line_index),
+                    span_to_range(nb.name.span, line_index),
+                    build_body_symbols(&nb.body, line_index),
+                ));
             }
             BodyEntryKind::FieldDefinition(fd) => {
-                let range = span_to_range(entry.span, source_map);
-                let selection_range = span_to_range(fd.name.span, source_map);
-                let type_name = format_field_type_expr(&fd.field_type);
-                #[allow(deprecated)]
-                symbols.push(DocumentSymbol {
-                    name: fd.name.name.clone(),
-                    detail: Some(type_name),
-                    kind: SymbolKind::FIELD,
-                    tags: None,
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: None,
-                });
+                symbols.push(document_symbol(
+                    fd.name.name.clone(),
+                    Some(format_field_type_expr(&fd.field_type)),
+                    SymbolKind::FIELD,
+                    span_to_range(entry.span, line_index),
+                    span_to_range(fd.name.span, line_index),
+                    Vec::new(),
+                ));
             }
             BodyEntryKind::ListItem(item) => {
                 if let ListItemKind::Named { name, body } = &item.kind {
-                    let range = span_to_range(item.span, source_map);
-                    let selection_range = span_to_range(name.span, source_map);
-                    let children = build_body_symbols(body, source_map);
-                    #[allow(deprecated)]
-                    symbols.push(DocumentSymbol {
-                        name: name.name.clone(),
-                        detail: None,
-                        kind: SymbolKind::FIELD,
-                        tags: None,
-                        deprecated: None,
-                        range,
-                        selection_range,
-                        children: if children.is_empty() {
-                            None
-                        } else {
-                            Some(children)
-                        },
-                    });
+                    symbols.push(document_symbol(
+                        name.name.clone(),
+                        None,
+                        SymbolKind::FIELD,
+                        span_to_range(item.span, line_index),
+                        span_to_range(name.span, line_index),
+                        build_body_symbols(body, line_index),
+                    ));
                 }
             }
             _ => {}
@@ -960,28 +950,18 @@ fn build_body_symbols(body: &Body, source_map: &SourceMap) -> Vec<DocumentSymbol
     symbols
 }
 
-fn build_array_body_symbols(body: &ArrayBody, source_map: &SourceMap) -> Vec<DocumentSymbol> {
+fn build_array_body_symbols(body: &ArrayBody, line_index: &LineIndex) -> Vec<DocumentSymbol> {
     let mut symbols = Vec::new();
     for item in &body.items {
         if let ListItemKind::Named { name, body } = &item.kind {
-            let range = span_to_range(item.span, source_map);
-            let selection_range = span_to_range(name.span, source_map);
-            let children = build_body_symbols(body, source_map);
-            #[allow(deprecated)]
-            symbols.push(DocumentSymbol {
-                name: name.name.clone(),
-                detail: None,
-                kind: SymbolKind::FIELD,
-                tags: None,
-                deprecated: None,
-                range,
-                selection_range,
-                children: if children.is_empty() {
-                    None
-                } else {
-                    Some(children)
-                },
-            });
+            symbols.push(document_symbol(
+                name.name.clone(),
+                None,
+                SymbolKind::FIELD,
+                span_to_range(item.span, line_index),
+                span_to_range(name.span, line_index),
+                build_body_symbols(body, line_index),
+            ));
         }
     }
     symbols
@@ -989,44 +969,44 @@ fn build_array_body_symbols(body: &ArrayBody, source_map: &SourceMap) -> Vec<Doc
 
 // ── References ────────────────────────────────────────────────
 
-fn find_references_in_source(source: &str, name: &str, source_map: &SourceMap) -> Vec<Range> {
+fn find_references_in_source(source: &str, name: &str, line_index: &LineIndex) -> Vec<Range> {
     let mut ranges = Vec::new();
     if let Ok(file) = nml_core::parse(source) {
-        collect_references(&file, name, source_map, &mut ranges);
+        collect_references(&file, name, line_index, &mut ranges);
     }
     ranges
 }
 
-fn collect_references(file: &File, name: &str, source_map: &SourceMap, ranges: &mut Vec<Range>) {
+fn collect_references(file: &File, name: &str, line_index: &LineIndex, ranges: &mut Vec<Range>) {
     for decl in &file.declarations {
         match &decl.kind {
             DeclarationKind::Block(block) => {
                 if block.name.name == name {
-                    ranges.push(span_to_range(block.name.span, source_map));
+                    ranges.push(span_to_range(block.name.span, line_index));
                 }
-                collect_body_references(&block.body, name, source_map, ranges);
+                collect_body_references(&block.body, name, line_index, ranges);
             }
             DeclarationKind::Array(arr) => {
                 if arr.name.name == name {
-                    ranges.push(span_to_range(arr.name.span, source_map));
+                    ranges.push(span_to_range(arr.name.span, line_index));
                 }
                 for item in &arr.body.items {
-                    collect_list_item_references(item, name, source_map, ranges);
+                    collect_list_item_references(item, name, line_index, ranges);
                 }
             }
             DeclarationKind::Const(c) => {
                 if c.name.name == name {
-                    ranges.push(span_to_range(c.name.span, source_map));
+                    ranges.push(span_to_range(c.name.span, line_index));
                 }
                 if let Value::Reference(ref_name) = &c.value.value {
                     if ref_name == name {
-                        ranges.push(span_to_range(c.value.span, source_map));
+                        ranges.push(span_to_range(c.value.span, line_index));
                     }
                 }
             }
             DeclarationKind::Template(t) => {
                 if t.name.name == name {
-                    ranges.push(span_to_range(t.name.span, source_map));
+                    ranges.push(span_to_range(t.name.span, line_index));
                 }
             }
         }
@@ -1036,7 +1016,7 @@ fn collect_references(file: &File, name: &str, source_map: &SourceMap, ranges: &
 fn collect_body_references(
     body: &Body,
     name: &str,
-    source_map: &SourceMap,
+    line_index: &LineIndex,
     ranges: &mut Vec<Range>,
 ) {
     for entry in &body.entries {
@@ -1044,18 +1024,18 @@ fn collect_body_references(
             BodyEntryKind::Property(prop) => {
                 if let Value::Reference(ref_name) = &prop.value.value {
                     if ref_name == name {
-                        ranges.push(span_to_range(prop.value.span, source_map));
+                        ranges.push(span_to_range(prop.value.span, line_index));
                     }
                 }
             }
             BodyEntryKind::NestedBlock(nb) => {
                 if nb.name.name == name {
-                    ranges.push(span_to_range(nb.name.span, source_map));
+                    ranges.push(span_to_range(nb.name.span, line_index));
                 }
-                collect_body_references(&nb.body, name, source_map, ranges);
+                collect_body_references(&nb.body, name, line_index, ranges);
             }
             BodyEntryKind::ListItem(item) => {
-                collect_list_item_references(item, name, source_map, ranges);
+                collect_list_item_references(item, name, line_index, ranges);
             }
             _ => {}
         }
@@ -1065,20 +1045,18 @@ fn collect_body_references(
 fn collect_list_item_references(
     item: &ListItem,
     name: &str,
-    source_map: &SourceMap,
+    line_index: &LineIndex,
     ranges: &mut Vec<Range>,
 ) {
     match &item.kind {
         ListItemKind::Named { name: ident, body } => {
             if ident.name == name {
-                ranges.push(span_to_range(ident.span, source_map));
+                ranges.push(span_to_range(ident.span, line_index));
             }
-            collect_body_references(body, name, source_map, ranges);
+            collect_body_references(body, name, line_index, ranges);
         }
-        ListItemKind::Reference(ident) => {
-            if ident.name == name {
-                ranges.push(span_to_range(ident.span, source_map));
-            }
+        ListItemKind::Reference(ident) if ident.name == name => {
+            ranges.push(span_to_range(ident.span, line_index));
         }
         _ => {}
     }
@@ -1089,7 +1067,7 @@ fn format_field_type_expr(expr: &FieldTypeExpr) -> String {
         FieldTypeExpr::Named(id) => id.name.clone(),
         FieldTypeExpr::Array(inner) => format!("[]{}", format_field_type_expr(inner)),
         FieldTypeExpr::Union(variants) => {
-            let names: Vec<_> = variants.iter().map(|v| format_field_type_expr(v)).collect();
+            let names: Vec<_> = variants.iter().map(format_field_type_expr).collect();
             format!("({})", names.join(" | "))
         }
     }
@@ -1105,7 +1083,7 @@ fn summarize_body(body: &Body) -> String {
                 lines.push(format!(
                     "  {} = {}",
                     prop.name.name,
-                    format_value(&prop.value.value)
+                    format_named_value(&prop.name.name, &prop.value.value)
                 ));
             }
             BodyEntryKind::NestedBlock(nb) => {
@@ -1130,9 +1108,9 @@ fn format_field_type(field_type: &FieldType) -> String {
         FieldType::Primitive(p) => p.as_str().to_string(),
         FieldType::List(inner) => format!("[]{}", format_field_type(inner)),
         FieldType::ModelRef(name) => name.clone(),
-        FieldType::Modifier(name) => format!("|{}", name),
+        FieldType::Modifier(inner) => format!("|{}", format_field_type(inner)),
         FieldType::Union(variants) => {
-            let names: Vec<_> = variants.iter().map(|v| format_field_type(v)).collect();
+            let names: Vec<_> = variants.iter().map(format_field_type).collect();
             format!("({})", names.join(" | "))
         }
     }
@@ -1141,9 +1119,8 @@ fn format_field_type(field_type: &FieldType) -> String {
 /// Determine if the cursor is in a value position for a ModelRef field.
 /// Returns the target model name (e.g. "step", "tool") if applicable.
 fn find_model_ref_type_at(source: &str, pos: Position, models: &[ModelDef]) -> Option<String> {
-    let lines: Vec<&str> = source.lines().collect();
-    let line = lines.get(pos.line as usize)?;
-    let end = (pos.character as usize).min(line.len());
+    let line = position::line_at(source, pos.line)?;
+    let end = position::utf16_to_byte(line, pos.character);
 
     let eq_pos = line[..end].find('=')?;
     let prop_name = line[..eq_pos].trim();
@@ -1152,8 +1129,8 @@ fn find_model_ref_type_at(source: &str, pos: Position, models: &[ModelDef]) -> O
     }
 
     let file = nml_core::parse(source).ok()?;
-    let source_map = SourceMap::new(source);
-    let keyword = find_enclosing_block_keyword(&file, pos, &source_map)?;
+    let line_index = LineIndex::new(source);
+    let keyword = find_enclosing_block_keyword(&file, pos, &line_index)?;
 
     let model = models.iter().find(|m| m.name == keyword)?;
     let field = model.fields.iter().find(|f| f.name == prop_name)?;
@@ -1178,7 +1155,7 @@ fn collect_declarations_by_keyword(
         if let Ok(file) = nml_core::parse(source) {
             let file_name = uri
                 .path_segments()
-                .and_then(|s| s.last())
+                .and_then(|mut s| s.next_back())
                 .unwrap_or("unknown")
                 .to_string();
             for decl in &file.declarations {
@@ -1209,14 +1186,15 @@ fn collect_declarations_by_keyword(
     results
 }
 
-fn is_property_name_position(line: &str, word: &str, col: usize) -> bool {
+/// Whether the *byte* column `byte_col` sits on a property name.
+fn is_property_name_position(line: &str, word: &str, byte_col: usize) -> bool {
     if word.is_empty() {
         return false;
     }
     let trimmed = line.trim();
 
     if let Some(eq_pos) = line.find('=') {
-        if col < eq_pos {
+        if byte_col < eq_pos {
             return true;
         }
     }
@@ -1246,6 +1224,25 @@ fn format_value(value: &Value) -> String {
     }
 }
 
+/// Whether a property name suggests credential material.
+fn is_sensitive_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["key", "token", "secret", "password"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Format a named value for hover display, redacting literal strings whose
+/// name suggests credentials. `Value::Secret` is shown as-is: it renders
+/// the `$ENV.KEY` reference text, not actual secret material.
+fn format_named_value(name: &str, value: &Value) -> String {
+    if matches!(value, Value::String(_)) && is_sensitive_name(name) {
+        "\"…\"".to_string()
+    } else {
+        format_value(value)
+    }
+}
+
 fn is_template_namespace_position(before_cursor: &str) -> bool {
     if let Some(last_open) = before_cursor.rfind("{{") {
         let after_open = &before_cursor[last_open + 2..];
@@ -1258,14 +1255,16 @@ fn is_template_namespace_position(before_cursor: &str) -> bool {
     }
 }
 
+/// Detect a `{{namespace.path}}` template expression around the given
+/// *byte* column and return its hover documentation.
 fn detect_template_hover(
     line: &str,
-    col: usize,
+    byte_col: usize,
     ext: Option<&dyn LanguageExtension>,
 ) -> Option<String> {
     let bytes = line.as_bytes();
     let mut start = None;
-    let mut i = col.min(line.len());
+    let mut i = byte_col.min(line.len());
     while i >= 2 {
         if bytes.get(i - 1) == Some(&b'{') && bytes.get(i - 2) == Some(&b'{') {
             start = Some(i);
@@ -1352,6 +1351,14 @@ impl LanguageServer for NmlLanguageServer {
             .map(|folders| folders.iter().map(|f| f.uri.clone()).collect())
             .or_else(|| params.root_uri.clone().map(|u| vec![u]))
             .unwrap_or_default();
+        *self
+            .workspace_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = roots
+            .iter()
+            .filter_map(|r| r.to_file_path().ok())
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
         if !roots.is_empty() {
             self.index_workspace(&roots);
             self.rebuild_schema_registry();
@@ -1457,10 +1464,21 @@ impl LanguageServer for NmlLanguageServer {
         for change in params.changes {
             match change.typ {
                 FileChangeType::CREATED | FileChangeType::CHANGED => {
-                    if let Ok(path) = change.uri.to_file_path() {
-                        if let Ok(content) = fs::read_to_string(&path) {
-                            self.on_change(change.uri, content).await;
-                        }
+                    let Ok(path) = change.uri.to_file_path() else {
+                        continue;
+                    };
+                    let eligible = {
+                        let roots = self
+                            .workspace_roots
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        watched_file_is_eligible(&path, &roots)
+                    };
+                    if !eligible {
+                        continue;
+                    }
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        self.on_change(change.uri, content).await;
                     }
                 }
                 FileChangeType::DELETED => {
@@ -1491,9 +1509,8 @@ impl LanguageServer for NmlLanguageServer {
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             docs.get(&uri)
                 .and_then(|source| {
-                    let lines: Vec<&str> = source.lines().collect();
-                    let line = lines.get(pos.line as usize)?;
-                    let end = (pos.character as usize).min(line.len());
+                    let line = position::line_at(source, pos.line)?;
+                    let end = position::utf16_to_byte(line, pos.character);
                     Some(line[..end].contains('='))
                 })
                 .unwrap_or(false)
@@ -1503,9 +1520,8 @@ impl LanguageServer for NmlLanguageServer {
             let template_context = {
                 let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
                 docs.get(&uri).and_then(|source| {
-                    let lines: Vec<&str> = source.lines().collect();
-                    let line = lines.get(pos.line as usize)?;
-                    let end = (pos.character as usize).min(line.len());
+                    let line = position::line_at(source, pos.line)?;
+                    let end = position::utf16_to_byte(line, pos.character);
                     let before_cursor = &line[..end];
                     if is_template_namespace_position(before_cursor) {
                         Some(true)
@@ -1650,7 +1666,10 @@ impl LanguageServer for NmlLanguageServer {
                             let kw = &block.keyword.name;
                             let name = &block.name.name;
                             let is_tagged = member_kws.iter().any(|mk| mk == kw)
-                                || block.extends.iter().any(|e| member_kws.iter().any(|mk| mk == &e.name));
+                                || block
+                                    .extends
+                                    .iter()
+                                    .any(|e| member_kws.iter().any(|mk| mk == &e.name));
                             if is_tagged {
                                 let label = format!("@{kw}/{name}");
                                 if seen_refs.insert(label.clone()) {
@@ -1683,16 +1702,14 @@ impl LanguageServer for NmlLanguageServer {
             }
         };
 
-        let lines: Vec<&str> = source_clone.lines().collect();
-        let Some(line) = lines.get(pos.line as usize) else {
+        let Some(line) = position::line_at(&source_clone, pos.line) else {
             return Ok(None);
         };
+        let byte_col = position::utf16_to_byte(line, pos.character);
 
-        if let Some(template_hover) = detect_template_hover(
-            line,
-            pos.character as usize,
-            self.language_extension.as_deref(),
-        ) {
+        if let Some(template_hover) =
+            detect_template_hover(line, byte_col, self.language_extension.as_deref())
+        {
             return Ok(Some(Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
@@ -1702,7 +1719,7 @@ impl LanguageServer for NmlLanguageServer {
             }));
         }
 
-        let word = extract_word_at(line, pos.character as usize);
+        let word = extract_word_at(line, byte_col);
 
         if word.starts_with('@') {
             let hover_text = if let Some(ext) = &self.language_extension {
@@ -1730,12 +1747,12 @@ impl LanguageServer for NmlLanguageServer {
             return Ok(None);
         }
 
-        let is_prop = is_property_name_position(line, &word, pos.character as usize);
+        let is_prop = is_property_name_position(line, &word, byte_col);
 
         if is_prop && !word.is_empty() {
             if let Ok(file) = nml_core::parse(&source_clone) {
-                let source_map = SourceMap::new(&source_clone);
-                if let Some(keyword) = find_enclosing_block_keyword(&file, pos, &source_map) {
+                let line_index = LineIndex::new(&source_clone);
+                if let Some(keyword) = find_enclosing_block_keyword(&file, pos, &line_index) {
                     let (models, _) = self.models_for_file(&uri);
                     if let Some(model) = models.iter().find(|m| m.name == keyword) {
                         if let Some(field) = model.fields.iter().find(|f| f.name == word) {
@@ -1808,11 +1825,11 @@ impl LanguageServer for NmlLanguageServer {
                                 String::new(),
                             ),
                             DeclarationKind::Const(c) if c.name.name == word => {
-                                let val = format_value(&c.value.value);
+                                let val = format_named_value(&c.name.name, &c.value.value);
                                 ("const".into(), c.name.name.clone(), val)
                             }
                             DeclarationKind::Template(t) if t.name.name == word => {
-                                let val = format_value(&t.value.value);
+                                let val = format_named_value(&t.name.name, &t.value.value);
                                 ("template".into(), t.name.name.clone(), val)
                             }
                             _ => continue,
@@ -1829,7 +1846,7 @@ impl LanguageServer for NmlLanguageServer {
 
                         let file_name = doc_uri
                             .path_segments()
-                            .and_then(|s| s.last())
+                            .and_then(|mut s| s.next_back())
                             .unwrap_or("unknown");
                         text.push_str(&format!("\n\n*Source: {file_name}*"));
 
@@ -1860,16 +1877,16 @@ impl LanguageServer for NmlLanguageServer {
             let Some(source) = docs.get(&uri) else {
                 return Ok(None);
             };
-            let lines: Vec<&str> = source.lines().collect();
-            let Some(line) = lines.get(pos.line as usize) else {
+            let Some(line) = position::line_at(source, pos.line) else {
                 return Ok(None);
             };
-            let word = extract_word_at(line, pos.character as usize);
-            let is_prop = is_property_name_position(line, &word, pos.character as usize);
+            let byte_col = position::utf16_to_byte(line, pos.character);
+            let word = extract_word_at(line, byte_col);
+            let is_prop = is_property_name_position(line, &word, byte_col);
 
             let enclosing = if let Ok(file) = nml_core::parse(source) {
-                let source_map = SourceMap::new(source);
-                find_enclosing_block_keyword(&file, pos, &source_map)
+                let line_index = LineIndex::new(source);
+                find_enclosing_block_keyword(&file, pos, &line_index)
             } else {
                 None
             };
@@ -1922,11 +1939,10 @@ impl LanguageServer for NmlLanguageServer {
             let Some(source) = docs.get(&uri) else {
                 return Ok(None);
             };
-            let lines: Vec<&str> = source.lines().collect();
-            let Some(line) = lines.get(pos.line as usize) else {
+            let Some(line) = position::line_at(source, pos.line) else {
                 return Ok(None);
             };
-            extract_word_at(line, pos.character as usize)
+            extract_word_at(line, position::utf16_to_byte(line, pos.character))
         };
 
         if word.is_empty() {
@@ -1941,8 +1957,8 @@ impl LanguageServer for NmlLanguageServer {
         let mut locations = Vec::new();
 
         for (doc_uri, source) in &docs {
-            let source_map = SourceMap::new(source);
-            for range in find_references_in_source(source, &word, &source_map) {
+            let line_index = LineIndex::new(source);
+            for range in find_references_in_source(source, &word, &line_index) {
                 locations.push(Location {
                     uri: doc_uri.clone(),
                     range,
@@ -1975,8 +1991,8 @@ impl LanguageServer for NmlLanguageServer {
             Err(_) => return Ok(None),
         };
 
-        let source_map = SourceMap::new(&source_clone);
-        let symbols = build_document_symbols(&file, &source_map);
+        let line_index = LineIndex::new(&source_clone);
+        let symbols = build_document_symbols(&file, &line_index);
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
@@ -1992,12 +2008,11 @@ impl LanguageServer for NmlLanguageServer {
             let Some(source) = docs.get(&uri) else {
                 return Ok(None);
             };
-            let lines: Vec<&str> = source.lines().collect();
-            let Some(line) = lines.get(pos.line as usize) else {
+            let Some(line) = position::line_at(source, pos.line) else {
                 return Ok(None);
             };
             (
-                extract_word_at(line, pos.character as usize),
+                extract_word_at(line, position::utf16_to_byte(line, pos.character)),
                 source.clone(),
             )
         };
@@ -2006,8 +2021,8 @@ impl LanguageServer for NmlLanguageServer {
             return Ok(None);
         }
 
-        let source_map = SourceMap::new(&source_clone);
-        let refs = find_references_in_source(&source_clone, &word, &source_map);
+        let line_index = LineIndex::new(&source_clone);
+        let refs = find_references_in_source(&source_clone, &word, &line_index);
 
         if refs.is_empty() {
             Ok(None)
@@ -2033,18 +2048,19 @@ impl LanguageServer for NmlLanguageServer {
             }
         };
 
-        let file = match nml_core::parse(&source_clone) {
+        let formatted = match nml_fmt::formatter::format_source(&source_clone) {
             Ok(f) => f,
             Err(_) => return Ok(None),
         };
-
-        let formatted = nml_fmt::formatter::format(&file);
         if formatted == source_clone {
             return Ok(None);
         }
 
         let line_count = source_clone.lines().count() as u32;
-        let last_line_len = source_clone.lines().last().map_or(0, |l| l.len()) as u32;
+        let last_line_len = source_clone
+            .lines()
+            .last()
+            .map_or(0, |l| position::byte_to_utf16(l, l.len()));
         let (end_line, end_char) = if source_clone.ends_with('\n') {
             (line_count, 0)
         } else {
@@ -2094,21 +2110,24 @@ impl LanguageServer for NmlLanguageServer {
         let indent_str: String = " ".repeat(desired);
 
         let current_line_idx = pos.line as usize;
-        let existing_ws = if current_line_idx < lines.len() {
+        // `trim_start` trims Unicode whitespace, so the byte count must be
+        // converted to UTF-16 units for the edit range.
+        let (existing_ws_bytes, existing_ws_end) = if current_line_idx < lines.len() {
             let cur = lines[current_line_idx];
-            cur.len() - cur.trim_start().len()
+            let ws = cur.len() - cur.trim_start().len();
+            (ws, position::byte_to_utf16(cur, ws))
         } else {
-            0
+            (0, 0)
         };
 
-        if existing_ws == desired {
+        if existing_ws_bytes == desired {
             return Ok(None);
         }
 
         Ok(Some(vec![TextEdit {
             range: Range {
                 start: Position::new(pos.line, 0),
-                end: Position::new(pos.line, existing_ws as u32),
+                end: Position::new(pos.line, existing_ws_end),
             },
             new_text: indent_str,
         }]))
@@ -2124,11 +2143,10 @@ impl LanguageServer for NmlLanguageServer {
             let Some(source) = docs.get(&uri) else {
                 return Ok(None);
             };
-            let lines: Vec<&str> = source.lines().collect();
-            let Some(line) = lines.get(pos.line as usize) else {
+            let Some(line) = position::line_at(source, pos.line) else {
                 return Ok(None);
             };
-            extract_word_at(line, pos.character as usize)
+            extract_word_at(line, position::utf16_to_byte(line, pos.character))
         };
 
         if word.is_empty() {
@@ -2143,8 +2161,8 @@ impl LanguageServer for NmlLanguageServer {
         let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
 
         for (doc_uri, source) in &docs {
-            let source_map = SourceMap::new(source);
-            let refs = find_references_in_source(source, &word, &source_map);
+            let line_index = LineIndex::new(source);
+            let refs = find_references_in_source(source, &word, &line_index);
             if !refs.is_empty() {
                 changes.insert(
                     doc_uri.clone(),
@@ -2179,34 +2197,47 @@ impl LanguageServer for NmlLanguageServer {
         let Some(source) = docs.get(&uri) else {
             return Ok(None);
         };
-        let lines: Vec<&str> = source.lines().collect();
-        let Some(line) = lines.get(pos.line as usize) else {
+        let Some(line) = position::line_at(source, pos.line) else {
             return Ok(None);
         };
 
-        let word = extract_word_at(line, pos.character as usize);
+        let byte_col = position::utf16_to_byte(line, pos.character);
+        let word = extract_word_at(line, byte_col);
         if word.is_empty() {
             return Ok(None);
         }
 
-        let chars: Vec<char> = line.chars().collect();
-        let col = (pos.character as usize).min(chars.len());
-        let start = chars[..col]
-            .iter()
-            .rposition(|c| !c.is_alphanumeric() && *c != '_' && *c != '-')
-            .map(|p| p + 1)
-            .unwrap_or(0);
-        let end = chars[col..]
-            .iter()
-            .position(|c| !c.is_alphanumeric() && *c != '_' && *c != '-')
-            .map(|p| col + p)
-            .unwrap_or(chars.len());
-
+        let (start, end) = rename_word_byte_range(line, byte_col);
         Ok(Some(PrepareRenameResponse::Range(Range {
-            start: Position::new(pos.line, start as u32),
-            end: Position::new(pos.line, end as u32),
+            start: Position::new(pos.line, position::byte_to_utf16(line, start)),
+            end: Position::new(pos.line, position::byte_to_utf16(line, end)),
         })))
     }
+}
+
+/// Byte range of the renameable identifier around the given byte column.
+/// Uses a narrower character set than `is_word_char`: rename targets plain
+/// identifiers, not `@kind/name` references.
+fn rename_word_byte_range(line: &str, byte_col: usize) -> (usize, usize) {
+    let is_rename_char = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    let mut col = byte_col.min(line.len());
+    while col > 0 && !line.is_char_boundary(col) {
+        col -= 1;
+    }
+
+    let start = line[..col]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_rename_char(*c))
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let end = line[col..]
+        .char_indices()
+        .find(|(_, c)| !is_rename_char(*c))
+        .map(|(i, _)| col + i)
+        .unwrap_or(line.len());
+
+    (start, end)
 }
 
 // ── Tests ─────────────────────────────────────────────────────
@@ -2324,9 +2355,9 @@ mod tests {
     #[test]
     fn span_to_range_single_line() {
         let source = "provider GroqFast:";
-        let source_map = SourceMap::new(source);
+        let line_index = LineIndex::new(source);
         let span = nml_core::span::Span::new(9, 17);
-        let range = span_to_range(span, &source_map);
+        let range = span_to_range(span, &line_index);
         assert_eq!(range.start.line, 0);
         assert_eq!(range.start.character, 9);
         assert_eq!(range.end.line, 0);
@@ -2336,9 +2367,9 @@ mod tests {
     #[test]
     fn span_to_range_multi_line() {
         let source = "hello\nworld";
-        let source_map = SourceMap::new(source);
+        let line_index = LineIndex::new(source);
         let span = nml_core::span::Span::new(6, 11);
-        let range = span_to_range(span, &source_map);
+        let range = span_to_range(span, &line_index);
         assert_eq!(range.start.line, 1);
         assert_eq!(range.start.character, 0);
         assert_eq!(range.end.line, 1);
@@ -2351,24 +2382,24 @@ mod tests {
     fn find_top_level_block() {
         let source = "provider GroqFast:\n    type = \"groq\"\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
-        assert!(find_top_level_decl(&file, "GroqFast", &source_map).is_some());
+        let line_index = LineIndex::new(source);
+        assert!(find_top_level_decl(&file, "GroqFast", &line_index).is_some());
     }
 
     #[test]
     fn find_top_level_const() {
         let source = "const Limit = 100\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
-        assert!(find_top_level_decl(&file, "Limit", &source_map).is_some());
+        let line_index = LineIndex::new(source);
+        assert!(find_top_level_decl(&file, "Limit", &line_index).is_some());
     }
 
     #[test]
     fn find_top_level_not_found() {
         let source = "provider GroqFast:\n    type = \"groq\"\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
-        assert!(find_top_level_decl(&file, "NonExistent", &source_map).is_none());
+        let line_index = LineIndex::new(source);
+        assert!(find_top_level_decl(&file, "NonExistent", &line_index).is_none());
     }
 
     // ── find_field_definition ─────────────────────────────────
@@ -2377,24 +2408,24 @@ mod tests {
     fn find_field_in_model() {
         let source = "model user:\n    name string\n    email string\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
-        assert!(find_field_definition(&file, "email", &source_map).is_some());
+        let line_index = LineIndex::new(source);
+        assert!(find_field_definition(&file, "email", &line_index).is_some());
     }
 
     #[test]
     fn find_field_ignores_non_model() {
         let source = "service Svc:\n    localMount = \"/\"\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
-        assert!(find_field_definition(&file, "localMount", &source_map).is_none());
+        let line_index = LineIndex::new(source);
+        assert!(find_field_definition(&file, "localMount", &line_index).is_none());
     }
 
     #[test]
     fn find_field_not_found() {
         let source = "model user:\n    name string\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
-        assert!(find_field_definition(&file, "nonexistent", &source_map).is_none());
+        let line_index = LineIndex::new(source);
+        assert!(find_field_definition(&file, "nonexistent", &line_index).is_none());
     }
 
     // ── find_name_in_file ─────────────────────────────────────
@@ -2403,8 +2434,8 @@ mod tests {
     fn find_name_top_level() {
         let source = "provider GroqFast:\n    type = \"groq\"\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
-        assert!(find_name_in_file(&file, "GroqFast", &source_map).is_some());
+        let line_index = LineIndex::new(source);
+        assert!(find_name_in_file(&file, "GroqFast", &line_index).is_some());
     }
 
     #[test]
@@ -2412,24 +2443,24 @@ mod tests {
         let source =
             "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - s1:\n            provider = GroqFast\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
-        assert!(find_name_in_file(&file, "steps", &source_map).is_some());
+        let line_index = LineIndex::new(source);
+        assert!(find_name_in_file(&file, "steps", &line_index).is_some());
     }
 
     #[test]
     fn find_name_list_item() {
         let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - myStep:\n            provider = GroqFast\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
-        assert!(find_name_in_file(&file, "myStep", &source_map).is_some());
+        let line_index = LineIndex::new(source);
+        assert!(find_name_in_file(&file, "myStep", &line_index).is_some());
     }
 
     #[test]
     fn find_name_not_found_in_file() {
         let source = "provider GroqFast:\n    type = \"groq\"\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
-        assert!(find_name_in_file(&file, "NonExistent", &source_map).is_none());
+        let line_index = LineIndex::new(source);
+        assert!(find_name_in_file(&file, "NonExistent", &line_index).is_none());
     }
 
     // ── find_definition_in_docs (priority + regression) ───────
@@ -2668,9 +2699,9 @@ mod tests {
     fn find_schema_block_definition_finds_model() {
         let source = "model provider:\n    type string\n\nmodel workflow:\n    entrypoint string\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
+        let line_index = LineIndex::new(source);
 
-        let result = find_schema_block_definition(&file, "workflow", &source_map);
+        let result = find_schema_block_definition(&file, "workflow", &line_index);
         assert!(result.is_some());
         assert_eq!(
             result.unwrap().start.line,
@@ -2683,9 +2714,9 @@ mod tests {
     fn find_schema_block_definition_finds_enum() {
         let source = "enum transport:\n    - \"http\"\n    - \"websocket\"\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
+        let line_index = LineIndex::new(source);
 
-        let result = find_schema_block_definition(&file, "transport", &source_map);
+        let result = find_schema_block_definition(&file, "transport", &line_index);
         assert!(result.is_some());
         assert_eq!(result.unwrap().start.line, 0);
     }
@@ -2694,9 +2725,9 @@ mod tests {
     fn find_schema_block_definition_ignores_instances() {
         let source = "provider GroqFast:\n    type = \"groq\"\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
+        let line_index = LineIndex::new(source);
 
-        let result = find_schema_block_definition(&file, "GroqFast", &source_map);
+        let result = find_schema_block_definition(&file, "GroqFast", &line_index);
         assert!(result.is_none(), "should not match instance declarations");
     }
 
@@ -2811,11 +2842,11 @@ workflow VoiceAgent:
             provider = GroqFast
 "#;
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
+        let line_index = LineIndex::new(source);
 
         // "workflow" keyword is on line 11 (0-indexed)
         let pos = Position::new(11, 3);
-        let result = find_enclosing_block_keyword(&file, pos, &source_map);
+        let result = find_enclosing_block_keyword(&file, pos, &line_index);
         assert_eq!(
             result,
             Some("workflow".to_string()),
@@ -2824,7 +2855,7 @@ workflow VoiceAgent:
 
         // "provider" keyword is on line 5 (0-indexed)
         let pos = Position::new(5, 3);
-        let result = find_enclosing_block_keyword(&file, pos, &source_map);
+        let result = find_enclosing_block_keyword(&file, pos, &line_index);
         assert_eq!(
             result,
             Some("provider".to_string()),
@@ -2857,11 +2888,11 @@ workflow VoiceAgent:
             provider = GroqFast
 "#;
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
+        let line_index = LineIndex::new(source);
 
         // "tool" keyword is on line 9 (0-indexed) - must return "tool" not "workflow" or "stage"
         let pos = Position::new(9, 3);
-        let result = find_enclosing_block_keyword(&file, pos, &source_map);
+        let result = find_enclosing_block_keyword(&file, pos, &line_index);
         assert_eq!(
             result,
             Some("tool".to_string()),
@@ -2873,11 +2904,11 @@ workflow VoiceAgent:
     fn enclosing_keyword_returns_none_for_blank_line() {
         let source = "stage A:\n    wasm = \"a.wasm\"\n\nstage B:\n    wasm = \"b.wasm\"\n";
         let file = nml_core::parse(source).unwrap();
-        let source_map = SourceMap::new(source);
+        let line_index = LineIndex::new(source);
 
         // Line 2 is the blank line between stage A and stage B
         let pos = Position::new(2, 0);
-        let result = find_enclosing_block_keyword(&file, pos, &source_map);
+        let result = find_enclosing_block_keyword(&file, pos, &line_index);
         // Blank line may or may not be inside a declaration depending on parser spans
         // Just verify it doesn't panic
         let _ = result;
@@ -2960,8 +2991,8 @@ workflow VoiceAgent:
         {
             let source = docs.get(&model_uri).unwrap();
             let file = nml_core::parse(source).unwrap();
-            let source_map = SourceMap::new(source);
-            let result = find_schema_block_definition(&file, "workflow", &source_map);
+            let line_index = LineIndex::new(source);
+            let result = find_schema_block_definition(&file, "workflow", &line_index);
             assert!(
                 result.is_some(),
                 "find_schema_block_definition should find model workflow:"
@@ -2977,8 +3008,8 @@ workflow VoiceAgent:
         {
             let source = docs.get(&model_uri).unwrap();
             let file = nml_core::parse(source).unwrap();
-            let source_map = SourceMap::new(source);
-            let result = find_schema_block_definition(&file, "provider", &source_map);
+            let line_index = LineIndex::new(source);
+            let result = find_schema_block_definition(&file, "provider", &line_index);
             assert!(
                 result.is_some(),
                 "find_schema_block_definition should find model provider:"
@@ -3313,5 +3344,210 @@ workflow VoiceAgent:
             !role_names.contains(&"classify"),
             "steps should not appear in role results"
         );
+    }
+
+    // ── UTF-16 position handling (multibyte content) ──────────
+
+    #[test]
+    fn extract_word_multibyte_line() {
+        let line = "naïve = café";
+        let byte_col = position::utf16_to_byte(line, 10); // inside "café"
+        assert_eq!(extract_word_at(line, byte_col), "café");
+    }
+
+    #[test]
+    fn extract_word_cjk() {
+        let line = "tag = 日本語";
+        let byte_col = position::utf16_to_byte(line, 7); // inside 日本語
+        assert_eq!(extract_word_at(line, byte_col), "日本語");
+    }
+
+    #[test]
+    fn extract_word_mid_multibyte_does_not_panic() {
+        // Byte 1 is inside the emoji; must clamp to a char boundary.
+        assert_eq!(extract_word_at("😀abc", 1), "");
+    }
+
+    #[test]
+    fn span_to_range_utf16_after_emoji() {
+        // 'y' begins at byte 11 but UTF-16 column 9 (the emoji is 4 bytes
+        // yet only 2 UTF-16 units).
+        let source = "x = \"😀\" y";
+        let line_index = LineIndex::new(source);
+        let range = span_to_range(nml_core::span::Span::new(11, 12), &line_index);
+        assert_eq!(range.start, Position::new(0, 9));
+        assert_eq!(range.end, Position::new(0, 10));
+    }
+
+    #[test]
+    fn find_by_text_multibyte_prefix() {
+        // 'é' is 2 bytes but 1 UTF-16 unit; reported columns must be UTF-16.
+        let source = "sérvice GroqFast:\n    type = \"groq\"";
+        let range = find_name_by_text(source, "GroqFast").unwrap();
+        assert_eq!(range.start.character, 8);
+        assert_eq!(range.end.character, 16);
+    }
+
+    #[test]
+    fn model_ref_type_multibyte_value_does_not_panic() {
+        let schema_source = "model workflow:\n    entrypoint string\n";
+        let schema = nml_core::model_extract::extract(&nml_core::parse(schema_source).unwrap());
+
+        // Cursor between CJK chars: treating the UTF-16 column as a byte
+        // index would slice mid-character and panic.
+        let source = "workflow W:\n    entrypoint = \"日本語テスト\"\n";
+        let pos = Position::new(1, 23);
+        assert_eq!(find_model_ref_type_at(source, pos, &schema.models), None);
+    }
+
+    #[test]
+    fn property_name_position_multibyte() {
+        let line = "    clé = \"x\"";
+        let byte_col = position::utf16_to_byte(line, 6); // on "clé"
+        assert!(is_property_name_position(line, "clé", byte_col));
+    }
+
+    #[test]
+    fn rename_range_multibyte() {
+        let line = "naïve = café";
+        let byte_col = position::utf16_to_byte(line, 9); // inside "café"
+        let (start, end) = rename_word_byte_range(line, byte_col);
+        assert_eq!(&line[start..end], "café");
+        assert_eq!(position::byte_to_utf16(line, start), 8);
+        assert_eq!(position::byte_to_utf16(line, end), 12);
+    }
+
+    #[test]
+    fn rename_range_excludes_ref_punctuation() {
+        let line = "access = @role/admin";
+        let (start, end) = rename_word_byte_range(line, 16); // on "admin"
+        assert_eq!(&line[start..end], "admin");
+    }
+
+    // ── Watched-file eligibility ──────────────────────────────
+
+    fn temp_workspace(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nml-lsp-{tag}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn watched_file_inside_root_is_eligible() {
+        let root = temp_workspace("inside");
+        let file = root.join("a.nml");
+        fs::write(&file, "x").unwrap();
+        let canon_root = root.canonicalize().unwrap();
+
+        assert!(watched_file_is_eligible(&file, &[canon_root]));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn watched_file_outside_root_is_rejected() {
+        let root = temp_workspace("outside-root");
+        let elsewhere = temp_workspace("outside-other");
+        let file = elsewhere.join("a.nml");
+        fs::write(&file, "x").unwrap();
+        let canon_root = root.canonicalize().unwrap();
+
+        assert!(!watched_file_is_eligible(&file, &[canon_root]));
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    #[test]
+    fn watched_file_with_no_roots_is_rejected() {
+        let root = temp_workspace("no-roots");
+        let file = root.join("a.nml");
+        fs::write(&file, "x").unwrap();
+
+        assert!(!watched_file_is_eligible(&file, &[]));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn watched_file_missing_is_rejected() {
+        let root = temp_workspace("missing");
+        let canon_root = root.canonicalize().unwrap();
+
+        assert!(!watched_file_is_eligible(
+            &root.join("nope.nml"),
+            &[canon_root]
+        ));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watched_file_symlink_is_rejected() {
+        let root = temp_workspace("symlink-root");
+        let elsewhere = temp_workspace("symlink-target");
+        let target = elsewhere.join("real.nml");
+        fs::write(&target, "x").unwrap();
+        let link = root.join("link.nml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let canon_root = root.canonicalize().unwrap();
+
+        assert!(
+            !watched_file_is_eligible(&link, &[canon_root]),
+            "symlinks must be rejected even when placed inside a root"
+        );
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    // ── Hover credential redaction ────────────────────────────
+
+    #[test]
+    fn sensitive_names_detected() {
+        assert!(is_sensitive_name("apiKey"));
+        assert!(is_sensitive_name("API_TOKEN"));
+        assert!(is_sensitive_name("clientSecret"));
+        assert!(is_sensitive_name("Password"));
+        assert!(!is_sensitive_name("name"));
+        assert!(!is_sensitive_name("description"));
+    }
+
+    #[test]
+    fn hover_summary_redacts_credential_strings() {
+        let source = "provider P:\n    apiKey = \"gsk_super_secret\"\n    model = \"llama\"\n";
+        let file = nml_core::parse(source).unwrap();
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("expected block declaration");
+        };
+        let summary = summarize_body(&block.body);
+        assert!(summary.contains("apiKey = \"…\""), "summary: {summary}");
+        assert!(
+            !summary.contains("gsk_super_secret"),
+            "credential leaked: {summary}"
+        );
+        assert!(summary.contains("model = \"llama\""), "summary: {summary}");
+    }
+
+    #[test]
+    fn hover_summary_keeps_secret_env_reference() {
+        // `$ENV.X` is a reference, not secret material; it stays visible.
+        let source = "provider P:\n    apiKey = $ENV.GROQ_KEY\n";
+        let file = nml_core::parse(source).unwrap();
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("expected block declaration");
+        };
+        let summary = summarize_body(&block.body);
+        assert!(summary.contains("GROQ_KEY"), "summary: {summary}");
+    }
+
+    #[test]
+    fn format_named_value_redacts_only_sensitive_strings() {
+        let secret = Value::String("hunter2".into());
+        assert_eq!(format_named_value("password", &secret), "\"…\"");
+        assert_eq!(format_named_value("greeting", &secret), "\"hunter2\"");
+        // Non-string values keep their normal rendering.
+        assert_eq!(format_named_value("maxKeys", &Value::number(3.0)), "3");
     }
 }

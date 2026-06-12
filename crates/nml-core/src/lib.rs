@@ -57,13 +57,14 @@ pub mod parser;
 pub mod project;
 pub mod query;
 pub mod resolve;
-pub mod resolver;
 pub mod span;
+pub mod symbols;
 pub mod template;
 pub mod types;
 
-pub use parser::parse;
+pub use lexer::Comment;
+pub use parser::{parse, parse_with_comments};
 pub use project::ProjectConfig;
 pub use query::Document;
 pub use resolve::ValueResolver;
-pub use resolver::Resolver;
+pub use symbols::SymbolTable;

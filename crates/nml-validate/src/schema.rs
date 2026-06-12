@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef};
+use nml_core::span::Span;
 use nml_core::types::{PrimitiveType, Value};
 
 use crate::diagnostics::Diagnostic;
@@ -138,13 +139,17 @@ impl SchemaValidator {
 
         if !is_schema_def {
             if let Some(model) = self.find_model(keyword) {
-                self.validate_instance_against_model(&block.body, model, 0, diags);
+                self.validate_instance_against_model(
+                    &block.body,
+                    model,
+                    0,
+                    Some(block.name.span),
+                    diags,
+                );
             } else if self.strict_unknown_fields {
                 diags.push(
-                    Diagnostic::error(format!(
-                        "block keyword '{keyword}' has no model definition"
-                    ))
-                    .with_span(block.keyword.span),
+                    Diagnostic::error(format!("block keyword '{keyword}' has no model definition"))
+                        .with_span(block.keyword.span),
                 );
             }
         }
@@ -180,12 +185,12 @@ impl SchemaValidator {
         }
 
         for item in &arr.body.items {
-            if let ListItemKind::Named { body, .. } = &item.kind {
+            if let ListItemKind::Named { name, body } = &item.kind {
                 self.validate_body(body, is_schema_def, keyword, diags);
                 self.validate_members_builtin_refs(body, keyword, diags);
 
                 if let Some(model) = model {
-                    self.validate_instance_against_model(body, model, 0, diags);
+                    self.validate_instance_against_model(body, model, 0, Some(name.span), diags);
                 }
             }
         }
@@ -240,14 +245,25 @@ impl SchemaValidator {
         }
     }
 
+    /// `header_span` points at the instance's block-header / item name and is
+    /// preferred for diagnostics that concern the instance as a whole (e.g.
+    /// missing required fields).
     fn validate_instance_against_model(
         &self,
         body: &Body,
         model: &ModelDef,
         depth: u32,
+        header_span: Option<Span>,
         diags: &mut Vec<Diagnostic>,
     ) {
         if depth >= MAX_VALIDATION_DEPTH {
+            let mut diag = Diagnostic::warning(format!(
+                "validation truncated: nesting exceeds maximum depth of {MAX_VALIDATION_DEPTH}; deeper entries were not checked"
+            ));
+            if let Some(span) = header_span.or_else(|| body.entries.first().map(|e| e.span)) {
+                diag = diag.with_span(span);
+            }
+            diags.push(diag);
             return;
         }
 
@@ -260,9 +276,11 @@ impl SchemaValidator {
                     seen_fields.push(name);
 
                     if let Some(field_def) = model.fields.iter().find(|f| f.name == *name) {
-                        self.validate_value_type(
+                        self.validate_value_against_type(
                             &prop.value.value,
-                            field_def,
+                            &field_def.field_type,
+                            &field_def.name,
+                            "for",
                             prop.value.span,
                             diags,
                         );
@@ -287,6 +305,7 @@ impl SchemaValidator {
                                         &nb.body,
                                         nested_model,
                                         depth + 1,
+                                        Some(nb.name.span),
                                         diags,
                                     );
                                 }
@@ -294,7 +313,7 @@ impl SchemaValidator {
                             FieldType::List(inner) => {
                                 for entry in &nb.body.entries {
                                     if let BodyEntryKind::ListItem(item) = &entry.kind {
-                                        if let ListItemKind::Named { body, .. } = &item.kind {
+                                        if let ListItemKind::Named { name, body } = &item.kind {
                                             match inner.as_ref() {
                                                 FieldType::ModelRef(ref_name) => {
                                                     if let Some(inner_model) =
@@ -304,6 +323,7 @@ impl SchemaValidator {
                                                             body,
                                                             inner_model,
                                                             depth + 1,
+                                                            Some(name.span),
                                                             diags,
                                                         );
                                                     }
@@ -324,7 +344,7 @@ impl SchemaValidator {
                                                                 if let Some(m) =
                                                                     self.find_model(ref_name)
                                                                 {
-                                                                    self.validate_instance_against_model(body, m, depth + 1, diags);
+                                                                    self.validate_instance_against_model(body, m, depth + 1, Some(name.span), diags);
                                                                 }
                                                                 break;
                                                             }
@@ -342,8 +362,8 @@ impl SchemaValidator {
                                                                             &body.entries
                                                                         {
                                                                             if let BodyEntryKind::ListItem(sub_item) = &sub_entry.kind {
-                                                                                if let ListItemKind::Named { body: sub_body, .. } = &sub_item.kind {
-                                                                                    self.validate_instance_against_model(sub_body, m, depth + 1, diags);
+                                                                                if let ListItemKind::Named { name: sub_name, body: sub_body } = &sub_item.kind {
+                                                                                    self.validate_instance_against_model(sub_body, m, depth + 1, Some(sub_name.span), diags);
                                                                                 }
                                                                             }
                                                                         }
@@ -377,64 +397,92 @@ impl SchemaValidator {
                 }
                 BodyEntryKind::Modifier(m) => {
                     seen_fields.push(&m.name.name);
+
+                    if let Some(field_def) = model.fields.iter().find(|f| f.name == m.name.name) {
+                        self.validate_modifier_value(m, field_def, diags);
+                    }
                 }
                 _ => {}
             }
         }
 
         for field in &model.fields {
-            if !field.optional && field.default_value.is_none() {
-                if !seen_fields.contains(&field.name.as_str()) {
-                    diags.push(
-                        Diagnostic::error(format!(
-                            "missing required field '{}' (defined in model '{}')",
-                            field.name, model.name
-                        ))
-                        .with_span(body.entries.first().map(|e| e.span).unwrap_or(field.span)),
-                    );
-                }
+            if !field.optional
+                && field.default_value.is_none()
+                && !seen_fields.contains(&field.name.as_str())
+            {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "missing required field '{}' (defined in model '{}')",
+                        field.name, model.name
+                    ))
+                    .with_span(
+                        header_span
+                            .or_else(|| body.entries.first().map(|e| e.span))
+                            .unwrap_or(field.span),
+                    ),
+                );
             }
         }
     }
 
-    fn validate_value_type(
-        &self,
-        value: &Value,
-        field: &FieldDef,
-        span: nml_core::span::Span,
-        diags: &mut Vec<Diagnostic>,
-    ) {
-        if let Value::Fallback(primary, fallback) = value {
-            self.validate_value_type(&primary.value, field, primary.span, diags);
-            self.validate_value_type(&fallback.value, field, fallback.span, diags);
+    /// Validate a modifier's value against the type declared in the model
+    /// (e.g. `|allow []string?`).
+    fn validate_modifier_value(&self, m: &Modifier, field: &FieldDef, diags: &mut Vec<Diagnostic>) {
+        let FieldType::Modifier(declared) = &field.field_type else {
             return;
-        }
+        };
 
-        match &field.field_type {
-            FieldType::Primitive(prim) => {
-                self.validate_primitive_value(value, prim, &field.name, "for", span, diags);
+        match &m.value {
+            ModifierValue::Inline(sv) => {
+                self.validate_value_against_type(
+                    &sv.value,
+                    declared,
+                    &field.name,
+                    "for",
+                    sv.span,
+                    diags,
+                );
             }
-            FieldType::ModelRef(ref_name) => {
-                if let Some(enum_def) = self.find_enum(ref_name) {
-                    self.validate_enum_value(value, enum_def, &field.name, span, diags);
-                } else {
-                    self.validate_model_ref_value(value, ref_name, &field.name, span, diags);
-                }
-            }
-            FieldType::List(inner) => {
-                if let Value::Array(items) = value {
-                    for item in items {
-                        self.validate_value_against_type(
-                            &item.value,
-                            inner,
-                            &field.name,
-                            item.span,
-                            diags,
-                        );
+            ModifierValue::Block(items) => {
+                let FieldType::List(inner) = declared.as_ref() else {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "type mismatch for '{}': expected {}, got array",
+                            field.name,
+                            field_type_display(declared)
+                        ))
+                        .with_span(m.name.span),
+                    );
+                    return;
+                };
+                for item in items {
+                    match &item.kind {
+                        ListItemKind::Shorthand(sv) => {
+                            self.validate_value_against_type(
+                                &sv.value,
+                                inner,
+                                &field.name,
+                                "in array",
+                                sv.span,
+                                diags,
+                            );
+                        }
+                        ListItemKind::Role(role_ref) => {
+                            self.validate_value_against_type(
+                                &Value::Role(role_ref.clone()),
+                                inner,
+                                &field.name,
+                                "in array",
+                                item.span,
+                                diags,
+                            );
+                        }
+                        ListItemKind::Reference(_) | ListItemKind::Named { .. } => {}
                     }
                 }
             }
-            _ => {}
+            ModifierValue::TypeAnnotation { .. } => {}
         }
     }
 
@@ -443,12 +491,33 @@ impl SchemaValidator {
         value: &Value,
         field_type: &FieldType,
         field_name: &str,
-        span: nml_core::span::Span,
+        context: &str,
+        span: Span,
         diags: &mut Vec<Diagnostic>,
     ) {
+        if let Value::Fallback(primary, fallback) = value {
+            self.validate_value_against_type(
+                &primary.value,
+                field_type,
+                field_name,
+                context,
+                primary.span,
+                diags,
+            );
+            self.validate_value_against_type(
+                &fallback.value,
+                field_type,
+                field_name,
+                context,
+                fallback.span,
+                diags,
+            );
+            return;
+        }
+
         match field_type {
             FieldType::Primitive(prim) => {
-                self.validate_primitive_value(value, prim, field_name, "in array", span, diags);
+                self.validate_primitive_value(value, prim, field_name, context, span, diags);
             }
             FieldType::ModelRef(ref_name) => {
                 if let Some(enum_def) = self.find_enum(ref_name) {
@@ -457,7 +526,90 @@ impl SchemaValidator {
                     self.validate_model_ref_value(value, ref_name, field_name, span, diags);
                 }
             }
-            _ => {}
+            FieldType::List(inner) => match value {
+                Value::Array(items) => {
+                    for item in items {
+                        self.validate_value_against_type(
+                            &item.value,
+                            inner,
+                            field_name,
+                            "in array",
+                            item.span,
+                            diags,
+                        );
+                    }
+                }
+                // References (e.g. to consts) and env vars may resolve to arrays.
+                Value::Reference(_) | Value::Secret(_) => {}
+                _ => {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "type mismatch {context} '{field_name}': expected {}, got {}",
+                            field_type_display(field_type),
+                            value_type_name(value)
+                        ))
+                        .with_span(span),
+                    );
+                }
+            },
+            FieldType::Union(variants) => {
+                if !self.value_matches_type(value, field_type) {
+                    let expected = variants
+                        .iter()
+                        .map(field_type_display)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "type mismatch {context} '{field_name}': expected one of {expected}; got {}",
+                            value_type_name(value)
+                        ))
+                        .with_span(span),
+                    );
+                }
+            }
+            FieldType::Modifier(declared) => {
+                self.validate_value_against_type(value, declared, field_name, context, span, diags);
+            }
+        }
+    }
+
+    /// Non-emitting check used for union variant matching: does `value`
+    /// structurally satisfy `field_type`?
+    fn value_matches_type(&self, value: &Value, field_type: &FieldType) -> bool {
+        if let Value::Fallback(primary, fallback) = value {
+            return self.value_matches_type(&primary.value, field_type)
+                && self.value_matches_type(&fallback.value, field_type);
+        }
+        // References and env vars are resolved later; accept them anywhere.
+        if matches!(value, Value::Reference(_) | Value::Secret(_)) {
+            return true;
+        }
+
+        match field_type {
+            FieldType::Primitive(prim) => value_matches_primitive(value, prim),
+            FieldType::ModelRef(ref_name) => {
+                if let Some(enum_def) = self.find_enum(ref_name) {
+                    match value {
+                        Value::String(s) => enum_def.variants.iter().any(|v| v == s),
+                        // Template strings are resolved later; unverifiable here.
+                        Value::TemplateString(_) => true,
+                        _ => false,
+                    }
+                } else {
+                    matches!(value, Value::String(_) | Value::TemplateString(_))
+                }
+            }
+            FieldType::List(inner) => match value {
+                Value::Array(items) => items
+                    .iter()
+                    .all(|item| self.value_matches_type(&item.value, inner)),
+                _ => false,
+            },
+            FieldType::Union(variants) => variants
+                .iter()
+                .any(|variant| self.value_matches_type(value, variant)),
+            FieldType::Modifier(declared) => self.value_matches_type(value, declared),
         }
     }
 
@@ -467,7 +619,7 @@ impl SchemaValidator {
         prim: &PrimitiveType,
         field_name: &str,
         context: &str,
-        span: nml_core::span::Span,
+        span: Span,
         diags: &mut Vec<Diagnostic>,
     ) {
         if value_matches_primitive(value, prim) {
@@ -503,26 +655,38 @@ impl SchemaValidator {
         value: &Value,
         enum_def: &EnumDef,
         field_name: &str,
-        span: nml_core::span::Span,
+        span: Span,
         diags: &mut Vec<Diagnostic>,
     ) {
-        let val_str = match value {
-            Value::String(s) => Some(s.as_str()),
-            Value::Reference(r) => Some(r.as_str()),
-            _ => None,
+        let variants = || {
+            enum_def
+                .variants
+                .iter()
+                .map(|v| format!("\"{v}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
 
-        if let Some(val) = val_str {
-            if !enum_def.variants.iter().any(|v| v == val) {
+        match value {
+            Value::String(s) | Value::Reference(s) => {
+                if !enum_def.variants.iter().any(|v| v == s) {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "invalid value '{s}' for '{field_name}': expected one of {}",
+                            variants()
+                        ))
+                        .with_span(span),
+                    );
+                }
+            }
+            // Resolved later; unverifiable at validation time.
+            Value::TemplateString(_) | Value::Secret(_) => {}
+            _ => {
                 diags.push(
                     Diagnostic::error(format!(
-                        "invalid value '{val}' for '{field_name}': expected one of {}",
-                        enum_def
-                            .variants
-                            .iter()
-                            .map(|v| format!("\"{v}\""))
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        "type mismatch for '{field_name}': expected one of {}, got {}",
+                        variants(),
+                        value_type_name(value)
                     ))
                     .with_span(span),
                 );
@@ -535,7 +699,7 @@ impl SchemaValidator {
         value: &Value,
         ref_name: &str,
         field_name: &str,
-        span: nml_core::span::Span,
+        span: Span,
         diags: &mut Vec<Diagnostic>,
     ) {
         match value {
@@ -587,7 +751,7 @@ impl SchemaValidator {
     fn check_user_ref_in_value(
         &self,
         value: &Value,
-        span: nml_core::span::Span,
+        span: Span,
         prefix: &str,
         diags: &mut Vec<Diagnostic>,
     ) {
@@ -668,18 +832,27 @@ impl SchemaValidator {
         for decl in &file.declarations {
             match &decl.kind {
                 DeclarationKind::Block(block) => {
-                    if self.membership.member_keywords.iter().any(|k| k == &block.keyword.name) {
+                    if self
+                        .membership
+                        .member_keywords
+                        .iter()
+                        .any(|k| k == &block.keyword.name)
+                    {
                         let refs = collect_member_refs(&block.body, &prefixes);
                         membership.insert(block.name.name.clone(), refs);
                     }
                 }
-                DeclarationKind::Array(arr) => {
-                    if self.membership.member_keywords.iter().any(|k| k == &arr.item_keyword.name) {
-                        for item in &arr.body.items {
-                            if let ListItemKind::Named { name, body } = &item.kind {
-                                let refs = collect_member_refs(body, &prefixes);
-                                membership.insert(name.name.clone(), refs);
-                            }
+                DeclarationKind::Array(arr)
+                    if self
+                        .membership
+                        .member_keywords
+                        .iter()
+                        .any(|k| k == &arr.item_keyword.name) =>
+                {
+                    for item in &arr.body.items {
+                        if let ListItemKind::Named { name, body } = &item.kind {
+                            let refs = collect_member_refs(body, &prefixes);
+                            membership.insert(name.name.clone(), refs);
                         }
                     }
                 }
@@ -752,6 +925,28 @@ fn detect_member_cycle(
     }
     path.pop();
     globally_visited.insert(name.to_string());
+}
+
+/// Human-readable name for a field type, used in diagnostics.
+fn field_type_display(field_type: &FieldType) -> String {
+    match field_type {
+        FieldType::Primitive(prim) => prim.as_str().to_string(),
+        FieldType::ModelRef(name) => name.clone(),
+        FieldType::Modifier(inner) => field_type_display(inner),
+        FieldType::List(inner) => {
+            let inner_name = field_type_display(inner);
+            if matches!(inner.as_ref(), FieldType::Union(_)) {
+                format!("[]({inner_name})")
+            } else {
+                format!("[]{inner_name}")
+            }
+        }
+        FieldType::Union(variants) => variants
+            .iter()
+            .map(field_type_display)
+            .collect::<Vec<_>>()
+            .join(" | "),
+    }
 }
 
 fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
@@ -1752,9 +1947,7 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            !diags
-                .iter()
-                .any(|d| d.message.contains("@user/")),
+            !diags.iter().any(|d| d.message.contains("@user/")),
             "without membership semantics, @user/ should not be warned: {:?}",
             diags
         );
@@ -2001,9 +2194,9 @@ workflow W:
         let file = parser::parse(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags
-                .iter()
-                .any(|d| d.message.contains("block keyword 'bogusBlock' has no model definition")),
+            diags.iter().any(|d| d
+                .message
+                .contains("block keyword 'bogusBlock' has no model definition")),
             "strict mode should reject unmodeled block keyword; diags: {:?}",
             diags
         );
@@ -2075,10 +2268,345 @@ workflow W:
         );
     }
 
+    // --- Union property type validation tests ---
+
+    #[test]
+    fn test_union_property_mismatch_reports_variants() {
+        let schema = "model cfg:\n    value (string | number)\n";
+        let validator = make_validator(schema);
+
+        let source = "cfg C:\n    value = true\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("type mismatch for 'value'")
+                    && d.message.contains("expected one of string, number")
+                    && d.message.contains("got bool")),
+            "union mismatch should name the expected variants; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_union_property_matching_variants_ok() {
+        let schema = "model cfg:\n    value (string | number)\n";
+        let validator = make_validator(schema);
+
+        for source in ["cfg C:\n    value = \"text\"\n", "cfg C:\n    value = 42\n"] {
+            let file = parser::parse(source).unwrap();
+            let diags = validator.validate(&file);
+            assert!(
+                diags.is_empty(),
+                "matching union variant should pass for {source:?}; diags: {:?}",
+                diags
+            );
+        }
+    }
+
+    #[test]
+    fn test_union_property_with_list_variant() {
+        let schema = "model cfg:\n    value (string | []number)\n";
+        let validator = make_validator(schema);
+
+        let file = parser::parse("cfg C:\n    value = [1, 2]\n").unwrap();
+        assert!(validator.validate(&file).is_empty());
+
+        let file = parser::parse("cfg C:\n    value = [true]\n").unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("expected one of string, []number")),
+            "array of wrong element type should not match union; diags: {:?}",
+            diags
+        );
+    }
+
+    // --- List type validation tests ---
+
+    #[test]
+    fn test_list_field_non_array_value_is_error() {
+        let schema = "model svc:\n    tags []string\n";
+        let validator = make_validator(schema);
+
+        let source = "svc S:\n    tags = \"oops\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("type mismatch for 'tags'")
+                    && d.message.contains("expected []string, got string")),
+            "non-array value for list field should be an error; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_list_field_reference_value_ok() {
+        let schema = "model svc:\n    tags []string\n";
+        let validator = make_validator(schema);
+
+        let source = "svc S:\n    tags = sharedTags\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let type_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("type mismatch"))
+            .collect();
+        assert!(
+            type_diags.is_empty(),
+            "references may resolve to arrays and should pass; diags: {:?}",
+            type_diags
+        );
+    }
+
+    // --- Enum type mismatch tests ---
+
+    #[test]
+    fn test_enum_non_string_value_is_error() {
+        let schema = "enum providerType:\n    - \"openai\"\n    - \"groq\"\n\nmodel provider:\n    type providerType\n";
+        let validator = make_validator(schema);
+
+        let source = "provider P:\n    type = 42\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("type mismatch for 'type'")
+                    && d.message.contains("expected one of \"openai\", \"groq\"")
+                    && d.message.contains("got number")),
+            "non-string enum value should be a type error; diags: {:?}",
+            diags
+        );
+    }
+
+    // --- Depth truncation tests ---
+
+    #[test]
+    fn test_depth_truncation_emits_diagnostic() {
+        let schema = "model tree:\n    child tree?\n";
+        let validator = make_validator(schema);
+
+        let span = Span::empty(0);
+        let mut body = Body { entries: vec![] };
+        for _ in 0..(MAX_VALIDATION_DEPTH + 4) {
+            body = Body {
+                entries: vec![BodyEntry {
+                    kind: BodyEntryKind::NestedBlock(NestedBlock {
+                        name: Identifier::new("child", span),
+                        body,
+                    }),
+                    span,
+                }],
+            };
+        }
+        let file = File {
+            declarations: vec![Declaration {
+                kind: DeclarationKind::Block(BlockDecl {
+                    keyword: Identifier::new("tree", span),
+                    name: Identifier::new("Root", span),
+                    extends: vec![],
+                    body,
+                }),
+                span,
+            }],
+        };
+
+        let diags = validator.validate(&file);
+        let truncated = diags
+            .iter()
+            .find(|d| d.message.contains("validation truncated"))
+            .expect("hitting the depth limit should emit a diagnostic");
+        assert!(
+            matches!(truncated.severity, Severity::Warning),
+            "truncation should be a warning"
+        );
+    }
+
+    #[test]
+    fn test_shallow_nesting_no_truncation_diagnostic() {
+        let schema = "model tree:\n    child tree?\n    value string?\n";
+        let validator = make_validator(schema);
+
+        let source = "tree Root:\n    child:\n        value = \"leaf\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("validation truncated")),
+            "shallow nesting should not be truncated; diags: {:?}",
+            diags
+        );
+    }
+
+    // --- Typed modifier value validation tests ---
+
+    #[test]
+    fn test_modifier_inline_value_valid_ok() {
+        let schema = "model plugin:\n    wasm string\n    |allow []string?\n";
+        let validator = make_validator(schema);
+
+        let source = "plugin P:\n    wasm = \"a.wasm\"\n    |allow = [\"fs:read\"]\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.is_empty(),
+            "well-typed modifier value should pass; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_modifier_inline_value_type_mismatch() {
+        let schema = "model plugin:\n    wasm string\n    |allow []string?\n";
+        let validator = make_validator(schema);
+
+        let source = "plugin P:\n    wasm = \"a.wasm\"\n    |allow = [42]\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("type mismatch in array 'allow'")
+                    && d.message.contains("expected string, got number")),
+            "mistyped modifier array element should be an error; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_modifier_block_value_type_mismatch() {
+        let schema = "model plugin:\n    wasm string\n    |caps []number?\n";
+        let validator = make_validator(schema);
+
+        let source = "plugin P:\n    wasm = \"a.wasm\"\n    |caps:\n        - \"high\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("type mismatch in array 'caps'")
+                    && d.message.contains("expected number, got string")),
+            "mistyped modifier block item should be an error; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_modifier_block_value_for_scalar_type_mismatch() {
+        let schema = "model svc:\n    name string\n    |limit number?\n";
+        let validator = make_validator(schema);
+
+        let source = "svc S:\n    name = \"s\"\n    |limit:\n        - \"high\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("type mismatch for 'limit'")
+                    && d.message.contains("expected number, got array")),
+            "block value for scalar modifier should be an error; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_modifier_scalar_value_type_mismatch() {
+        let schema = "model svc:\n    name string\n    |limit number?\n";
+        let validator = make_validator(schema);
+
+        let source = "svc S:\n    name = \"s\"\n    |limit = \"high\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("type mismatch for 'limit'")
+                    && d.message.contains("expected number, got string")),
+            "mistyped scalar modifier should be an error; diags: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn test_modifier_role_list_accepts_roles() {
+        let schema = "model svc:\n    name string\n    |allow []role?\n";
+        let validator = make_validator(schema);
+
+        let source = "svc S:\n    name = \"s\"\n    |allow = [@public]\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags.is_empty(),
+            "role refs should match a []role modifier; diags: {:?}",
+            diags
+        );
+    }
+
+    // --- Missing-required-field span tests ---
+
+    #[test]
+    fn test_missing_required_span_points_at_block_name() {
+        let schema = "model mount:\n    path string\n    wasm string?\n";
+        let validator = make_validator(schema);
+
+        let source = "mount Test:\n    wasm = \"handler.wasm\"\n";
+        let file = parser::parse(source).unwrap();
+        let diags = validator.validate(&file);
+        let missing = diags
+            .iter()
+            .find(|d| d.message.contains("missing required field 'path'"))
+            .expect("should report missing required field");
+        let span = missing.span.expect("diagnostic should carry a span");
+        assert_eq!(
+            &source[span.start..span.end],
+            "Test",
+            "missing-required diagnostic should point at the block name"
+        );
+    }
+
+    // --- structured modifier type tests ---
+
+    #[test]
+    fn test_modifier_field_type_is_structured() {
+        // `model_extract` must produce a structured inner type for typed
+        // modifiers, including nested lists and unions -- no string
+        // round-trip involved.
+        let schema = "model route:\n    |allow []string?\n    |variant (step | []step)?\n";
+        let file = nml_core::parse(schema).unwrap();
+        let extracted = nml_core::model_extract::extract(&file);
+        let model = &extracted.models[0];
+
+        let FieldType::Modifier(inner) = &model.fields[0].field_type else {
+            panic!("expected modifier type for |allow");
+        };
+        let FieldType::List(elem) = inner.as_ref() else {
+            panic!("expected list inside modifier");
+        };
+        assert!(matches!(
+            elem.as_ref(),
+            FieldType::Primitive(PrimitiveType::String)
+        ));
+
+        let FieldType::Modifier(inner) = &model.fields[1].field_type else {
+            panic!("expected modifier type for |variant");
+        };
+        let FieldType::Union(variants) = inner.as_ref() else {
+            panic!("expected union inside modifier");
+        };
+        assert_eq!(variants.len(), 2);
+        assert!(matches!(&variants[0], FieldType::ModelRef(n) if n == "step"));
+        assert!(matches!(&variants[1], FieldType::List(_)));
+    }
+
     #[test]
     fn test_strict_nested_unknown_property_is_error() {
-        let schema =
-            "model prompt:\n    system string?\n\nmodel step:\n    prompt prompt?\n";
+        let schema = "model prompt:\n    system string?\n\nmodel step:\n    prompt prompt?\n";
         let validator = make_strict_validator(schema);
 
         let source = "step S:\n    prompt:\n        systm = \"typo\"\n";

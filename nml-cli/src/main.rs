@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 use std::process;
 
+use nml_validate::diagnostics::{Diagnostic, Severity};
+use nml_validate::loader::LoadedSchema;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -87,11 +90,11 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
         format!("{}:{}:{}: {}", path.display(), loc.line, loc.column, e)
     })?;
 
-    let mut resolver = nml_core::resolver::Resolver::new();
-    resolver.register_file(&file);
+    let mut symbols = nml_core::symbols::SymbolTable::new();
+    symbols.register_file(&file);
 
-    let mut errors = resolver.find_duplicates();
-    errors.extend(resolver.find_unresolved_references(&file));
+    let mut errors = symbols.find_duplicates();
+    errors.extend(symbols.find_unresolved_references(&file));
     if errors.is_empty() {
         println!("{}: ok", path.display());
         Ok(())
@@ -109,13 +112,11 @@ fn cmd_fmt(args: &[String]) -> Result<(), String> {
     let path = require_file_arg(args, "fmt")?;
     let source = read_file(&path)?;
 
-    let file = nml_core::parse(&source).map_err(|e| {
+    let formatted = nml_fmt::formatter::format_source(&source).map_err(|e| {
         let source_map = nml_core::span::SourceMap::new(&source);
         let loc = source_map.location(e.span().start);
         format!("{}:{}:{}: {}", path.display(), loc.line, loc.column, e)
     })?;
-
-    let formatted = nml_fmt::formatter::format(&file);
     write_file_atomically(&path, &formatted)?;
 
     println!("formatted {}", path.display());
@@ -158,54 +159,55 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
         format!("{}:{}:{}: {}", path.display(), loc.line, loc.column, e)
     })?;
 
-    let mut resolver = nml_core::resolver::Resolver::new();
-    resolver.register_file(&file);
+    let mut symbols = nml_core::symbols::SymbolTable::new();
+    symbols.register_file(&file);
 
     let source_map = nml_core::span::SourceMap::new(&source);
     let mut error_count = 0;
 
-    for err in resolver.find_duplicates() {
+    for err in symbols.find_duplicates() {
         let loc = source_map.location(err.span().start);
         eprintln!("{}:{}:{}: {}", path.display(), loc.line, loc.column, err);
         error_count += 1;
     }
-    for err in resolver.find_unresolved_references(&file) {
+    for err in symbols.find_unresolved_references(&file) {
         let loc = source_map.location(err.span().start);
         eprintln!("{}:{}:{}: {}", path.display(), loc.line, loc.column, err);
         error_count += 1;
     }
 
     if let Some(sd) = schema_dir {
-        let (models, enums) = load_schema_dir(&sd)?;
-        if !models.is_empty() || !enums.is_empty() {
-            let validator = nml_validate::schema::SchemaValidator::new(models, enums);
+        let (schema, schema_diags) = load_schema_dir(&sd)?;
+
+        // Schema-level diagnostics (cycles, duplicates) refer to the schema
+        // files, not the checked file; report them against the schema dir.
+        for diag in &schema_diags {
+            eprintln!("{}: {}", sd.display(), diag);
+            if matches!(diag.severity, Severity::Error) {
+                error_count += 1;
+            }
+        }
+
+        if !schema.is_empty() {
+            let validator = schema.into_validator();
             for diag in validator.validate(&file) {
-                if let Some(span) = diag.span {
-                    let loc = source_map.location(span.start);
-                    let prefix = match diag.severity {
-                        nml_validate::diagnostics::Severity::Error => "error",
-                        nml_validate::diagnostics::Severity::Warning => "warning",
-                    };
-                    eprintln!(
-                        "{}:{}:{}: {}: {}",
-                        path.display(),
-                        loc.line,
-                        loc.column,
-                        prefix,
-                        diag.message
-                    );
-                    if matches!(diag.severity, nml_validate::diagnostics::Severity::Error) {
-                        error_count += 1;
+                let (line, column) = match diag.span {
+                    Some(span) => {
+                        let loc = source_map.location(span.start);
+                        (loc.line, loc.column)
                     }
-                } else {
-                    let prefix = match diag.severity {
-                        nml_validate::diagnostics::Severity::Error => "error",
-                        nml_validate::diagnostics::Severity::Warning => "warning",
-                    };
-                    eprintln!("{}:0:0: {}: {}", path.display(), prefix, diag.message);
-                    if matches!(diag.severity, nml_validate::diagnostics::Severity::Error) {
-                        error_count += 1;
-                    }
+                    None => (0, 0),
+                };
+                eprintln!(
+                    "{}:{}:{}: {}: {}",
+                    path.display(),
+                    line,
+                    column,
+                    diag.severity,
+                    diag.message
+                );
+                if matches!(diag.severity, Severity::Error) {
+                    error_count += 1;
                 }
             }
         }
@@ -220,37 +222,33 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn load_schema_dir(
-    dir: &PathBuf,
-) -> Result<
-    (
-        Vec<nml_core::model::ModelDef>,
-        Vec<nml_core::model::EnumDef>,
-    ),
-    String,
-> {
-    let mut models = Vec::new();
-    let mut enums = Vec::new();
-
+/// Parse all `*.model.nml` / `*.schema.nml` files in `dir` and run them
+/// through the schema-loading pipeline (inheritance resolution, cycle and
+/// duplicate detection).
+fn load_schema_dir(dir: &PathBuf) -> Result<(LoadedSchema, Vec<Diagnostic>), String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("failed to read schema dir {}: {e}", dir.display()))?;
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "nml") {
-            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if filename.ends_with(".model.nml") {
-                let source = read_file(&path)?;
-                let file = nml_core::parse(&source)
-                    .map_err(|e| format!("failed to parse schema {}: {e}", path.display()))?;
-                let schema = nml_core::model_extract::extract(&file);
-                models.extend(schema.models);
-                enums.extend(schema.enums);
-            }
-        }
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.ends_with(".model.nml") || name.ends_with(".schema.nml"))
+        })
+        .collect();
+    paths.sort();
+
+    let mut files = Vec::new();
+    for path in paths {
+        let source = read_file(&path)?;
+        let file = nml_core::parse(&source)
+            .map_err(|e| format!("failed to parse schema {}: {e}", path.display()))?;
+        files.push(file);
     }
 
-    Ok((models, enums))
+    Ok(nml_validate::loader::load_schema(&files))
 }
 
 fn require_file_arg(args: &[String], cmd: &str) -> Result<PathBuf, String> {

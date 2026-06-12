@@ -35,6 +35,8 @@ pub enum FieldType {
     Primitive(PrimitiveType),
     List(Box<FieldType>),
     ModelRef(String),
-    Modifier(String),
+    /// A typed modifier field (`|allow []string?`); the inner type is the
+    /// declared type of the modifier's value.
+    Modifier(Box<FieldType>),
     Union(Vec<FieldType>),
 }

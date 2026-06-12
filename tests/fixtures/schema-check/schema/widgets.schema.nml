@@ -1,0 +1,5 @@
+model base:
+    name string
+
+model widget is base:
+    size number?

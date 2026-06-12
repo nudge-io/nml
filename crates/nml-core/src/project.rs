@@ -92,14 +92,12 @@ impl ProjectConfig {
                         _ => {}
                     }
                 }
-                BodyEntryKind::NestedBlock(nested) => {
-                    if nested.name.name == "schema" {
-                        for schema_entry in &nested.body.entries {
-                            if let BodyEntryKind::ListItem(item) = &schema_entry.kind {
-                                if let ListItemKind::Shorthand(val) = &item.kind {
-                                    if let Value::String(s) = &val.value {
-                                        config.schema_files.push(s.clone());
-                                    }
+                BodyEntryKind::NestedBlock(nested) if nested.name.name == "schema" => {
+                    for schema_entry in &nested.body.entries {
+                        if let BodyEntryKind::ListItem(item) = &schema_entry.kind {
+                            if let ListItemKind::Shorthand(val) = &item.kind {
+                                if let Value::String(s) = &val.value {
+                                    config.schema_files.push(s.clone());
                                 }
                             }
                         }

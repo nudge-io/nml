@@ -8,19 +8,49 @@ use crate::types::{SpannedValue, Value};
 
 const MAX_NESTING_DEPTH: u32 = 64;
 
-pub struct Parser {
+pub struct Parser<'src> {
     tokens: Vec<Token>,
+    /// Original source text; spans index into it. Required for exact
+    /// decimal money parsing (the lexer's `f64` cannot round-trip all
+    /// decimal literals losslessly).
+    source: &'src str,
     pos: usize,
+    /// Block-body nesting depth (guards `parse_body` recursion).
     depth: u32,
+    /// Value-expression nesting depth (guards the mutually recursive
+    /// fallback-chain / array-literal / type-expression parsers, which
+    /// would otherwise allow stack-overflow via inputs like
+    /// `x = a | a | a | ...` or `[[[[...]]]]`).
+    value_depth: u32,
 }
 
-impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
+impl<'src> Parser<'src> {
+    pub fn new(tokens: Vec<Token>, source: &'src str) -> Self {
         Self {
             tokens,
+            source,
             pos: 0,
             depth: 0,
+            value_depth: 0,
         }
+    }
+
+    /// Bump the value-expression depth, erroring past [`MAX_NESTING_DEPTH`].
+    /// Callers must pair with [`Self::exit_value_depth`] on all Ok paths;
+    /// error paths abort the whole parse, so unwinding is not required.
+    fn enter_value_depth(&mut self) -> NmlResult<()> {
+        self.value_depth += 1;
+        if self.value_depth > MAX_NESTING_DEPTH {
+            return Err(NmlError::parse(
+                format!("maximum value nesting depth ({MAX_NESTING_DEPTH}) exceeded"),
+                self.current_span(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn exit_value_depth(&mut self) {
+        self.value_depth -= 1;
     }
 
     pub fn parse(&mut self) -> NmlResult<File> {
@@ -301,10 +331,11 @@ impl Parser {
     }
 
     fn parse_field_type_expr(&mut self) -> NmlResult<FieldTypeExpr> {
-        if self.check(TokenKind::ArrayPrefix) {
+        self.enter_value_depth()?;
+        let expr = if self.check(TokenKind::ArrayPrefix) {
             self.advance();
             let inner = self.parse_field_type_expr()?;
-            Ok(FieldTypeExpr::Array(Box::new(inner)))
+            FieldTypeExpr::Array(Box::new(inner))
         } else if self.check(TokenKind::ParenOpen) {
             self.advance();
             let mut variants = vec![self.parse_field_type_expr()?];
@@ -313,11 +344,13 @@ impl Parser {
                 variants.push(self.parse_field_type_expr()?);
             }
             self.expect_kind(TokenKind::ParenClose)?;
-            Ok(FieldTypeExpr::Union(variants))
+            FieldTypeExpr::Union(variants)
         } else {
             let name = self.expect_identifier()?;
-            Ok(FieldTypeExpr::Named(name))
-        }
+            FieldTypeExpr::Named(name)
+        };
+        self.exit_value_depth();
+        Ok(expr)
     }
 
     fn parse_field_definition(&mut self, name: Identifier) -> NmlResult<FieldDefinition> {
@@ -551,18 +584,18 @@ impl Parser {
     }
 
     fn parse_value_or_fallback(&mut self) -> NmlResult<SpannedValue> {
+        self.enter_value_depth()?;
         let value = self.parse_value()?;
-        if self.check(TokenKind::Pipe) {
+        let result = if self.check(TokenKind::Pipe) {
             self.advance();
             let fallback = self.parse_value_or_fallback()?;
             let span = value.span.merge(fallback.span);
-            Ok(SpannedValue::new(
-                Value::Fallback(Box::new(value), Box::new(fallback)),
-                span,
-            ))
+            SpannedValue::new(Value::Fallback(Box::new(value), Box::new(fallback)), span)
         } else {
-            Ok(value)
-        }
+            value
+        };
+        self.exit_value_depth();
+        Ok(result)
     }
 
     fn parse_value(&mut self) -> NmlResult<SpannedValue> {
@@ -592,7 +625,7 @@ impl Parser {
                     let full_span = num_span.merge(end_span);
 
                     // Use the raw string from source for precise decimal parsing
-                    let src_slice = &self.source_slice(num_span);
+                    let src_slice = self.source_slice(num_span);
                     let m = money::parse_money(src_slice, &code, full_span)?;
                     Ok(SpannedValue::new(Value::Money(m), full_span))
                 } else {
@@ -625,6 +658,7 @@ impl Parser {
     }
 
     fn parse_array_literal(&mut self) -> NmlResult<SpannedValue> {
+        self.enter_value_depth()?;
         let start = self.current_span();
         self.expect_kind(TokenKind::BracketOpen)?;
 
@@ -634,14 +668,23 @@ impl Parser {
             let val = self.parse_value()?;
             values.push(val);
 
+            // Per the grammar, elements are comma-separated. A trailing
+            // comma before `]` is tolerated; adjacent values without a
+            // comma are a parse error rather than silently two elements.
             if self.check(TokenKind::Comma) {
                 self.advance();
+            } else if !self.check(TokenKind::BracketClose) {
+                return Err(NmlError::parse(
+                    "expected ',' or ']' in array literal",
+                    self.current_span(),
+                ));
             }
         }
 
         let end = self.current_span();
         self.expect_kind(TokenKind::BracketClose)?;
 
+        self.exit_value_depth();
         Ok(SpannedValue::new(Value::Array(values), start.merge(end)))
     }
 
@@ -652,13 +695,12 @@ impl Parser {
     }
 
     fn peek_kind_matches(&self, f: impl FnOnce(&TokenKind) -> bool) -> bool {
-        self.peek_kind().map_or(false, f)
+        self.peek_kind().is_some_and(f)
     }
 
     fn check(&self, kind: TokenKind) -> bool {
-        self.peek_kind().map_or(false, |k| {
-            std::mem::discriminant(k) == std::mem::discriminant(&kind)
-        })
+        self.peek_kind()
+            .is_some_and(|k| std::mem::discriminant(k) == std::mem::discriminant(&kind))
     }
 
     fn advance(&mut self) -> &Token {
@@ -718,31 +760,30 @@ impl Parser {
         }
     }
 
-    fn source_slice(&self, span: Span) -> String {
-        self.tokens
-            .iter()
-            .find(|t| t.span.start == span.start)
-            .map(|t| match &t.kind {
-                TokenKind::NumberLiteral(n) => {
-                    // Reconstruct the original number string
-                    if n.fract() == 0.0 && !format!("{n}").contains('.') {
-                        format!("{}", *n as i64)
-                    } else {
-                        format!("{n}")
-                    }
-                }
-                _ => String::new(),
-            })
-            .unwrap_or_default()
+    /// Exact source text for a span. Used for money literals, whose
+    /// decimal text must be parsed losslessly (an `f64` round-trip can
+    /// mis-round large or high-precision decimals). Spans come from the
+    /// lexer and are valid by construction; out-of-range spans yield ""
+    /// rather than panicking.
+    fn source_slice(&self, span: Span) -> &str {
+        self.source.get(span.start..span.end).unwrap_or("")
     }
 }
 
 /// Parse NML source text into an AST.
 pub fn parse(source: &str) -> NmlResult<File> {
+    parse_with_comments(source).map(|(file, _)| file)
+}
+
+/// Parse NML source text into an AST, also returning the source comments
+/// in order of appearance. Comments are not part of the AST; this side
+/// channel exists for tools that must preserve them (e.g. the formatter).
+pub fn parse_with_comments(source: &str) -> NmlResult<(File, Vec<crate::lexer::Comment>)> {
     let mut lexer = crate::lexer::Lexer::new(source);
     let tokens = lexer.tokenize()?;
-    let mut parser = Parser::new(tokens);
-    parser.parse()
+    let comments = lexer.take_comments();
+    let mut parser = Parser::new(tokens, source);
+    Ok((parser.parse()?, comments))
 }
 
 #[cfg(test)]
@@ -1528,25 +1569,19 @@ workflow W:
     fn test_block_no_body() {
         let result = parse("service App:\n");
         // Should either parse with empty body or error -- not panic
-        match result {
-            Ok(file) => {
-                assert_eq!(file.declarations.len(), 1);
-                if let DeclarationKind::Block(b) = &file.declarations[0].kind {
-                    assert!(b.body.entries.is_empty());
-                }
+        if let Ok(file) = result {
+            assert_eq!(file.declarations.len(), 1);
+            if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+                assert!(b.body.entries.is_empty());
             }
-            Err(_) => {} // also acceptable
         }
     }
 
     #[test]
     fn test_block_eof_immediately_after_colon() {
         let result = parse("service App:");
-        match result {
-            Ok(file) => {
-                assert_eq!(file.declarations.len(), 1);
-            }
-            Err(_) => {}
+        if let Ok(file) = result {
+            assert_eq!(file.declarations.len(), 1);
         }
     }
 
@@ -1594,15 +1629,12 @@ workflow W:
     #[test]
     fn test_nested_block_no_body() {
         let result = parse("service App:\n    db:\n");
-        match result {
-            Ok(file) => {
-                if let DeclarationKind::Block(b) = &file.declarations[0].kind {
-                    if let BodyEntryKind::NestedBlock(nb) = &b.body.entries[0].kind {
-                        assert!(nb.body.entries.is_empty());
-                    }
+        if let Ok(file) = result {
+            if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+                if let BodyEntryKind::NestedBlock(nb) = &b.body.entries[0].kind {
+                    assert!(nb.body.entries.is_empty());
                 }
             }
-            Err(_) => {}
         }
     }
 
@@ -1664,7 +1696,7 @@ workflow W:
         let file = parse("service App:\n    offset = -10\n").unwrap();
         if let DeclarationKind::Block(b) = &file.declarations[0].kind {
             if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
-                assert_eq!(p.value.value, Value::Number(-10.0));
+                assert_eq!(p.value.value, Value::number(-10.0));
             }
         }
     }
@@ -1674,7 +1706,7 @@ workflow W:
         let file = parse("service App:\n    rate = 0.75\n").unwrap();
         if let DeclarationKind::Block(b) = &file.declarations[0].kind {
             if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
-                assert_eq!(p.value.value, Value::Number(0.75));
+                assert_eq!(p.value.value, Value::number(0.75));
             }
         }
     }
@@ -1769,6 +1801,104 @@ workflow W:
             result.is_ok(),
             "wide shallow nesting should not hit depth limit"
         );
+    }
+
+    #[test]
+    fn test_deep_fallback_chain_rejected() {
+        // Each `|` segment recurses; an attacker-supplied chain must hit
+        // the value depth limit instead of overflowing the stack.
+        let chain = vec!["$ENV.X"; 100_000].join(" | ");
+        let source = format!("service App:\n    key = {chain}\n");
+        let err = parse(&source).unwrap_err();
+        assert!(
+            err.message().contains("maximum value nesting depth"),
+            "expected depth error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_moderate_fallback_chain_ok() {
+        let chain = vec!["$ENV.X"; 16].join(" | ");
+        let source = format!("service App:\n    key = {chain} | \"default\"\n");
+        assert!(parse(&source).is_ok());
+    }
+
+    #[test]
+    fn test_deep_nested_array_rejected() {
+        let source = format!(
+            "service App:\n    v = {}1{}\n",
+            "[".repeat(100_000),
+            "]".repeat(100_000)
+        );
+        let err = parse(&source).unwrap_err();
+        assert!(
+            err.message().contains("maximum value nesting depth"),
+            "expected depth error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_deep_union_type_expr_rejected() {
+        // Nested union parens drive parse_field_type_expr recursion.
+        let source = format!(
+            "model thing:\n    items {}string{}\n",
+            "(".repeat(100_000),
+            ")".repeat(100_000)
+        );
+        let err = parse(&source).unwrap_err();
+        assert!(
+            err.message().contains("maximum value nesting depth"),
+            "expected depth error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_array_missing_comma_rejected() {
+        let source = "service App:\n    ports = [8080 8081]\n";
+        let err = parse(source).unwrap_err();
+        assert!(
+            err.message().contains("expected ',' or ']'"),
+            "expected comma error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_array_trailing_comma_ok() {
+        let source = "service App:\n    ports = [8080, 8081,]\n";
+        let file = parse(source).unwrap();
+        let DeclarationKind::Block(b) = &file.declarations[0].kind else {
+            panic!("expected block");
+        };
+        let BodyEntryKind::Property(p) = &b.body.entries[0].kind else {
+            panic!("expected property");
+        };
+        let Value::Array(items) = &p.value.value else {
+            panic!("expected array");
+        };
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn test_money_large_integer_exact() {
+        // 9007199254740993 is not representable as f64 (rounds to ...992).
+        // Money parsing must use the raw source text, not the lexed f64.
+        let source = "service App:\n    price = 9007199254740993 JPY\n";
+        let file = parse(source).unwrap();
+        let DeclarationKind::Block(b) = &file.declarations[0].kind else {
+            panic!("expected block");
+        };
+        let BodyEntryKind::Property(p) = &b.body.entries[0].kind else {
+            panic!("expected property");
+        };
+        let Value::Money(m) = &p.value.value else {
+            panic!("expected money");
+        };
+        assert_eq!(m.amount, 9_007_199_254_740_993);
+        assert_eq!(m.currency, "JPY");
     }
 
     #[test]
@@ -1940,13 +2070,10 @@ workflow W:
     #[test]
     fn test_parse_enum_empty() {
         let result = parse("enum Empty:\n");
-        match result {
-            Ok(file) => {
-                if let DeclarationKind::Block(b) = &file.declarations[0].kind {
-                    assert!(b.body.entries.is_empty());
-                }
+        if let Ok(file) = result {
+            if let DeclarationKind::Block(b) = &file.declarations[0].kind {
+                assert!(b.body.entries.is_empty());
             }
-            Err(_) => {}
         }
     }
 
@@ -1982,7 +2109,7 @@ workflow W:
             assert_eq!(sp.name.name, "interval");
             match &sp.kind {
                 SharedPropertyKind::Scalar(sv) => {
-                    assert_eq!(sv.value, Value::Number(7200.0));
+                    assert_eq!(sv.value, Value::number(7200.0));
                 }
                 other => panic!("expected scalar shared property, got {other:?}"),
             }
@@ -2002,7 +2129,7 @@ workflow W:
                 assert_eq!(sp.name.name, "interval");
                 assert!(matches!(
                     &sp.kind,
-                    SharedPropertyKind::Scalar(sv) if sv.value == Value::Number(300.0)
+                    SharedPropertyKind::Scalar(sv) if sv.value == Value::number(300.0)
                 ));
             }
             other => panic!("expected array, got {other:?}"),

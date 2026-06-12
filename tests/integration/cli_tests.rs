@@ -163,6 +163,71 @@ fn test_check_money_and_secret_valid_files() {
 }
 
 #[test]
+fn test_check_schema_dir_accepts_schema_extension_and_inheritance() {
+    let output = nml_bin()
+        .args([
+            "check",
+            "--schema",
+            "tests/fixtures/schema-check/schema",
+            "tests/fixtures/schema-check/widget-ok.nml",
+        ])
+        .output()
+        .expect("failed to run nml");
+
+    assert!(
+        output.status.success(),
+        "check against .schema.nml dir should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_check_schema_enforces_inherited_required_field() {
+    let output = nml_bin()
+        .args([
+            "check",
+            "--schema",
+            "tests/fixtures/schema-check/schema",
+            "tests/fixtures/schema-check/widget-missing-name.nml",
+        ])
+        .output()
+        .expect("failed to run nml");
+
+    assert!(
+        !output.status.success(),
+        "check should fail when an inherited required field is missing"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("missing required field 'name'"),
+        "stderr should report the inherited field: {stderr}"
+    );
+}
+
+#[test]
+fn test_check_schema_reports_duplicate_model_names() {
+    let output = nml_bin()
+        .args([
+            "check",
+            "--schema",
+            "tests/fixtures/schema-check/dup-schema",
+            "tests/fixtures/schema-check/widget-ok.nml",
+        ])
+        .output()
+        .expect("failed to run nml");
+
+    assert!(
+        !output.status.success(),
+        "check should fail when schema files define duplicate models"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("duplicate model definition 'widget'"),
+        "stderr should report the duplicate model: {stderr}"
+    );
+}
+
+#[test]
 fn test_fmt_produces_output() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let source = workspace_root.join("tests/fixtures/valid/minimal-service.nml");
@@ -179,6 +244,43 @@ fn test_fmt_produces_output() {
     let contents = std::fs::read_to_string(&temp).expect("failed to read formatted file");
     assert!(contents.contains("service MinimalService:"));
     assert!(contents.contains("localMount = \"/\""));
+
+    std::fs::remove_file(&temp).ok();
+}
+
+#[test]
+fn test_fmt_preserves_comments() {
+    let temp = std::env::temp_dir().join("nml_fmt_comments_test.nml");
+    std::fs::write(
+        &temp,
+        "// header comment\nservice App: // trailing\n    // body comment\n    port=8080 // why\n",
+    )
+    .expect("failed to write test file");
+
+    let output = nml_bin()
+        .args(["fmt", temp.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+
+    assert!(output.status.success(), "fmt should succeed");
+
+    let contents = std::fs::read_to_string(&temp).expect("failed to read formatted file");
+    assert!(
+        contents.contains("// header comment\n"),
+        "header comment lost: {contents}"
+    );
+    assert!(
+        contents.contains("service App: // trailing\n"),
+        "trailing header comment lost: {contents}"
+    );
+    assert!(
+        contents.contains("    // body comment\n"),
+        "body comment lost: {contents}"
+    );
+    assert!(
+        contents.contains("port = 8080 // why\n"),
+        "trailing property comment lost (and spacing should normalize): {contents}"
+    );
 
     std::fs::remove_file(&temp).ok();
 }

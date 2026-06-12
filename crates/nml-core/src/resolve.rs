@@ -24,8 +24,12 @@ use crate::types::{SpannedValue, Value};
 /// let resolved = resolver.resolve(&Value::String("hello".into()));
 /// assert!(resolved.is_ok());
 /// ```
+/// Pluggable variable lookup: maps a `$ENV.KEY` name to its value, or
+/// `None` when unset (which triggers the fallback chain, if any).
+type VarLookup = Box<dyn Fn(&str) -> Option<String>>;
+
 pub struct ValueResolver {
-    var_resolver: Box<dyn Fn(&str) -> Option<String>>,
+    var_resolver: VarLookup,
 }
 
 impl ValueResolver {
@@ -44,6 +48,15 @@ impl ValueResolver {
     }
 
     /// Resolve a single value through fallback chains and secret lookups.
+    ///
+    /// Resolution recurses into arrays, so `keys = [$ENV.A, $ENV.B]`
+    /// resolves every element. An environment variable that is set but
+    /// empty is treated as unset (triggering the fallback chain, if any):
+    /// an empty `PORT=""` almost always means "not configured", and
+    /// silently resolving to `""` would bypass explicit defaults.
+    ///
+    /// Resolved secrets become plain [`Value::String`]s; callers must not
+    /// log or serialize resolved bodies that may contain secret material.
     pub fn resolve(&self, value: &Value) -> Result<Value, ResolveError> {
         match value {
             Value::Fallback(primary, fallback) => match self.resolve(&primary.value) {
@@ -53,12 +66,19 @@ impl ValueResolver {
             Value::Secret(s) => {
                 if let Some(key) = s.strip_prefix("$ENV.") {
                     match (self.var_resolver)(key) {
-                        Some(val) => Ok(Value::String(val)),
-                        None => Err(ResolveError::EnvNotSet(key.to_string())),
+                        Some(val) if !val.is_empty() => Ok(Value::String(val)),
+                        _ => Err(ResolveError::EnvNotSet(key.to_string())),
                     }
                 } else {
                     Err(ResolveError::UnknownSource(s.clone()))
                 }
+            }
+            Value::Array(items) => {
+                let resolved = items
+                    .iter()
+                    .map(|sv| Ok(SpannedValue::new(self.resolve(&sv.value)?, sv.span)))
+                    .collect::<Result<Vec<_>, ResolveError>>()?;
+                Ok(Value::Array(resolved))
             }
             other => Ok(other.clone()),
         }
@@ -349,6 +369,73 @@ mod tests {
     use crate::parser;
 
     #[test]
+    fn resolve_array_elements() {
+        let r = ValueResolver::new(|key| match key {
+            "A" => Some("alpha".into()),
+            "B" => Some("beta".into()),
+            _ => None,
+        });
+        let arr = Value::Array(vec![
+            SpannedValue::new(Value::Secret("$ENV.A".into()), crate::span::Span::new(0, 6)),
+            SpannedValue::new(
+                Value::Secret("$ENV.B".into()),
+                crate::span::Span::new(8, 14),
+            ),
+            SpannedValue::new(Value::String("lit".into()), crate::span::Span::new(16, 21)),
+        ]);
+        let Value::Array(resolved) = r.resolve(&arr).unwrap() else {
+            panic!("expected array");
+        };
+        assert_eq!(resolved[0].value, Value::String("alpha".into()));
+        assert_eq!(resolved[1].value, Value::String("beta".into()));
+        assert_eq!(resolved[2].value, Value::String("lit".into()));
+    }
+
+    #[test]
+    fn resolve_array_unset_env_errors() {
+        let r = ValueResolver::new(|_| None);
+        let arr = Value::Array(vec![SpannedValue::new(
+            Value::Secret("$ENV.MISSING".into()),
+            crate::span::Span::new(0, 12),
+        )]);
+        assert!(matches!(
+            r.resolve(&arr),
+            Err(ResolveError::EnvNotSet(key)) if key == "MISSING"
+        ));
+    }
+
+    #[test]
+    fn empty_env_var_treated_as_unset_triggers_fallback() {
+        let r = ValueResolver::new(|key| {
+            if key == "PORT" {
+                Some(String::new())
+            } else {
+                None
+            }
+        });
+        let fallback = Value::Fallback(
+            Box::new(SpannedValue::new(
+                Value::Secret("$ENV.PORT".into()),
+                crate::span::Span::new(0, 9),
+            )),
+            Box::new(SpannedValue::new(
+                Value::number(8080.0),
+                crate::span::Span::new(12, 16),
+            )),
+        );
+        assert_eq!(r.resolve(&fallback).unwrap(), Value::number(8080.0));
+    }
+
+    #[test]
+    fn empty_env_var_without_fallback_errors() {
+        let r = ValueResolver::new(|_| Some(String::new()));
+        assert!(matches!(
+            r.resolve(&Value::Secret("$ENV.KEY".into())),
+            Err(ResolveError::EnvNotSet(key)) if key == "KEY"
+        ));
+    }
+
+    #[test]
     fn resolve_literal_passthrough() {
         let r = ValueResolver::env();
         assert_eq!(
@@ -356,8 +443,8 @@ mod tests {
             Value::String("hello".into())
         );
         assert_eq!(
-            r.resolve(&Value::Number(42.0)).unwrap(),
-            Value::Number(42.0)
+            r.resolve(&Value::number(42.0)).unwrap(),
+            Value::number(42.0)
         );
         assert_eq!(r.resolve(&Value::Bool(true)).unwrap(), Value::Bool(true));
     }
@@ -397,7 +484,7 @@ mod tests {
                 crate::span::Span::empty(0),
             )),
             Box::new(SpannedValue::new(
-                Value::Number(3000.0),
+                Value::number(3000.0),
                 crate::span::Span::empty(0),
             )),
         );
@@ -413,11 +500,11 @@ mod tests {
                 crate::span::Span::empty(0),
             )),
             Box::new(SpannedValue::new(
-                Value::Number(3000.0),
+                Value::number(3000.0),
                 crate::span::Span::empty(0),
             )),
         );
-        assert_eq!(r.resolve(&val).unwrap(), Value::Number(3000.0));
+        assert_eq!(r.resolve(&val).unwrap(), Value::number(3000.0));
     }
 
     #[test]
@@ -567,7 +654,7 @@ workflow W:
                                 crate::span::Span::empty(0),
                             )),
                             Box::new(SpannedValue::new(
-                                Value::Number(42.0),
+                                Value::number(42.0),
                                 crate::span::Span::empty(0),
                             )),
                         ),
@@ -577,7 +664,7 @@ workflow W:
                 crate::span::Span::empty(0),
             )),
         );
-        assert_eq!(r.resolve(&val).unwrap(), Value::Number(42.0));
+        assert_eq!(r.resolve(&val).unwrap(), Value::number(42.0));
     }
 
     #[test]
@@ -622,33 +709,44 @@ workflow W:
         };
 
         let merged = apply_shared_properties(body);
-        if let BodyEntryKind::ListItem(item) = &merged.entries[0].kind {
-            if let ListItemKind::Named { body, .. } = &item.kind {
-                // Should have retries=10 from item, not retries=3 from shared
-                let retries_prop = body.entries.iter().find(|e| {
-                    matches!(
-                        &e.kind,
-                        BodyEntryKind::Property(p) if p.name.name == "retries"
-                    )
-                });
-                if let Some(entry) = retries_prop {
-                    if let BodyEntryKind::Property(p) = &entry.kind {
-                        assert_eq!(p.value.value, Value::Number(10.0));
-                    }
-                }
-                // Should also have timeout from shared
-                let has_timeout = body.entries.iter().any(|e| {
-                    matches!(
-                        &e.kind,
-                        BodyEntryKind::NestedBlock(nb) if nb.name.name == "defaults"
-                    ) || matches!(
-                        &e.kind,
-                        BodyEntryKind::Property(p) if p.name.name == "timeout"
-                    )
-                });
-                assert!(has_timeout || true); // timeout injected via NestedBlock
-            }
-        }
+        let BodyEntryKind::ListItem(item) = &merged.entries[0].kind else {
+            panic!("expected first merged entry to be a list item");
+        };
+        let ListItemKind::Named { body, .. } = &item.kind else {
+            panic!("expected named list item");
+        };
+
+        // Item's own retries=10 must win over the shared default.
+        let retries = body
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::Property(p) if p.name.name == "retries" => Some(&p.value.value),
+                _ => None,
+            })
+            .expect("merged item must keep its own retries property");
+        assert_eq!(*retries, Value::number(10.0));
+
+        // The `.defaults:` block shared property is injected as a nested
+        // block (scalar shared properties inject as top-level properties;
+        // block shared properties inject as nested blocks).
+        let defaults = body
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::NestedBlock(nb) if nb.name.name == "defaults" => Some(&nb.body),
+                _ => None,
+            })
+            .expect("shared `.defaults:` block must be injected into the item");
+        let timeout = defaults
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::Property(p) if p.name.name == "timeout" => Some(&p.value.value),
+                _ => None,
+            })
+            .expect("injected defaults block must carry timeout");
+        assert_eq!(*timeout, Value::String("30s".into()));
     }
 
     #[test]
@@ -742,7 +840,7 @@ workflow W:
                     _ => None,
                 });
                 let interval = interval.expect("interval property");
-                assert_eq!(interval.value.value, Value::Number(7200.0));
+                assert_eq!(interval.value.value, Value::number(7200.0));
             }
         } else {
             panic!("expected list item");
@@ -776,7 +874,7 @@ workflow W:
                     })
                     .collect();
                 assert_eq!(props.len(), 1);
-                assert_eq!(props[0], Value::Number(100.0));
+                assert_eq!(props[0], Value::number(100.0));
             }
         } else {
             panic!("expected list item");
@@ -804,7 +902,7 @@ workflow W:
                     BodyEntryKind::Property(p) if p.name.name == "interval" => Some(&p.value.value),
                     _ => None,
                 });
-                assert_eq!(interval, Some(&Value::Number(900.0)));
+                assert_eq!(interval, Some(&Value::number(900.0)));
                 let has_defaults = body.entries.iter().any(|e| {
                     matches!(
                         &e.kind,
@@ -837,7 +935,7 @@ workflow W:
                 BodyEntryKind::Property(p) if p.name.name == "interval" => Some(&p.value.value),
                 _ => None,
             });
-            assert_eq!(interval, Some(&Value::Number(500.0)));
+            assert_eq!(interval, Some(&Value::number(500.0)));
         } else {
             panic!("expected named item");
         }
