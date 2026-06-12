@@ -40,3 +40,29 @@ pub enum FieldType {
     Modifier(Box<FieldType>),
     Union(Vec<FieldType>),
 }
+
+/// Renders the type in NML source syntax: `[]string`, `(step | []step)`,
+/// `[](string | number)`.
+///
+/// A modifier's type displays as its declared inner type -- the `|` sigil
+/// belongs to the field *name* (`|allow []string`), not the type.
+impl std::fmt::Display for FieldType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FieldType::Primitive(p) => f.write_str(p.as_str()),
+            FieldType::List(inner) => write!(f, "[]{inner}"),
+            FieldType::ModelRef(name) => f.write_str(name),
+            FieldType::Modifier(inner) => write!(f, "{inner}"),
+            FieldType::Union(variants) => {
+                f.write_str("(")?;
+                for (i, v) in variants.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(" | ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str(")")
+            }
+        }
+    }
+}

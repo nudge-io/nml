@@ -10,6 +10,27 @@ pub enum FieldTypeExpr {
     Union(Vec<FieldTypeExpr>),
 }
 
+/// Renders the type expression in NML source syntax: `string`, `[]route`,
+/// `(step | []step)`.
+impl std::fmt::Display for FieldTypeExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FieldTypeExpr::Named(id) => f.write_str(&id.name),
+            FieldTypeExpr::Array(inner) => write!(f, "[]{inner}"),
+            FieldTypeExpr::Union(variants) => {
+                f.write_str("(")?;
+                for (i, v) in variants.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(" | ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str(")")
+            }
+        }
+    }
+}
+
 /// A field definition within a model/trait body: `name type[?] [= default]`.
 #[derive(Debug, Clone, Serialize)]
 pub struct FieldDefinition {

@@ -925,7 +925,7 @@ fn build_body_symbols(body: &Body, line_index: &LineIndex) -> Vec<DocumentSymbol
             BodyEntryKind::FieldDefinition(fd) => {
                 symbols.push(document_symbol(
                     fd.name.name.clone(),
-                    Some(format_field_type_expr(&fd.field_type)),
+                    Some(fd.field_type.to_string()),
                     SymbolKind::FIELD,
                     span_to_range(entry.span, line_index),
                     span_to_range(fd.name.span, line_index),
@@ -1062,17 +1062,6 @@ fn collect_list_item_references(
     }
 }
 
-fn format_field_type_expr(expr: &FieldTypeExpr) -> String {
-    match expr {
-        FieldTypeExpr::Named(id) => id.name.clone(),
-        FieldTypeExpr::Array(inner) => format!("[]{}", format_field_type_expr(inner)),
-        FieldTypeExpr::Union(variants) => {
-            let names: Vec<_> = variants.iter().map(format_field_type_expr).collect();
-            format!("({})", names.join(" | "))
-        }
-    }
-}
-
 // ── Hover helpers ─────────────────────────────────────────────
 
 fn summarize_body(body: &Body) -> String {
@@ -1090,7 +1079,7 @@ fn summarize_body(body: &Body) -> String {
                 lines.push(format!("  {}:", nb.name.name));
             }
             BodyEntryKind::FieldDefinition(fd) => {
-                let type_name = format_field_type_expr(&fd.field_type);
+                let type_name = fd.field_type.to_string();
                 let opt = if fd.optional { "?" } else { "" };
                 lines.push(format!("  {} {}{}", fd.name.name, type_name, opt));
             }
@@ -1101,19 +1090,6 @@ fn summarize_body(body: &Body) -> String {
         return String::new();
     }
     format!("```nml\n{}\n```", lines.join("\n"))
-}
-
-fn format_field_type(field_type: &FieldType) -> String {
-    match field_type {
-        FieldType::Primitive(p) => p.as_str().to_string(),
-        FieldType::List(inner) => format!("[]{}", format_field_type(inner)),
-        FieldType::ModelRef(name) => name.clone(),
-        FieldType::Modifier(inner) => format!("|{}", format_field_type(inner)),
-        FieldType::Union(variants) => {
-            let names: Vec<_> = variants.iter().map(format_field_type).collect();
-            format!("({})", names.join(" | "))
-        }
-    }
 }
 
 /// Determine if the cursor is in a value position for a ModelRef field.
@@ -1756,11 +1732,17 @@ impl LanguageServer for NmlLanguageServer {
                     let (models, _) = self.models_for_file(&uri);
                     if let Some(model) = models.iter().find(|m| m.name == keyword) {
                         if let Some(field) = model.fields.iter().find(|f| f.name == word) {
-                            let type_str = format_field_type(&field.field_type);
+                            // In source syntax the `|` sigil belongs to the
+                            // field name (`|allow []string`), not the type.
+                            let sigil = if matches!(field.field_type, FieldType::Modifier(_)) {
+                                "|"
+                            } else {
+                                ""
+                            };
                             let opt = if field.optional { "?" } else { "" };
                             let text = format!(
-                                "**{keyword}** field\n\n```nml\n  {} {}{}\n```",
-                                field.name, type_str, opt
+                                "**{keyword}** field\n\n```nml\n  {sigil}{} {}{opt}\n```",
+                                field.name, field.field_type
                             );
                             return Ok(Some(Hover {
                                 contents: HoverContents::Markup(MarkupContent {

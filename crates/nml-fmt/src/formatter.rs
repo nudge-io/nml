@@ -224,7 +224,7 @@ impl<'a> Formatter<'a> {
                 self.write_indent(depth);
                 self.out.push_str(&f.name.name);
                 self.out.push(' ');
-                format_field_type_expr_out(&mut self.out, &f.field_type);
+                self.out.push_str(&f.field_type.to_string());
                 if f.optional {
                     self.out.push('?');
                 }
@@ -273,7 +273,7 @@ impl<'a> Formatter<'a> {
                 optional,
             } => {
                 self.out.push(' ');
-                format_field_type_expr_out(&mut self.out, field_type);
+                self.out.push_str(&field_type.to_string());
                 if *optional {
                     self.out.push('?');
                 }
@@ -356,26 +356,6 @@ impl<'a> Formatter<'a> {
                 self.emit_trailing_comment(val.span.end.saturating_sub(1));
                 self.out.push('\n');
             }
-        }
-    }
-}
-
-fn format_field_type_expr_out(out: &mut String, expr: &FieldTypeExpr) {
-    match expr {
-        FieldTypeExpr::Named(id) => out.push_str(&id.name),
-        FieldTypeExpr::Array(inner) => {
-            out.push_str("[]");
-            format_field_type_expr_out(out, inner);
-        }
-        FieldTypeExpr::Union(variants) => {
-            out.push('(');
-            for (i, v) in variants.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(" | ");
-                }
-                format_field_type_expr_out(out, v);
-            }
-            out.push(')');
         }
     }
 }

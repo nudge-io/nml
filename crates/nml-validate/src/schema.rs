@@ -449,8 +449,7 @@ impl SchemaValidator {
                     diags.push(
                         Diagnostic::error(format!(
                             "type mismatch for '{}': expected {}, got array",
-                            field.name,
-                            field_type_display(declared)
+                            field.name, declared
                         ))
                         .with_span(m.name.span),
                     );
@@ -544,8 +543,7 @@ impl SchemaValidator {
                 _ => {
                     diags.push(
                         Diagnostic::error(format!(
-                            "type mismatch {context} '{field_name}': expected {}, got {}",
-                            field_type_display(field_type),
+                            "type mismatch {context} '{field_name}': expected {field_type}, got {}",
                             value_type_name(value)
                         ))
                         .with_span(span),
@@ -556,7 +554,7 @@ impl SchemaValidator {
                 if !self.value_matches_type(value, field_type) {
                     let expected = variants
                         .iter()
-                        .map(field_type_display)
+                        .map(|v| v.to_string())
                         .collect::<Vec<_>>()
                         .join(", ");
                     diags.push(
@@ -925,28 +923,6 @@ fn detect_member_cycle(
     }
     path.pop();
     globally_visited.insert(name.to_string());
-}
-
-/// Human-readable name for a field type, used in diagnostics.
-fn field_type_display(field_type: &FieldType) -> String {
-    match field_type {
-        FieldType::Primitive(prim) => prim.as_str().to_string(),
-        FieldType::ModelRef(name) => name.clone(),
-        FieldType::Modifier(inner) => field_type_display(inner),
-        FieldType::List(inner) => {
-            let inner_name = field_type_display(inner);
-            if matches!(inner.as_ref(), FieldType::Union(_)) {
-                format!("[]({inner_name})")
-            } else {
-                format!("[]{inner_name}")
-            }
-        }
-        FieldType::Union(variants) => variants
-            .iter()
-            .map(field_type_display)
-            .collect::<Vec<_>>()
-            .join(" | "),
-    }
 }
 
 fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
