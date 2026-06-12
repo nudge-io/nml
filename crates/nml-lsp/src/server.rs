@@ -3548,6 +3548,6 @@ workflow VoiceAgent:
         assert_eq!(format_named_value("password", &secret), "\"…\"");
         assert_eq!(format_named_value("greeting", &secret), "\"hunter2\"");
         // Non-string values keep their normal rendering.
-        assert_eq!(format_named_value("maxKeys", &Value::number(3.0)), "3");
+        assert_eq!(format_named_value("maxKeys", &Value::number(3)), "3");
     }
 }

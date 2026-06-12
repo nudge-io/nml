@@ -97,8 +97,9 @@ impl SymbolTable {
         }
     }
 
-    /// Resolve a reference name to its declaration info.
-    pub fn resolve(&self, name: &str) -> Option<&[DeclInfo]> {
+    /// Look up a declaration name, returning every declaration that uses it
+    /// (more than one indicates a duplicate).
+    pub fn lookup(&self, name: &str) -> Option<&[DeclInfo]> {
         self.declarations.get(name).map(|v| v.as_slice())
     }
 
@@ -229,7 +230,7 @@ impl SymbolTable {
             match &entry.kind {
                 BodyEntryKind::Property(prop) => {
                     if let Value::Reference(name) = &prop.value.value {
-                        if self.resolve(name).is_none() && !local_names.contains(name.as_str()) {
+                        if self.lookup(name).is_none() && !local_names.contains(name.as_str()) {
                             errors.push(NmlError::Validation {
                                 message: format!("unresolved reference '{name}'"),
                                 span: prop.value.span,
@@ -288,9 +289,9 @@ mod tests {
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
-        assert!(symbols.resolve("Svc").is_some());
-        assert!(symbols.resolve("Res").is_some());
-        assert!(symbols.resolve("Unknown").is_none());
+        assert!(symbols.lookup("Svc").is_some());
+        assert!(symbols.lookup("Res").is_some());
+        assert!(symbols.lookup("Unknown").is_none());
     }
 
     #[test]

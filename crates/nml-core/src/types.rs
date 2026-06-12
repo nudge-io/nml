@@ -99,6 +99,10 @@ impl std::fmt::Display for Number {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Number::Int(i) => write!(f, "{i}"),
+            // A whole float keeps its decimal point (`2.0`, not `2`) so the
+            // int/float distinction survives a format -> reparse round-trip
+            // and the author's literal form is preserved.
+            Number::Float(n) if n.fract() == 0.0 && n.is_finite() => write!(f, "{n:.1}"),
             Number::Float(n) => write!(f, "{n}"),
         }
     }
@@ -488,7 +492,21 @@ mod tests {
         assert_eq!(Number::Int(42).to_string(), "42");
         assert_eq!(Number::Int(i64::MAX).to_string(), "9223372036854775807");
         assert_eq!(Number::Float(2.5).to_string(), "2.5");
-        assert_eq!(Number::Float(2.0).to_string(), "2");
+        // Whole floats keep their decimal point: the literal form
+        // round-trips through format -> reparse without changing variant.
+        assert_eq!(Number::Float(2.0).to_string(), "2.0");
+    }
+
+    #[test]
+    fn number_display_roundtrips_variant() {
+        // Display output must reparse to the same variant.
+        for (n, text) in [
+            (Number::Int(8080), "8080"),
+            (Number::Float(8080.0), "8080.0"),
+            (Number::Float(0.75), "0.75"),
+        ] {
+            assert_eq!(n.to_string(), text);
+        }
     }
 
     #[test]
