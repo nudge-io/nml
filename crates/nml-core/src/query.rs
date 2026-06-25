@@ -110,6 +110,9 @@ impl<'a> Document<'a> {
                 DeclarationKind::Template(t) => {
                     result.push(("template", t.name.name.as_str()));
                 }
+                DeclarationKind::OneOf(o) => {
+                    result.push(("oneof", o.name.name.as_str()));
+                }
             }
         }
         result

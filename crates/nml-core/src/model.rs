@@ -19,6 +19,21 @@ pub struct EnumDef {
     pub span: Span,
 }
 
+/// A discriminated-union definition extracted from `oneof Name by <field>:`.
+///
+/// Selects one of several variant models by the value of a discriminator
+/// field. Validation dispatches an instance to the variant model named by the
+/// discriminator's value.
+#[derive(Debug, Clone, Serialize)]
+pub struct OneOfDef {
+    pub name: String,
+    /// Field whose value selects the variant.
+    pub discriminator: String,
+    /// `(discriminator_value, variant_model_name)` pairs, in source order.
+    pub variants: Vec<(String, String)>,
+    pub span: Span,
+}
+
 /// A field definition within a model.
 #[derive(Debug, Clone, Serialize)]
 pub struct FieldDef {

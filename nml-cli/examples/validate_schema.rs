@@ -32,7 +32,7 @@ service MyApp:
 
     let config_file = parse(config_source).expect("failed to parse config");
 
-    let validator = SchemaValidator::new(schema.models, schema.enums);
+    let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
     let diagnostics = validator.validate(&config_file);
 
     if diagnostics.is_empty() {

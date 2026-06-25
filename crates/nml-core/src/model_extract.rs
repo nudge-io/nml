@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::error::NmlError;
-use crate::model::{EnumDef, FieldDef, FieldType, ModelDef};
+use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
 use crate::types::PrimitiveType;
 
 /// Results of extracting schema definitions from a parsed NML file.
@@ -10,9 +10,10 @@ use crate::types::PrimitiveType;
 pub struct ExtractedSchema {
     pub models: Vec<ModelDef>,
     pub enums: Vec<EnumDef>,
+    pub oneofs: Vec<OneOfDef>,
 }
 
-/// Extract model and enum definitions from a parsed AST.
+/// Extract model, enum, and oneof definitions from a parsed AST.
 pub fn extract(file: &File) -> ExtractedSchema {
     let mut schema = ExtractedSchema::default();
 
@@ -31,12 +32,74 @@ pub fn extract(file: &File) -> ExtractedSchema {
                 }
                 _ => {}
             },
+            DeclarationKind::OneOf(oneof) => {
+                schema.oneofs.push(extract_oneof(oneof, decl.span));
+            }
             DeclarationKind::Array(_) => {}
             DeclarationKind::Const(_) | DeclarationKind::Template(_) => {}
         }
     }
 
     schema
+}
+
+fn extract_oneof(decl: &OneOfDecl, span: crate::span::Span) -> OneOfDef {
+    OneOfDef {
+        name: decl.name.name.clone(),
+        discriminator: decl.discriminator.name.clone(),
+        variants: decl
+            .arms
+            .iter()
+            .map(|arm| (arm.value.clone(), arm.model.name.clone()))
+            .collect(),
+        span,
+    }
+}
+
+/// Validate `oneof` declarations against the rest of the schema:
+/// - every arm model must be a declared `model`,
+/// - discriminator values must be unique within a union,
+/// - a union name must not collide with a model or enum name.
+pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<NmlError> {
+    let model_names: HashSet<&str> = schema.models.iter().map(|m| m.name.as_str()).collect();
+    let enum_names: HashSet<&str> = schema.enums.iter().map(|e| e.name.as_str()).collect();
+    let mut errors = Vec::new();
+
+    for oneof in &schema.oneofs {
+        if model_names.contains(oneof.name.as_str()) || enum_names.contains(oneof.name.as_str()) {
+            errors.push(NmlError::Validation {
+                message: format!(
+                    "name '{}' is declared as both a oneof and a model/enum; names must be unique across model/enum/oneof",
+                    oneof.name
+                ),
+                span: oneof.span,
+            });
+        }
+
+        let mut seen_values: HashSet<&str> = HashSet::new();
+        for (value, model) in &oneof.variants {
+            if !seen_values.insert(value.as_str()) {
+                errors.push(NmlError::Validation {
+                    message: format!(
+                        "oneof '{}' has duplicate discriminator value \"{}\"",
+                        oneof.name, value
+                    ),
+                    span: oneof.span,
+                });
+            }
+            if !model_names.contains(model.as_str()) {
+                errors.push(NmlError::Validation {
+                    message: format!(
+                        "oneof '{}' arm \"{}\" references unknown model '{}'",
+                        oneof.name, value, model
+                    ),
+                    span: oneof.span,
+                });
+            }
+        }
+    }
+
+    errors
 }
 
 /// Detect cycles in the model dependency graph.
@@ -46,9 +109,26 @@ pub fn extract(file: &File) -> ExtractedSchema {
 pub fn find_model_cycles(schema: &ExtractedSchema) -> Vec<NmlError> {
     let model_names: HashSet<&str> = schema.models.iter().map(|m| m.name.as_str()).collect();
 
+    // A field that references a `oneof` depends transitively on each of its
+    // variant models, so expand those references into model-to-model edges to
+    // keep cycle detection sound through unions.
+    let oneof_variants: HashMap<&str, Vec<&str>> = schema
+        .oneofs
+        .iter()
+        .map(|o| {
+            let variants = o
+                .variants
+                .iter()
+                .map(|(_, model)| model.as_str())
+                .filter(|m| model_names.contains(m))
+                .collect();
+            (o.name.as_str(), variants)
+        })
+        .collect();
+
     let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
     for model in &schema.models {
-        let refs = collect_model_refs(&model.fields, &model_names);
+        let refs = collect_model_refs(&model.fields, &model_names, &oneof_variants);
         edges.insert(model.name.as_str(), refs);
     }
 
@@ -73,10 +153,14 @@ pub fn find_model_cycles(schema: &ExtractedSchema) -> Vec<NmlError> {
     errors
 }
 
-fn collect_model_refs<'a>(fields: &'a [FieldDef], known_models: &HashSet<&str>) -> Vec<&'a str> {
+fn collect_model_refs<'a>(
+    fields: &'a [FieldDef],
+    known_models: &HashSet<&str>,
+    oneof_variants: &HashMap<&'a str, Vec<&'a str>>,
+) -> Vec<&'a str> {
     let mut refs = Vec::new();
     for field in fields {
-        collect_refs_from_type(&field.field_type, known_models, &mut refs);
+        collect_refs_from_type(&field.field_type, known_models, oneof_variants, &mut refs);
     }
     refs
 }
@@ -84,16 +168,25 @@ fn collect_model_refs<'a>(fields: &'a [FieldDef], known_models: &HashSet<&str>) 
 fn collect_refs_from_type<'a>(
     ft: &'a FieldType,
     known_models: &HashSet<&str>,
+    oneof_variants: &HashMap<&'a str, Vec<&'a str>>,
     refs: &mut Vec<&'a str>,
 ) {
     match ft {
         FieldType::ModelRef(name) if known_models.contains(name.as_str()) => {
             refs.push(name.as_str());
         }
-        FieldType::List(inner) => collect_refs_from_type(inner, known_models, refs),
+        // A reference to a `oneof` is a dependency on each of its variants.
+        FieldType::ModelRef(name) => {
+            if let Some(variants) = oneof_variants.get(name.as_str()) {
+                refs.extend(variants.iter().copied());
+            }
+        }
+        FieldType::List(inner) => {
+            collect_refs_from_type(inner, known_models, oneof_variants, refs)
+        }
         FieldType::Union(variants) => {
             for v in variants {
-                collect_refs_from_type(v, known_models, refs);
+                collect_refs_from_type(v, known_models, oneof_variants, refs);
             }
         }
         _ => {}
@@ -401,6 +494,80 @@ fn format_default(value: &crate::types::Value) -> String {
 mod tests {
     use super::*;
     use crate::parser;
+
+    fn extract_src(src: &str) -> ExtractedSchema {
+        extract(&parser::parse(src).unwrap())
+    }
+
+    #[test]
+    fn test_extract_oneof() {
+        let schema = extract_src(
+            "model emailLog:\n    fromAddress string?\n\nmodel emailPostmark:\n    serverToken secret\n\noneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n",
+        );
+        assert_eq!(schema.oneofs.len(), 1);
+        let o = &schema.oneofs[0];
+        assert_eq!(o.name, "email");
+        assert_eq!(o.discriminator, "provider");
+        assert_eq!(
+            o.variants,
+            vec![
+                ("log".to_string(), "emailLog".to_string()),
+                ("postmark".to_string(), "emailPostmark".to_string()),
+            ]
+        );
+        assert!(find_oneof_errors(&schema).is_empty());
+    }
+
+    #[test]
+    fn test_oneof_unknown_arm_model_rejected() {
+        let schema = extract_src(
+            "model emailLog:\n    x string?\n\noneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n",
+        );
+        let errs = find_oneof_errors(&schema);
+        assert!(
+            errs.iter().any(|e| e.message().contains("emailPostmark")),
+            "expected unknown-arm-model error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_oneof_duplicate_value_rejected() {
+        let schema = extract_src(
+            "model a:\n    x string?\n\nmodel b:\n    y string?\n\noneof u by kind:\n    \"k\" => a\n    \"k\" => b\n",
+        );
+        let errs = find_oneof_errors(&schema);
+        assert!(
+            errs.iter().any(|e| e.message().contains("duplicate discriminator value")),
+            "expected duplicate-value error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_oneof_name_collision_with_model_rejected() {
+        let schema = extract_src(
+            "model email:\n    x string?\n\nmodel emailLog:\n    y string?\n\noneof email by provider:\n    \"log\" => emailLog\n",
+        );
+        let errs = find_oneof_errors(&schema);
+        assert!(
+            errs.iter().any(|e| e.message().contains("both a oneof and a model")),
+            "expected name-collision error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_cycle_detection_traverses_oneof_variants() {
+        // a -> (field u: oneof) -> variant b -> field a  => cycle a,b
+        let schema = extract_src(
+            "model a:\n    u u?\n\nmodel b:\n    parent a?\n\noneof u by kind:\n    \"b\" => b\n",
+        );
+        let cycles = find_model_cycles(&schema);
+        assert!(
+            cycles
+                .iter()
+                .any(|e| e.message().contains("circular dependency")),
+            "cycle through oneof variant should be detected; got {cycles:?}"
+        );
+    }
 
     #[test]
     fn test_extract_model() {

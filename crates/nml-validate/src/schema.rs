@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use nml_core::ast::*;
-use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef};
+use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
 use nml_core::span::Span;
 use nml_core::types::{PrimitiveType, Value};
 
@@ -24,6 +24,7 @@ const MAX_VALIDATION_DEPTH: u32 = 64;
 pub struct SchemaValidator {
     models: Vec<ModelDef>,
     enums: Vec<EnumDef>,
+    oneofs: Vec<OneOfDef>,
     valid_modifiers: Vec<String>,
     strict_unknown_fields: bool,
     membership: MembershipSemantics,
@@ -46,10 +47,11 @@ pub struct MembershipSemantics {
 }
 
 impl SchemaValidator {
-    pub fn new(models: Vec<ModelDef>, enums: Vec<EnumDef>) -> Self {
+    pub fn new(models: Vec<ModelDef>, enums: Vec<EnumDef>, oneofs: Vec<OneOfDef>) -> Self {
         Self {
             models,
             enums,
+            oneofs,
             valid_modifiers: Vec::new(),
             strict_unknown_fields: false,
             membership: MembershipSemantics::default(),
@@ -95,6 +97,10 @@ impl SchemaValidator {
         self.enums.iter().find(|e| e.name == name)
     }
 
+    pub fn find_oneof(&self, name: &str) -> Option<&OneOfDef> {
+        self.oneofs.iter().find(|o| o.name == name)
+    }
+
     /// Validate a parsed NML file against the loaded models.
     pub fn validate(&self, file: &File) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
@@ -107,7 +113,11 @@ impl SchemaValidator {
                 DeclarationKind::Array(arr) => {
                     self.validate_array(arr, &mut diagnostics);
                 }
-                DeclarationKind::Const(_) | DeclarationKind::Template(_) => {}
+                // `oneof` declarations are schema definitions, validated when
+                // the schema is loaded; they carry no instance data here.
+                DeclarationKind::Const(_)
+                | DeclarationKind::Template(_)
+                | DeclarationKind::OneOf(_) => {}
             }
         }
 
@@ -146,6 +156,14 @@ impl SchemaValidator {
                     Some(block.name.span),
                     diags,
                 );
+            } else if let Some(oneof) = self.find_oneof(keyword) {
+                self.validate_instance_against_oneof(
+                    &block.body,
+                    oneof,
+                    0,
+                    Some(block.name.span),
+                    diags,
+                );
             } else if self.strict_unknown_fields {
                 diags.push(
                     Diagnostic::error(format!("block keyword '{keyword}' has no model definition"))
@@ -168,6 +186,13 @@ impl SchemaValidator {
         } else {
             None
         };
+        // An array item keyword may name a `oneof` instead of a model, mirroring
+        // the block-keyword dispatch in `validate_block`.
+        let oneof = if !is_schema_def && model.is_none() {
+            self.find_oneof(keyword)
+        } else {
+            None
+        };
 
         let has_named_items = arr
             .body
@@ -175,10 +200,15 @@ impl SchemaValidator {
             .iter()
             .any(|i| matches!(&i.kind, ListItemKind::Named { .. }));
 
-        if !is_schema_def && model.is_none() && has_named_items && self.strict_unknown_fields {
+        if !is_schema_def
+            && model.is_none()
+            && oneof.is_none()
+            && has_named_items
+            && self.strict_unknown_fields
+        {
             diags.push(
                 Diagnostic::error(format!(
-                    "array item keyword '{keyword}' has no model definition"
+                    "array item keyword '{keyword}' has no model or oneof definition"
                 ))
                 .with_span(arr.item_keyword.span),
             );
@@ -191,6 +221,8 @@ impl SchemaValidator {
 
                 if let Some(model) = model {
                     self.validate_instance_against_model(body, model, 0, Some(name.span), diags);
+                } else if let Some(oneof) = oneof {
+                    self.validate_instance_against_oneof(body, oneof, 0, Some(name.span), diags);
                 }
             }
         }
@@ -308,6 +340,14 @@ impl SchemaValidator {
                                         Some(nb.name.span),
                                         diags,
                                     );
+                                } else if let Some(oneof) = self.find_oneof(ref_name) {
+                                    self.validate_instance_against_oneof(
+                                        &nb.body,
+                                        oneof,
+                                        depth + 1,
+                                        Some(nb.name.span),
+                                        diags,
+                                    );
                                 }
                             }
                             FieldType::List(inner) => {
@@ -322,6 +362,16 @@ impl SchemaValidator {
                                                         self.validate_instance_against_model(
                                                             body,
                                                             inner_model,
+                                                            depth + 1,
+                                                            Some(name.span),
+                                                            diags,
+                                                        );
+                                                    } else if let Some(oneof) =
+                                                        self.find_oneof(ref_name)
+                                                    {
+                                                        self.validate_instance_against_oneof(
+                                                            body,
+                                                            oneof,
                                                             depth + 1,
                                                             Some(name.span),
                                                             diags,
@@ -424,6 +474,122 @@ impl SchemaValidator {
                 );
             }
         }
+    }
+
+    /// Validate an instance block against a `oneof`: resolve the discriminator
+    /// value to a variant model, then validate the remaining fields against
+    /// that variant (per-variant required/unknown-field enforcement).
+    ///
+    /// The discriminator field belongs to the union, not the variant model, so
+    /// it is excluded before the variant check (mirroring how serde's
+    /// internally-tagged enums consume the tag field).
+    fn validate_instance_against_oneof(
+        &self,
+        body: &Body,
+        oneof: &OneOfDef,
+        depth: u32,
+        header_span: Option<Span>,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        if depth >= MAX_VALIDATION_DEPTH {
+            let mut diag = Diagnostic::warning(format!(
+                "validation truncated: nesting exceeds maximum depth of {MAX_VALIDATION_DEPTH}; deeper entries were not checked"
+            ));
+            if let Some(span) = header_span.or_else(|| body.entries.first().map(|e| e.span)) {
+                diag = diag.with_span(span);
+            }
+            diags.push(diag);
+            return;
+        }
+
+        let valid_values = || {
+            oneof
+                .variants
+                .iter()
+                .map(|(v, _)| format!("\"{v}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let fallback_span = || {
+            header_span
+                .or_else(|| body.entries.first().map(|e| e.span))
+                .unwrap_or(oneof.span)
+        };
+
+        // Locate the discriminator property within the block.
+        let discriminator = body.entries.iter().find_map(|entry| match &entry.kind {
+            BodyEntryKind::Property(prop) if prop.name.name == oneof.discriminator => Some(prop),
+            _ => None,
+        });
+
+        let Some(discriminator) = discriminator else {
+            diags.push(
+                Diagnostic::error(format!(
+                    "missing discriminator '{disc}' for oneof '{name}'; set `{disc} = <one of: {values}>`",
+                    disc = oneof.discriminator,
+                    name = oneof.name,
+                    values = valid_values(),
+                ))
+                .with_span(fallback_span()),
+            );
+            return;
+        };
+
+        let Value::String(value) = &discriminator.value.value else {
+            diags.push(
+                Diagnostic::error(format!(
+                    "discriminator '{}' for oneof '{}' must be a string (one of: {})",
+                    oneof.discriminator,
+                    oneof.name,
+                    valid_values(),
+                ))
+                .with_span(discriminator.value.span),
+            );
+            return;
+        };
+
+        let Some((_, model_name)) = oneof.variants.iter().find(|(v, _)| v == value) else {
+            diags.push(
+                Diagnostic::error(format!(
+                    "unknown {} \"{}\" for oneof '{}'; expected one of: {}",
+                    oneof.discriminator,
+                    value,
+                    oneof.name,
+                    valid_values(),
+                ))
+                .with_span(discriminator.value.span),
+            );
+            return;
+        };
+
+        // The variant model is guaranteed to exist (checked at schema-load
+        // time by `find_oneof_errors`); skip silently if the schema was built
+        // without that check.
+        let Some(variant_model) = self.find_model(model_name) else {
+            return;
+        };
+
+        // Validate everything except the discriminator against the variant.
+        let variant_body = Body {
+            entries: body
+                .entries
+                .iter()
+                .filter(|entry| {
+                    !matches!(
+                        &entry.kind,
+                        BodyEntryKind::Property(prop) if prop.name.name == oneof.discriminator
+                    )
+                })
+                .cloned()
+                .collect(),
+        };
+        self.validate_instance_against_model(
+            &variant_body,
+            variant_model,
+            depth,
+            header_span,
+            diags,
+        );
     }
 
     /// Validate a modifier's value against the type declared in the model
@@ -971,13 +1137,13 @@ mod tests {
     fn make_validator(schema_source: &str) -> SchemaValidator {
         let file = parser::parse(schema_source).unwrap();
         let schema = model_extract::extract(&file);
-        SchemaValidator::new(schema.models, schema.enums)
+        SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
     }
 
     fn make_validator_with_modifiers(schema_source: &str, modifiers: &[&str]) -> SchemaValidator {
         let file = parser::parse(schema_source).unwrap();
         let schema = model_extract::extract(&file);
-        SchemaValidator::new(schema.models, schema.enums)
+        SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
             .with_modifiers(modifiers.iter().map(|s| s.to_string()).collect())
     }
 
@@ -1911,7 +2077,7 @@ workflow W:
     fn make_validator_with_membership(schema_source: &str) -> SchemaValidator {
         let file = parser::parse(schema_source).unwrap();
         let schema = model_extract::extract(&file);
-        SchemaValidator::new(schema.models, schema.enums)
+        SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
             .with_membership_semantics(nudge_membership())
     }
 
@@ -2122,7 +2288,7 @@ workflow W:
     fn make_strict_validator(schema_source: &str) -> SchemaValidator {
         let file = parser::parse(schema_source).unwrap();
         let schema = model_extract::extract(&file);
-        SchemaValidator::new(schema.models, schema.enums).strict()
+        SchemaValidator::new(schema.models, schema.enums, schema.oneofs).strict()
     }
 
     #[test]
@@ -2206,7 +2372,7 @@ workflow W:
         assert!(
             diags.iter().any(|d| d
                 .message
-                .contains("array item keyword 'bogus' has no model definition")),
+                .contains("array item keyword 'bogus' has no model or oneof definition")),
             "strict mode should reject unmodeled array with named items; diags: {:?}",
             diags
         );
@@ -2595,6 +2761,125 @@ workflow W:
         assert!(
             matches!(unknown.severity, Severity::Error),
             "strict mode should emit Error for nested unknown properties"
+        );
+    }
+
+    // ---- oneof (discriminated union) validation ----
+
+    const ONEOF_SCHEMA: &str = concat!(
+        "model emailLog:\n    fromAddress string?\n\n",
+        "model emailPostmark:\n    fromAddress string?\n    serverToken secret\n\n",
+        "oneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n\n",
+        "model server:\n    email email?\n\n",
+        "model providers:\n    items []email?\n",
+    );
+
+    fn oneof_errors(source: &str) -> Vec<String> {
+        let validator = make_strict_validator(ONEOF_SCHEMA);
+        let file = parser::parse(source).unwrap();
+        validator
+            .validate(&file)
+            .into_iter()
+            .filter(|d| matches!(d.severity, Severity::Error))
+            .map(|d| d.message)
+            .collect()
+    }
+
+    #[test]
+    fn test_oneof_block_keyword_valid_variant() {
+        let errs = oneof_errors(
+            "email Cfg:\n    provider = \"postmark\"\n    fromAddress = \"a@b.co\"\n    serverToken = $ENV.TOK\n",
+        );
+        assert!(errs.is_empty(), "valid postmark variant should pass: {errs:?}");
+    }
+
+    #[test]
+    fn test_oneof_rejects_cross_variant_field() {
+        // serverToken belongs to the postmark variant, not log.
+        let errs = oneof_errors("email Cfg:\n    provider = \"log\"\n    serverToken = $ENV.TOK\n");
+        assert!(
+            errs.iter().any(|m| m.contains("unknown property 'serverToken'")),
+            "log variant must reject postmark-only field: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_oneof_missing_discriminator() {
+        let errs = oneof_errors("email Cfg:\n    fromAddress = \"a@b.co\"\n");
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("missing discriminator 'provider'")),
+            "missing discriminator should be flagged: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_oneof_unknown_discriminator_value() {
+        let errs = oneof_errors("email Cfg:\n    provider = \"sendgrid\"\n");
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("unknown provider \"sendgrid\"")),
+            "unknown discriminator value should be flagged: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_oneof_enforces_variant_required_field() {
+        // postmark requires serverToken.
+        let errs = oneof_errors("email Cfg:\n    provider = \"postmark\"\n");
+        assert!(
+            errs.iter()
+                .any(|m| m.contains("missing required field 'serverToken'")),
+            "postmark variant must enforce serverToken: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_oneof_nested_block_ref_context() {
+        let errs = oneof_errors(
+            "server S:\n    email:\n        provider = \"postmark\"\n        serverToken = $ENV.TOK\n",
+        );
+        assert!(
+            errs.is_empty(),
+            "oneof referenced as a nested-block field should validate: {errs:?}"
+        );
+        let bad = oneof_errors(
+            "server S:\n    email:\n        provider = \"log\"\n        serverToken = $ENV.TOK\n",
+        );
+        assert!(
+            bad.iter().any(|m| m.contains("unknown property 'serverToken'")),
+            "nested oneof must enforce per-variant fields: {bad:?}"
+        );
+    }
+
+    #[test]
+    fn test_oneof_top_level_array_context() {
+        // A top-level `[]<oneof>` declaration validates each named item against
+        // the union (parity with the block-keyword surface).
+        let errs = oneof_errors(
+            "[]email mailers:\n    - primary:\n        provider = \"postmark\"\n        serverToken = $ENV.TOK\n    - fallback:\n        provider = \"log\"\n",
+        );
+        assert!(
+            errs.is_empty(),
+            "top-level []oneof should validate per-variant: {errs:?}"
+        );
+        let bad = oneof_errors(
+            "[]email mailers:\n    - primary:\n        provider = \"log\"\n        serverToken = $ENV.TOK\n",
+        );
+        assert!(
+            bad.iter().any(|m| m.contains("unknown property 'serverToken'")),
+            "top-level []oneof must enforce per-variant fields: {bad:?}"
+        );
+    }
+
+    #[test]
+    fn test_oneof_list_context() {
+        let errs = oneof_errors(
+            "providers P:\n    items:\n        - log:\n            provider = \"log\"\n        - pm:\n            provider = \"postmark\"\n            serverToken = $ENV.TOK\n",
+        );
+        assert!(
+            errs.is_empty(),
+            "[]oneof list items should validate per-variant: {errs:?}"
         );
     }
 }

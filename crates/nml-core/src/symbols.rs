@@ -67,6 +67,11 @@ impl SymbolTable {
                         span: decl.span,
                     }
                 }
+                DeclarationKind::OneOf(oneof) => DeclInfo {
+                    keyword: "oneof".into(),
+                    name: oneof.name.name.clone(),
+                    span: decl.span,
+                },
             };
             self.declarations
                 .entry(info.name.clone())

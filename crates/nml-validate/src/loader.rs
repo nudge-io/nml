@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use nml_core::ast::File;
 use nml_core::error::NmlError;
-use nml_core::model::{EnumDef, ModelDef};
+use nml_core::model::{EnumDef, ModelDef, OneOfDef};
 use nml_core::model_extract::{self, ExtractedSchema};
 
 use crate::diagnostics::{Diagnostic, Severity};
@@ -21,17 +21,18 @@ use crate::schema::SchemaValidator;
 pub struct LoadedSchema {
     pub models: Vec<ModelDef>,
     pub enums: Vec<EnumDef>,
+    pub oneofs: Vec<OneOfDef>,
 }
 
 impl LoadedSchema {
     /// Whether the schema contains no definitions at all.
     pub fn is_empty(&self) -> bool {
-        self.models.is_empty() && self.enums.is_empty()
+        self.models.is_empty() && self.enums.is_empty() && self.oneofs.is_empty()
     }
 
     /// Consume the schema and build a [`SchemaValidator`] from it.
     pub fn into_validator(self) -> SchemaValidator {
-        SchemaValidator::new(self.models, self.enums)
+        SchemaValidator::new(self.models, self.enums, self.oneofs)
     }
 }
 
@@ -57,6 +58,7 @@ pub fn load_schema(files: &[File]) -> (LoadedSchema, Vec<Diagnostic>) {
         let extracted = model_extract::extract(file);
         schema.models.extend(extracted.models);
         schema.enums.extend(extracted.enums);
+        schema.oneofs.extend(extracted.oneofs);
     }
 
     report_duplicates(&schema, &mut diagnostics);
@@ -67,6 +69,12 @@ pub fn load_schema(files: &[File]) -> (LoadedSchema, Vec<Diagnostic>) {
 
     model_extract::resolve_model_inheritance(&mut schema);
 
+    // `oneof` integrity (arm models exist, unique values, name collisions) is
+    // an error: a malformed union cannot be validated against.
+    for err in model_extract::find_oneof_errors(&schema) {
+        diagnostics.push(to_diagnostic(&err, Severity::Error));
+    }
+
     for err in model_extract::find_model_cycles(&schema) {
         diagnostics.push(to_diagnostic(&err, Severity::Warning));
     }
@@ -75,6 +83,7 @@ pub fn load_schema(files: &[File]) -> (LoadedSchema, Vec<Diagnostic>) {
         LoadedSchema {
             models: schema.models,
             enums: schema.enums,
+            oneofs: schema.oneofs,
         },
         diagnostics,
     )
@@ -97,6 +106,16 @@ fn report_duplicates(schema: &ExtractedSchema, diagnostics: &mut Vec<Diagnostic>
             diagnostics.push(
                 Diagnostic::error(format!("duplicate enum definition '{}'", enum_def.name))
                     .with_span(enum_def.span),
+            );
+        }
+    }
+
+    let mut seen_oneofs = HashSet::new();
+    for oneof in &schema.oneofs {
+        if !seen_oneofs.insert(oneof.name.as_str()) {
+            diagnostics.push(
+                Diagnostic::error(format!("duplicate oneof definition '{}'", oneof.name))
+                    .with_span(oneof.span),
             );
         }
     }

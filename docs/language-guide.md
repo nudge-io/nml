@@ -24,7 +24,7 @@ keyword Name:
     body...
 ```
 
-Keywords are either built-in (`model`, `trait`, `enum`, `role`) or
+Keywords are either built-in (`model`, `trait`, `enum`, `oneof`, `role`) or
 user-defined via models (e.g. `service`, `resource`).
 
 ### Array Declarations
@@ -343,6 +343,45 @@ enum httpMethod:
 model resource:
     method httpMethod = "GET"
 ```
+
+### Discriminated Unions (`oneof`)
+
+A `oneof` selects one of several variant models by the value of a
+**discriminator** field. It is the schema-level expression of a tagged union:
+each arm binds a discriminator value to a variant model, and an instance block
+carries the discriminator flat alongside the selected variant's fields.
+
+```
+model emailLog:
+
+model emailPostmark:
+    fromAddress string
+    serverToken secret
+    messageStream string = "outbound"
+
+oneof email by provider:
+    "log"      => emailLog
+    "postmark" => emailPostmark
+```
+
+A matching instance sets the discriminator and the chosen variant's fields:
+
+```
+email Outbound:
+    provider = "postmark"
+    fromAddress = "no-reply@example.com"
+    serverToken = $ENV.POSTMARK_TOKEN
+```
+
+The validator resolves `provider` to a variant and enforces **that variant's**
+required and unknown fields: a missing `serverToken`, or a `serverToken` placed
+on a `"log"` block, is rejected at validation time. The discriminator itself is
+owned by the union, so variant models do not redeclare it.
+
+A `oneof` can be referenced anywhere a model can — as a block keyword, a nested
+field (`email email?`), or a list element (`[]email`). Variant model names must
+be unique, discriminator values must be distinct, and a name cannot be declared
+as more than one of `model` / `enum` / `oneof`.
 
 ### Inline Nested Objects
 

@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use nml_core::ast::*;
-use nml_core::model::{EnumDef, FieldType, ModelDef};
+use nml_core::model::{EnumDef, FieldType, ModelDef, OneOfDef};
 use nml_core::types::Value;
 use nml_validate::schema::MembershipSemantics;
 
@@ -24,6 +24,7 @@ pub struct NmlLanguageServer {
     indexed_uris: Mutex<HashSet<Url>>,
     scoped_models: Mutex<HashMap<String, Vec<ModelDef>>>,
     scoped_enums: Mutex<HashMap<String, Vec<EnumDef>>>,
+    scoped_oneofs: Mutex<HashMap<String, Vec<OneOfDef>>>,
     project_config: Mutex<nml_core::ProjectConfig>,
     /// Canonicalized workspace roots captured at initialize; watched-file
     /// events outside these roots are ignored.
@@ -40,6 +41,7 @@ impl NmlLanguageServer {
             indexed_uris: Mutex::new(HashSet::new()),
             scoped_models: Mutex::new(HashMap::new()),
             scoped_enums: Mutex::new(HashMap::new()),
+            scoped_oneofs: Mutex::new(HashMap::new()),
             project_config: Mutex::new(nml_core::ProjectConfig::default()),
             workspace_roots: Mutex::new(Vec::new()),
             language_extension: None,
@@ -131,6 +133,7 @@ impl NmlLanguageServer {
         let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         let mut scoped_models: HashMap<String, Vec<ModelDef>> = HashMap::new();
         let mut scoped_enums: HashMap<String, Vec<EnumDef>> = HashMap::new();
+        let mut scoped_oneofs: HashMap<String, Vec<OneOfDef>> = HashMap::new();
 
         for (uri, source) in docs.iter() {
             if !uri.as_str().ends_with(".model.nml") {
@@ -143,23 +146,31 @@ impl NmlLanguageServer {
                     .entry(scope.clone())
                     .or_default()
                     .extend(schema.models);
-                scoped_enums.entry(scope).or_default().extend(schema.enums);
+                scoped_enums
+                    .entry(scope.clone())
+                    .or_default()
+                    .extend(schema.enums);
+                scoped_oneofs.entry(scope).or_default().extend(schema.oneofs);
             }
         }
 
         *self.scoped_models.lock().unwrap_or_else(|e| e.into_inner()) = scoped_models;
         *self.scoped_enums.lock().unwrap_or_else(|e| e.into_inner()) = scoped_enums;
+        *self.scoped_oneofs.lock().unwrap_or_else(|e| e.into_inner()) = scoped_oneofs;
     }
 
-    fn models_for_file(&self, uri: &Url) -> (Vec<ModelDef>, Vec<EnumDef>) {
+    fn models_for_file(&self, uri: &Url) -> (Vec<ModelDef>, Vec<EnumDef>, Vec<OneOfDef>) {
         let file_scope = extract_file_scope(uri.as_str());
         let scoped_models = self.scoped_models.lock().unwrap_or_else(|e| e.into_inner());
         let scoped_enums = self.scoped_enums.lock().unwrap_or_else(|e| e.into_inner());
+        let scoped_oneofs = self.scoped_oneofs.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut models = Vec::new();
         let mut enums = Vec::new();
+        let mut oneofs = Vec::new();
         let mut seen_model_names: HashSet<String> = HashSet::new();
         let mut seen_enum_names: HashSet<String> = HashSet::new();
+        let mut seen_oneof_names: HashSet<String> = HashSet::new();
 
         if let Some(ref scope) = file_scope {
             if let Some(scope_models) = scoped_models.get(scope) {
@@ -172,6 +183,12 @@ impl NmlLanguageServer {
                 for e in scope_enums {
                     seen_enum_names.insert(e.name.clone());
                     enums.push(e.clone());
+                }
+            }
+            if let Some(scope_oneofs) = scoped_oneofs.get(scope) {
+                for o in scope_oneofs {
+                    seen_oneof_names.insert(o.name.clone());
+                    oneofs.push(o.clone());
                 }
             }
         }
@@ -196,8 +213,18 @@ impl NmlLanguageServer {
                 }
             }
         }
+        for (scope, os) in scoped_oneofs.iter() {
+            if file_scope.as_deref() == Some(scope.as_str()) {
+                continue;
+            }
+            for o in os {
+                if seen_oneof_names.insert(o.name.clone()) {
+                    oneofs.push(o.clone());
+                }
+            }
+        }
 
-        (models, enums)
+        (models, enums, oneofs)
     }
 
     fn diagnostic_config(&self) -> diagnostics::DiagnosticConfig {
@@ -250,9 +277,9 @@ impl NmlLanguageServer {
             self.rebuild_schema_registry();
         }
 
-        let (models, enums) = self.models_for_file(&uri);
+        let (models, enums, oneofs) = self.models_for_file(&uri);
         let dc = self.diagnostic_config();
-        let diags = diagnostics::compute(&text, &models, &enums, &dc);
+        let diags = diagnostics::compute(&text, &models, &enums, &oneofs, &dc);
 
         self.client
             .publish_diagnostics(uri.clone(), diags, None)
@@ -274,8 +301,8 @@ impl NmlLanguageServer {
             if uri.as_str().ends_with(".model.nml") {
                 continue;
             }
-            let (models, enums) = self.models_for_file(&uri);
-            let diags = diagnostics::compute(&source, &models, &enums, &dc);
+            let (models, enums, oneofs) = self.models_for_file(&uri);
+            let diags = diagnostics::compute(&source, &models, &enums, &oneofs, &dc);
             self.client.publish_diagnostics(uri, diags, None).await;
         }
     }
@@ -371,6 +398,9 @@ impl NmlLanguageServer {
                         }
                         DeclarationKind::Template(t) => {
                             names.push((t.name.name.clone(), "template".into()));
+                        }
+                        DeclarationKind::OneOf(o) => {
+                            names.push((o.name.name.clone(), "oneof".into()));
                         }
                     }
                 }
@@ -687,6 +717,11 @@ fn find_top_level_decl(file: &File, name: &str, line_index: &LineIndex) -> Optio
                     return Some(span_to_range(t.name.span, line_index));
                 }
             }
+            DeclarationKind::OneOf(o) => {
+                if o.name.name == name {
+                    return Some(span_to_range(o.name.span, line_index));
+                }
+            }
         }
     }
     None
@@ -721,6 +756,11 @@ fn find_name_in_file(file: &File, name: &str, line_index: &LineIndex) -> Option<
             DeclarationKind::Template(t) => {
                 if t.name.name == name {
                     return Some(span_to_range(t.name.span, line_index));
+                }
+            }
+            DeclarationKind::OneOf(o) => {
+                if o.name.name == name {
+                    return Some(span_to_range(o.name.span, line_index));
                 }
             }
         }
@@ -893,6 +933,30 @@ fn build_document_symbols(file: &File, line_index: &LineIndex) -> Vec<DocumentSy
                     Vec::new(),
                 ));
             }
+            DeclarationKind::OneOf(o) => {
+                let arms = o
+                    .arms
+                    .iter()
+                    .map(|arm| {
+                        document_symbol(
+                            arm.value.clone(),
+                            Some(arm.model.name.clone()),
+                            SymbolKind::ENUM_MEMBER,
+                            span_to_range(arm.model.span, line_index),
+                            span_to_range(arm.value_span, line_index),
+                            Vec::new(),
+                        )
+                    })
+                    .collect();
+                symbols.push(document_symbol(
+                    o.name.name.clone(),
+                    Some(format!("oneof by {}", o.discriminator.name)),
+                    SymbolKind::ENUM,
+                    span_to_range(decl.span, line_index),
+                    span_to_range(o.name.span, line_index),
+                    arms,
+                ));
+            }
         }
     }
     symbols
@@ -1007,6 +1071,17 @@ fn collect_references(file: &File, name: &str, line_index: &LineIndex, ranges: &
             DeclarationKind::Template(t) => {
                 if t.name.name == name {
                     ranges.push(span_to_range(t.name.span, line_index));
+                }
+            }
+            DeclarationKind::OneOf(o) => {
+                if o.name.name == name {
+                    ranges.push(span_to_range(o.name.span, line_index));
+                }
+                // A oneof arm references a variant model by name.
+                for arm in &o.arms {
+                    if arm.model.name == name {
+                        ranges.push(span_to_range(arm.model.span, line_index));
+                    }
                 }
             }
         }
@@ -1529,7 +1604,7 @@ impl LanguageServer for NmlLanguageServer {
             let model_ref_type = {
                 let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
                 docs.get(&uri).and_then(|source| {
-                    let (models, _) = self.models_for_file(&uri);
+                    let (models, _, _) = self.models_for_file(&uri);
                     find_model_ref_type_at(source, pos, &models)
                 })
             };
@@ -1729,7 +1804,7 @@ impl LanguageServer for NmlLanguageServer {
             if let Ok(file) = nml_core::parse(&source_clone) {
                 let line_index = LineIndex::new(&source_clone);
                 if let Some(keyword) = find_enclosing_block_keyword(&file, pos, &line_index) {
-                    let (models, _) = self.models_for_file(&uri);
+                    let (models, _, _) = self.models_for_file(&uri);
                     if let Some(model) = models.iter().find(|m| m.name == keyword) {
                         if let Some(field) = model.fields.iter().find(|f| f.name == word) {
                             // In source syntax the `|` sigil belongs to the
@@ -1786,7 +1861,7 @@ impl LanguageServer for NmlLanguageServer {
 
         if !word.is_empty() {
             let model_ref_type = if !is_prop {
-                let (models, _) = self.models_for_file(&uri);
+                let (models, _, _) = self.models_for_file(&uri);
                 find_model_ref_type_at(&source_clone, pos, &models)
             } else {
                 None

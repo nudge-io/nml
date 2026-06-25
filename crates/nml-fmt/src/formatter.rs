@@ -188,6 +188,34 @@ impl<'a> Formatter<'a> {
                 self.emit_trailing_comment(t.value.span.end.saturating_sub(1));
                 self.out.push('\n');
             }
+            DeclarationKind::OneOf(oneof) => {
+                self.write_indent(depth);
+                self.out.push_str("oneof ");
+                self.out.push_str(&oneof.name.name);
+                self.out.push_str(" by ");
+                self.out.push_str(&oneof.discriminator.name);
+                self.out.push(':');
+                self.emit_trailing_comment(decl.span.start);
+                self.out.push('\n');
+
+                // Align the `=>` arrows on the widest quoted value so arms
+                // read as a tidy table.
+                let quoted: Vec<String> =
+                    oneof.arms.iter().map(|a| quote_string(&a.value)).collect();
+                let max_w = quoted.iter().map(|q| q.chars().count()).max().unwrap_or(0);
+                for (arm, q) in oneof.arms.iter().zip(&quoted) {
+                    self.emit_comments_before(arm.value_span.start, depth + 1);
+                    self.write_indent(depth + 1);
+                    self.out.push_str(q);
+                    for _ in 0..(max_w - q.chars().count()) {
+                        self.out.push(' ');
+                    }
+                    self.out.push_str(" => ");
+                    self.out.push_str(&arm.model.name);
+                    self.emit_trailing_comment(arm.model.span.start);
+                    self.out.push('\n');
+                }
+            }
         }
     }
 
@@ -360,6 +388,24 @@ impl<'a> Formatter<'a> {
     }
 }
 
+/// Render a string as a single-line, double-quoted NML literal with the same
+/// escaping rules the lexer accepts. Used for `oneof` discriminator values.
+fn quote_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn format_value(out: &mut String, value: &Value, depth: usize) {
     match value {
         Value::String(s) => format_string(out, s, depth),
@@ -476,6 +522,20 @@ mod tests {
         assert_eq!(first, second, "formatting is not idempotent");
     }
 
+    #[test]
+    fn test_format_oneof_aligns_arrows_and_roundtrips() {
+        let source = "oneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let formatted = format(&parse(source).unwrap());
+        // Arrows are aligned on the widest quoted value ("postmark" = 10 cols).
+        assert!(
+            formatted.contains("    \"log\"      => emailLog\n"),
+            "arrows should be aligned:\n{formatted}"
+        );
+        assert!(formatted.contains("    \"postmark\" => emailPostmark\n"));
+        roundtrip(source);
+        idempotent(source);
+    }
+
     /// Comment-preserving formatting must reparse cleanly, keep every
     /// comment, and be idempotent.
     fn roundtrip_comments(source: &str) -> String {
@@ -515,6 +575,15 @@ mod tests {
     #[test]
     fn roundtrip_const() {
         roundtrip("const Port = 8080\n");
+    }
+
+    #[test]
+    fn roundtrip_oneof_with_comments() {
+        // Own-line comment before an arm, trailing comment on the header, and
+        // trailing comment on an arm must all survive and be idempotent.
+        roundtrip_comments(
+            "// email transport\noneof email by provider: // tagged\n    // dev default\n    \"log\" => emailLog // no delivery\n    \"postmark\" => emailPostmark\n",
+        );
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub enum TokenKind {
     // Punctuation
     Colon,        // :
     Equals,       // =
+    FatArrow,     // =>
     Dash,         // -
     Pipe,         // |
     Dot,          // .
@@ -167,9 +168,15 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 '=' => {
-                    let bp = self.byte_pos();
-                    tokens.push(Token::new(TokenKind::Equals, Span::new(bp, bp + 1)));
-                    self.pos += 1;
+                    if self.peek_char() == Some('>') {
+                        let span = Span::new(self.byte_pos(), self.byte_pos_at(self.pos + 2));
+                        tokens.push(Token::new(TokenKind::FatArrow, span));
+                        self.pos += 2;
+                    } else {
+                        let bp = self.byte_pos();
+                        tokens.push(Token::new(TokenKind::Equals, Span::new(bp, bp + 1)));
+                        self.pos += 1;
+                    }
                 }
                 '-' => {
                     if self.peek_char().is_some_and(|c| c.is_ascii_digit()) {
@@ -1203,6 +1210,34 @@ mod tests {
                 TokenKind::Identifier("member".into()),
                 TokenKind::Equals,
                 TokenKind::Role("@user/test@example.com".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_fat_arrow_token() {
+        let tokens = lex("\"postmark\" => emailPostmark");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::StringLiteral("postmark".into()),
+                TokenKind::FatArrow,
+                TokenKind::Identifier("emailPostmark".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_equals_not_confused_with_fat_arrow() {
+        let tokens = lex("x = 1");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Identifier("x".into()),
+                TokenKind::Equals,
+                TokenKind::NumberLiteral(crate::types::Number::Int(1)),
                 TokenKind::Eof,
             ]
         );

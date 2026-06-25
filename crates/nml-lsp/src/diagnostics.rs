@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use nml_core::ast::*;
-use nml_core::model::{EnumDef, ModelDef};
+use nml_core::model::{EnumDef, ModelDef, OneOfDef};
 use nml_core::types::{TemplateSegment, Value};
 use nml_validate::diagnostics::Severity;
 use nml_validate::schema::{MembershipSemantics, SchemaValidator};
@@ -53,6 +53,7 @@ pub fn compute(
     source: &str,
     models: &[ModelDef],
     enums: &[EnumDef],
+    oneofs: &[OneOfDef],
     config: &DiagnosticConfig,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
@@ -75,10 +76,11 @@ pub fn compute(
                 diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
             }
 
-            if !models.is_empty() || !enums.is_empty() {
-                let validator = SchemaValidator::new(models.to_vec(), enums.to_vec())
-                    .with_modifiers(config.modifiers.clone())
-                    .with_membership_semantics(config.membership.clone());
+            if !models.is_empty() || !enums.is_empty() || !oneofs.is_empty() {
+                let validator =
+                    SchemaValidator::new(models.to_vec(), enums.to_vec(), oneofs.to_vec())
+                        .with_modifiers(config.modifiers.clone())
+                        .with_membership_semantics(config.membership.clone());
                 for diag in validator.validate(&file) {
                     if let Some(span) = diag.span {
                         diagnostics.push(Diagnostic {
@@ -166,6 +168,9 @@ fn validate_templates(
                     validate_list_item_templates(item, decl, valid_ns, config, line_index, diags);
                 }
             }
+            // `oneof` arms hold only discriminator literals and model names;
+            // there are no template-bearing values to validate.
+            DeclarationKind::OneOf(_) => {}
         }
     }
 }
@@ -301,7 +306,7 @@ mod tests {
     #[test]
     fn valid_source_no_diagnostics() {
         let source = "service Svc:\n    localMount = \"/\"\n";
-        let diags = compute(source, &[], &[], &default_config());
+        let diags = compute(source, &[], &[], &[], &default_config());
         assert!(
             diags.is_empty(),
             "valid source should produce no diagnostics: {:?}",
@@ -312,7 +317,7 @@ mod tests {
     #[test]
     fn parse_error_produces_diagnostic() {
         let source = "service\n";
-        let diags = compute(source, &[], &[], &default_config());
+        let diags = compute(source, &[], &[], &[], &default_config());
         assert!(!diags.is_empty(), "parse error should produce diagnostics");
         assert!(diags
             .iter()
@@ -323,7 +328,7 @@ mod tests {
     fn duplicate_decl_produces_diagnostic() {
         let source =
             "service Svc:\n    localMount = \"/\"\n\nservice Svc:\n    localMount = \"/other\"\n";
-        let diags = compute(source, &[], &[], &default_config());
+        let diags = compute(source, &[], &[], &[], &default_config());
         assert!(
             diags.iter().any(|d| d.message.contains("duplicate")),
             "duplicate declarations should be flagged: {:?}",
@@ -334,7 +339,7 @@ mod tests {
     #[test]
     fn const_cycle_produces_diagnostic() {
         let source = "const A = B\nconst B = A\n";
-        let diags = compute(source, &[], &[], &default_config());
+        let diags = compute(source, &[], &[], &[], &default_config());
         assert!(
             diags
                 .iter()
@@ -347,7 +352,7 @@ mod tests {
     #[test]
     fn const_chain_without_cycle_not_flagged() {
         let source = "const A = 1\nconst B = A\n";
-        let diags = compute(source, &[], &[], &default_config());
+        let diags = compute(source, &[], &[], &[], &default_config());
         assert!(
             !diags
                 .iter()
@@ -367,7 +372,7 @@ mod tests {
         let config = config_with_namespaces(&["args"]);
 
         let find_range = |source: &str| {
-            compute(source, &[], &[], &config)
+            compute(source, &[], &[], &[], &config)
                 .into_iter()
                 .find(|d| d.message.contains("unknown template namespace 'foo'"))
                 .expect("namespace diagnostic expected")
@@ -386,7 +391,7 @@ mod tests {
     #[test]
     fn unresolved_ref_produces_diagnostic() {
         let source = "workflow W:\n    provider = NonExistent\n";
-        let diags = compute(source, &[], &[], &default_config());
+        let diags = compute(source, &[], &[], &[], &default_config());
         assert!(
             diags.iter().any(|d| d.message.contains("unresolved")),
             "unresolved references should be flagged: {:?}",
@@ -405,7 +410,7 @@ mod tests {
     fn valid_template_namespace_no_diagnostic() {
         let source = "service Svc:\n    instructions = \"{{args.instructions}} base\"\n";
         let config = config_with_namespaces(&["args", "steps"]);
-        let diags = compute(source, &[], &[], &config);
+        let diags = compute(source, &[], &[], &[], &config);
         assert!(
             !diags.iter().any(|d| d.message.contains("namespace")),
             "valid namespace should not be flagged: {:?}",
@@ -416,7 +421,7 @@ mod tests {
     #[test]
     fn empty_namespaces_accepts_all() {
         let source = "service Svc:\n    val = \"{{anything.goes}} ok\"\n";
-        let diags = compute(source, &[], &[], &default_config());
+        let diags = compute(source, &[], &[], &[], &default_config());
         assert!(
             !diags.iter().any(|d| d.message.contains("namespace")),
             "empty namespace config should accept all namespaces: {:?}",
@@ -428,7 +433,7 @@ mod tests {
     fn unknown_namespace_flagged_when_configured() {
         let source = "service Svc:\n    val = \"{{foo.bar}} baz\"\n";
         let config = config_with_namespaces(&["args", "steps"]);
-        let diags = compute(source, &[], &[], &config);
+        let diags = compute(source, &[], &[], &[], &config);
         assert!(
             diags
                 .iter()
@@ -474,7 +479,7 @@ mod tests {
             "                system = \"{{steps.nonexistent.intent}} generate\"\n",
         );
         let config = config_with_namespaces(&["args", "steps"]);
-        let diags = compute(source, &[], &[], &config);
+        let diags = compute(source, &[], &[], &[], &config);
         assert!(
             !diags
                 .iter()
@@ -495,7 +500,7 @@ mod tests {
             language_extension: Some(Arc::new(ext)),
             ..Default::default()
         };
-        let diags = compute(source, &[], &[], &config);
+        let diags = compute(source, &[], &[], &[], &config);
         assert!(
             !diags
                 .iter()
@@ -516,7 +521,7 @@ mod tests {
             language_extension: Some(Arc::new(ext)),
             ..Default::default()
         };
-        let diags = compute(source, &[], &[], &config);
+        let diags = compute(source, &[], &[], &[], &config);
         assert!(
             diags
                 .iter()
@@ -537,7 +542,7 @@ mod tests {
             "        - respond:\n",
             "            provider = \"groq\"\n",
         );
-        let diags = compute(source, &[], &[], &default_config());
+        let diags = compute(source, &[], &[], &[], &default_config());
         assert!(
             !diags.iter().any(|d| d.message.contains("unresolved")),
             "valid bare step refs should not produce diagnostics: {:?}",
@@ -554,7 +559,7 @@ mod tests {
             "        - start:\n",
             "            next = nonexistent\n",
         );
-        let diags = compute(source, &[], &[], &default_config());
+        let diags = compute(source, &[], &[], &[], &default_config());
         assert!(
             diags
                 .iter()

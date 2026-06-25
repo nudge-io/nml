@@ -63,6 +63,36 @@ pub enum DeclarationKind {
     Const(ConstDecl),
     /// A template: `template Name: <string value>`
     Template(TemplateDecl),
+    /// A discriminated union of models: `oneof Name by <field>: "v" => Model ...`
+    OneOf(OneOfDecl),
+}
+
+/// A discriminated-union declaration:
+/// ```text
+/// oneof email by provider:
+///     "log"      => emailLog
+///     "postmark" => emailPostmark
+/// ```
+/// Each arm binds a discriminator value to a variant model. The discriminator
+/// field is owned by the union; an instance block carries it flat alongside the
+/// selected variant's fields.
+#[derive(Debug, Clone, Serialize)]
+pub struct OneOfDecl {
+    pub name: Identifier,
+    /// The field whose value selects the variant (the `by` clause).
+    pub discriminator: Identifier,
+    pub arms: Vec<OneOfArm>,
+}
+
+/// One `"value" => ModelName` arm of a [`OneOfDecl`].
+#[derive(Debug, Clone, Serialize)]
+pub struct OneOfArm {
+    /// Discriminator value that selects this variant.
+    pub value: String,
+    /// Span of the value literal (for diagnostics).
+    pub value_span: Span,
+    /// Variant model selected by `value`.
+    pub model: Identifier,
 }
 
 /// A constant declaration: `const Name = value`.

@@ -142,6 +142,10 @@ impl<'src> Parser<'src> {
             });
         }
 
+        if keyword.name == "oneof" {
+            return self.parse_oneof_declaration(start_span, name);
+        }
+
         let extends = self.parse_extends_clause()?;
 
         if self.check(TokenKind::Colon) {
@@ -182,6 +186,95 @@ impl<'src> Parser<'src> {
 
     fn parse_declaration_name(&mut self) -> NmlResult<Identifier> {
         self.expect_identifier()
+    }
+
+    /// Parse a discriminated-union declaration after the `oneof` keyword and
+    /// name have been consumed:
+    /// ```text
+    /// oneof Name by <discriminator>:
+    ///     "value" => ModelName
+    ///     ...
+    /// ```
+    fn parse_oneof_declaration(
+        &mut self,
+        start_span: Span,
+        name: Identifier,
+    ) -> NmlResult<Declaration> {
+        // `by <discriminator>` (contextual keyword, mirrors `is`).
+        if !self.peek_kind_matches(|k| matches!(k, TokenKind::Identifier(s) if s == "by")) {
+            return Err(NmlError::parse(
+                format!(
+                    "expected 'by <discriminator>' after 'oneof {}'",
+                    name.name
+                ),
+                self.current_span(),
+            ));
+        }
+        self.advance(); // consume `by`
+        let discriminator = self.expect_identifier()?;
+
+        self.expect_kind(TokenKind::Colon)?;
+        self.skip_newlines();
+        self.expect_kind(TokenKind::Indent)?;
+
+        let mut arms = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.check(TokenKind::Dedent) {
+                self.advance();
+                break;
+            }
+            if self.at_eof() {
+                return Err(NmlError::parse(
+                    format!("unterminated 'oneof {}' (expected dedent)", name.name),
+                    self.current_span(),
+                ));
+            }
+            arms.push(self.parse_oneof_arm()?);
+        }
+
+        if arms.is_empty() {
+            return Err(NmlError::parse(
+                format!("'oneof {}' must declare at least one variant", name.name),
+                start_span,
+            ));
+        }
+
+        let end_span = self.prev_span();
+        Ok(Declaration {
+            kind: DeclarationKind::OneOf(OneOfDecl {
+                name,
+                discriminator,
+                arms,
+            }),
+            span: start_span.merge(end_span),
+        })
+    }
+
+    /// Parse one `"value" => ModelName` arm.
+    fn parse_oneof_arm(&mut self) -> NmlResult<OneOfArm> {
+        let value_span = self.current_span();
+        let value = match self.peek_kind() {
+            Some(TokenKind::StringLiteral(s)) => {
+                let s = s.clone();
+                self.advance();
+                s
+            }
+            _ => {
+                return Err(NmlError::parse(
+                    "expected a quoted discriminator value (e.g. \"postmark\") in oneof arm",
+                    value_span,
+                ));
+            }
+        };
+        self.expect_kind(TokenKind::FatArrow)?;
+        let model = self.expect_identifier()?;
+        self.skip_newlines();
+        Ok(OneOfArm {
+            value,
+            value_span,
+            model,
+        })
     }
 
     /// Parse an optional `is Parent1, Parent2` clause after a declaration name.
@@ -896,6 +989,41 @@ mod tests {
             }
             _ => panic!("expected template declaration"),
         }
+    }
+
+    #[test]
+    fn test_parse_oneof_declaration() {
+        let source = "oneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let file = parse(source).unwrap();
+        assert_eq!(file.declarations.len(), 1);
+        match &file.declarations[0].kind {
+            DeclarationKind::OneOf(o) => {
+                assert_eq!(o.name.name, "email");
+                assert_eq!(o.discriminator.name, "provider");
+                assert_eq!(o.arms.len(), 2);
+                assert_eq!(o.arms[0].value, "log");
+                assert_eq!(o.arms[0].model.name, "emailLog");
+                assert_eq!(o.arms[1].value, "postmark");
+                assert_eq!(o.arms[1].model.name, "emailPostmark");
+            }
+            _ => panic!("expected oneof declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_oneof_requires_by() {
+        let err = parse("oneof email:\n    \"log\" => emailLog\n").unwrap_err();
+        assert!(
+            err.message().contains("by <discriminator>"),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_parse_oneof_arm_requires_string_and_arrow() {
+        assert!(parse("oneof email by provider:\n    log => emailLog\n").is_err());
+        assert!(parse("oneof email by provider:\n    \"log\" emailLog\n").is_err());
     }
 
     #[test]
