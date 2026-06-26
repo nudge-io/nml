@@ -194,6 +194,14 @@ impl<'a> Formatter<'a> {
                 self.out.push_str(&oneof.name.name);
                 self.out.push_str(" by ");
                 self.out.push_str(&oneof.discriminator.name);
+                if let Some(type_id) = &oneof.discriminator_type {
+                    self.out.push_str(" as ");
+                    self.out.push_str(&type_id.name);
+                }
+                if let Some(default) = &oneof.default_discriminator {
+                    self.out.push_str(" = ");
+                    format_value(&mut self.out, &default.value, depth);
+                }
                 self.out.push(':');
                 self.emit_trailing_comment(decl.span.start);
                 self.out.push('\n');
@@ -532,6 +540,30 @@ mod tests {
             "arrows should be aligned:\n{formatted}"
         );
         assert!(formatted.contains("    \"postmark\" => emailPostmark\n"));
+        roundtrip(source);
+        idempotent(source);
+    }
+
+    #[test]
+    fn test_format_oneof_default_discriminator_roundtrips() {
+        let source = "oneof email by provider = \"log\":\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let formatted = format(&parse(source).unwrap());
+        assert!(
+            formatted.contains("oneof email by provider = \"log\":"),
+            "default discriminator must survive formatting:\n{formatted}"
+        );
+        roundtrip(source);
+        idempotent(source);
+    }
+
+    #[test]
+    fn test_format_oneof_enum_typed_discriminator_roundtrips() {
+        let source = "oneof email by provider as providerKind = \"log\":\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let formatted = format(&parse(source).unwrap());
+        assert!(
+            formatted.contains("oneof email by provider as providerKind = \"log\":"),
+            "enum type + default must survive formatting:\n{formatted}"
+        );
         roundtrip(source);
         idempotent(source);
     }

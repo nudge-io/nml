@@ -15,6 +15,9 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 
+# RFC drafts (local working docs)
+docs/rfcs/
+
 # VS Code extension
 editors/vscode/node_modules/
 editors/vscode/out/

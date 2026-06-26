@@ -48,6 +48,7 @@
 
 pub mod ast;
 pub mod de;
+pub mod defaults;
 pub mod error;
 pub mod lexer;
 pub mod model;
@@ -57,14 +58,17 @@ pub mod parser;
 pub mod project;
 pub mod query;
 pub mod resolve;
+pub mod schema_index;
 pub mod span;
 pub mod symbols;
 pub mod template;
 pub mod types;
 
+pub use defaults::{apply_defaults, from_block_defaulted, from_body_defaulted};
 pub use lexer::Comment;
 pub use parser::{parse, parse_with_comments};
 pub use project::ProjectConfig;
 pub use query::Document;
 pub use resolve::ValueResolver;
+pub use schema_index::{FieldTarget, SchemaIndex};
 pub use symbols::SymbolTable;

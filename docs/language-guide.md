@@ -378,6 +378,40 @@ required and unknown fields: a missing `serverToken`, or a `serverToken` placed
 on a `"log"` block, is rejected at validation time. The discriminator itself is
 owned by the union, so variant models do not redeclare it.
 
+#### Default discriminator
+
+A `oneof` may declare a **default arm** with `= "value"` after the `by` clause,
+mirroring field-default syntax. When an instance omits the discriminator, the
+default is injected and that variant's defaults are applied — so a fully-defaulted
+block needs no discriminator at all:
+
+```
+oneof email by provider = "log":
+    "log"      => emailLog
+    "postmark" => emailPostmark
+```
+
+The default value must name one of the arms (checked at schema load), and must be
+a quoted string. An explicitly authored discriminator always wins over the default.
+
+#### Enum-typed discriminator
+
+The discriminator may be typed by a declared `enum` with `as`, in which case the
+arms must **exactly** cover the enum's variants — a missing variant or an arm outside
+the enum is rejected at schema load (exhaustiveness):
+
+```
+enum providerKind:
+    - "log"
+    - "postmark"
+
+oneof email by provider as providerKind = "log":
+    "log"      => emailLog
+    "postmark" => emailPostmark
+```
+
+The clauses compose left to right: `by <field> [as <enum>] [= <default>]`.
+
 A `oneof` can be referenced anywhere a model can — as a block keyword, a nested
 field (`email email?`), or a list element (`[]email`). Variant model names must
 be unique, discriminator values must be distinct, and a name cannot be declared

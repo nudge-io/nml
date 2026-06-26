@@ -8,8 +8,9 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use nml_core::ast::*;
-use nml_core::model::{EnumDef, FieldType, ModelDef, OneOfDef};
+use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
 use nml_core::types::Value;
+use nml_core::{FieldTarget, SchemaIndex};
 use nml_validate::schema::MembershipSemantics;
 
 use crate::diagnostics::{self, LanguageExtension};
@@ -1169,21 +1170,27 @@ fn summarize_body(body: &Body) -> String {
 
 /// Determine if the cursor is in a value position for a ModelRef field.
 /// Returns the target model name (e.g. "step", "tool") if applicable.
-fn find_model_ref_type_at(source: &str, pos: Position, models: &[ModelDef]) -> Option<String> {
+/// At a value position (`<prop> = <here>`), the model-ref name the field's type expects, so
+/// declarations of that model can be offered. Built on the shared cursor-context walk
+/// ([`find_model_body_at`]) — which resolves the enclosing model at **any** nesting depth — so
+/// this works inside nested bodies too (the former top-level-only `find_enclosing_block_keyword`
+/// + flat `models.find` path is removed). Takes the parsed `&File` (parse-once).
+fn find_model_ref_type_at(
+    file: &File,
+    source: &str,
+    pos: Position,
+    index: &SchemaIndex,
+    line_index: &LineIndex,
+) -> Option<String> {
     let line = position::line_at(source, pos.line)?;
     let end = position::utf16_to_byte(line, pos.character);
-
     let eq_pos = line[..end].find('=')?;
     let prop_name = line[..eq_pos].trim();
     if prop_name.is_empty() {
         return None;
     }
 
-    let file = nml_core::parse(source).ok()?;
-    let line_index = LineIndex::new(source);
-    let keyword = find_enclosing_block_keyword(&file, pos, &line_index)?;
-
-    let model = models.iter().find(|m| m.name == keyword)?;
+    let (model, _body) = find_model_body_at(file, pos, index, line_index)?;
     let field = model.fields.iter().find(|f| f.name == prop_name)?;
 
     match &field.field_type {
@@ -1192,6 +1199,184 @@ fn find_model_ref_type_at(source: &str, pos: Position, models: &[ModelDef]) -> O
             FieldType::ModelRef(ref_name) => Some(ref_name.clone()),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+// ── Schema-driven field completion (RFC 0003) ─────────────────────────────────
+
+/// Resolve the model whose fields are valid at the cursor's body, **and that body** (so the
+/// caller excludes already-present fields without re-walking). The schema-driven dual of
+/// [`find_model_ref_type_at`]: that resolves a *field's value type*; this resolves the
+/// *enclosing body's model* so its fields can be completed.
+///
+/// Resolves the **top-level** block the cursor sits in (`resolve_ref(keyword)`), then
+/// **recursively descends** to the innermost body the cursor is in — through nested
+/// model-typed fields (`prompt:`), list items (`steps:` → `- step:`), and `oneof` variants
+/// (selected from the body's discriminator). `None` when no schema model applies (unknown
+/// keyword / free-form `object` / a union whose discriminator is unset), or the cursor is on a
+/// header line.
+fn find_model_body_at<'i, 'f>(
+    file: &'f File,
+    pos: Position,
+    index: &'i SchemaIndex,
+    line_index: &LineIndex,
+) -> Option<(&'i ModelDef, &'f Body)> {
+    let block = file.declarations.iter().find_map(|decl| {
+        let range = span_to_range(decl.span, line_index);
+        // Strictly inside the body — `pos.line > start` excludes the `keyword Name:` header.
+        if pos.line > range.start.line && pos.line <= range.end.line {
+            if let DeclarationKind::Block(b) = &decl.kind {
+                return Some(b);
+            }
+        }
+        None
+    })?;
+    let FieldTarget::Model(model) = index.resolve_ref(&block.keyword.name) else {
+        return None;
+    };
+    descend_to_cursor(model, &block.body, pos, index, line_index)
+}
+
+/// From a `(model, body)` known to contain the cursor, descend to the innermost body the
+/// cursor is in and the model whose fields are valid there. Recurses through nested
+/// model-typed fields and list-of-model items. Returns `None` (no field suggestions) if the
+/// cursor is inside a sub-body that resolves to no concrete model.
+fn descend_to_cursor<'i, 'f>(
+    model: &'i ModelDef,
+    body: &'f Body,
+    pos: Position,
+    index: &'i SchemaIndex,
+    line_index: &LineIndex,
+) -> Option<(&'i ModelDef, &'f Body)> {
+    for entry in &body.entries {
+        let BodyEntryKind::NestedBlock(nested) = &entry.kind else {
+            continue;
+        };
+        let range = span_to_range(entry.span, line_index);
+        // Cursor strictly inside this nested block's body (not on its `name:` header).
+        if pos.line <= range.start.line || pos.line > range.end.line {
+            continue;
+        }
+        let field = model.fields.iter().find(|f| f.name == nested.name.name)?;
+        return match index.resolve_field(field) {
+            FieldTarget::Model(child) => {
+                descend_to_cursor(child, &nested.body, pos, index, line_index)
+            }
+            // A list-of-model field: the nested body holds list items — descend into the one
+            // containing the cursor, as the item model.
+            FieldTarget::ListOf(inner) => {
+                let FieldTarget::Model(item_model) = inner.as_ref() else {
+                    return None;
+                };
+                let item = nested.body.entries.iter().find_map(|e| match &e.kind {
+                    BodyEntryKind::ListItem(item) => {
+                        let r = span_to_range(item.span, line_index);
+                        (pos.line > r.start.line && pos.line <= r.end.line).then_some(item)
+                    }
+                    _ => None,
+                })?;
+                let ListItemKind::Named { body: item_body, .. } = &item.kind else {
+                    return None;
+                };
+                descend_to_cursor(item_model, item_body, pos, index, line_index)
+            }
+            // A `oneof` field: select the variant from the body's discriminator and descend
+            // into the same body as that variant model. This is variant-field completion.
+            FieldTarget::OneOf(oneof) => {
+                let variant = resolve_oneof_variant(oneof, &nested.body, index)?;
+                descend_to_cursor(variant, &nested.body, pos, index, line_index)
+            }
+            // union / object / leaf → no concrete model to complete here.
+            _ => None,
+        };
+    }
+    Some((model, body))
+}
+
+/// Resolve a `oneof` instance body to its variant model: read the discriminator value the
+/// body sets (or the schema default), match it to an arm, and resolve that variant. `None`
+/// when no discriminator is set/defaulted or it names no arm — an unresolved union, so no
+/// fields to offer.
+fn resolve_oneof_variant<'i>(
+    oneof: &OneOfDef,
+    body: &Body,
+    index: &'i SchemaIndex,
+) -> Option<&'i ModelDef> {
+    let value = body
+        .entries
+        .iter()
+        .find_map(|e| match &e.kind {
+            BodyEntryKind::Property(p) if p.name.name == oneof.discriminator => {
+                p.value.value.as_str().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .or_else(|| oneof.default_discriminator.clone())?;
+    let (_, variant_model) = oneof.variants.iter().find(|(v, _)| *v == value)?;
+    match index.resolve_ref(variant_model) {
+        FieldTarget::Model(m) => Some(m),
+        _ => None,
+    }
+}
+
+/// Property/block names already present in `body` — excluded from field suggestions so a
+/// field set once is not re-offered.
+fn present_field_names(body: &Body) -> HashSet<String> {
+    body.entries
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            BodyEntryKind::Property(prop) => Some(prop.name.name.clone()),
+            BodyEntryKind::NestedBlock(nested) => Some(nested.name.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `detail` for a field completion — the NML type as authored, with `?` for optional.
+fn field_detail(field: &FieldDef) -> String {
+    format!(
+        "{}{}",
+        field.field_type,
+        if field.optional { "?" } else { "" }
+    )
+}
+
+/// Sort key: required fields first, then schema declaration order (`idx`).
+fn field_sort_key(field: &FieldDef, idx: usize) -> String {
+    format!("{}_{idx:04}", u8::from(field.optional))
+}
+
+/// `insert_text`: `<field> = ` for a scalar/leaf field, `<field>:` for a model/oneof/list/
+/// object field (which is authored as a block) — a blanket `= ` would be wrong for blocks.
+fn field_insert_text(index: &SchemaIndex, field: &FieldDef) -> String {
+    match index.resolve_field(field) {
+        FieldTarget::Leaf => format!("{} = ", field.name),
+        _ => format!("{}:", field.name),
+    }
+}
+
+/// When the cursor is at the value position of a `oneof` instance's discriminator
+/// (`<discriminator> = <here>` inside a block whose keyword names the union), return
+/// that `oneof` so its arm keys can be offered as completions.
+fn find_oneof_discriminator_at<'i>(
+    file: &File,
+    source: &str,
+    pos: Position,
+    index: &'i SchemaIndex,
+    line_index: &LineIndex,
+) -> Option<&'i OneOfDef> {
+    let line = position::line_at(source, pos.line)?;
+    let end = position::utf16_to_byte(line, pos.character);
+    let eq_pos = line[..end].find('=')?;
+    let prop_name = line[..eq_pos].trim();
+    if prop_name.is_empty() {
+        return None;
+    }
+
+    let keyword = find_enclosing_block_keyword(file, pos, line_index)?;
+    match index.resolve_ref(&keyword) {
+        FieldTarget::OneOf(oneof) if oneof.discriminator == prop_name => Some(oneof),
         _ => None,
     }
 }
@@ -1601,12 +1786,28 @@ impl LanguageServer for NmlLanguageServer {
                 return Ok(Some(CompletionResponse::Array(items)));
             }
 
-            let model_ref_type = {
+            // Schema-driven value completions (model refs + oneof discriminator arm
+            // keys) share one schema snapshot rather than re-cloning it per detector.
+            let (model_ref_type, discriminator_values): (Option<String>, Option<Vec<String>>) = {
                 let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-                docs.get(&uri).and_then(|source| {
-                    let (models, _, _) = self.models_for_file(&uri);
-                    find_model_ref_type_at(source, pos, &models)
-                })
+                match docs
+                    .get(&uri)
+                    .and_then(|source| Some((source, nml_core::parse(source).ok()?)))
+                {
+                    // Parse once and build one schema index, shared by both detectors.
+                    Some((source, file)) => {
+                        let (models, enums, oneofs) = self.models_for_file(&uri);
+                        let index = SchemaIndex::build(models, enums, oneofs);
+                        let line_index = LineIndex::new(source);
+                        let model_ref =
+                            find_model_ref_type_at(&file, source, pos, &index, &line_index);
+                        let discriminator =
+                            find_oneof_discriminator_at(&file, source, pos, &index, &line_index)
+                                .map(|o| o.variants.iter().map(|(value, _)| value.clone()).collect());
+                        (model_ref, discriminator)
+                    }
+                    None => (None, None),
+                }
             };
 
             if let Some(ref ref_type) = model_ref_type {
@@ -1623,6 +1824,19 @@ impl LanguageServer for NmlLanguageServer {
                 }
             }
 
+            // Inside a `oneof` block, offer the arm keys as discriminator values.
+            if let Some(values) = discriminator_values {
+                for value in values {
+                    items.push(CompletionItem {
+                        label: format!("\"{value}\""),
+                        kind: Some(CompletionItemKind::ENUM_MEMBER),
+                        detail: Some("discriminator value".to_string()),
+                        sort_text: Some(format!("0_{value}")),
+                        ..Default::default()
+                    });
+                }
+            }
+
             let names = self.collect_declaration_names();
             for (name, keyword) in names {
                 items.push(CompletionItem {
@@ -1631,6 +1845,36 @@ impl LanguageServer for NmlLanguageServer {
                     detail: Some(keyword),
                     ..Default::default()
                 });
+            }
+        } else {
+            // Property position (no `=` before the cursor): schema-driven FIELD completion
+            // (RFC 0003) — the dual of the value-position completions above. Offer the
+            // enclosing model's not-yet-present fields, type-aware insertion, required-first.
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(source) = docs.get(&uri) {
+                if let Ok(file) = nml_core::parse(source) {
+                    let (models, enums, oneofs) = self.models_for_file(&uri);
+                    let index = SchemaIndex::build(models, enums, oneofs);
+                    let line_index = LineIndex::new(source);
+                    if let Some((model, body)) =
+                        find_model_body_at(&file, pos, &index, &line_index)
+                    {
+                        let present = present_field_names(body);
+                        for (idx, field) in model.fields.iter().enumerate() {
+                            if present.contains(&field.name) {
+                                continue;
+                            }
+                            items.push(CompletionItem {
+                                label: field.name.clone(),
+                                kind: Some(CompletionItemKind::FIELD),
+                                detail: Some(field_detail(field)),
+                                sort_text: Some(field_sort_key(field, idx)),
+                                insert_text: Some(field_insert_text(&index, field)),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -1861,8 +2105,12 @@ impl LanguageServer for NmlLanguageServer {
 
         if !word.is_empty() {
             let model_ref_type = if !is_prop {
-                let (models, _, _) = self.models_for_file(&uri);
-                find_model_ref_type_at(&source_clone, pos, &models)
+                nml_core::parse(&source_clone).ok().and_then(|file| {
+                    let (models, enums, oneofs) = self.models_for_file(&uri);
+                    let index = SchemaIndex::build(models, enums, oneofs);
+                    let line_index = LineIndex::new(&source_clone);
+                    find_model_ref_type_at(&file, &source_clone, pos, &index, &line_index)
+                })
             } else {
                 None
             };
@@ -3168,39 +3416,220 @@ workflow VoiceAgent:
         assert_eq!(compute_indent_after_line(&lines, 0), 4);
     }
 
-    // ── ModelRef helpers ──────────────────────────────────────────
+    // ── ModelRef + discriminator helpers (share the parse-once / index walk) ──────
+
+    /// Resolve the model-ref type at the cursor via the shared walk (parse-once + index).
+    fn ref_type_at(schema_source: &str, source: &str, pos: Position) -> Option<String> {
+        let index = field_index(schema_source);
+        let file = nml_core::parse(source).unwrap();
+        let line_index = LineIndex::new(source);
+        find_model_ref_type_at(&file, source, pos, &index, &line_index)
+    }
+
+    /// The `oneof` arm keys offered at the cursor, or `None` if not a discriminator position.
+    fn discriminator_arm_keys(
+        schema_source: &str,
+        source: &str,
+        pos: Position,
+    ) -> Option<Vec<String>> {
+        let index = field_index(schema_source);
+        let file = nml_core::parse(source).unwrap();
+        let line_index = LineIndex::new(source);
+        find_oneof_discriminator_at(&file, source, pos, &index, &line_index)
+            .map(|o| o.variants.iter().map(|(v, _)| v.clone()).collect())
+    }
 
     #[test]
     fn model_ref_type_detected_for_step_field() {
-        let schema_source = "model step:\n    provider string?\n\nmodel workflow:\n    next step?\n    entrypoint step\n";
-        let schema = nml_core::model_extract::extract(&nml_core::parse(schema_source).unwrap());
-
+        let schema = "model step:\n    provider string?\n\nmodel workflow:\n    next step?\n    entrypoint step\n";
         let source = "workflow W:\n    next = classify\n";
-        let pos = Position::new(1, 14);
-        let result = find_model_ref_type_at(source, pos, &schema.models);
-        assert_eq!(result, Some("step".to_string()));
+        assert_eq!(
+            ref_type_at(schema, source, Position::new(1, 14)),
+            Some("step".to_string())
+        );
+    }
+
+    #[test]
+    fn oneof_discriminator_completion_offers_arm_keys() {
+        let schema = "model emailLog:\n    x string?\n\nmodel emailPostmark:\n    y string?\n\noneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let source = "email Outbound:\n    provider = \"log\"\n";
+        assert_eq!(
+            discriminator_arm_keys(schema, source, Position::new(1, 20)),
+            Some(vec!["log".to_string(), "postmark".to_string()])
+        );
+    }
+
+    #[test]
+    fn oneof_discriminator_completion_ignores_non_discriminator_field() {
+        let schema = "model emailLog:\n    fromAddress string?\n\noneof email by provider:\n    \"log\" => emailLog\n";
+        // `fromAddress` is a variant field, not the discriminator — no arm-key completion.
+        let source = "email Outbound:\n    fromAddress = \"x\"\n";
+        assert!(discriminator_arm_keys(schema, source, Position::new(1, 19)).is_none());
     }
 
     #[test]
     fn model_ref_type_none_for_primitive_field() {
-        let schema_source = "model workflow:\n    entrypoint string\n";
-        let schema = nml_core::model_extract::extract(&nml_core::parse(schema_source).unwrap());
-
+        let schema = "model workflow:\n    entrypoint string\n";
         let source = "workflow W:\n    entrypoint = \"start\"\n";
-        let pos = Position::new(1, 18);
-        let result = find_model_ref_type_at(source, pos, &schema.models);
-        assert_eq!(result, None);
+        assert_eq!(ref_type_at(schema, source, Position::new(1, 18)), None);
     }
 
     #[test]
     fn model_ref_type_detected_for_list_field() {
-        let schema_source = "model tool:\n    wasm string?\n\nmodel workflow:\n    tools []tool?\n";
-        let schema = nml_core::model_extract::extract(&nml_core::parse(schema_source).unwrap());
-
+        let schema = "model tool:\n    wasm string?\n\nmodel workflow:\n    tools []tool?\n";
         let source = "workflow W:\n    tools = [myTool]\n";
-        let pos = Position::new(1, 14);
-        let result = find_model_ref_type_at(source, pos, &schema.models);
-        assert_eq!(result, Some("tool".to_string()));
+        assert_eq!(
+            ref_type_at(schema, source, Position::new(1, 14)),
+            Some("tool".to_string())
+        );
+    }
+
+    #[test]
+    fn model_ref_type_works_in_nested_body() {
+        // `fallback` is a model-ref field of the *nested* `prompt` model. The former
+        // top-level-only detector returned `None` here; the shared walk (RFC 0003) resolves
+        // it — a capability gain from refactoring `find_model_ref_type_at` onto the walk.
+        let schema = "model prompt:\n    fallback step?\n\nmodel step:\n    name string\n    prompt prompt?\n";
+        let source = "step S:\n    prompt:\n        fallback = other\n";
+        assert_eq!(
+            ref_type_at(schema, source, Position::new(2, 18)),
+            Some("step".to_string())
+        );
+    }
+
+    // ── Field completion (RFC 0003) ───────────────────────────────
+
+    fn field_index(schema_source: &str) -> SchemaIndex {
+        let s = nml_core::model_extract::extract(&nml_core::parse(schema_source).unwrap());
+        SchemaIndex::build(s.models, s.enums, s.oneofs)
+    }
+
+    #[test]
+    fn field_completion_offers_top_level_fields_excluding_present() {
+        let index = field_index(
+            "model provider:\n    type string\n    model string\n    temperature number?\n    baseUrl string?\n",
+        );
+        // `model` and `type` are already set; cursor on a blank body line between them.
+        let source = "provider GroqFast:\n    model = \"llama\"\n\n    type = \"groq\"\n";
+        let file = nml_core::parse(source).unwrap();
+        let line_index = LineIndex::new(source);
+        let (model, body) =
+            find_model_body_at(&file, Position::new(2, 0), &index, &line_index).unwrap();
+        assert_eq!(model.name, "provider");
+        let offered: Vec<&str> = model
+            .fields
+            .iter()
+            .filter(|f| !present_field_names(body).contains(&f.name))
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(offered, vec!["temperature", "baseUrl"]);
+    }
+
+    #[test]
+    fn field_completion_none_on_header_line() {
+        let index = field_index("model provider:\n    type string\n");
+        let source = "provider GroqFast:\n    type = \"x\"\n";
+        let file = nml_core::parse(source).unwrap();
+        let line_index = LineIndex::new(source);
+        // Cursor on the `provider GroqFast:` header (line 0) — not a body position.
+        assert!(find_model_body_at(&file, Position::new(0, 8), &index, &line_index).is_none());
+    }
+
+    #[test]
+    fn field_completion_none_for_unknown_keyword() {
+        let index = field_index("model provider:\n    type string\n");
+        let source = "widget Foo:\n    color = \"red\"\n"; // `widget` is not a declared model
+        let file = nml_core::parse(source).unwrap();
+        let line_index = LineIndex::new(source);
+        assert!(find_model_body_at(&file, Position::new(1, 0), &index, &line_index).is_none());
+    }
+
+    #[test]
+    fn field_insert_text_is_type_aware() {
+        // A scalar field is `f = `; a model-typed field is a block `f:`.
+        let s = nml_core::model_extract::extract(
+            &nml_core::parse("model prompt:\n    system string?\n\nmodel step:\n    name string\n    prompt prompt?\n").unwrap(),
+        );
+        let index = SchemaIndex::build(s.models.clone(), s.enums.clone(), s.oneofs.clone());
+        let step = s.models.iter().find(|m| m.name == "step").unwrap();
+        let name = step.fields.iter().find(|f| f.name == "name").unwrap();
+        let prompt = step.fields.iter().find(|f| f.name == "prompt").unwrap();
+        assert_eq!(field_insert_text(&index, name), "name = ");
+        assert_eq!(field_insert_text(&index, prompt), "prompt:");
+    }
+
+    #[test]
+    fn field_sort_key_orders_required_before_optional() {
+        let s = nml_core::model_extract::extract(
+            &nml_core::parse("model m:\n    req string\n    opt string?\n").unwrap(),
+        );
+        let m = &s.models[0];
+        let req = &m.fields[0];
+        let opt = &m.fields[1];
+        assert!(field_sort_key(req, 0) < field_sort_key(opt, 1));
+    }
+
+    #[test]
+    fn field_completion_descends_into_nested_model_block() {
+        let index = field_index(
+            "model prompt:\n    system string?\n    user string?\n\nmodel step:\n    name string\n    prompt prompt?\n",
+        );
+        // Cursor inside the nested `prompt:` block — should resolve to the `prompt` model.
+        let source = "step S:\n    name = \"x\"\n    prompt:\n        system = \"hi\"\n";
+        let file = nml_core::parse(source).unwrap();
+        let line_index = LineIndex::new(source);
+        let (model, body) =
+            find_model_body_at(&file, Position::new(3, 8), &index, &line_index).unwrap();
+        assert_eq!(model.name, "prompt");
+        let offered: Vec<&str> = model
+            .fields
+            .iter()
+            .filter(|f| !present_field_names(body).contains(&f.name))
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(offered, vec!["user"]); // `system` already present
+    }
+
+    #[test]
+    fn field_completion_resolves_oneof_variant_fields() {
+        // A `email` oneof field; the body's `provider = "postmark"` selects `emailPostmark`,
+        // so its fields are offered (variant-field completion — RFC 0002 §7b, now landed).
+        let index = field_index(concat!(
+            "model emailLog:\n    path string?\n\n",
+            "model emailPostmark:\n    apiKey string?\n    fromAddress string?\n\n",
+            "oneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n\n",
+            "model config:\n    email email?\n",
+        ));
+        let source =
+            "config C:\n    email:\n        provider = \"postmark\"\n        apiKey = \"x\"\n";
+        let file = nml_core::parse(source).unwrap();
+        let line_index = LineIndex::new(source);
+        // Cursor inside the `email` body (the `apiKey` line, property position).
+        let (model, body) =
+            find_model_body_at(&file, Position::new(3, 8), &index, &line_index).unwrap();
+        assert_eq!(model.name, "emailPostmark");
+        let offered: Vec<&str> = model
+            .fields
+            .iter()
+            .filter(|f| !present_field_names(body).contains(&f.name))
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(offered, vec!["fromAddress"]); // `apiKey` present; variant of "postmark"
+    }
+
+    #[test]
+    fn field_completion_descends_into_list_item() {
+        let index = field_index(
+            "model step:\n    name string\n    tag string?\n\nmodel workflow:\n    steps []step?\n",
+        );
+        // Cursor inside the `- classify:` list item — should resolve to the `step` model
+        // (workflow → steps list → step item).
+        let source = "workflow W:\n    steps:\n        - classify:\n            name = \"x\"\n";
+        let file = nml_core::parse(source).unwrap();
+        let line_index = LineIndex::new(source);
+        let (model, _body) =
+            find_model_body_at(&file, Position::new(3, 12), &index, &line_index).unwrap();
+        assert_eq!(model.name, "step");
     }
 
     #[test]
@@ -3447,14 +3876,11 @@ workflow VoiceAgent:
 
     #[test]
     fn model_ref_type_multibyte_value_does_not_panic() {
-        let schema_source = "model workflow:\n    entrypoint string\n";
-        let schema = nml_core::model_extract::extract(&nml_core::parse(schema_source).unwrap());
-
         // Cursor between CJK chars: treating the UTF-16 column as a byte
         // index would slice mid-character and panic.
+        let schema = "model workflow:\n    entrypoint string\n";
         let source = "workflow W:\n    entrypoint = \"日本語テスト\"\n";
-        let pos = Position::new(1, 23);
-        assert_eq!(find_model_ref_type_at(source, pos, &schema.models), None);
+        assert_eq!(ref_type_at(schema, source, Position::new(1, 23)), None);
     }
 
     #[test]

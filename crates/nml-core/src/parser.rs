@@ -213,6 +213,40 @@ impl<'src> Parser<'src> {
         self.advance(); // consume `by`
         let discriminator = self.expect_identifier()?;
 
+        // Optional enum type: `by <discriminator> as <enumName>` (contextual `as`,
+        // mirroring `by`/`is`). The arms must cover the enum (checked at schema load).
+        let discriminator_type =
+            if self.peek_kind_matches(|k| matches!(k, TokenKind::Identifier(s) if s == "as")) {
+                self.advance(); // consume `as`
+                Some(self.expect_identifier()?)
+            } else {
+                None
+            };
+
+        // Optional default discriminator: `by <discriminator> = "value"`. A
+        // discriminator value is always a quoted string (like an arm key), so a
+        // string literal is required here; the value must name an arm (checked at
+        // schema load).
+        let default_discriminator = if self.check(TokenKind::Equals) {
+            self.advance();
+            let span = self.current_span();
+            match self.peek_kind() {
+                Some(TokenKind::StringLiteral(s)) => {
+                    let s = s.clone();
+                    self.advance();
+                    Some(SpannedValue::new(Value::String(s), span))
+                }
+                _ => {
+                    return Err(NmlError::parse(
+                        "expected a quoted default discriminator value (e.g. = \"log\") after 'by'",
+                        span,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         self.expect_kind(TokenKind::Colon)?;
         self.skip_newlines();
         self.expect_kind(TokenKind::Indent)?;
@@ -245,6 +279,8 @@ impl<'src> Parser<'src> {
             kind: DeclarationKind::OneOf(OneOfDecl {
                 name,
                 discriminator,
+                discriminator_type,
+                default_discriminator,
                 arms,
             }),
             span: start_span.merge(end_span),
@@ -1015,6 +1051,50 @@ mod tests {
         let err = parse("oneof email:\n    \"log\" => emailLog\n").unwrap_err();
         assert!(
             err.message().contains("by <discriminator>"),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn test_parse_oneof_with_default_discriminator() {
+        let source = "oneof email by provider = \"log\":\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let file = parse(source).unwrap();
+        match &file.declarations[0].kind {
+            DeclarationKind::OneOf(o) => {
+                assert_eq!(o.discriminator.name, "provider");
+                assert_eq!(
+                    o.default_discriminator.as_ref().map(|v| &v.value),
+                    Some(&Value::String("log".into()))
+                );
+            }
+            _ => panic!("expected oneof declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_oneof_with_enum_typed_discriminator() {
+        let source = "oneof email by provider as providerKind = \"log\":\n    \"log\" => emailLog\n";
+        let file = parse(source).unwrap();
+        match &file.declarations[0].kind {
+            DeclarationKind::OneOf(o) => {
+                assert_eq!(o.discriminator.name, "provider");
+                assert_eq!(o.discriminator_type.as_ref().map(|t| t.name.as_str()), Some("providerKind"));
+                assert_eq!(
+                    o.default_discriminator.as_ref().map(|v| &v.value),
+                    Some(&Value::String("log".into()))
+                );
+            }
+            _ => panic!("expected oneof declaration"),
+        }
+    }
+
+    #[test]
+    fn test_parse_oneof_default_requires_string() {
+        // A non-string default is a parse error (a discriminator value is a string).
+        let err = parse("oneof email by provider = 5:\n    \"log\" => emailLog\n").unwrap_err();
+        assert!(
+            err.message().contains("quoted default discriminator"),
             "got: {}",
             err.message()
         );

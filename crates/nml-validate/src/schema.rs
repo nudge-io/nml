@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
+use nml_core::schema_index::{FieldTarget, SchemaIndex};
 use nml_core::span::Span;
 use nml_core::types::{PrimitiveType, Value};
 
@@ -22,9 +23,7 @@ const MAX_VALIDATION_DEPTH: u32 = 64;
 /// keywords, or built-in references are assumed.  Embedders opt in to
 /// domain-specific checks via builder methods.
 pub struct SchemaValidator {
-    models: Vec<ModelDef>,
-    enums: Vec<EnumDef>,
-    oneofs: Vec<OneOfDef>,
+    index: SchemaIndex,
     valid_modifiers: Vec<String>,
     strict_unknown_fields: bool,
     membership: MembershipSemantics,
@@ -49,13 +48,17 @@ pub struct MembershipSemantics {
 impl SchemaValidator {
     pub fn new(models: Vec<ModelDef>, enums: Vec<EnumDef>, oneofs: Vec<OneOfDef>) -> Self {
         Self {
-            models,
-            enums,
-            oneofs,
+            index: SchemaIndex::build(models, enums, oneofs),
             valid_modifiers: Vec::new(),
             strict_unknown_fields: false,
             membership: MembershipSemantics::default(),
         }
+    }
+
+    /// The schema index backing this validator, for callers that need the shared
+    /// lookup / dispatch primitive (e.g. the defaulting pass).
+    pub fn index(&self) -> &SchemaIndex {
+        &self.index
     }
 
     /// Promote unknown-property diagnostics to errors and reject blocks /
@@ -90,15 +93,15 @@ impl SchemaValidator {
     }
 
     pub fn find_model(&self, name: &str) -> Option<&ModelDef> {
-        self.models.iter().find(|m| m.name == name)
+        self.index.model(name)
     }
 
     pub fn find_enum(&self, name: &str) -> Option<&EnumDef> {
-        self.enums.iter().find(|e| e.name == name)
+        self.index.enum_def(name)
     }
 
     pub fn find_oneof(&self, name: &str) -> Option<&OneOfDef> {
-        self.oneofs.iter().find(|o| o.name == name)
+        self.index.oneof(name)
     }
 
     /// Validate a parsed NML file against the loaded models.
@@ -142,29 +145,16 @@ impl SchemaValidator {
                     );
                 }
             }
+            self.validate_field_defaults(block, diags);
         }
 
         self.validate_body(&block.body, is_schema_def, keyword, diags);
         self.validate_members_builtin_refs(&block.body, keyword, diags);
 
         if !is_schema_def {
-            if let Some(model) = self.find_model(keyword) {
-                self.validate_instance_against_model(
-                    &block.body,
-                    model,
-                    0,
-                    Some(block.name.span),
-                    diags,
-                );
-            } else if let Some(oneof) = self.find_oneof(keyword) {
-                self.validate_instance_against_oneof(
-                    &block.body,
-                    oneof,
-                    0,
-                    Some(block.name.span),
-                    diags,
-                );
-            } else if self.strict_unknown_fields {
+            let resolved =
+                self.validate_ref_instance(keyword, &block.body, 0, Some(block.name.span), diags);
+            if !resolved && self.strict_unknown_fields {
                 diags.push(
                     Diagnostic::error(format!("block keyword '{keyword}' has no model definition"))
                         .with_span(block.keyword.span),
@@ -181,18 +171,13 @@ impl SchemaValidator {
 
         let keyword = &arr.item_keyword.name;
         let is_schema_def = matches!(keyword.as_str(), "model" | "enum");
-        let model = if !is_schema_def {
-            self.find_model(keyword)
-        } else {
-            None
-        };
-        // An array item keyword may name a `oneof` instead of a model, mirroring
-        // the block-keyword dispatch in `validate_block`.
-        let oneof = if !is_schema_def && model.is_none() {
-            self.find_oneof(keyword)
-        } else {
-            None
-        };
+        // An array item keyword may name a model or a `oneof`, mirroring the
+        // block-keyword dispatch in `validate_block` — same single `resolve_ref`.
+        let resolves = !is_schema_def
+            && matches!(
+                self.index.resolve_ref(keyword),
+                FieldTarget::Model(_) | FieldTarget::OneOf(_)
+            );
 
         let has_named_items = arr
             .body
@@ -200,12 +185,7 @@ impl SchemaValidator {
             .iter()
             .any(|i| matches!(&i.kind, ListItemKind::Named { .. }));
 
-        if !is_schema_def
-            && model.is_none()
-            && oneof.is_none()
-            && has_named_items
-            && self.strict_unknown_fields
-        {
+        if !is_schema_def && !resolves && has_named_items && self.strict_unknown_fields {
             diags.push(
                 Diagnostic::error(format!(
                     "array item keyword '{keyword}' has no model or oneof definition"
@@ -219,12 +199,40 @@ impl SchemaValidator {
                 self.validate_body(body, is_schema_def, keyword, diags);
                 self.validate_members_builtin_refs(body, keyword, diags);
 
-                if let Some(model) = model {
-                    self.validate_instance_against_model(body, model, 0, Some(name.span), diags);
-                } else if let Some(oneof) = oneof {
-                    self.validate_instance_against_oneof(body, oneof, 0, Some(name.span), diags);
+                if !is_schema_def {
+                    self.validate_ref_instance(keyword, body, 0, Some(name.span), diags);
                 }
             }
+        }
+    }
+
+    /// Type-check each declared default against its field's type, reusing the
+    /// exact check applied to instance values so default-checking and
+    /// value-checking can never diverge. Only this model's own declared fields
+    /// are checked (inherited fields are checked on their defining model), so a
+    /// default is never reported twice.
+    fn validate_field_defaults(&self, block: &BlockDecl, diags: &mut Vec<Diagnostic>) {
+        let Some(model) = self.find_model(&block.name.name) else {
+            return;
+        };
+        for entry in &block.body.entries {
+            let BodyEntryKind::FieldDefinition(fd) = &entry.kind else {
+                continue;
+            };
+            let Some(default) = &fd.default_value else {
+                continue;
+            };
+            let Some(field) = model.fields.iter().find(|f| f.name == fd.name.name) else {
+                continue;
+            };
+            self.validate_value_against_type(
+                &default.value,
+                &field.field_type,
+                &field.name,
+                "as the default for",
+                default.span,
+                diags,
+            );
         }
     }
 
@@ -274,6 +282,86 @@ impl SchemaValidator {
                 ))
                 .with_span(m.name.span),
             );
+        }
+    }
+
+    /// Validate an instance body against a named type reference — a model or a
+    /// `oneof` — via the shared name→target dispatch. Enum and unknown refs carry
+    /// no instance structure to validate. This is the single place the validator
+    /// turns a `someModel` reference into a nested validation, sharing
+    /// [`SchemaIndex::resolve_ref`] with the defaulting pass so the dispatch has
+    /// one definition.
+    /// Returns whether the reference resolved to a model or `oneof` (callers at
+    /// keyword level use this to emit a strict "no definition" diagnostic).
+    fn validate_ref_instance(
+        &self,
+        ref_name: &str,
+        body: &Body,
+        depth: u32,
+        header_span: Option<Span>,
+        diags: &mut Vec<Diagnostic>,
+    ) -> bool {
+        self.validate_target_instance(self.index.resolve_ref(ref_name), body, depth, header_span, diags)
+    }
+
+    /// Validate `body` against an already-resolved [`FieldTarget`]. The single
+    /// dispatch on a resolved target, shared by keyword/ref dispatch
+    /// ([`Self::validate_ref_instance`]) and union variant selection (via
+    /// [`SchemaIndex::resolve_type_in_body`]). A `ListOf` target validates each
+    /// named item against the item target. Returns whether the target carried
+    /// instance structure (model / oneof / list of those).
+    fn validate_target_instance(
+        &self,
+        target: FieldTarget,
+        body: &Body,
+        depth: u32,
+        header_span: Option<Span>,
+        diags: &mut Vec<Diagnostic>,
+    ) -> bool {
+        match target {
+            FieldTarget::Model(m) => {
+                self.validate_instance_against_model(body, m, depth, header_span, diags);
+                true
+            }
+            FieldTarget::OneOf(o) => {
+                self.validate_instance_against_oneof(body, o, depth, header_span, diags);
+                true
+            }
+            FieldTarget::ListOf(inner) => {
+                for entry in &body.entries {
+                    let BodyEntryKind::ListItem(item) = &entry.kind else {
+                        continue;
+                    };
+                    let ListItemKind::Named {
+                        name,
+                        body: item_body,
+                    } = &item.kind
+                    else {
+                        continue;
+                    };
+                    match inner.as_ref() {
+                        FieldTarget::Model(m) => self
+                            .validate_instance_against_model(
+                                item_body,
+                                m,
+                                depth,
+                                Some(name.span),
+                                diags,
+                            ),
+                        FieldTarget::OneOf(o) => self
+                            .validate_instance_against_oneof(
+                                item_body,
+                                o,
+                                depth,
+                                Some(name.span),
+                                diags,
+                            ),
+                        _ => {}
+                    }
+                }
+                true
+            }
+            FieldTarget::Object | FieldTarget::Union | FieldTarget::Leaf => false,
         }
     }
 
@@ -332,101 +420,31 @@ impl SchemaValidator {
                     if let Some(field_def) = model.fields.iter().find(|f| f.name == nb.name.name) {
                         match &field_def.field_type {
                             FieldType::ModelRef(ref_name) => {
-                                if let Some(nested_model) = self.find_model(ref_name) {
-                                    self.validate_instance_against_model(
-                                        &nb.body,
-                                        nested_model,
-                                        depth + 1,
-                                        Some(nb.name.span),
-                                        diags,
-                                    );
-                                } else if let Some(oneof) = self.find_oneof(ref_name) {
-                                    self.validate_instance_against_oneof(
-                                        &nb.body,
-                                        oneof,
-                                        depth + 1,
-                                        Some(nb.name.span),
-                                        diags,
-                                    );
-                                }
+                                self.validate_ref_instance(
+                                    ref_name,
+                                    &nb.body,
+                                    depth + 1,
+                                    Some(nb.name.span),
+                                    diags,
+                                );
                             }
                             FieldType::List(inner) => {
+                                // Each named item resolves its inner type against
+                                // its own body (so a `(a | b)` union variant is
+                                // picked per item) via the shared dispatch; a
+                                // `ModelRef` inner resolves body-independently.
                                 for entry in &nb.body.entries {
                                     if let BodyEntryKind::ListItem(item) = &entry.kind {
                                         if let ListItemKind::Named { name, body } = &item.kind {
-                                            match inner.as_ref() {
-                                                FieldType::ModelRef(ref_name) => {
-                                                    if let Some(inner_model) =
-                                                        self.find_model(ref_name)
-                                                    {
-                                                        self.validate_instance_against_model(
-                                                            body,
-                                                            inner_model,
-                                                            depth + 1,
-                                                            Some(name.span),
-                                                            diags,
-                                                        );
-                                                    } else if let Some(oneof) =
-                                                        self.find_oneof(ref_name)
-                                                    {
-                                                        self.validate_instance_against_oneof(
-                                                            body,
-                                                            oneof,
-                                                            depth + 1,
-                                                            Some(name.span),
-                                                            diags,
-                                                        );
-                                                    }
-                                                }
-                                                FieldType::Union(variants) => {
-                                                    let has_list_items =
-                                                        body.entries.iter().any(|e| {
-                                                            matches!(
-                                                                &e.kind,
-                                                                BodyEntryKind::ListItem(_)
-                                                            )
-                                                        });
-                                                    for variant in variants {
-                                                        match variant {
-                                                            FieldType::ModelRef(ref_name)
-                                                                if !has_list_items =>
-                                                            {
-                                                                if let Some(m) =
-                                                                    self.find_model(ref_name)
-                                                                {
-                                                                    self.validate_instance_against_model(body, m, depth + 1, Some(name.span), diags);
-                                                                }
-                                                                break;
-                                                            }
-                                                            FieldType::List(list_inner)
-                                                                if has_list_items =>
-                                                            {
-                                                                if let FieldType::ModelRef(
-                                                                    ref_name,
-                                                                ) = list_inner.as_ref()
-                                                                {
-                                                                    if let Some(m) =
-                                                                        self.find_model(ref_name)
-                                                                    {
-                                                                        for sub_entry in
-                                                                            &body.entries
-                                                                        {
-                                                                            if let BodyEntryKind::ListItem(sub_item) = &sub_entry.kind {
-                                                                                if let ListItemKind::Named { name: sub_name, body: sub_body } = &sub_item.kind {
-                                                                                    self.validate_instance_against_model(sub_body, m, depth + 1, Some(sub_name.span), diags);
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                                break;
-                                                            }
-                                                            _ => {}
-                                                        }
-                                                    }
-                                                }
-                                                _ => {}
-                                            }
+                                            let target =
+                                                self.index.resolve_type_in_body(inner, body);
+                                            self.validate_target_instance(
+                                                target,
+                                                body,
+                                                depth + 1,
+                                                Some(name.span),
+                                                diags,
+                                            );
                                         }
                                     }
                                 }
@@ -523,6 +541,24 @@ impl SchemaValidator {
         });
 
         let Some(discriminator) = discriminator else {
+            // An omitted discriminator is valid when the union declares a default —
+            // the defaulting pass injects it. Validate the body against the default
+            // variant so validation agrees with defaulting. (The default is
+            // guaranteed to name an arm by `find_oneof_errors`.)
+            if let Some(default) = &oneof.default_discriminator {
+                if let Some((_, model_name)) = oneof.variants.iter().find(|(v, _)| v == default) {
+                    if let Some(variant_model) = self.find_model(model_name) {
+                        self.validate_instance_against_model(
+                            body,
+                            variant_model,
+                            depth,
+                            header_span,
+                            diags,
+                        );
+                    }
+                }
+                return;
+            }
             diags.push(
                 Diagnostic::error(format!(
                     "missing discriminator '{disc}' for oneof '{name}'; set `{disc} = <one of: {values}>`",
@@ -2881,5 +2917,87 @@ workflow W:
             errs.is_empty(),
             "[]oneof list items should validate per-variant: {errs:?}"
         );
+    }
+
+    #[test]
+    fn oneof_omitted_discriminator_with_default_validates() {
+        // A `oneof` with a default arm: omitting the discriminator is valid (the
+        // defaulter injects it), so the validator must agree and check the default
+        // variant rather than reporting a missing discriminator.
+        let schema = "model emailLog:\n    level string?\n\nmodel emailPostmark:\n    serverToken string\n\noneof email by provider = \"log\":\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let validator = make_validator(schema);
+        let doc = parser::parse("email Outbound:\n    level = \"info\"\n").unwrap();
+        let errors: Vec<_> = validator
+            .validate(&doc)
+            .into_iter()
+            .filter(|d| matches!(d.severity, Severity::Error))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "omitted discriminator with a default should validate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn oneof_omitted_discriminator_without_default_still_errors() {
+        // Without a default, an omitted discriminator remains an error.
+        let schema = "model emailLog:\n    level string?\n\noneof email by provider:\n    \"log\" => emailLog\n";
+        let validator = make_validator(schema);
+        let doc = parser::parse("email Outbound:\n    level = \"info\"\n").unwrap();
+        assert!(
+            validator
+                .validate(&doc)
+                .iter()
+                .any(|d| d.message.contains("missing discriminator")),
+            "omitted discriminator without a default must error"
+        );
+    }
+
+    #[test]
+    fn type_mismatched_default_is_rejected() {
+        let src = "model cfg:\n    count number = \"high\"\n";
+        let file = parser::parse(src).unwrap();
+        let schema = model_extract::extract(&file);
+        let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
+        let diags = validator.validate(&file);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("as the default for") && d.message.contains("count")),
+            "expected a default type-mismatch diagnostic; got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn valid_typed_defaults_pass() {
+        // duration accepts a string literal; an `$ENV` secret default is lenient;
+        // a numeric default matches a number field — all reuse the value check.
+        let src = "model cfg:\n    sessionDuration duration = \"24h\"\n    apiKey secret = $ENV.KEY\n    retries number = 3\n";
+        let file = parser::parse(src).unwrap();
+        let schema = model_extract::extract(&file);
+        let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
+        let errors: Vec<_> = validator
+            .validate(&file)
+            .into_iter()
+            .filter(|d| matches!(d.severity, Severity::Error))
+            .collect();
+        assert!(errors.is_empty(), "valid typed defaults should pass: {errors:?}");
+    }
+
+    #[test]
+    fn inherited_default_not_double_reported() {
+        // A bad default on a parent is reported once (on the parent), not again
+        // on each child that inherits it.
+        let src = "model base:\n    count number = \"high\"\n\nmodel child is base:\n    extra string = \"x\"\n";
+        let file = parser::parse(src).unwrap();
+        let mut schema = model_extract::extract(&file);
+        model_extract::resolve_model_inheritance(&mut schema);
+        let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
+        let count = validator
+            .validate(&file)
+            .iter()
+            .filter(|d| d.message.contains("as the default for") && d.message.contains("count"))
+            .count();
+        assert_eq!(count, 1, "inherited bad default must be reported exactly once");
     }
 }

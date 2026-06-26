@@ -81,6 +81,12 @@ pub struct OneOfDecl {
     pub name: Identifier,
     /// The field whose value selects the variant (the `by` clause).
     pub discriminator: Identifier,
+    /// Optional enum type for the discriminator (`by provider as providerKind`). When
+    /// present, the arm keys must exactly cover the enum's variants (checked at load).
+    pub discriminator_type: Option<Identifier>,
+    /// Optional default discriminator value (`by provider = "log"`), injected when
+    /// an instance omits the discriminator. Must name one of the `arms`.
+    pub default_discriminator: Option<SpannedValue>,
     pub arms: Vec<OneOfArm>,
 }
 

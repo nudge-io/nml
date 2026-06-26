@@ -102,6 +102,23 @@ impl SymbolTable {
         }
     }
 
+    /// Snapshot every `const` to its fully chain-resolved value, dropping cyclic
+    /// references (which resolve to nothing — same as [`Self::resolve_const_value`]).
+    ///
+    /// Produces an owned map suitable for a `'static` const lookup, e.g.
+    /// `ValueResolver::env().with_symbols(move |name| snapshot.get(name).cloned())`,
+    /// so deserialization resolves `Value::Reference` consts the same way the
+    /// hand-written `resolve_string` does.
+    pub fn resolved_const_snapshot(&self) -> HashMap<String, Value> {
+        self.const_values
+            .keys()
+            .filter_map(|name| {
+                self.resolve_const_value(name)
+                    .map(|value| (name.clone(), value.clone()))
+            })
+            .collect()
+    }
+
     /// Look up a declaration name, returning every declaration that uses it
     /// (more than one indicates a duplicate).
     pub fn lookup(&self, name: &str) -> Option<&[DeclInfo]> {
@@ -572,6 +589,22 @@ mod tests {
             Some(&Value::String("hello".into()))
         );
         assert_eq!(symbols.resolve_const_value("Missing"), None);
+    }
+
+    #[test]
+    fn test_resolved_const_snapshot_chain_resolves_and_drops_cycles() {
+        let source = "const A = B\n\nconst B = \"hello\"\n\nconst C = D\n\nconst D = C\n";
+        let file = parser::parse(source).unwrap();
+        let mut symbols = SymbolTable::new();
+        symbols.register_file(&file);
+
+        let snapshot = symbols.resolved_const_snapshot();
+        // A and B both chain-resolve to "hello".
+        assert_eq!(snapshot.get("A"), Some(&Value::String("hello".into())));
+        assert_eq!(snapshot.get("B"), Some(&Value::String("hello".into())));
+        // The C/D cycle is dropped (resolves to nothing).
+        assert!(!snapshot.contains_key("C"));
+        assert!(!snapshot.contains_key("D"));
     }
 
     #[test]

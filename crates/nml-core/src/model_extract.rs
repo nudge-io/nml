@@ -47,6 +47,13 @@ fn extract_oneof(decl: &OneOfDecl, span: crate::span::Span) -> OneOfDef {
     OneOfDef {
         name: decl.name.name.clone(),
         discriminator: decl.discriminator.name.clone(),
+        discriminator_type: decl.discriminator_type.as_ref().map(|id| id.name.clone()),
+        // The parser requires a string literal for the default discriminator, so
+        // `as_str` always succeeds; this is a total, defensive extraction.
+        default_discriminator: decl
+            .default_discriminator
+            .as_ref()
+            .and_then(|v| v.value.as_str().map(str::to_string)),
         variants: decl
             .arms
             .iter()
@@ -66,35 +73,77 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<NmlError> {
     let mut errors = Vec::new();
 
     for oneof in &schema.oneofs {
+        // Every diagnostic for this union points at its declaration span.
+        let err = |message: String| NmlError::Validation {
+            message,
+            span: oneof.span,
+        };
+
         if model_names.contains(oneof.name.as_str()) || enum_names.contains(oneof.name.as_str()) {
-            errors.push(NmlError::Validation {
-                message: format!(
-                    "name '{}' is declared as both a oneof and a model/enum; names must be unique across model/enum/oneof",
-                    oneof.name
-                ),
-                span: oneof.span,
-            });
+            errors.push(err(format!(
+                "name '{}' is declared as both a oneof and a model/enum; names must be unique across model/enum/oneof",
+                oneof.name
+            )));
         }
 
         let mut seen_values: HashSet<&str> = HashSet::new();
         for (value, model) in &oneof.variants {
             if !seen_values.insert(value.as_str()) {
-                errors.push(NmlError::Validation {
-                    message: format!(
-                        "oneof '{}' has duplicate discriminator value \"{}\"",
-                        oneof.name, value
-                    ),
-                    span: oneof.span,
-                });
+                errors.push(err(format!(
+                    "oneof '{}' has duplicate discriminator value \"{}\"",
+                    oneof.name, value
+                )));
             }
             if !model_names.contains(model.as_str()) {
-                errors.push(NmlError::Validation {
-                    message: format!(
-                        "oneof '{}' arm \"{}\" references unknown model '{}'",
-                        oneof.name, value, model
-                    ),
-                    span: oneof.span,
-                });
+                errors.push(err(format!(
+                    "oneof '{}' arm \"{}\" references unknown model '{}'",
+                    oneof.name, value, model
+                )));
+            }
+        }
+
+        // A declared default discriminator must name one of the arms.
+        if let Some(default) = &oneof.default_discriminator {
+            if !oneof.variants.iter().any(|(value, _)| value == default) {
+                errors.push(err(format!(
+                    "oneof '{}' default discriminator \"{}\" does not match any arm",
+                    oneof.name, default
+                )));
+            }
+        }
+
+        // An enum-typed discriminator must name a declared enum, and the arm keys
+        // must *exactly* cover its variants (exhaustiveness — no missing variant and
+        // no arm outside the enum).
+        if let Some(type_name) = &oneof.discriminator_type {
+            match schema.enums.iter().find(|e| &e.name == type_name) {
+                None => errors.push(err(format!(
+                    "oneof '{}' discriminator type '{}' is not a declared enum",
+                    oneof.name, type_name
+                ))),
+                Some(enum_def) => {
+                    let variants: HashSet<&str> =
+                        enum_def.variants.iter().map(String::as_str).collect();
+                    let arms: HashSet<&str> =
+                        oneof.variants.iter().map(|(v, _)| v.as_str()).collect();
+                    // Iterate in source order so diagnostics are deterministic.
+                    for variant in &enum_def.variants {
+                        if !arms.contains(variant.as_str()) {
+                            errors.push(err(format!(
+                                "oneof '{}' is missing an arm for enum '{}' variant \"{}\"",
+                                oneof.name, type_name, variant
+                            )));
+                        }
+                    }
+                    for (value, _) in &oneof.variants {
+                        if !variants.contains(value.as_str()) {
+                            errors.push(err(format!(
+                                "oneof '{}' arm \"{}\" is not a variant of enum '{}'",
+                                oneof.name, value, type_name
+                            )));
+                        }
+                    }
+                }
             }
         }
     }
@@ -456,13 +505,12 @@ fn extract_enum(block: &BlockDecl, span: crate::span::Span) -> Option<EnumDef> {
 
 fn convert_field_def(fd: &FieldDefinition, span: crate::span::Span) -> FieldDef {
     let field_type = resolve_field_type(&fd.field_type);
-    let default_value = fd.default_value.as_ref().map(|v| format_default(&v.value));
 
     FieldDef {
         name: fd.name.name.clone(),
         field_type,
         optional: fd.optional,
-        default_value,
+        default_value: fd.default_value.clone(),
         span,
     }
 }
@@ -477,16 +525,6 @@ fn resolve_field_type(expr: &FieldTypeExpr) -> FieldType {
         FieldTypeExpr::Union(variants) => {
             FieldType::Union(variants.iter().map(resolve_field_type).collect())
         }
-    }
-}
-
-fn format_default(value: &crate::types::Value) -> String {
-    match value {
-        crate::types::Value::String(s) => s.clone(),
-        crate::types::Value::Number(n) => format!("{n}"),
-        crate::types::Value::Bool(b) => format!("{b}"),
-        crate::types::Value::Reference(r) => r.clone(),
-        _ => String::new(),
     }
 }
 
@@ -539,6 +577,82 @@ mod tests {
         assert!(
             errs.iter().any(|e| e.message().contains("duplicate discriminator value")),
             "expected duplicate-value error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_oneof_default_discriminator_must_match_arm() {
+        let schema = extract_src(
+            "model a:\n    x string?\n\noneof u by kind = \"bogus\":\n    \"k\" => a\n",
+        );
+        let errs = find_oneof_errors(&schema);
+        assert!(
+            errs.iter().any(|e| e
+                .message()
+                .contains("default discriminator \"bogus\" does not match any arm")),
+            "expected default-mismatch error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_oneof_valid_default_discriminator_accepted() {
+        let schema = extract_src(
+            "model a:\n    x string?\n\noneof u by kind = \"k\":\n    \"k\" => a\n",
+        );
+        assert!(
+            find_oneof_errors(&schema).is_empty(),
+            "a default matching an arm should be accepted"
+        );
+        assert_eq!(schema.oneofs[0].default_discriminator.as_deref(), Some("k"));
+    }
+
+    #[test]
+    fn test_oneof_enum_typed_discriminator_exhaustive_ok() {
+        let schema = extract_src(
+            "enum kind:\n    - \"log\"\n    - \"postmark\"\n\nmodel a:\n    x string?\n\nmodel b:\n    y string?\n\noneof email by provider as kind:\n    \"log\" => a\n    \"postmark\" => b\n",
+        );
+        assert!(
+            find_oneof_errors(&schema).is_empty(),
+            "arms exactly covering the enum should be accepted"
+        );
+        assert_eq!(schema.oneofs[0].discriminator_type.as_deref(), Some("kind"));
+    }
+
+    #[test]
+    fn test_oneof_enum_typed_missing_arm_rejected() {
+        let schema = extract_src(
+            "enum kind:\n    - \"log\"\n    - \"postmark\"\n\nmodel a:\n    x string?\n\noneof email by provider as kind:\n    \"log\" => a\n",
+        );
+        let errs = find_oneof_errors(&schema);
+        assert!(
+            errs.iter().any(|e| e.message().contains("missing an arm")
+                && e.message().contains("postmark")),
+            "missing enum variant should be reported; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_oneof_enum_typed_extra_arm_rejected() {
+        let schema = extract_src(
+            "enum kind:\n    - \"log\"\n\nmodel a:\n    x string?\n\nmodel b:\n    y string?\n\noneof email by provider as kind:\n    \"log\" => a\n    \"postmark\" => b\n",
+        );
+        let errs = find_oneof_errors(&schema);
+        assert!(
+            errs.iter().any(|e| e.message().contains("not a variant of enum")
+                && e.message().contains("postmark")),
+            "arm outside the enum should be reported; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn test_oneof_discriminator_type_must_be_enum() {
+        let schema = extract_src(
+            "model a:\n    x string?\n\noneof email by provider as notAnEnum:\n    \"log\" => a\n",
+        );
+        let errs = find_oneof_errors(&schema);
+        assert!(
+            errs.iter().any(|e| e.message().contains("is not a declared enum")),
+            "unknown discriminator type should be reported; got {errs:?}"
         );
     }
 
@@ -608,7 +722,10 @@ mod tests {
         assert_eq!(schema.models.len(), 1);
         let field = &schema.models[0].fields[0];
         assert_eq!(field.name, "outputFormat");
-        assert_eq!(field.default_value, Some("text".to_string()));
+        assert_eq!(
+            field.default_value.as_ref().map(|v| &v.value),
+            Some(&crate::types::Value::String("text".into()))
+        );
     }
 
     #[test]

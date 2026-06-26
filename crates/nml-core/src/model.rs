@@ -1,5 +1,5 @@
 use crate::span::Span;
-use crate::types::PrimitiveType;
+use crate::types::{PrimitiveType, SpannedValue};
 use serde::Serialize;
 
 /// A model definition parsed from `model name:` or `model name is parent:`.
@@ -29,6 +29,12 @@ pub struct OneOfDef {
     pub name: String,
     /// Field whose value selects the variant.
     pub discriminator: String,
+    /// Optional enum type for the discriminator. When present, the arm keys must
+    /// exactly cover the enum's variants (enforced at schema load).
+    pub discriminator_type: Option<String>,
+    /// Default discriminator value, injected when an instance omits it. Always one
+    /// of the `variants`' keys (enforced at schema load).
+    pub default_discriminator: Option<String>,
     /// `(discriminator_value, variant_model_name)` pairs, in source order.
     pub variants: Vec<(String, String)>,
     pub span: Span,
@@ -40,7 +46,10 @@ pub struct FieldDef {
     pub name: String,
     pub field_type: FieldType,
     pub optional: bool,
-    pub default_value: Option<String>,
+    /// The declared default, retaining its parsed type and source span. `None`
+    /// when the field has no `= value`. The span points at the default literal so
+    /// type-check diagnostics can locate it precisely.
+    pub default_value: Option<SpannedValue>,
     pub span: Span,
 }
 

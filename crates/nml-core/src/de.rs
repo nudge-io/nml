@@ -49,7 +49,7 @@ macro_rules! deserialize_int {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
             match coerce_to_number(self.value) {
                 Some(n) => visitor.$visit(number_to_int::<$ty>(n, $name)?),
-                None => Err(Error(format!(
+                None => Err(Error::De(format!(
                     "expected number, got {}",
                     self.value.type_name()
                 ))),
@@ -60,11 +60,35 @@ macro_rules! deserialize_int {
 
 /// Errors that can occur during NML deserialization.
 #[derive(Debug)]
-pub struct Error(String);
+pub enum Error {
+    /// A deserialization / shape error (serde-level message).
+    De(String),
+    /// A value-resolution failure (`$ENV`, fallback, reference cycle). The typed
+    /// [`ResolveError`](crate::resolve::ResolveError) is **preserved** (not flattened to a
+    /// string) so a caller can react to a specific kind — e.g. remap
+    /// [`ResolveError::EnvDisabled`] to domain guidance — without fragile message matching.
+    Resolve(crate::resolve::ResolveError),
+}
+
+impl Error {
+    /// If this error wraps a denied `$ENV` reference, the referenced variable text (e.g.
+    /// `"$ENV.GROQ_API_KEY"`). Delegates to
+    /// [`ResolveError::env_disabled_var`](crate::resolve::ResolveError::env_disabled_var) so
+    /// the two error types answer the question identically.
+    pub fn env_disabled_var(&self) -> Option<&str> {
+        match self {
+            Error::Resolve(e) => e.env_disabled_var(),
+            Error::De(_) => None,
+        }
+    }
+}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        match self {
+            Error::De(msg) => write!(f, "{msg}"),
+            Error::Resolve(e) => write!(f, "{e}"),
+        }
     }
 }
 
@@ -72,7 +96,15 @@ impl std::error::Error for Error {}
 
 impl de::Error for Error {
     fn custom<T: fmt::Display>(msg: T) -> Self {
-        Error(msg.to_string())
+        Error::De(msg.to_string())
+    }
+}
+
+/// A failed `$ENV`/fallback resolution surfaces as a deserialization error, so
+/// the defaulted pipeline can resolve-then-deserialize with `?` in one place.
+impl From<crate::resolve::ResolveError> for Error {
+    fn from(e: crate::resolve::ResolveError) -> Self {
+        Error::Resolve(e)
     }
 }
 
@@ -82,14 +114,14 @@ impl de::Error for Error {
 fn number_to_int<T: TryFrom<i64>>(n: Number, type_name: &'static str) -> Result<T, Error> {
     if let Number::Float(f) = n {
         if f.fract() != 0.0 {
-            return Err(Error(format!(
+            return Err(Error::De(format!(
                 "{type_name} value {f} has a fractional part"
             )));
         }
     }
     n.as_i64()
         .and_then(|i| T::try_from(i).ok())
-        .ok_or_else(|| Error(format!("{type_name} value {n} out of range")))
+        .ok_or_else(|| Error::De(format!("{type_name} value {n} out of range")))
 }
 
 /// Deserialize a struct from an NML block body.
@@ -117,9 +149,7 @@ pub fn from_body_resolved<T: for<'de> Deserialize<'de>>(
     body: &Body,
     resolver: &ValueResolver,
 ) -> Result<T, Error> {
-    let resolved = resolver
-        .resolve_body(body)
-        .map_err(|e| Error(e.to_string()))?;
+    let resolved = resolver.resolve_body(body)?;
     let merged = resolve::apply_shared_properties(&resolved);
     from_block(&merged)
 }
@@ -530,7 +560,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
             Value::Bool(b) => visitor.visit_bool(*b),
             _ => match coerce_to_bool(self.value) {
                 Some(b) => visitor.visit_bool(b),
-                None => Err(Error(format!(
+                None => Err(Error::De(format!(
                     "expected bool, got {}",
                     self.value.type_name()
                 ))),
@@ -541,7 +571,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match coerce_to_number(self.value) {
             Some(n) => visitor.visit_f64(n.as_f64()),
-            None => Err(Error(format!(
+            None => Err(Error::De(format!(
                 "expected number, got {}",
                 self.value.type_name()
             ))),
@@ -551,7 +581,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match coerce_to_number(self.value) {
             Some(n) => visitor.visit_f32(n.as_f64() as f32),
-            None => Err(Error(format!(
+            None => Err(Error::De(format!(
                 "expected number, got {}",
                 self.value.type_name()
             ))),
@@ -574,7 +604,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
             Value::Path(s) | Value::Duration(s) | Value::Secret(s) => visitor.visit_str(s),
             Value::Reference(s) | Value::Role(s) => visitor.visit_str(s),
             Value::Money(m) => visitor.visit_string(m.format_display()),
-            _ => Err(Error(format!(
+            _ => Err(Error::De(format!(
                 "expected string, got {}",
                 self.value.type_name()
             ))),
@@ -588,7 +618,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Array(items) => visitor.visit_seq(ArraySeqAccess { items, index: 0 }),
-            _ => Err(Error(format!(
+            _ => Err(Error::De(format!(
                 "expected array, got {}",
                 self.value.type_name()
             ))),
@@ -631,7 +661,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
                 value: &primary.value,
             }
             .deserialize_enum(name, variants, visitor),
-            _ => Err(Error(format!(
+            _ => Err(Error::De(format!(
                 "expected string for enum {name}, got {}",
                 self.value.type_name()
             ))),

@@ -28,23 +28,60 @@ use crate::types::{SpannedValue, Value};
 /// `None` when unset (which triggers the fallback chain, if any).
 type VarLookup = Box<dyn Fn(&str) -> Option<String>>;
 
+/// Pluggable `const` lookup: maps a `Value::Reference` name to the value the
+/// `const` declares, or `None` when the name is not a known `const` (in which
+/// case the reference resolves to its literal name).
+type SymbolLookup = Box<dyn Fn(&str) -> Option<Value>>;
+
+/// Bounds reference-chain recursion. Const cycles are normally rejected up front
+/// by `SymbolTable::find_const_cycles`; this is defense-in-depth so the resolver
+/// is total even if handed a cyclic lookup directly.
+const MAX_RESOLVE_DEPTH: u32 = 64;
+
 pub struct ValueResolver {
-    var_resolver: VarLookup,
+    /// `None` means the environment is off-limits: any `$ENV.X` is a hard error
+    /// ([`ResolveError::EnvDisabled`]) rather than a lookup. See [`Self::without_env`].
+    var_resolver: Option<VarLookup>,
+    symbol_resolver: Option<SymbolLookup>,
 }
 
 impl ValueResolver {
     /// Create a resolver that reads `$ENV.KEY` from `std::env::var`.
     pub fn env() -> Self {
         Self {
-            var_resolver: Box::new(|key| std::env::var(key).ok()),
+            var_resolver: Some(Box::new(|key| std::env::var(key).ok())),
+            symbol_resolver: None,
         }
     }
 
     /// Create a resolver with a custom variable lookup function.
     pub fn new(resolver: impl Fn(&str) -> Option<String> + 'static) -> Self {
         Self {
-            var_resolver: Box::new(resolver),
+            var_resolver: Some(Box::new(resolver)),
+            symbol_resolver: None,
         }
+    }
+
+    /// Create a resolver that **cannot** read the environment: any `$ENV.X` is a
+    /// hard error. For contexts that must not touch process env — e.g. potentially
+    /// tenant-authored config — combine with [`Self::with_symbols`] for const-only
+    /// resolution.
+    pub fn without_env() -> Self {
+        Self {
+            var_resolver: None,
+            symbol_resolver: None,
+        }
+    }
+
+    /// Also resolve `const` references (`Value::Reference`) via `lookup`. A
+    /// reference resolves to the named `const`'s value and is then resolved
+    /// recursively, so a `const` that holds `$ENV.X` (or another reference)
+    /// resolves to fixpoint in this single pass. An unknown reference is left
+    /// as-is (it deserializes as its literal name), matching the workflow
+    /// parser's `resolve_string` fallback.
+    pub fn with_symbols(mut self, lookup: impl Fn(&str) -> Option<Value> + 'static) -> Self {
+        self.symbol_resolver = Some(Box::new(lookup));
+        self
     }
 
     /// Resolve a single value through fallback chains and secret lookups.
@@ -58,25 +95,44 @@ impl ValueResolver {
     /// Resolved secrets become plain [`Value::String`]s; callers must not
     /// log or serialize resolved bodies that may contain secret material.
     pub fn resolve(&self, value: &Value) -> Result<Value, ResolveError> {
+        self.resolve_at(value, 0)
+    }
+
+    fn resolve_at(&self, value: &Value, depth: u32) -> Result<Value, ResolveError> {
+        if depth >= MAX_RESOLVE_DEPTH {
+            return Err(ResolveError::ReferenceCycle);
+        }
         match value {
-            Value::Fallback(primary, fallback) => match self.resolve(&primary.value) {
+            Value::Fallback(primary, fallback) => match self.resolve_at(&primary.value, depth + 1) {
                 Ok(val) => Ok(val),
-                Err(_) => self.resolve(&fallback.value),
+                Err(_) => self.resolve_at(&fallback.value, depth + 1),
             },
             Value::Secret(s) => {
-                if let Some(key) = s.strip_prefix("$ENV.") {
-                    match (self.var_resolver)(key) {
-                        Some(val) if !val.is_empty() => Ok(Value::String(val)),
-                        _ => Err(ResolveError::EnvNotSet(key.to_string())),
-                    }
-                } else {
-                    Err(ResolveError::UnknownSource(s.clone()))
+                let Some(key) = s.strip_prefix("$ENV.") else {
+                    return Err(ResolveError::UnknownSource(s.clone()));
+                };
+                // No env lookup configured ⇒ the environment is off-limits here.
+                let Some(var_resolver) = &self.var_resolver else {
+                    return Err(ResolveError::EnvDisabled(s.clone()));
+                };
+                match var_resolver(key) {
+                    Some(val) if !val.is_empty() => Ok(Value::String(val)),
+                    _ => Err(ResolveError::EnvNotSet(key.to_string())),
                 }
             }
+            // A `const` reference resolves to its value and is then resolved
+            // recursively (so a const holding `$ENV.X` or another reference is
+            // fully resolved in this one pass). An unknown reference — or no
+            // configured symbol lookup — leaves the reference untouched, so it
+            // deserializes as its literal name (parser parity).
+            Value::Reference(name) => match self.symbol_resolver.as_ref().and_then(|f| f(name)) {
+                Some(resolved) => self.resolve_at(&resolved, depth + 1),
+                None => Ok(value.clone()),
+            },
             Value::Array(items) => {
                 let resolved = items
                     .iter()
-                    .map(|sv| Ok(SpannedValue::new(self.resolve(&sv.value)?, sv.span)))
+                    .map(|sv| Ok(SpannedValue::new(self.resolve_at(&sv.value, depth + 1)?, sv.span)))
                     .collect::<Result<Vec<_>, ResolveError>>()?;
                 Ok(Value::Array(resolved))
             }
@@ -197,6 +253,23 @@ pub enum ResolveError {
     EnvNotSet(String),
     #[error("unknown variable source in '{0}'")]
     UnknownSource(String),
+    #[error("reference resolution exceeded depth limit (cyclic const reference?)")]
+    ReferenceCycle,
+    #[error("environment variables are not available in this context (got '{0}')")]
+    EnvDisabled(String),
+}
+
+impl ResolveError {
+    /// If this is a denied `$ENV` reference ([`Self::EnvDisabled`] — the environment is
+    /// off-limits in the resolving context), the referenced variable text (e.g.
+    /// `"$ENV.GROQ_API_KEY"`). Lets a caller replace the generic message with
+    /// domain-specific guidance without matching the variant directly.
+    pub fn env_disabled_var(&self) -> Option<&str> {
+        match self {
+            ResolveError::EnvDisabled(var) => Some(var),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +589,91 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unknown variable source"));
+    }
+
+    // -------------------------------------------------------------------
+    // Const reference resolution (RFC 0002 §9)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn reference_passthrough_without_symbols() {
+        // Backward-compatible: with no symbol lookup, a reference is untouched.
+        let r = ValueResolver::env();
+        assert_eq!(
+            r.resolve(&Value::Reference("foo".into())).unwrap(),
+            Value::Reference("foo".into())
+        );
+    }
+
+    #[test]
+    fn unknown_reference_is_literal() {
+        // Parity with the parser's `resolve_string`: an unknown ref stays a
+        // reference (which deserializes as its literal name), not an error.
+        let r = ValueResolver::new(|_| None).with_symbols(|_| None);
+        assert_eq!(
+            r.resolve(&Value::Reference("missing".into())).unwrap(),
+            Value::Reference("missing".into())
+        );
+    }
+
+    #[test]
+    fn const_reference_resolves_and_chains() {
+        let r = ValueResolver::new(|_| None).with_symbols(|name| match name {
+            "model" => Some(Value::Reference("defaultModel".into())),
+            "defaultModel" => Some(Value::String("llama".into())),
+            _ => None,
+        });
+        assert_eq!(
+            r.resolve(&Value::Reference("model".into())).unwrap(),
+            Value::String("llama".into())
+        );
+    }
+
+    #[test]
+    fn const_wrapping_env_resolves_in_one_pass() {
+        // `const base = $ENV.B`: the reference resolves to the const's `$ENV.B`,
+        // which is then env-resolved — all in one pass, order-independent.
+        let r = ValueResolver::new(|k| (k == "B").then(|| "envval".to_string()))
+            .with_symbols(|name| (name == "base").then(|| Value::Secret("$ENV.B".into())));
+        assert_eq!(
+            r.resolve(&Value::Reference("base".into())).unwrap(),
+            Value::String("envval".into())
+        );
+    }
+
+    #[test]
+    fn without_env_rejects_secrets_but_resolves_consts() {
+        // A const-only resolver: consts resolve, `$ENV` is a hard error (never reads
+        // the environment), and an unknown reference still passes through as a literal.
+        let r = ValueResolver::without_env()
+            .with_symbols(|name| (name == "model").then(|| Value::String("llama".into())));
+
+        assert_eq!(
+            r.resolve(&Value::Reference("model".into())).unwrap(),
+            Value::String("llama".into())
+        );
+        assert!(matches!(
+            r.resolve(&Value::Secret("$ENV.SECRET".into())),
+            Err(ResolveError::EnvDisabled(s)) if s == "$ENV.SECRET"
+        ));
+        assert_eq!(
+            r.resolve(&Value::Reference("unknown".into())).unwrap(),
+            Value::Reference("unknown".into())
+        );
+    }
+
+    #[test]
+    fn reference_cycle_is_bounded() {
+        // Defense-in-depth: a cyclic lookup terminates with an error, not a hang.
+        let r = ValueResolver::new(|_| None).with_symbols(|name| match name {
+            "a" => Some(Value::Reference("b".into())),
+            "b" => Some(Value::Reference("a".into())),
+            _ => None,
+        });
+        assert!(matches!(
+            r.resolve(&Value::Reference("a".into())),
+            Err(ResolveError::ReferenceCycle)
+        ));
     }
 
     #[test]
