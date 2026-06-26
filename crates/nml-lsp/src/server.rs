@@ -1333,13 +1333,27 @@ fn present_field_names(body: &Body) -> HashSet<String> {
         .collect()
 }
 
-/// `detail` for a field completion — the NML type as authored, with `?` for optional.
+/// `detail` for a field completion — the NML type as authored, with `?` for optional and
+/// `= <default>` when the schema declares one (so the author sees the effective value).
 fn field_detail(field: &FieldDef) -> String {
-    format!(
-        "{}{}",
-        field.field_type,
-        if field.optional { "?" } else { "" }
-    )
+    let mut detail = format!("{}{}", field.field_type, if field.optional { "?" } else { "" });
+    if let Some(rendered) = field.default_value.as_ref().and_then(|d| render_scalar(&d.value)) {
+        detail.push_str(&format!(" = {rendered}"));
+    }
+    detail
+}
+
+/// Render a **scalar** schema default to its NML text for a completion hint. Schema defaults
+/// are always scalars, so this is sufficient; a non-scalar (array/template/…) returns `None`
+/// and is simply omitted from the hint rather than rendered imprecisely.
+fn render_scalar(value: &Value) -> Option<String> {
+    Some(match value {
+        Value::String(s) | Value::Duration(s) | Value::Path(s) => format!("{s:?}"),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Reference(s) | Value::Role(s) | Value::Secret(s) => s.clone(),
+        _ => return None,
+    })
 }
 
 /// Sort key: required fields first, then schema declaration order (`idx`).
@@ -3556,6 +3570,18 @@ workflow VoiceAgent:
         let prompt = step.fields.iter().find(|f| f.name == "prompt").unwrap();
         assert_eq!(field_insert_text(&index, name), "name = ");
         assert_eq!(field_insert_text(&index, prompt), "prompt:");
+    }
+
+    #[test]
+    fn field_detail_shows_type_and_default() {
+        let s = nml_core::model_extract::extract(
+            &nml_core::parse("model prompt:\n    outputFormat string = \"text\"\n    retries number?\n").unwrap(),
+        );
+        let m = &s.models[0];
+        let out_fmt = m.fields.iter().find(|f| f.name == "outputFormat").unwrap();
+        let retries = m.fields.iter().find(|f| f.name == "retries").unwrap();
+        assert_eq!(field_detail(out_fmt), "string = \"text\"");
+        assert_eq!(field_detail(retries), "number?"); // no default → just the type
     }
 
     #[test]
