@@ -7,7 +7,7 @@ use thiserror::Error;
 ///
 /// Each variant carries a human-readable message and a [`Span`] pointing
 /// to the location in source where the error occurred.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum NmlError {
     /// A syntax error during parsing.
     #[error("{message}")]

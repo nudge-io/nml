@@ -24,7 +24,7 @@
 //!     host = "localhost"
 //!     debug = true
 //! "#;
-//! let file = nml_core::parse(source).unwrap();
+//! let file = nml_core::cst::parse_to_ast(source).unwrap();
 //! let doc = Document::new(&file);
 //! let body = doc.block("service", "MyApp").body().unwrap();
 //! let config: ServerConfig = from_block(body).unwrap();
@@ -66,7 +66,8 @@ pub enum Error {
     /// A value-resolution failure (`$ENV`, fallback, reference cycle). The typed
     /// [`ResolveError`](crate::resolve::ResolveError) is **preserved** (not flattened to a
     /// string) so a caller can react to a specific kind — e.g. remap
-    /// [`ResolveError::EnvDisabled`] to domain guidance — without fragile message matching.
+    /// [`EnvDisabled`](crate::resolve::ResolveError::EnvDisabled) to domain guidance —
+    /// without fragile message matching.
     Resolve(crate::resolve::ResolveError),
 }
 
@@ -703,7 +704,7 @@ impl<'de> SeqAccess<'de> for ArraySeqAccess<'de> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser;
+    use crate::cst::parse_to_ast;
     use crate::query::Document;
     use serde::Deserialize;
 
@@ -722,7 +723,7 @@ service MyApp:
     host = "localhost"
     debug = true
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "MyApp").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -739,7 +740,7 @@ service MyApp:
         }
 
         let source = "service App:\n    tags = [\"web\", \"api\"]\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -781,7 +782,7 @@ server App:
         backend = "postgres"
         url = "postgres://localhost/dev"
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
         let config: Server = from_block(body).unwrap();
@@ -804,7 +805,7 @@ server App:
         }
 
         let source = "server App:\n    port = 3000\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
         let config: Server = from_block(body).unwrap();
@@ -833,7 +834,7 @@ workflow W:
         - generate:
             provider = "slow"
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("workflow", "W").body().unwrap();
         let config: Workflow = from_block(body).unwrap();
@@ -859,7 +860,7 @@ service S:
             name = "OverriddenName"
             url = "/api"
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "S").body().unwrap();
 
@@ -889,7 +890,7 @@ service App:
     offset = -10
     big = 1000000
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -912,7 +913,7 @@ service S:
         - "tool-a"
         - "tool-b"
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "S").body().unwrap();
         let config: Tools = from_block(body).unwrap();
@@ -933,7 +934,7 @@ service S:
         - "/api/v2"
         - "/health"
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "S").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -969,7 +970,7 @@ service S:
         - step2:
             provider = "anthropic"
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "S").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -1029,7 +1030,7 @@ auth MyAuth:
             clientId = "def456"
             scopes = ["read:user"]
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("auth", "MyAuth").body().unwrap();
         let config: Auth = from_block(body).unwrap();
@@ -1054,7 +1055,7 @@ auth MyAuth:
         }
 
         let source = "server App:\n    host = $ENV.HOST | \"localhost\"\n    port = 3000\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -1076,7 +1077,7 @@ auth MyAuth:
         }
 
         let source = "workflow W:\n    .interval = 42\n    - S:\n        name = \"x\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -1121,7 +1122,7 @@ auth MyAuth:
         // Control: the complete source deserializes, proving the struct
         // shape is right and the failure below is really the missing field.
         let complete = "service App:\n    host = \"localhost\"\n    port = 8080\n";
-        let file = parser::parse(complete).unwrap();
+        let file = parse_to_ast(complete).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -1129,7 +1130,7 @@ auth MyAuth:
         assert_eq!(config.port, 8080);
 
         let source = "service App:\n    host = \"localhost\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let result: Result<Config, _> = from_block(body);
@@ -1145,7 +1146,7 @@ auth MyAuth:
         }
 
         let source = "service App:\n    host = \"localhost\"\n    port = 8080\n    debug = true\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -1189,7 +1190,7 @@ auth MyAuth:
         }
 
         let source = "root R:\n    l2:\n        l3:\n            value = \"deep\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("root", "R").body().unwrap();
         let config: L1 = from_block(body).unwrap();
@@ -1207,7 +1208,7 @@ auth MyAuth:
         }
 
         let source = "service App:\n    x = 1\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -1225,7 +1226,7 @@ auth MyAuth:
         }
 
         let source = "service App:\n    apiKey = \"abc\"\n    maxRetries = 3\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -1241,7 +1242,7 @@ auth MyAuth:
         }
 
         let source = "service App:\n    secret = $ENV.NONEXISTENT_NML_TEST_VAR_XYZ\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -1257,7 +1258,7 @@ auth MyAuth:
         // Control: with a fallback the same shape resolves cleanly.
         let with_fallback =
             "service App:\n    secret = $ENV.NONEXISTENT_NML_TEST_VAR_XYZ | \"fallback\"\n";
-        let file = parser::parse(with_fallback).unwrap();
+        let file = parse_to_ast(with_fallback).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -1276,7 +1277,7 @@ auth MyAuth:
         }
 
         let source = "service App:\n    host = \"localhost\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -1293,7 +1294,7 @@ auth MyAuth:
         }
 
         let source = "service App:\n    host = \"localhost\"\n    port = 3000\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -1359,7 +1360,7 @@ workflow W:
         - step2:
             provider = "slow"
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("workflow", "W").body().unwrap();
         let config: Workflow = from_block(body).unwrap();
@@ -1379,7 +1380,7 @@ workflow W:
             monthly_price: String,
         }
         let source = "plan ProPlan:\n    monthlyPrice = 29.99 USD\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("plan", "ProPlan").body().unwrap();
         let plan: Plan = from_block(body).unwrap();
@@ -1393,7 +1394,7 @@ workflow W:
             port: u16,
         }
         let source = "server S:\n    port = \"3000\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "S").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -1410,7 +1411,7 @@ workflow W:
         }
 
         let source = "server S:\n    port = $ENV.PORT | 8080\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let resolver = ValueResolver::new(|key| match key {
             "PORT" => Some("3000".into()),
             _ => None,
@@ -1431,7 +1432,7 @@ workflow W:
         }
 
         let source = "server S:\n    port = $ENV.PORT | 8080\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let resolver = ValueResolver::new(|_| None);
         let doc = Document::new(&file);
         let body = doc.block("server", "S").body().unwrap();
@@ -1446,7 +1447,7 @@ workflow W:
             enabled: bool,
         }
         let source = "server S:\n    enabled = \"true\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "S").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -1469,7 +1470,7 @@ workflow W:
     }
 
     fn parse_port(nml: &str) -> Result<PortConfig, Error> {
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
         from_block(body)
@@ -1519,14 +1520,14 @@ workflow W:
             level: u8,
         }
         let nml = "server App:\n    level = 255\n";
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
         assert_eq!(config.level, 255);
 
         let nml_bad = "server App:\n    level = 256\n";
-        let file2 = parser::parse(nml_bad).unwrap();
+        let file2 = parse_to_ast(nml_bad).unwrap();
         let doc2 = crate::query::Document::new(&file2);
         let body2 = doc2.block("server", "App").body().unwrap();
         let result: Result<Config, _> = from_block(body2);
@@ -1540,14 +1541,14 @@ workflow W:
             offset: i8,
         }
         let nml = "server App:\n    offset = -128\n";
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
         assert_eq!(config.offset, -128);
 
         let nml_bad = "server App:\n    offset = 128\n";
-        let file2 = parser::parse(nml_bad).unwrap();
+        let file2 = parse_to_ast(nml_bad).unwrap();
         let doc2 = crate::query::Document::new(&file2);
         let body2 = doc2.block("server", "App").body().unwrap();
         let result: Result<Config, _> = from_block(body2);
@@ -1561,7 +1562,7 @@ workflow W:
     }
 
     fn parse_count(nml: &str) -> Result<CountConfig, Error> {
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
         from_block(body)
@@ -1622,7 +1623,7 @@ workflow W:
             max: i64,
         }
         let source = "service App:\n    id = 9007199254740993\n    max = 9223372036854775807\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -1667,7 +1668,7 @@ workflow W:
             access: String,
         }
         let source = "service App:\n    access = @role/admin\n";
-        let file = crate::parse(source).unwrap();
+        let file = crate::cst::parse_to_ast(source).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -1681,7 +1682,7 @@ workflow W:
             members: Vec<String>,
         }
         let source = "role admin:\n    members:\n        - @role/editor\n        - @public\n";
-        let file = crate::parse(source).unwrap();
+        let file = crate::cst::parse_to_ast(source).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("role", "admin").body().unwrap();
         let config: Config = from_block(body).unwrap();
@@ -1704,7 +1705,7 @@ workflow W:
     }
 
     fn parse_backend(nml: &str) -> Result<BackendConfig, Error> {
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
         from_block(body)
@@ -1745,7 +1746,7 @@ workflow W:
         }
 
         let source = "server App:\n    mode = \"allInOne\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
         let config: Config = from_block(body).unwrap();

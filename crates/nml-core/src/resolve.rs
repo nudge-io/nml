@@ -439,7 +439,7 @@ fn merge_shared_block_into_nested(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser;
+    use crate::cst::parse_to_ast;
 
     #[test]
     fn resolve_array_elements() {
@@ -686,7 +686,7 @@ mod tests {
             }
         });
         let nml = "server App:\n    host = $ENV.HOST\n    port = 8080\n    db:\n        url = $ENV.DB_URL | \"postgres://localhost/dev\"\n";
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -725,7 +725,7 @@ workflow W:
         defaults:
             retries = 5
 "#;
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -777,7 +777,7 @@ workflow W:
     - StepA:
         provider = "fast"
 "#;
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -838,7 +838,7 @@ workflow W:
     fn resolve_body_error_propagation() {
         let r = ValueResolver::new(|_| None);
         let nml = "server App:\n    secret = $ENV.REQUIRED\n    port = 8080\n";
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -860,7 +860,7 @@ workflow W:
     - StepA:
         retries = 10
 "#;
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -915,7 +915,7 @@ workflow W:
         retries = 3
     - "plain-item"
 "#;
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -945,7 +945,7 @@ workflow W:
     - StepA:
         provider = "fast"
 "#;
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -985,7 +985,7 @@ workflow W:
     - StepA:
         name = "a"
 "#;
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -1013,7 +1013,7 @@ workflow W:
         interval = 100
         name = "a"
 "#;
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -1048,7 +1048,7 @@ workflow W:
     - StepA:
         name = "a"
 "#;
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -1081,7 +1081,7 @@ workflow W:
     - Row:
         key = "k"
 "#;
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let arr = match &file.declarations[0].kind {
             DeclarationKind::Array(a) => a,
             _ => panic!("expected array"),
@@ -1109,7 +1109,7 @@ workflow W:
             }
         });
         let nml = "workflow W:\n    .port = $ENV.PORT\n    - S:\n        host = \"h\"\n";
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),
@@ -1139,7 +1139,7 @@ workflow W:
             }
         });
         let nml = "server App:\n    a:\n        b:\n            host = $ENV.HOST\n";
-        let file = parser::parse(nml).unwrap();
+        let file = parse_to_ast(nml).unwrap();
         let body = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => &b.body,
             _ => panic!("expected block"),

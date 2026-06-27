@@ -103,13 +103,12 @@ impl NmlLanguageServer {
             let project_file = path.join("nml-project.nml");
             if project_file.exists() {
                 if let Ok(content) = fs::read_to_string(&project_file) {
-                    if let Ok(file) = nml_core::parse(&content) {
-                        let config = nml_core::ProjectConfig::from_file(&file);
-                        *self
-                            .project_config
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner()) = config;
-                    }
+                    let file = nml_core::cst::parse_best_effort(&content);
+                    let config = nml_core::ProjectConfig::from_file(&file);
+                    *self
+                        .project_config
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = config;
                     if let Ok(uri) = Url::from_file_path(&project_file) {
                         docs.insert(uri.clone(), content);
                         indexed.insert(uri);
@@ -141,18 +140,18 @@ impl NmlLanguageServer {
                 continue;
             }
             let scope = extract_schema_scope(uri.as_str());
-            if let Ok(file) = nml_core::parse(source) {
-                let schema = nml_core::model_extract::extract(&file);
-                scoped_models
-                    .entry(scope.clone())
-                    .or_default()
-                    .extend(schema.models);
-                scoped_enums
-                    .entry(scope.clone())
-                    .or_default()
-                    .extend(schema.enums);
-                scoped_oneofs.entry(scope).or_default().extend(schema.oneofs);
-            }
+            // Extract straight from the CST (no owned-AST round-trip); parse errors
+            // surface through the diagnostics path, so the registry ignores them.
+            let (schema, _) = nml_core::cst::extract_schema(source);
+            scoped_models
+                .entry(scope.clone())
+                .or_default()
+                .extend(schema.models);
+            scoped_enums
+                .entry(scope.clone())
+                .or_default()
+                .extend(schema.enums);
+            scoped_oneofs.entry(scope).or_default().extend(schema.oneofs);
         }
 
         *self.scoped_models.lock().unwrap_or_else(|e| e.into_inner()) = scoped_models;
@@ -262,13 +261,12 @@ impl NmlLanguageServer {
             .insert(uri.clone(), text.clone());
 
         if uri.as_str().ends_with("nml-project.nml") {
-            if let Ok(file) = nml_core::parse(&text) {
-                let config = nml_core::ProjectConfig::from_file(&file);
-                *self
-                    .project_config
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = config;
-            }
+            let file = nml_core::cst::parse_best_effort(&text);
+            let config = nml_core::ProjectConfig::from_file(&file);
+            *self
+                .project_config
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = config;
             self.revalidate_all_documents().await;
             return;
         }
@@ -349,11 +347,10 @@ impl NmlLanguageServer {
 
         for uri in model_uris {
             if let Some(source) = docs.get(uri) {
-                if let Ok(file) = nml_core::parse(source) {
-                    let line_index = LineIndex::new(source);
-                    if let Some(range) = find_schema_block_definition(&file, name, &line_index) {
-                        return Some((uri.clone(), range));
-                    }
+                let file = nml_core::cst::parse_best_effort(source);
+                let line_index = LineIndex::new(source);
+                if let Some(range) = find_schema_block_definition(&file, name, &line_index) {
+                    return Some((uri.clone(), range));
                 }
             }
         }
@@ -382,27 +379,26 @@ impl NmlLanguageServer {
         let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         let mut names = Vec::new();
         for (_, source) in docs.iter() {
-            if let Ok(file) = nml_core::parse(source) {
-                for decl in &file.declarations {
-                    match &decl.kind {
-                        DeclarationKind::Block(block) => {
-                            names.push((block.name.name.clone(), block.keyword.name.clone()));
-                        }
-                        DeclarationKind::Array(arr) => {
-                            names.push((
-                                arr.name.name.clone(),
-                                format!("[]{}", arr.item_keyword.name),
-                            ));
-                        }
-                        DeclarationKind::Const(c) => {
-                            names.push((c.name.name.clone(), "const".into()));
-                        }
-                        DeclarationKind::Template(t) => {
-                            names.push((t.name.name.clone(), "template".into()));
-                        }
-                        DeclarationKind::OneOf(o) => {
-                            names.push((o.name.name.clone(), "oneof".into()));
-                        }
+            let file = nml_core::cst::parse_best_effort(source);
+            for decl in &file.declarations {
+                match &decl.kind {
+                    DeclarationKind::Block(block) => {
+                        names.push((block.name.name.clone(), block.keyword.name.clone()));
+                    }
+                    DeclarationKind::Array(arr) => {
+                        names.push((
+                            arr.name.name.clone(),
+                            format!("[]{}", arr.item_keyword.name),
+                        ));
+                    }
+                    DeclarationKind::Const(c) => {
+                        names.push((c.name.name.clone(), "const".into()));
+                    }
+                    DeclarationKind::Template(t) => {
+                        names.push((t.name.name.clone(), "template".into()));
+                    }
+                    DeclarationKind::OneOf(o) => {
+                        names.push((o.name.name.clone(), "oneof".into()));
                     }
                 }
             }
@@ -441,16 +437,15 @@ fn find_tagged_ref_definition_in_docs(
     let (keyword, name) = stripped.split_once('/')?;
 
     for (uri, source) in docs {
-        if let Ok(file) = nml_core::parse(source) {
-            let line_index = LineIndex::new(source);
-            for decl in &file.declarations {
-                if let DeclarationKind::Block(block) = &decl.kind {
-                    if block.keyword.name == keyword && block.name.name == name {
-                        return Some(Location {
-                            uri: uri.clone(),
-                            range: span_to_range(block.name.span, &line_index),
-                        });
-                    }
+        let file = nml_core::cst::parse_best_effort(source);
+        let line_index = LineIndex::new(source);
+        for decl in &file.declarations {
+            if let DeclarationKind::Block(block) = &decl.kind {
+                if block.keyword.name == keyword && block.name.name == name {
+                    return Some(Location {
+                        uri: uri.clone(),
+                        range: span_to_range(block.name.span, &line_index),
+                    });
                 }
             }
         }
@@ -464,40 +459,44 @@ fn find_tagged_ref_hover_in_docs(
     name: &str,
 ) -> Option<String> {
     for (uri, source) in docs {
-        if let Ok(file) = nml_core::parse(source) {
-            for decl in &file.declarations {
-                if let DeclarationKind::Block(block) = &decl.kind {
-                    if block.keyword.name == keyword && block.name.name == name {
-                        let mut text = format!("**{keyword}** `{name}`");
+        let file = nml_core::cst::parse_best_effort(source);
+        for decl in &file.declarations {
+            if let DeclarationKind::Block(block) = &decl.kind {
+                if block.keyword.name == keyword && block.name.name == name {
+                    let mut text = format!("**{keyword}** `{name}`");
 
-                        let desc = block.body.entries.iter().find_map(|e| {
-                            if let BodyEntryKind::Property(prop) = &e.kind {
-                                if prop.name.name == "description" {
-                                    if let Value::String(s) = &prop.value.value {
-                                        return Some(s.clone());
-                                    }
+                    // A comment above the declaration documents it (RFC 0004 §4.3).
+                    if let Some(doc) = nml_core::cst::doc_comment_for(source, name) {
+                        text.push_str(&format!("\n\n{doc}"));
+                    }
+
+                    let desc = block.body.entries.iter().find_map(|e| {
+                        if let BodyEntryKind::Property(prop) = &e.kind {
+                            if prop.name.name == "description" {
+                                if let Value::String(s) = &prop.value.value {
+                                    return Some(s.clone());
                                 }
                             }
-                            None
-                        });
-                        if let Some(d) = desc {
-                            text.push_str(&format!("\n\n{d}"));
                         }
-
-                        let summary = summarize_body(&block.body);
-                        if !summary.is_empty() {
-                            text.push_str("\n\n");
-                            text.push_str(&summary);
-                        }
-
-                        let file_name = uri
-                            .path_segments()
-                            .and_then(|mut s| s.next_back())
-                            .unwrap_or("unknown");
-                        text.push_str(&format!("\n\n*Source: {file_name}*"));
-
-                        return Some(text);
+                        None
+                    });
+                    if let Some(d) = desc {
+                        text.push_str(&format!("\n\n{d}"));
                     }
+
+                    let summary = summarize_body(&block.body);
+                    if !summary.is_empty() {
+                        text.push_str("\n\n");
+                        text.push_str(&summary);
+                    }
+
+                    let file_name = uri
+                        .path_segments()
+                        .and_then(|mut s| s.next_back())
+                        .unwrap_or("unknown");
+                    text.push_str(&format!("\n\n*Source: {file_name}*"));
+
+                    return Some(text);
                 }
             }
         }
@@ -584,13 +583,12 @@ fn find_definition_in_docs(
 
             for uri in &model_uris {
                 if let Some(source) = docs.get(*uri) {
-                    if let Ok(file) = nml_core::parse(source) {
-                        let line_index = LineIndex::new(source);
-                        if let Some(range) =
-                            find_field_definition_in_model(&file, name, keyword, &line_index)
-                        {
-                            return Some(((*uri).clone(), range));
-                        }
+                    let file = nml_core::cst::parse_best_effort(source);
+                    let line_index = LineIndex::new(source);
+                    if let Some(range) =
+                        find_field_definition_in_model(&file, name, keyword, &line_index)
+                    {
+                        return Some(((*uri).clone(), range));
                     }
                 }
             }
@@ -604,23 +602,24 @@ fn find_definition_in_docs(
             if !uri.as_str().ends_with(".model.nml") {
                 continue;
             }
-            if let Ok(file) = nml_core::parse(source) {
-                let line_index = LineIndex::new(source);
-                if let Some(range) = find_field_definition(&file, name, &line_index) {
-                    return Some((uri.clone(), range));
-                }
+            let file = nml_core::cst::parse_best_effort(source);
+            let line_index = LineIndex::new(source);
+            if let Some(range) = find_field_definition(&file, name, &line_index) {
+                return Some((uri.clone(), range));
             }
         }
     }
 
-    // Priority 3: Names in current file (top-level + nested)
+    // Priority 3: Names in current file (top-level + nested). Resilient parsing
+    // always yields a best-effort AST; if the structural lookup misses (e.g. the
+    // name sits in a region the parser had to recover), fall back to a text scan.
     if let Some(source) = docs.get(current_uri) {
-        if let Ok(file) = nml_core::parse(source) {
-            let line_index = LineIndex::new(source);
-            if let Some(range) = find_name_in_file(&file, name, &line_index) {
-                return Some((current_uri.clone(), range));
-            }
-        } else if let Some(range) = find_name_by_text(source, name) {
+        let file = nml_core::cst::parse_best_effort(source);
+        let line_index = LineIndex::new(source);
+        if let Some(range) = find_name_in_file(&file, name, &line_index) {
+            return Some((current_uri.clone(), range));
+        }
+        if let Some(range) = find_name_by_text(source, name) {
             return Some((current_uri.clone(), range));
         }
     }
@@ -630,11 +629,10 @@ fn find_definition_in_docs(
         if uri == current_uri {
             continue;
         }
-        if let Ok(file) = nml_core::parse(source) {
-            let line_index = LineIndex::new(source);
-            if let Some(range) = find_top_level_decl(&file, name, &line_index) {
-                return Some((uri.clone(), range));
-            }
+        let file = nml_core::cst::parse_best_effort(source);
+        let line_index = LineIndex::new(source);
+        if let Some(range) = find_top_level_decl(&file, name, &line_index) {
+            return Some((uri.clone(), range));
         }
     }
 
@@ -1036,9 +1034,8 @@ fn build_array_body_symbols(body: &ArrayBody, line_index: &LineIndex) -> Vec<Doc
 
 fn find_references_in_source(source: &str, name: &str, line_index: &LineIndex) -> Vec<Range> {
     let mut ranges = Vec::new();
-    if let Ok(file) = nml_core::parse(source) {
-        collect_references(&file, name, line_index, &mut ranges);
-    }
+    let file = nml_core::cst::parse_best_effort(source);
+    collect_references(&file, name, line_index, &mut ranges);
     ranges
 }
 
@@ -1402,34 +1399,33 @@ fn collect_declarations_by_keyword(
 ) -> Vec<(String, String, String)> {
     let mut results = Vec::new();
     for (uri, source) in docs.iter() {
-        if let Ok(file) = nml_core::parse(source) {
-            let file_name = uri
-                .path_segments()
-                .and_then(|mut s| s.next_back())
-                .unwrap_or("unknown")
-                .to_string();
-            for decl in &file.declarations {
-                match &decl.kind {
-                    DeclarationKind::Block(block) if block.keyword.name == keyword => {
-                        results.push((
-                            block.name.name.clone(),
-                            block.keyword.name.clone(),
-                            file_name.clone(),
-                        ));
-                    }
-                    DeclarationKind::Array(arr) if arr.item_keyword.name == keyword => {
-                        for item in &arr.body.items {
-                            if let ListItemKind::Named { name, .. } = &item.kind {
-                                results.push((
-                                    name.name.clone(),
-                                    arr.item_keyword.name.clone(),
-                                    file_name.clone(),
-                                ));
-                            }
+        let file = nml_core::cst::parse_best_effort(source);
+        let file_name = uri
+            .path_segments()
+            .and_then(|mut s| s.next_back())
+            .unwrap_or("unknown")
+            .to_string();
+        for decl in &file.declarations {
+            match &decl.kind {
+                DeclarationKind::Block(block) if block.keyword.name == keyword => {
+                    results.push((
+                        block.name.name.clone(),
+                        block.keyword.name.clone(),
+                        file_name.clone(),
+                    ));
+                }
+                DeclarationKind::Array(arr) if arr.item_keyword.name == keyword => {
+                    for item in &arr.body.items {
+                        if let ListItemKind::Named { name, .. } = &item.kind {
+                            results.push((
+                                name.name.clone(),
+                                arr.item_keyword.name.clone(),
+                                file_name.clone(),
+                            ));
                         }
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
@@ -1806,7 +1802,7 @@ impl LanguageServer for NmlLanguageServer {
                 let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
                 match docs
                     .get(&uri)
-                    .and_then(|source| Some((source, nml_core::parse(source).ok()?)))
+                    .map(|source| (source, nml_core::cst::parse_best_effort(source)))
                 {
                     // Parse once and build one schema index, shared by both detectors.
                     Some((source, file)) => {
@@ -1866,27 +1862,24 @@ impl LanguageServer for NmlLanguageServer {
             // enclosing model's not-yet-present fields, type-aware insertion, required-first.
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(source) = docs.get(&uri) {
-                if let Ok(file) = nml_core::parse(source) {
-                    let (models, enums, oneofs) = self.models_for_file(&uri);
-                    let index = SchemaIndex::build(models, enums, oneofs);
-                    let line_index = LineIndex::new(source);
-                    if let Some((model, body)) =
-                        find_model_body_at(&file, pos, &index, &line_index)
-                    {
-                        let present = present_field_names(body);
-                        for (idx, field) in model.fields.iter().enumerate() {
-                            if present.contains(&field.name) {
-                                continue;
-                            }
-                            items.push(CompletionItem {
-                                label: field.name.clone(),
-                                kind: Some(CompletionItemKind::FIELD),
-                                detail: Some(field_detail(field)),
-                                sort_text: Some(field_sort_key(field, idx)),
-                                insert_text: Some(field_insert_text(&index, field)),
-                                ..Default::default()
-                            });
+                let file = nml_core::cst::parse_best_effort(source);
+                let (models, enums, oneofs) = self.models_for_file(&uri);
+                let index = SchemaIndex::build(models, enums, oneofs);
+                let line_index = LineIndex::new(source);
+                if let Some((model, body)) = find_model_body_at(&file, pos, &index, &line_index) {
+                    let present = present_field_names(body);
+                    for (idx, field) in model.fields.iter().enumerate() {
+                        if present.contains(&field.name) {
+                            continue;
                         }
+                        items.push(CompletionItem {
+                            label: field.name.clone(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some(field_detail(field)),
+                            sort_text: Some(field_sort_key(field, idx)),
+                            insert_text: Some(field_insert_text(&index, field)),
+                            ..Default::default()
+                        });
                     }
                 }
             }
@@ -1924,18 +1917,17 @@ impl LanguageServer for NmlLanguageServer {
 
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             for source in docs.values() {
-                if let Ok(file) = nml_core::parse(source) {
-                    for decl in &file.declarations {
-                        if let nml_core::ast::DeclarationKind::Block(block) = &decl.kind {
-                            let kw = &block.keyword.name;
-                            if seen.insert(kw.clone()) {
-                                items.push(CompletionItem {
-                                    label: kw.clone(),
-                                    kind: Some(CompletionItemKind::KEYWORD),
-                                    detail: Some("workspace".to_string()),
-                                    ..Default::default()
-                                });
-                            }
+                let file = nml_core::cst::parse_best_effort(source);
+                for decl in &file.declarations {
+                    if let nml_core::ast::DeclarationKind::Block(block) = &decl.kind {
+                        let kw = &block.keyword.name;
+                        if seen.insert(kw.clone()) {
+                            items.push(CompletionItem {
+                                label: kw.clone(),
+                                kind: Some(CompletionItemKind::KEYWORD),
+                                detail: Some("workspace".to_string()),
+                                ..Default::default()
+                            });
                         }
                     }
                 }
@@ -1969,26 +1961,25 @@ impl LanguageServer for NmlLanguageServer {
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             let mut seen_refs = HashSet::new();
             for source in docs.values() {
-                if let Ok(file) = nml_core::parse(source) {
-                    for decl in &file.declarations {
-                        if let DeclarationKind::Block(block) = &decl.kind {
-                            let kw = &block.keyword.name;
-                            let name = &block.name.name;
-                            let is_tagged = member_kws.iter().any(|mk| mk == kw)
-                                || block
-                                    .extends
-                                    .iter()
-                                    .any(|e| member_kws.iter().any(|mk| mk == &e.name));
-                            if is_tagged {
-                                let label = format!("@{kw}/{name}");
-                                if seen_refs.insert(label.clone()) {
-                                    items.push(CompletionItem {
-                                        label,
-                                        kind: Some(CompletionItemKind::ENUM_MEMBER),
-                                        detail: Some(format!("{kw} instance")),
-                                        ..Default::default()
-                                    });
-                                }
+                let file = nml_core::cst::parse_best_effort(source);
+                for decl in &file.declarations {
+                    if let DeclarationKind::Block(block) = &decl.kind {
+                        let kw = &block.keyword.name;
+                        let name = &block.name.name;
+                        let is_tagged = member_kws.iter().any(|mk| mk == kw)
+                            || block
+                                .extends
+                                .iter()
+                                .any(|e| member_kws.iter().any(|mk| mk == &e.name));
+                        if is_tagged {
+                            let label = format!("@{kw}/{name}");
+                            if seen_refs.insert(label.clone()) {
+                                items.push(CompletionItem {
+                                    label,
+                                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                                    detail: Some(format!("{kw} instance")),
+                                    ..Default::default()
+                                });
                             }
                         }
                     }
@@ -2059,32 +2050,31 @@ impl LanguageServer for NmlLanguageServer {
         let is_prop = is_property_name_position(line, &word, byte_col);
 
         if is_prop && !word.is_empty() {
-            if let Ok(file) = nml_core::parse(&source_clone) {
-                let line_index = LineIndex::new(&source_clone);
-                if let Some(keyword) = find_enclosing_block_keyword(&file, pos, &line_index) {
-                    let (models, _, _) = self.models_for_file(&uri);
-                    if let Some(model) = models.iter().find(|m| m.name == keyword) {
-                        if let Some(field) = model.fields.iter().find(|f| f.name == word) {
-                            // In source syntax the `|` sigil belongs to the
-                            // field name (`|allow []string`), not the type.
-                            let sigil = if matches!(field.field_type, FieldType::Modifier(_)) {
-                                "|"
-                            } else {
-                                ""
-                            };
-                            let opt = if field.optional { "?" } else { "" };
-                            let text = format!(
-                                "**{keyword}** field\n\n```nml\n  {sigil}{} {}{opt}\n```",
-                                field.name, field.field_type
-                            );
-                            return Ok(Some(Hover {
-                                contents: HoverContents::Markup(MarkupContent {
-                                    kind: MarkupKind::Markdown,
-                                    value: text,
-                                }),
-                                range: None,
-                            }));
-                        }
+            let file = nml_core::cst::parse_best_effort(&source_clone);
+            let line_index = LineIndex::new(&source_clone);
+            if let Some(keyword) = find_enclosing_block_keyword(&file, pos, &line_index) {
+                let (models, _, _) = self.models_for_file(&uri);
+                if let Some(model) = models.iter().find(|m| m.name == keyword) {
+                    if let Some(field) = model.fields.iter().find(|f| f.name == word) {
+                        // In source syntax the `|` sigil belongs to the
+                        // field name (`|allow []string`), not the type.
+                        let sigil = if matches!(field.field_type, FieldType::Modifier(_)) {
+                            "|"
+                        } else {
+                            ""
+                        };
+                        let opt = if field.optional { "?" } else { "" };
+                        let text = format!(
+                            "**{keyword}** field\n\n```nml\n  {sigil}{} {}{opt}\n```",
+                            field.name, field.field_type
+                        );
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: text,
+                            }),
+                            range: None,
+                        }));
                     }
                 }
             }
@@ -2119,64 +2109,68 @@ impl LanguageServer for NmlLanguageServer {
 
         if !word.is_empty() {
             let model_ref_type = if !is_prop {
-                nml_core::parse(&source_clone).ok().and_then(|file| {
-                    let (models, enums, oneofs) = self.models_for_file(&uri);
-                    let index = SchemaIndex::build(models, enums, oneofs);
-                    let line_index = LineIndex::new(&source_clone);
-                    find_model_ref_type_at(&file, &source_clone, pos, &index, &line_index)
-                })
+                let file = nml_core::cst::parse_best_effort(&source_clone);
+                let (models, enums, oneofs) = self.models_for_file(&uri);
+                let index = SchemaIndex::build(models, enums, oneofs);
+                let line_index = LineIndex::new(&source_clone);
+                find_model_ref_type_at(&file, &source_clone, pos, &index, &line_index)
             } else {
                 None
             };
 
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             for (doc_uri, source) in docs.iter() {
-                if let Ok(file) = nml_core::parse(source) {
-                    for decl in &file.declarations {
-                        let (kw, decl_name, body_summary) = match &decl.kind {
-                            DeclarationKind::Block(block) if block.name.name == word => {
-                                let summary = summarize_body(&block.body);
-                                (block.keyword.name.clone(), block.name.name.clone(), summary)
-                            }
-                            DeclarationKind::Array(arr) if arr.name.name == word => (
-                                format!("[]{}", arr.item_keyword.name),
-                                arr.name.name.clone(),
-                                String::new(),
-                            ),
-                            DeclarationKind::Const(c) if c.name.name == word => {
-                                let val = format_named_value(&c.name.name, &c.value.value);
-                                ("const".into(), c.name.name.clone(), val)
-                            }
-                            DeclarationKind::Template(t) if t.name.name == word => {
-                                let val = format_named_value(&t.name.name, &t.value.value);
-                                ("template".into(), t.name.name.clone(), val)
-                            }
-                            _ => continue,
-                        };
-
-                        let mut text = format!("**{kw}** `{decl_name}`");
-                        if let Some(ref ref_type) = model_ref_type {
-                            text.push_str(&format!(" *(referenced as {ref_type})*"));
+                let file = nml_core::cst::parse_best_effort(source);
+                for decl in &file.declarations {
+                    let (kw, decl_name, body_summary) = match &decl.kind {
+                        DeclarationKind::Block(block) if block.name.name == word => {
+                            let summary = summarize_body(&block.body);
+                            (block.keyword.name.clone(), block.name.name.clone(), summary)
                         }
-                        if !body_summary.is_empty() {
-                            text.push_str("\n\n");
-                            text.push_str(&body_summary);
+                        DeclarationKind::Array(arr) if arr.name.name == word => (
+                            format!("[]{}", arr.item_keyword.name),
+                            arr.name.name.clone(),
+                            String::new(),
+                        ),
+                        DeclarationKind::Const(c) if c.name.name == word => {
+                            let val = format_named_value(&c.name.name, &c.value.value);
+                            ("const".into(), c.name.name.clone(), val)
                         }
+                        DeclarationKind::Template(t) if t.name.name == word => {
+                            let val = format_named_value(&t.name.name, &t.value.value);
+                            ("template".into(), t.name.name.clone(), val)
+                        }
+                        _ => continue,
+                    };
 
-                        let file_name = doc_uri
-                            .path_segments()
-                            .and_then(|mut s| s.next_back())
-                            .unwrap_or("unknown");
-                        text.push_str(&format!("\n\n*Source: {file_name}*"));
-
-                        return Ok(Some(Hover {
-                            contents: HoverContents::Markup(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: text,
-                            }),
-                            range: None,
-                        }));
+                    let mut text = format!("**{kw}** `{decl_name}`");
+                    if let Some(ref ref_type) = model_ref_type {
+                        text.push_str(&format!(" *(referenced as {ref_type})*"));
                     }
+                    // A comment written above the declaration is its documentation
+                    // (RFC 0004 §4.3 comment attachment — the hover-on-comment payoff).
+                    if let Some(doc) = nml_core::cst::doc_comment_for(source, &decl_name) {
+                        text.push_str("\n\n");
+                        text.push_str(&doc);
+                    }
+                    if !body_summary.is_empty() {
+                        text.push_str("\n\n");
+                        text.push_str(&body_summary);
+                    }
+
+                    let file_name = doc_uri
+                        .path_segments()
+                        .and_then(|mut s| s.next_back())
+                        .unwrap_or("unknown");
+                    text.push_str(&format!("\n\n*Source: {file_name}*"));
+
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: text,
+                        }),
+                        range: None,
+                    }));
                 }
             }
         }
@@ -2203,11 +2197,10 @@ impl LanguageServer for NmlLanguageServer {
             let word = extract_word_at(line, byte_col);
             let is_prop = is_property_name_position(line, &word, byte_col);
 
-            let enclosing = if let Ok(file) = nml_core::parse(source) {
+            let enclosing = {
+                let file = nml_core::cst::parse_best_effort(source);
                 let line_index = LineIndex::new(source);
                 find_enclosing_block_keyword(&file, pos, &line_index)
-            } else {
-                None
             };
 
             (word, enclosing, is_prop)
@@ -2305,10 +2298,9 @@ impl LanguageServer for NmlLanguageServer {
             }
         };
 
-        let file = match nml_core::parse(&source_clone) {
-            Ok(f) => f,
-            Err(_) => return Ok(None),
-        };
+        // Resilient parse keeps the document outline populated mid-edit instead
+        // of collapsing to empty on the first syntax error.
+        let file = nml_core::cst::parse_best_effort(&source_clone);
 
         let line_index = LineIndex::new(&source_clone);
         let symbols = build_document_symbols(&file, &line_index);
@@ -2700,7 +2692,7 @@ mod tests {
     #[test]
     fn find_top_level_block() {
         let source = "provider GroqFast:\n    type = \"groq\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         assert!(find_top_level_decl(&file, "GroqFast", &line_index).is_some());
     }
@@ -2708,7 +2700,7 @@ mod tests {
     #[test]
     fn find_top_level_const() {
         let source = "const Limit = 100\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         assert!(find_top_level_decl(&file, "Limit", &line_index).is_some());
     }
@@ -2716,7 +2708,7 @@ mod tests {
     #[test]
     fn find_top_level_not_found() {
         let source = "provider GroqFast:\n    type = \"groq\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         assert!(find_top_level_decl(&file, "NonExistent", &line_index).is_none());
     }
@@ -2726,7 +2718,7 @@ mod tests {
     #[test]
     fn find_field_in_model() {
         let source = "model user:\n    name string\n    email string\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         assert!(find_field_definition(&file, "email", &line_index).is_some());
     }
@@ -2734,7 +2726,7 @@ mod tests {
     #[test]
     fn find_field_ignores_non_model() {
         let source = "service Svc:\n    localMount = \"/\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         assert!(find_field_definition(&file, "localMount", &line_index).is_none());
     }
@@ -2742,7 +2734,7 @@ mod tests {
     #[test]
     fn find_field_not_found() {
         let source = "model user:\n    name string\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         assert!(find_field_definition(&file, "nonexistent", &line_index).is_none());
     }
@@ -2752,7 +2744,7 @@ mod tests {
     #[test]
     fn find_name_top_level() {
         let source = "provider GroqFast:\n    type = \"groq\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         assert!(find_name_in_file(&file, "GroqFast", &line_index).is_some());
     }
@@ -2761,7 +2753,7 @@ mod tests {
     fn find_name_nested_block() {
         let source =
             "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - s1:\n            provider = GroqFast\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         assert!(find_name_in_file(&file, "steps", &line_index).is_some());
     }
@@ -2769,7 +2761,7 @@ mod tests {
     #[test]
     fn find_name_list_item() {
         let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - myStep:\n            provider = GroqFast\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         assert!(find_name_in_file(&file, "myStep", &line_index).is_some());
     }
@@ -2777,7 +2769,7 @@ mod tests {
     #[test]
     fn find_name_not_found_in_file() {
         let source = "provider GroqFast:\n    type = \"groq\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         assert!(find_name_in_file(&file, "NonExistent", &line_index).is_none());
     }
@@ -3017,7 +3009,7 @@ mod tests {
     #[test]
     fn find_schema_block_definition_finds_model() {
         let source = "model provider:\n    type string\n\nmodel workflow:\n    entrypoint string\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
 
         let result = find_schema_block_definition(&file, "workflow", &line_index);
@@ -3032,7 +3024,7 @@ mod tests {
     #[test]
     fn find_schema_block_definition_finds_enum() {
         let source = "enum transport:\n    - \"http\"\n    - \"websocket\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
 
         let result = find_schema_block_definition(&file, "transport", &line_index);
@@ -3043,7 +3035,7 @@ mod tests {
     #[test]
     fn find_schema_block_definition_ignores_instances() {
         let source = "provider GroqFast:\n    type = \"groq\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
 
         let result = find_schema_block_definition(&file, "GroqFast", &line_index);
@@ -3160,7 +3152,7 @@ workflow VoiceAgent:
         - conversation:
             provider = GroqFast
 "#;
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
 
         // "workflow" keyword is on line 11 (0-indexed)
@@ -3206,7 +3198,7 @@ workflow VoiceAgent:
         - conversation:
             provider = GroqFast
 "#;
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
 
         // "tool" keyword is on line 9 (0-indexed) - must return "tool" not "workflow" or "stage"
@@ -3222,7 +3214,7 @@ workflow VoiceAgent:
     #[test]
     fn enclosing_keyword_returns_none_for_blank_line() {
         let source = "stage A:\n    wasm = \"a.wasm\"\n\nstage B:\n    wasm = \"b.wasm\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
 
         // Line 2 is the blank line between stage A and stage B
@@ -3309,7 +3301,7 @@ workflow VoiceAgent:
         // Should find "model workflow:" on line 7 (0-indexed) in workflow.model.nml
         {
             let source = docs.get(&model_uri).unwrap();
-            let file = nml_core::parse(source).unwrap();
+            let file = nml_core::cst::parse_to_ast(source).unwrap();
             let line_index = LineIndex::new(source);
             let result = find_schema_block_definition(&file, "workflow", &line_index);
             assert!(
@@ -3326,7 +3318,7 @@ workflow VoiceAgent:
         // Test 2: "provider" with enclosing="provider" (cursor on keyword)
         {
             let source = docs.get(&model_uri).unwrap();
-            let file = nml_core::parse(source).unwrap();
+            let file = nml_core::cst::parse_to_ast(source).unwrap();
             let line_index = LineIndex::new(source);
             let result = find_schema_block_definition(&file, "provider", &line_index);
             assert!(
@@ -3435,7 +3427,7 @@ workflow VoiceAgent:
     /// Resolve the model-ref type at the cursor via the shared walk (parse-once + index).
     fn ref_type_at(schema_source: &str, source: &str, pos: Position) -> Option<String> {
         let index = field_index(schema_source);
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         find_model_ref_type_at(&file, source, pos, &index, &line_index)
     }
@@ -3447,7 +3439,7 @@ workflow VoiceAgent:
         pos: Position,
     ) -> Option<Vec<String>> {
         let index = field_index(schema_source);
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         find_oneof_discriminator_at(&file, source, pos, &index, &line_index)
             .map(|o| o.variants.iter().map(|(v, _)| v.clone()).collect())
@@ -3514,7 +3506,7 @@ workflow VoiceAgent:
     // ── Field completion (RFC 0003) ───────────────────────────────
 
     fn field_index(schema_source: &str) -> SchemaIndex {
-        let s = nml_core::model_extract::extract(&nml_core::parse(schema_source).unwrap());
+        let s = nml_core::cst::extract_schema(schema_source).0;
         SchemaIndex::build(s.models, s.enums, s.oneofs)
     }
 
@@ -3525,7 +3517,7 @@ workflow VoiceAgent:
         );
         // `model` and `type` are already set; cursor on a blank body line between them.
         let source = "provider GroqFast:\n    model = \"llama\"\n\n    type = \"groq\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         let (model, body) =
             find_model_body_at(&file, Position::new(2, 0), &index, &line_index).unwrap();
@@ -3543,7 +3535,7 @@ workflow VoiceAgent:
     fn field_completion_none_on_header_line() {
         let index = field_index("model provider:\n    type string\n");
         let source = "provider GroqFast:\n    type = \"x\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         // Cursor on the `provider GroqFast:` header (line 0) — not a body position.
         assert!(find_model_body_at(&file, Position::new(0, 8), &index, &line_index).is_none());
@@ -3553,7 +3545,7 @@ workflow VoiceAgent:
     fn field_completion_none_for_unknown_keyword() {
         let index = field_index("model provider:\n    type string\n");
         let source = "widget Foo:\n    color = \"red\"\n"; // `widget` is not a declared model
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         assert!(find_model_body_at(&file, Position::new(1, 0), &index, &line_index).is_none());
     }
@@ -3561,9 +3553,10 @@ workflow VoiceAgent:
     #[test]
     fn field_insert_text_is_type_aware() {
         // A scalar field is `f = `; a model-typed field is a block `f:`.
-        let s = nml_core::model_extract::extract(
-            &nml_core::parse("model prompt:\n    system string?\n\nmodel step:\n    name string\n    prompt prompt?\n").unwrap(),
-        );
+        let s = nml_core::cst::extract_schema(
+            "model prompt:\n    system string?\n\nmodel step:\n    name string\n    prompt prompt?\n",
+        )
+        .0;
         let index = SchemaIndex::build(s.models.clone(), s.enums.clone(), s.oneofs.clone());
         let step = s.models.iter().find(|m| m.name == "step").unwrap();
         let name = step.fields.iter().find(|f| f.name == "name").unwrap();
@@ -3574,9 +3567,10 @@ workflow VoiceAgent:
 
     #[test]
     fn field_detail_shows_type_and_default() {
-        let s = nml_core::model_extract::extract(
-            &nml_core::parse("model prompt:\n    outputFormat string = \"text\"\n    retries number?\n").unwrap(),
-        );
+        let s = nml_core::cst::extract_schema(
+            "model prompt:\n    outputFormat string = \"text\"\n    retries number?\n",
+        )
+        .0;
         let m = &s.models[0];
         let out_fmt = m.fields.iter().find(|f| f.name == "outputFormat").unwrap();
         let retries = m.fields.iter().find(|f| f.name == "retries").unwrap();
@@ -3586,9 +3580,7 @@ workflow VoiceAgent:
 
     #[test]
     fn field_sort_key_orders_required_before_optional() {
-        let s = nml_core::model_extract::extract(
-            &nml_core::parse("model m:\n    req string\n    opt string?\n").unwrap(),
-        );
+        let s = nml_core::cst::extract_schema("model m:\n    req string\n    opt string?\n").0;
         let m = &s.models[0];
         let req = &m.fields[0];
         let opt = &m.fields[1];
@@ -3602,7 +3594,7 @@ workflow VoiceAgent:
         );
         // Cursor inside the nested `prompt:` block — should resolve to the `prompt` model.
         let source = "step S:\n    name = \"x\"\n    prompt:\n        system = \"hi\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         let (model, body) =
             find_model_body_at(&file, Position::new(3, 8), &index, &line_index).unwrap();
@@ -3628,7 +3620,7 @@ workflow VoiceAgent:
         ));
         let source =
             "config C:\n    email:\n        provider = \"postmark\"\n        apiKey = \"x\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         // Cursor inside the `email` body (the `apiKey` line, property position).
         let (model, body) =
@@ -3651,7 +3643,7 @@ workflow VoiceAgent:
         // Cursor inside the `- classify:` list item — should resolve to the `step` model
         // (workflow → steps list → step item).
         let source = "workflow W:\n    steps:\n        - classify:\n            name = \"x\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         let (model, _body) =
             find_model_body_at(&file, Position::new(3, 12), &index, &line_index).unwrap();
@@ -3787,6 +3779,25 @@ workflow VoiceAgent:
         assert!(
             text.contains("Source: nudge.nml"),
             "should contain source file"
+        );
+    }
+
+    #[test]
+    fn hover_surfaces_leading_comment_as_documentation() {
+        // RFC 0004 §4.3 hover-on-comment payoff: a comment written above a
+        // declaration is surfaced as its hover documentation.
+        let mut docs = HashMap::new();
+        docs.insert(
+            make_uri("nudge.nml"),
+            "// Privileged operators.\n// Use sparingly.\nrole admin:\n    label = \"Admin\"\n"
+                .to_string(),
+        );
+
+        let text = find_tagged_ref_hover_in_docs(&docs, "role", "admin").expect("hover present");
+        assert!(text.contains("**role** `admin`"), "names the declaration: {text}");
+        assert!(
+            text.contains("Privileged operators.") && text.contains("Use sparingly."),
+            "surfaces the leading comment block as docs: {text}"
         );
     }
 
@@ -4026,7 +4037,7 @@ workflow VoiceAgent:
     #[test]
     fn hover_summary_redacts_credential_strings() {
         let source = "provider P:\n    apiKey = \"gsk_super_secret\"\n    model = \"llama\"\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let DeclarationKind::Block(block) = &file.declarations[0].kind else {
             panic!("expected block declaration");
         };
@@ -4043,7 +4054,7 @@ workflow VoiceAgent:
     fn hover_summary_keeps_secret_env_reference() {
         // `$ENV.X` is a reference, not secret material; it stays visible.
         let source = "provider P:\n    apiKey = $ENV.GROQ_KEY\n";
-        let file = nml_core::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let DeclarationKind::Block(block) = &file.declarations[0].kind else {
             panic!("expected block declaration");
         };

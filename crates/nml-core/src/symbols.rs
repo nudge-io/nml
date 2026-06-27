@@ -302,12 +302,12 @@ fn collect_local_names_recursive(body: &Body, names: &mut HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser;
+    use crate::cst::parse_to_ast;
 
     #[test]
     fn test_resolve_reference() {
         let source = "service Svc:\n    localMount = \"/\"\n\nresource Res:\n    path = \"/\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn test_unresolved_reference() {
         let source = "provider Groq:\n    type = \"groq\"\n\nworkflow W:\n    entrypoint = lasda\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -336,7 +336,7 @@ mod tests {
     #[test]
     fn test_valid_reference_no_error() {
         let source = "provider Groq:\n    type = \"groq\"\n\nworkflow W:\n    provider = Groq\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -351,7 +351,7 @@ mod tests {
     #[test]
     fn test_unresolved_ref_in_list_item() {
         let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - s1:\n            provider = NonExistent\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn test_local_step_ref_resolves() {
         let source = "workflow W:\n    entrypoint = classify\n    steps:\n        - classify:\n            next = respond\n        - respond:\n            provider = \"groq\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn test_step_ref_not_in_other_workflow() {
         let source = "workflow A:\n    entrypoint = respond\n    steps:\n        - start:\n            next = respond\n\nworkflow B:\n    entrypoint = respond\n    steps:\n        - respond:\n            provider = \"groq\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn test_top_level_ref_resolves_from_any_workflow() {
         let source = "provider Groq:\n    type = \"groq\"\n\nworkflow W:\n    steps:\n        - s1:\n            provider = Groq\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn test_model_definitions_skipped() {
         let source = "model step:\n    provider string?\n    prompt prompt?\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -431,7 +431,7 @@ mod tests {
     fn test_find_duplicates() {
         let source =
             "service Svc:\n    localMount = \"/\"\n\nservice Svc:\n    localMount = \"/other\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn test_const_cycle_direct() {
         let source = "const A = B\n\nconst B = A\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn test_const_cycle_three_way() {
         let source = "const A = B\n\nconst B = C\n\nconst C = A\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn test_const_no_cycle() {
         let source = "const A = B\n\nconst B = \"hello\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn test_const_self_reference() {
         let source = "const A = A\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -510,7 +510,7 @@ mod tests {
     fn test_template_no_false_positive() {
         // Templates always hold string values, not references, so they can't form cycles.
         let source = "template Greeting:\n    \"Hello world\"\n\nconst Name = \"Alice\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -527,7 +527,7 @@ mod tests {
         // A const referencing a template name: const uses Value::Reference, but the
         // template stores a string value, so the chain terminates.
         let source = "template Prompt:\n    \"You are a helpful assistant.\"\n\nconst SystemPrompt = Prompt\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn test_multiple_disjoint_cycles() {
         let source = "const A = B\n\nconst B = A\n\nconst X = Y\n\nconst Y = X\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -561,7 +561,7 @@ mod tests {
             source.push_str(&format!("const c{} = c{}\n\n", i, i + 1));
         }
         source.push_str("const c20 = \"end\"\n");
-        let file = parser::parse(&source).unwrap();
+        let file = parse_to_ast(&source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn test_resolve_const_value_follows_chain() {
         let source = "const A = B\n\nconst B = \"hello\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -594,7 +594,7 @@ mod tests {
     #[test]
     fn test_resolved_const_snapshot_chain_resolves_and_drops_cycles() {
         let source = "const A = B\n\nconst B = \"hello\"\n\nconst C = D\n\nconst D = C\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn test_resolve_const_value_cycle_returns_none() {
         let source = "const A = B\n\nconst B = A\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -623,7 +623,7 @@ mod tests {
         // A reference to something that is not a const (e.g. a block name)
         // is returned as-is; it is not this symbols's job to fail it.
         let source = "service Svc:\n    x = 1\n\nconst A = Svc\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn test_const_cycle_error_message_contains_path() {
         let source = "const A = B\n\nconst B = C\n\nconst C = A\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let mut symbols = SymbolTable::new();
         symbols.register_file(&file);
 

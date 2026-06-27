@@ -396,14 +396,13 @@ mod tests {
     use crate::types::Value;
 
     fn index_from(schema: &str) -> SchemaIndex {
-        let file = crate::parser::parse(schema).unwrap();
-        let mut ex = crate::model_extract::extract(&file);
-        crate::model_extract::resolve_model_inheritance(&mut ex);
+        let mut ex = crate::cst::extract_schema(schema).0;
+        crate::schema::resolve_model_inheritance(&mut ex);
         SchemaIndex::build(ex.models, ex.enums, ex.oneofs)
     }
 
     fn body_of(src: &str) -> Body {
-        let file = crate::parser::parse(src).unwrap();
+        let file = crate::cst::parse_to_ast(src).unwrap();
         match &file.declarations[0].kind {
             DeclarationKind::Block(b) => b.body.clone(),
             _ => panic!("expected block"),
@@ -714,7 +713,7 @@ mod tests {
             output_format: String,
         }
         let idx = index_from("model prompt:\n    outputFormat string = \"text\"\n");
-        let file = crate::parser::parse("prompt P:\n    other = \"z\"\n").unwrap();
+        let file = crate::cst::parse_to_ast("prompt P:\n    other = \"z\"\n").unwrap();
         let block = match &file.declarations[0].kind {
             DeclarationKind::Block(b) => b,
             _ => panic!(),

@@ -46,27 +46,39 @@
 //! let config: Config = from_block(body).unwrap();
 //! ```
 
+/// The typed **semantic AST** (`File`/`Declaration`/decoded `Value`s …) — the
+/// model that semantic consumers (validation, deserialization, defaulting) read.
+/// Produced by lowering the lossless [`cst`] (see [`cst::lower`]) — the production
+/// parse path that supersedes the legacy parser (which now survives only in
+/// nml-core's own tests, pending removal).
 pub mod ast;
+/// RFC 0004 lossless CST: the production parser (resilient red/green tree with
+/// exact spans, trivia, and comments). Tooling that needs losslessness/resilience
+/// reads this directly; semantic consumers read the [`ast`] it lowers to.
+pub mod cst;
 pub mod de;
 pub mod defaults;
 pub mod error;
-pub mod lexer;
 pub mod model;
-pub mod model_extract;
 pub mod money;
-pub mod parser;
 pub mod project;
 pub mod query;
 pub mod resolve;
+/// The assembled schema (`ExtractedSchema` = models + enums + oneofs, produced by
+/// [`cst::extract`]) and the passes over it: inheritance resolution and
+/// `extends`/model-reference cycle + `oneof` integrity detection. `model` holds
+/// the leaf definitions; this holds the aggregate and the checks.
+pub mod schema;
 pub mod schema_index;
 pub mod span;
 pub mod symbols;
 pub mod template;
 pub mod types;
 
+/// The top-level parse facade: source → semantic [`ast::File`], reporting the
+/// first error. Ergonomic alias for [`cst::parse_to_ast`] (the layered name).
+pub use cst::parse_to_ast as parse;
 pub use defaults::{apply_defaults, from_block_defaulted, from_body_defaulted};
-pub use lexer::Comment;
-pub use parser::{parse, parse_with_comments};
 pub use project::ProjectConfig;
 pub use query::Document;
 pub use resolve::ValueResolver;

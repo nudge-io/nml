@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
+use nml_core::schema::{report_graph_cycles, ExtractedSchema};
 use nml_core::schema_index::{FieldTarget, SchemaIndex};
 use nml_core::span::Span;
 use nml_core::types::{PrimitiveType, Value};
@@ -43,6 +44,14 @@ pub struct MembershipSemantics {
     /// Prefix for references that target individual principals.  Warned about
     /// when it appears inside access-control modifier rules (e.g. `"@user/"`).
     pub user_ref_prefix: Option<String>,
+}
+
+impl From<ExtractedSchema> for SchemaValidator {
+    /// Build a validator from a loaded schema (use after running the
+    /// inheritance/cycle passes, e.g. via [`crate::loader::load_schema`]).
+    fn from(schema: ExtractedSchema) -> Self {
+        Self::new(schema.models, schema.enums, schema.oneofs)
+    }
 }
 
 impl SchemaValidator {
@@ -1060,15 +1069,23 @@ impl SchemaValidator {
             }
         }
 
-        let mut globally_visited = HashSet::new();
-        let keys: Vec<String> = membership.keys().cloned().collect();
-        for name in &keys {
-            if globally_visited.contains(name.as_str()) {
-                continue;
-            }
-            let mut path = Vec::new();
-            detect_member_cycle(name, &membership, &mut path, &mut globally_visited, diags);
-        }
+        // Detect cycles via the shared, stack-safe iterative graph walk (a deep
+        // membership chain in an untrusted file must not overflow the stack).
+        let edges: HashMap<&str, Vec<&str>> = membership
+            .iter()
+            .map(|(name, members)| (name.as_str(), members.iter().map(String::as_str).collect()))
+            .collect();
+        report_graph_cycles(membership.keys().map(String::as_str), &edges, |cycle| {
+            let desc = cycle
+                .iter()
+                .chain(std::iter::once(&cycle[0]))
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            diags.push(Diagnostic::warning(format!(
+                "circular membership detected: {desc}"
+            )));
+        });
     }
 }
 
@@ -1093,38 +1110,6 @@ fn collect_member_refs(body: &Body, prefixes: &[String]) -> Vec<String> {
         }
     }
     refs
-}
-
-fn detect_member_cycle(
-    name: &str,
-    membership: &HashMap<String, Vec<String>>,
-    path: &mut Vec<String>,
-    globally_visited: &mut HashSet<String>,
-    diags: &mut Vec<Diagnostic>,
-) {
-    if let Some(pos) = path.iter().position(|n| n == name) {
-        let cycle: Vec<&str> = path[pos..].iter().map(|s| s.as_str()).collect();
-        let mut cycle_desc: Vec<&str> = cycle.to_vec();
-        cycle_desc.push(cycle[0]);
-        diags.push(Diagnostic::warning(format!(
-            "circular membership detected: {}",
-            cycle_desc.join(" -> ")
-        )));
-        return;
-    }
-
-    if globally_visited.contains(name) {
-        return;
-    }
-
-    path.push(name.to_string());
-    if let Some(members) = membership.get(name) {
-        for member in members {
-            detect_member_cycle(member, membership, path, globally_visited, diags);
-        }
-    }
-    path.pop();
-    globally_visited.insert(name.to_string());
 }
 
 fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
@@ -1167,18 +1152,14 @@ fn value_type_name(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nml_core::model_extract;
-    use nml_core::parser;
 
     fn make_validator(schema_source: &str) -> SchemaValidator {
-        let file = parser::parse(schema_source).unwrap();
-        let schema = model_extract::extract(&file);
+        let schema = nml_core::cst::extract_schema(schema_source).0;
         SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
     }
 
     fn make_validator_with_modifiers(schema_source: &str, modifiers: &[&str]) -> SchemaValidator {
-        let file = parser::parse(schema_source).unwrap();
-        let schema = model_extract::extract(&file);
+        let schema = nml_core::cst::extract_schema(schema_source).0;
         SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
             .with_modifiers(modifiers.iter().map(|s| s.to_string()).collect())
     }
@@ -1187,7 +1168,7 @@ mod tests {
     fn test_empty_modifiers_accepts_all() {
         let validator = make_validator("");
         let source = "service Svc:\n    |anything = [@public]\n    localMount = \"/\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let modifier_diags: Vec<_> = diags
             .iter()
@@ -1201,7 +1182,7 @@ mod tests {
         let validator = make_validator_with_modifiers("", &["allow", "deny"]);
         let source =
             "service Svc:\n    |allow = [@public]\n    |deny = []\n    localMount = \"/\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let modifier_diags: Vec<_> = diags
             .iter()
@@ -1214,7 +1195,7 @@ mod tests {
     fn test_invalid_modifier_name() {
         let validator = make_validator_with_modifiers("", &["allow", "deny"]);
         let source = "service Svc:\n    |forbid = [@public]\n    localMount = \"/\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(diags
             .iter()
@@ -1225,7 +1206,7 @@ mod tests {
     fn test_field_definition_outside_model() {
         let validator = make_validator("");
         let source = "service Svc:\n    name string\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(diags.iter().any(|d| d
             .message
@@ -1236,7 +1217,7 @@ mod tests {
     fn test_field_definition_in_model_ok() {
         let validator = make_validator("");
         let source = "model provider:\n    name string\n    url string?\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let field_diags: Vec<_> = diags
             .iter()
@@ -1251,7 +1232,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "mount Test:\n    path = \"/\"\n    unknown = \"value\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(diags
             .iter()
@@ -1264,7 +1245,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "mount Test:\n    wasm = \"handler.wasm\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(diags
             .iter()
@@ -1277,7 +1258,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "prompt MyPrompt:\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let required_diags: Vec<_> = diags
             .iter()
@@ -1292,7 +1273,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "mount Test:\n    path = 42\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(diags
             .iter()
@@ -1305,7 +1286,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "mount Test:\n    path = \"/api\"\n    port = 8080\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let type_diags: Vec<_> = diags
             .iter()
@@ -1320,7 +1301,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "provider Groq:\n    type = \"groq\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let enum_diags: Vec<_> = diags
             .iter()
@@ -1335,7 +1316,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "provider Groq:\n    type = \"gemini\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(diags
             .iter()
@@ -1347,7 +1328,7 @@ mod tests {
         let validator = make_validator_with_modifiers("", &["allow", "deny"]);
         let source =
             "[]mount mounts:\n    |restrict = [@admin]\n    - Test:\n        path = \"/\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(diags
             .iter()
@@ -1360,7 +1341,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "mount Root:\n    path = \"/\"\n    wasm = \"handler.wasm\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(diags.is_empty());
     }
@@ -1371,7 +1352,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "provider P:\n    apiKey = $ENV.MY_KEY\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let type_diags: Vec<_> = diags
             .iter()
@@ -1386,7 +1367,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "plugin EchoPlugin:\n    wasm = \"echo.wasm\"\n    config:\n        prefix = \"echo\"\n        count = 3\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.is_empty(),
@@ -1401,7 +1382,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "step MyStep:\n    prompt:\n        systm = \"typo\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1418,7 +1399,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "step MyStep:\n    prompt:\n        system = \"You are helpful\"\n        outputFormat = \"text\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.is_empty(),
@@ -1433,7 +1414,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "parent P:\n    child:\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1450,7 +1431,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - myStep:\n            provder = \"bad-typo\"\n            next = \"end\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1467,7 +1448,7 @@ mod tests {
         let validator = make_validator(schema);
 
         let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - s1:\n            provider = \"groq\"\n            next = \"s2\"\n        - s2:\n            provider = \"openai\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.is_empty(),
@@ -1537,7 +1518,7 @@ model workflow:
     extensions []extensionPoint?
 "#;
 
-        let parse_result = parser::parse(schema);
+        let parse_result = nml_core::cst::parse_to_ast(schema);
         assert!(
             parse_result.is_ok(),
             "workflow.model.nml should parse; error: {:?}",
@@ -1559,7 +1540,7 @@ workflow W:
             blaasdsa = "asdasd"
             next = "end"
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1576,7 +1557,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - s1:\n            provider = \"groq\"\n            blaasdsa=\"asdasd\"\n            next = \"end\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1593,7 +1574,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "auth A:\n    secret = \"dev-secret\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.iter().any(|d| d
@@ -1610,7 +1591,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "auth A:\n    secret = $ENV.AUTH_SECRET | \"dev-secret\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1627,7 +1608,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "auth A:\n    secret = $ENV.AUTH_SECRET\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let type_diags: Vec<_> = diags
             .iter()
@@ -1646,7 +1627,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "server S:\n    port = $ENV.PORT | 3000\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let type_diags: Vec<_> = diags
             .iter()
@@ -1665,7 +1646,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "server S:\n    port = $ENV.PORT | \"three\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1682,7 +1663,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "auth A:\n    secret = $ENV.PRIMARY | $ENV.FALLBACK\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let type_diags: Vec<_> = diags
             .iter()
@@ -1701,7 +1682,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - s1:\n            provider = \"groq\"\n            prompt:\n                systm = \"typo\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1718,7 +1699,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "step Fork:\n    parallel:\n        - branchA:\n            emit = \"hello\"\n        - branchB:\n            provider = \"fast\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let warnings: Vec<_> = diags
             .iter()
@@ -1733,7 +1714,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "step Fork:\n    parallel:\n        - pipeline:\n            - stepA:\n                emit = \"starting\"\n            - stepB:\n                emit = \"done\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let warnings: Vec<_> = diags
             .iter()
@@ -1748,7 +1729,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "step Fork:\n    parallel:\n        - pipeline:\n            - stepA:\n                emit = \"hello\"\n                bogus = \"bad\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1765,7 +1746,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "nodeA Root:\n    name = \"root\"\n    child:\n        name = \"leaf\"\n        parent:\n            name = \"back-ref\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             !diags
@@ -1782,7 +1763,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "tree Root:\n    value = \"root\"\n    left:\n        value = \"left\"\n    right:\n        value = \"right\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.is_empty(),
@@ -1812,7 +1793,7 @@ workflow W:
                         parent:
                             name = "p3"
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let start = std::time::Instant::now();
         let _diags = validator.validate(&file);
         let elapsed = start.elapsed();
@@ -1829,7 +1810,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "node N:\n    value = \"hello\"\n    self_ref:\n        value = \"nested\"\n    partner:\n        name = \"p\"\n        back:\n            value = \"back\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         // Should validate without crashing or hanging
         assert!(
@@ -1847,7 +1828,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "nodeA Root:\n    name = \"root\"\n    child:\n        name = \"leaf\"\n        typo_field = \"bad\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1871,7 +1852,7 @@ workflow W:
         let validator = make_validator(&schema);
 
         let source = "type0 Instance:\n    name = \"test\"\n    ref:\n        name = \"nested\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let start = std::time::Instant::now();
         let _diags = validator.validate(&file);
         let elapsed = start.elapsed();
@@ -1890,7 +1871,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "service Svc:\n    access = \"@public\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1907,7 +1888,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "service Svc:\n    access = \"admin\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1924,7 +1905,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "service Svc:\n    access = @public\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let role_diags: Vec<_> = diags
             .iter()
@@ -1943,7 +1924,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "service Svc:\n    roles = [\"@admin\"]\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1962,7 +1943,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "model child is nonexistent:\n    value string\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -1979,7 +1960,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "model child is base:\n    value string\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let extends_diags: Vec<_> = diags
             .iter()
@@ -1998,7 +1979,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "model child is foo, bar:\n    value string\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2023,7 +2004,7 @@ workflow W:
         let validator = make_validator_with_membership("");
 
         let source = "role Admin:\n    members:\n        - @role/Editor\n\nrole Editor:\n    members:\n        - @role/Admin\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2039,7 +2020,7 @@ workflow W:
         let validator = make_validator_with_membership("");
 
         let source = "role Admin:\n    members:\n        - @role/Editor\n\nrole Editor:\n    members:\n        - @role/Viewer\n\nrole Viewer:\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let cycle_diags: Vec<_> = diags
             .iter()
@@ -2057,7 +2038,7 @@ workflow W:
         let validator = make_validator_with_membership("");
 
         let source = "[]role roles:\n    - Admin:\n        members:\n            - @role/Editor\n    - Editor:\n        members:\n            - @role/Admin\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2073,7 +2054,7 @@ workflow W:
         let validator = make_validator_with_membership("");
 
         let source = "role Admin:\n    members:\n        - @role/Admin\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2089,7 +2070,7 @@ workflow W:
         let validator = make_validator("");
 
         let source = "role Admin:\n    members:\n        - @role/Editor\n\nrole Editor:\n    members:\n        - @role/Admin\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             !diags
@@ -2111,8 +2092,7 @@ workflow W:
     }
 
     fn make_validator_with_membership(schema_source: &str) -> SchemaValidator {
-        let file = parser::parse(schema_source).unwrap();
-        let schema = model_extract::extract(&file);
+        let schema = nml_core::cst::extract_schema(schema_source).0;
         SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
             .with_membership_semantics(nudge_membership())
     }
@@ -2122,7 +2102,7 @@ workflow W:
         let validator = make_validator("");
 
         let source = "service Svc:\n    |allow = [@user/john]\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             !diags.iter().any(|d| d.message.contains("@user/")),
@@ -2136,7 +2116,7 @@ workflow W:
         let validator = make_validator_with_membership("");
 
         let source = "service Svc:\n    |allow = [@user/john]\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.iter().any(|d| d
@@ -2152,7 +2132,7 @@ workflow W:
         let validator = make_validator_with_membership("");
 
         let source = "service Svc:\n    |deny:\n        - @user/john\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.iter().any(|d| d
@@ -2168,7 +2148,7 @@ workflow W:
         let validator = make_validator_with_membership("");
 
         let source = "service Svc:\n    |allow = [@role/admin]\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             !diags.iter().any(|d| d.message.contains("@user/")),
@@ -2184,7 +2164,7 @@ workflow W:
         let validator = make_validator_with_membership("");
 
         let source = "role Admin:\n    members:\n        - @public\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.iter().any(|d| d
@@ -2200,7 +2180,7 @@ workflow W:
         let validator = make_validator_with_membership("");
 
         let source = "role Admin:\n    members:\n        - @authenticated\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.iter().any(|d| d
@@ -2216,7 +2196,7 @@ workflow W:
         let validator = make_validator_with_membership("");
 
         let source = "service Svc:\n    |allow = [@public]\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             !diags
@@ -2232,7 +2212,7 @@ workflow W:
         let validator = make_validator_with_membership("");
 
         let source = "plan Pro:\n    includes:\n        - @public\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.iter().any(|d| d
@@ -2251,7 +2231,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "workflow W:\n    next = classify\n    entrypoint = start\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let type_diags: Vec<_> = diags
             .iter()
@@ -2270,7 +2250,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "workflow W:\n    next = \"classify\"\n    entrypoint = \"start\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let type_diags: Vec<_> = diags
             .iter()
@@ -2289,7 +2269,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "workflow W:\n    next = 42\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2306,7 +2286,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "workflow W:\n    tools = [myTool, anotherTool]\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let type_diags: Vec<_> = diags
             .iter()
@@ -2322,8 +2302,7 @@ workflow W:
     // --- Strict mode tests ---
 
     fn make_strict_validator(schema_source: &str) -> SchemaValidator {
-        let file = parser::parse(schema_source).unwrap();
-        let schema = model_extract::extract(&file);
+        let schema = nml_core::cst::extract_schema(schema_source).0;
         SchemaValidator::new(schema.models, schema.enums, schema.oneofs).strict()
     }
 
@@ -2333,7 +2312,7 @@ workflow W:
         let validator = make_strict_validator(schema);
 
         let source = "server S:\n    port = 3000\n    bogus = true\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let unknown = diags
             .iter()
@@ -2351,7 +2330,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "server S:\n    port = 3000\n    bogus = true\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let unknown = diags
             .iter()
@@ -2369,7 +2348,7 @@ workflow W:
         let validator = make_strict_validator(schema);
 
         let source = "bogusBlock Thing:\n    key = \"value\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.iter().any(|d| d
@@ -2386,7 +2365,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "bogusBlock Thing:\n    key = \"value\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             !diags
@@ -2403,7 +2382,7 @@ workflow W:
         let validator = make_strict_validator(schema);
 
         let source = "[]bogus items:\n    - Item1:\n        key = \"value\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.iter().any(|d| d
@@ -2420,7 +2399,7 @@ workflow W:
         let validator = make_strict_validator(schema);
 
         let source = "[]plugin plugins:\n    - \"echo\"\n    - \"telnyx\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             !diags
@@ -2437,7 +2416,7 @@ workflow W:
         let validator = make_strict_validator(schema);
 
         let source = "plugin P:\n    wasm = \"echo.wasm\"\n    config:\n        anyKey = \"value\"\n        nested:\n            deep = true\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.is_empty(),
@@ -2454,7 +2433,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "cfg C:\n    value = true\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2473,7 +2452,7 @@ workflow W:
         let validator = make_validator(schema);
 
         for source in ["cfg C:\n    value = \"text\"\n", "cfg C:\n    value = 42\n"] {
-            let file = parser::parse(source).unwrap();
+            let file = nml_core::cst::parse_to_ast(source).unwrap();
             let diags = validator.validate(&file);
             assert!(
                 diags.is_empty(),
@@ -2488,10 +2467,10 @@ workflow W:
         let schema = "model cfg:\n    value (string | []number)\n";
         let validator = make_validator(schema);
 
-        let file = parser::parse("cfg C:\n    value = [1, 2]\n").unwrap();
+        let file = nml_core::cst::parse_to_ast("cfg C:\n    value = [1, 2]\n").unwrap();
         assert!(validator.validate(&file).is_empty());
 
-        let file = parser::parse("cfg C:\n    value = [true]\n").unwrap();
+        let file = nml_core::cst::parse_to_ast("cfg C:\n    value = [true]\n").unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2510,7 +2489,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "svc S:\n    tags = \"oops\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2528,7 +2507,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "svc S:\n    tags = sharedTags\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let type_diags: Vec<_> = diags
             .iter()
@@ -2549,7 +2528,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "provider P:\n    type = 42\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2611,7 +2590,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "tree Root:\n    child:\n        value = \"leaf\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             !diags
@@ -2630,7 +2609,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "plugin P:\n    wasm = \"a.wasm\"\n    |allow = [\"fs:read\"]\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.is_empty(),
@@ -2645,7 +2624,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "plugin P:\n    wasm = \"a.wasm\"\n    |allow = [42]\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2663,7 +2642,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "plugin P:\n    wasm = \"a.wasm\"\n    |caps:\n        - \"high\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2681,7 +2660,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "svc S:\n    name = \"s\"\n    |limit:\n        - \"high\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2699,7 +2678,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "svc S:\n    name = \"s\"\n    |limit = \"high\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags
@@ -2717,7 +2696,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "svc S:\n    name = \"s\"\n    |allow = [@public]\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
             diags.is_empty(),
@@ -2734,7 +2713,7 @@ workflow W:
         let validator = make_validator(schema);
 
         let source = "mount Test:\n    wasm = \"handler.wasm\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let missing = diags
             .iter()
@@ -2752,12 +2731,11 @@ workflow W:
 
     #[test]
     fn test_modifier_field_type_is_structured() {
-        // `model_extract` must produce a structured inner type for typed
+        // `schema` must produce a structured inner type for typed
         // modifiers, including nested lists and unions -- no string
         // round-trip involved.
         let schema = "model route:\n    |allow []string?\n    |variant (step | []step)?\n";
-        let file = nml_core::parse(schema).unwrap();
-        let extracted = nml_core::model_extract::extract(&file);
+        let extracted = nml_core::cst::extract_schema(schema).0;
         let model = &extracted.models[0];
 
         let FieldType::Modifier(inner) = &model.fields[0].field_type else {
@@ -2788,7 +2766,7 @@ workflow W:
         let validator = make_strict_validator(schema);
 
         let source = "step S:\n    prompt:\n        systm = \"typo\"\n";
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         let unknown = diags
             .iter()
@@ -2812,7 +2790,7 @@ workflow W:
 
     fn oneof_errors(source: &str) -> Vec<String> {
         let validator = make_strict_validator(ONEOF_SCHEMA);
-        let file = parser::parse(source).unwrap();
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
         validator
             .validate(&file)
             .into_iter()
@@ -2926,7 +2904,7 @@ workflow W:
         // variant rather than reporting a missing discriminator.
         let schema = "model emailLog:\n    level string?\n\nmodel emailPostmark:\n    serverToken string\n\noneof email by provider = \"log\":\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
         let validator = make_validator(schema);
-        let doc = parser::parse("email Outbound:\n    level = \"info\"\n").unwrap();
+        let doc = nml_core::cst::parse_to_ast("email Outbound:\n    level = \"info\"\n").unwrap();
         let errors: Vec<_> = validator
             .validate(&doc)
             .into_iter()
@@ -2943,7 +2921,7 @@ workflow W:
         // Without a default, an omitted discriminator remains an error.
         let schema = "model emailLog:\n    level string?\n\noneof email by provider:\n    \"log\" => emailLog\n";
         let validator = make_validator(schema);
-        let doc = parser::parse("email Outbound:\n    level = \"info\"\n").unwrap();
+        let doc = nml_core::cst::parse_to_ast("email Outbound:\n    level = \"info\"\n").unwrap();
         assert!(
             validator
                 .validate(&doc)
@@ -2956,8 +2934,8 @@ workflow W:
     #[test]
     fn type_mismatched_default_is_rejected() {
         let src = "model cfg:\n    count number = \"high\"\n";
-        let file = parser::parse(src).unwrap();
-        let schema = model_extract::extract(&file);
+        let file = nml_core::cst::parse_to_ast(src).unwrap();
+        let schema = nml_core::cst::extract_schema(src).0;
         let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
         let diags = validator.validate(&file);
         assert!(
@@ -2973,8 +2951,8 @@ workflow W:
         // duration accepts a string literal; an `$ENV` secret default is lenient;
         // a numeric default matches a number field — all reuse the value check.
         let src = "model cfg:\n    sessionDuration duration = \"24h\"\n    apiKey secret = $ENV.KEY\n    retries number = 3\n";
-        let file = parser::parse(src).unwrap();
-        let schema = model_extract::extract(&file);
+        let file = nml_core::cst::parse_to_ast(src).unwrap();
+        let schema = nml_core::cst::extract_schema(src).0;
         let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
         let errors: Vec<_> = validator
             .validate(&file)
@@ -2989,9 +2967,9 @@ workflow W:
         // A bad default on a parent is reported once (on the parent), not again
         // on each child that inherits it.
         let src = "model base:\n    count number = \"high\"\n\nmodel child is base:\n    extra string = \"x\"\n";
-        let file = parser::parse(src).unwrap();
-        let mut schema = model_extract::extract(&file);
-        model_extract::resolve_model_inheritance(&mut schema);
+        let file = nml_core::cst::parse_to_ast(src).unwrap();
+        let mut schema = nml_core::cst::extract_schema(src).0;
+        nml_core::schema::resolve_model_inheritance(&mut schema);
         let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
         let count = validator
             .validate(&file)

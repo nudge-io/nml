@@ -1,8 +1,25 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
+use nml_core::schema::ExtractedSchema;
 use nml_validate::diagnostics::{Diagnostic, Severity};
-use nml_validate::loader::LoadedSchema;
+use nml_validate::schema::SchemaValidator;
+
+/// Parse a file via the CST, reporting **every** syntactic and semantic error
+/// at once (not just the first — exceeding the legacy one-at-a-time UX). Returns
+/// the AST when the input is fully valid.
+fn parse_or_report_all(path: &Path, source: &str) -> Result<nml_core::ast::File, String> {
+    let (file, errors) = nml_core::cst::parse_to_ast_all(source);
+    if errors.is_empty() {
+        return Ok(file);
+    }
+    let source_map = nml_core::span::SourceMap::new(source);
+    for e in &errors {
+        let loc = source_map.location(e.span().start);
+        eprintln!("{}:{}:{}: {}", path.display(), loc.line, loc.column, e);
+    }
+    Err(format!("{} parse error(s)", errors.len()))
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -59,36 +76,18 @@ fn cmd_parse(args: &[String]) -> Result<(), String> {
     let path = require_file_arg(args, "parse")?;
     let source = read_file(&path)?;
 
-    match nml_core::parse(&source) {
-        Ok(file) => {
-            let json = serde_json::to_string_pretty(&file)
-                .map_err(|e| format!("serialization error: {e}"))?;
-            println!("{json}");
-            Ok(())
-        }
-        Err(e) => {
-            let source_map = nml_core::span::SourceMap::new(&source);
-            let loc = source_map.location(e.span().start);
-            Err(format!(
-                "{}:{}:{}: {}",
-                path.display(),
-                loc.line,
-                loc.column,
-                e
-            ))
-        }
-    }
+    let file = parse_or_report_all(&path, &source)?;
+    let json = serde_json::to_string_pretty(&file)
+        .map_err(|e| format!("serialization error: {e}"))?;
+    println!("{json}");
+    Ok(())
 }
 
 fn cmd_validate(args: &[String]) -> Result<(), String> {
     let path = require_file_arg(args, "validate")?;
     let source = read_file(&path)?;
 
-    let file = nml_core::parse(&source).map_err(|e| {
-        let source_map = nml_core::span::SourceMap::new(&source);
-        let loc = source_map.location(e.span().start);
-        format!("{}:{}:{}: {}", path.display(), loc.line, loc.column, e)
-    })?;
+    let file = parse_or_report_all(&path, &source)?;
 
     let mut symbols = nml_core::symbols::SymbolTable::new();
     symbols.register_file(&file);
@@ -153,11 +152,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     let path = PathBuf::from(file_args[0]);
     let source = read_file(&path)?;
 
-    let file = nml_core::parse(&source).map_err(|e| {
-        let source_map = nml_core::span::SourceMap::new(&source);
-        let loc = source_map.location(e.span().start);
-        format!("{}:{}:{}: {}", path.display(), loc.line, loc.column, e)
-    })?;
+    let file = parse_or_report_all(&path, &source)?;
 
     let mut symbols = nml_core::symbols::SymbolTable::new();
     symbols.register_file(&file);
@@ -189,7 +184,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
         }
 
         if !schema.is_empty() {
-            let validator = schema.into_validator();
+            let validator = SchemaValidator::from(schema);
             for diag in validator.validate(&file) {
                 let (line, column) = match diag.span {
                     Some(span) => {
@@ -225,7 +220,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
 /// Parse all `*.model.nml` / `*.schema.nml` files in `dir` and run them
 /// through the schema-loading pipeline (inheritance resolution, cycle and
 /// duplicate detection).
-fn load_schema_dir(dir: &PathBuf) -> Result<(LoadedSchema, Vec<Diagnostic>), String> {
+fn load_schema_dir(dir: &PathBuf) -> Result<(ExtractedSchema, Vec<Diagnostic>), String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("failed to read schema dir {}: {e}", dir.display()))?;
 
@@ -240,15 +235,12 @@ fn load_schema_dir(dir: &PathBuf) -> Result<(LoadedSchema, Vec<Diagnostic>), Str
         .collect();
     paths.sort();
 
-    let mut files = Vec::new();
-    for path in paths {
-        let source = read_file(&path)?;
-        let file = nml_core::parse(&source)
-            .map_err(|e| format!("failed to parse schema {}: {e}", path.display()))?;
-        files.push(file);
-    }
-
-    Ok(nml_validate::loader::load_schema(&files))
+    // Read every schema source; `load_schema` parses over the CST and surfaces
+    // any parse error as a diagnostic (reported alongside cycle/duplicate
+    // diagnostics) rather than aborting on the first malformed file.
+    let sources = paths.iter().map(read_file).collect::<Result<Vec<String>, _>>()?;
+    let refs: Vec<&str> = sources.iter().map(String::as_str).collect();
+    Ok(nml_validate::loader::load_schema(&refs))
 }
 
 fn require_file_arg(args: &[String], cmd: &str) -> Result<PathBuf, String> {

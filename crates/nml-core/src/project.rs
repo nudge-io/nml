@@ -125,7 +125,7 @@ fn extract_string_array(value: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser;
+    use crate::cst::parse_to_ast;
 
     #[test]
     fn parse_full_project_config() {
@@ -141,7 +141,7 @@ project MyProject:
     builtinRefs = ["@public", "@authenticated"]
     userRefPrefix = "@user/"
 "#;
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let config = ProjectConfig::from_file(&file);
         assert_eq!(
             config.schema_files,
@@ -161,7 +161,7 @@ project MyProject:
     #[test]
     fn parse_empty_project_config() {
         let source = "project Empty:\n    templateNamespaces = []\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let config = ProjectConfig::from_file(&file);
         assert!(config.schema_files.is_empty());
         assert!(config.template_namespaces.is_empty());
@@ -172,7 +172,7 @@ project MyProject:
     #[test]
     fn no_project_block_returns_defaults() {
         let source = "service MyService:\n    port = 3000\n";
-        let file = parser::parse(source).unwrap();
+        let file = parse_to_ast(source).unwrap();
         let config = ProjectConfig::from_file(&file);
         assert!(config.schema_files.is_empty());
         assert!(config.template_namespaces.is_empty());

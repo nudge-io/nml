@@ -19,6 +19,8 @@ name = "nml-lsp"
 path = "src/main.rs"
 
 [dependencies]
+# Parses via the RFC 0004 CST: resilience (validation works mid-edit), all-errors
+# diagnostics, exact spans, and comment attachment for hover-on-comment.
 nml-core = { workspace = true }
 nml-validate = { workspace = true }
 nml-fmt = { workspace = true }

@@ -13,3 +13,9 @@ readme = "../../README.md"
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true }
+# RFC 0004 lossless CST — the production parser (red/green tree via rowan).
+rowan = { workspace = true }
+
+[dev-dependencies]
+# Used by the CST→AST lowering's full-AST differential test (span-stripped compare).
+serde_json = { workspace = true }

@@ -14,7 +14,7 @@
 //!     name = "my-app"
 //!     debug = true
 //! "#;
-//! let file = nml_core::parse(source).unwrap();
+//! let file = nml_core::cst::parse_to_ast(source).unwrap();
 //! let doc = Document::new(&file);
 //!
 //! let port = doc.block("service", "MyApp")
@@ -263,10 +263,10 @@ fn find_property<'a>(body: &'a Body, name: &str) -> ValueQuery<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser;
+    use crate::cst::parse_to_ast;
 
     fn parse_doc(source: &str) -> File {
-        parser::parse(source).unwrap()
+        parse_to_ast(source).unwrap()
     }
 
     #[test]

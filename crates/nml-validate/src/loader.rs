@@ -1,45 +1,30 @@
 //! Orchestrated schema-loading pipeline.
 //!
 //! [`load_schema`] is the single entry point for turning parsed schema files
-//! into definitions ready for [`SchemaValidator`].  It runs the full
+//! into definitions ready for a
+//! [`SchemaValidator`](crate::schema::SchemaValidator).  It runs the full
 //! `nml-core` extraction pipeline -- extract, duplicate detection,
 //! inheritance-cycle detection, inheritance resolution, and reference-cycle
 //! detection -- and surfaces every problem as a [`Diagnostic`].
 
 use std::collections::HashSet;
 
-use nml_core::ast::File;
 use nml_core::error::NmlError;
-use nml_core::model::{EnumDef, ModelDef, OneOfDef};
-use nml_core::model_extract::{self, ExtractedSchema};
+// Import the passes by name (not the module) so the bare `schema` identifier stays
+// free for the local `ExtractedSchema` value and our own `crate::schema` module.
+use nml_core::schema::{
+    find_extends_cycles, find_model_cycles, find_oneof_errors, resolve_model_inheritance,
+    ExtractedSchema,
+};
 
 use crate::diagnostics::{Diagnostic, Severity};
-use crate::schema::SchemaValidator;
 
-/// A fully resolved schema: inheritance applied and cycle checks run.
-#[derive(Debug, Default)]
-pub struct LoadedSchema {
-    pub models: Vec<ModelDef>,
-    pub enums: Vec<EnumDef>,
-    pub oneofs: Vec<OneOfDef>,
-}
-
-impl LoadedSchema {
-    /// Whether the schema contains no definitions at all.
-    pub fn is_empty(&self) -> bool {
-        self.models.is_empty() && self.enums.is_empty() && self.oneofs.is_empty()
-    }
-
-    /// Consume the schema and build a [`SchemaValidator`] from it.
-    pub fn into_validator(self) -> SchemaValidator {
-        SchemaValidator::new(self.models, self.enums, self.oneofs)
-    }
-}
-
-/// Load a schema from one or more parsed files.
+/// Load a schema from one or more NML source documents.
 ///
 /// Pipeline:
-/// 1. extract model/enum definitions from every file,
+/// 1. extract model/enum definitions from every source over the CST
+///    ([`extract_schema`](nml_core::cst::extract_schema)) — surfacing any parse
+///    error as a diagnostic while still extracting from the well-formed parts,
 /// 2. report duplicate model/enum names (first definition wins),
 /// 3. report inheritance (`is`) cycles as **errors** -- such hierarchies
 ///    cannot be resolved,
@@ -50,43 +35,39 @@ impl LoadedSchema {
 ///
 /// Always returns the loaded definitions, even when diagnostics are present,
 /// so callers can keep validating with a best-effort schema.
-pub fn load_schema(files: &[File]) -> (LoadedSchema, Vec<Diagnostic>) {
+pub fn load_schema(sources: &[&str]) -> (ExtractedSchema, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
 
     let mut schema = ExtractedSchema::default();
-    for file in files {
-        let extracted = model_extract::extract(file);
+    for source in sources {
+        let (extracted, errors) = nml_core::cst::extract_schema(source);
         schema.models.extend(extracted.models);
         schema.enums.extend(extracted.enums);
         schema.oneofs.extend(extracted.oneofs);
+        for err in &errors {
+            diagnostics.push(to_diagnostic(err, Severity::Error));
+        }
     }
 
     report_duplicates(&schema, &mut diagnostics);
 
-    for err in model_extract::find_extends_cycles(&schema) {
+    for err in find_extends_cycles(&schema) {
         diagnostics.push(to_diagnostic(&err, Severity::Error));
     }
 
-    model_extract::resolve_model_inheritance(&mut schema);
+    resolve_model_inheritance(&mut schema);
 
     // `oneof` integrity (arm models exist, unique values, name collisions) is
     // an error: a malformed union cannot be validated against.
-    for err in model_extract::find_oneof_errors(&schema) {
+    for err in find_oneof_errors(&schema) {
         diagnostics.push(to_diagnostic(&err, Severity::Error));
     }
 
-    for err in model_extract::find_model_cycles(&schema) {
+    for err in find_model_cycles(&schema) {
         diagnostics.push(to_diagnostic(&err, Severity::Warning));
     }
 
-    (
-        LoadedSchema {
-            models: schema.models,
-            enums: schema.enums,
-            oneofs: schema.oneofs,
-        },
-        diagnostics,
-    )
+    (schema, diagnostics)
 }
 
 fn report_duplicates(schema: &ExtractedSchema, diagnostics: &mut Vec<Diagnostic>) {
@@ -132,11 +113,7 @@ fn to_diagnostic(err: &NmlError, severity: Severity) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nml_core::parser;
-
-    fn parse_all(sources: &[&str]) -> Vec<File> {
-        sources.iter().map(|s| parser::parse(s).unwrap()).collect()
-    }
+    use crate::schema::SchemaValidator;
 
     fn errors(diags: &[Diagnostic]) -> Vec<&Diagnostic> {
         diags
@@ -147,11 +124,10 @@ mod tests {
 
     #[test]
     fn test_inheritance_resolved_through_pipeline() {
-        let files = parse_all(&[
+        let (schema, diags) = load_schema(&[
             "model base:\n    name string\n",
             "model child is base:\n    extra string\n",
         ]);
-        let (schema, diags) = load_schema(&files);
 
         assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
         let child = schema.models.iter().find(|m| m.name == "child").unwrap();
@@ -165,14 +141,13 @@ mod tests {
 
     #[test]
     fn test_inherited_required_field_enforced_by_validator() {
-        let files = parse_all(&[
+        let (schema, diags) = load_schema(&[
             "model base:\n    name string\n\nmodel child is base:\n    extra string\n",
         ]);
-        let (schema, diags) = load_schema(&files);
         assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
 
-        let validator = schema.into_validator();
-        let doc = parser::parse("child C:\n    extra = \"x\"\n").unwrap();
+        let validator = SchemaValidator::from(schema);
+        let doc = nml_core::cst::parse_to_ast("child C:\n    extra = \"x\"\n").unwrap();
         let result = validator.validate(&doc);
         assert!(
             result
@@ -184,8 +159,8 @@ mod tests {
 
     #[test]
     fn test_extends_cycle_reported_as_error() {
-        let files = parse_all(&["model a is b:\n    x string\n\nmodel b is a:\n    y string\n"]);
-        let (_, diags) = load_schema(&files);
+        let (_, diags) =
+            load_schema(&["model a is b:\n    x string\n\nmodel b is a:\n    y string\n"]);
         assert!(
             errors(&diags)
                 .iter()
@@ -196,8 +171,7 @@ mod tests {
 
     #[test]
     fn test_model_ref_cycle_reported_as_warning() {
-        let files = parse_all(&["model a:\n    child b?\n\nmodel b:\n    parent a?\n"]);
-        let (_, diags) = load_schema(&files);
+        let (_, diags) = load_schema(&["model a:\n    child b?\n\nmodel b:\n    parent a?\n"]);
         let cycle = diags
             .iter()
             .find(|d| d.message.contains("circular dependency"))
@@ -210,11 +184,10 @@ mod tests {
 
     #[test]
     fn test_duplicate_model_names_across_files() {
-        let files = parse_all(&[
+        let (schema, diags) = load_schema(&[
             "model server:\n    port number\n",
             "model server:\n    host string\n",
         ]);
-        let (schema, diags) = load_schema(&files);
 
         assert!(
             errors(&diags)
@@ -229,11 +202,10 @@ mod tests {
 
     #[test]
     fn test_duplicate_enum_names_across_files() {
-        let files = parse_all(&[
+        let (_, diags) = load_schema(&[
             "enum status:\n    - \"on\"\n",
             "enum status:\n    - \"off\"\n",
         ]);
-        let (_, diags) = load_schema(&files);
         assert!(
             errors(&diags)
                 .iter()
@@ -243,12 +215,27 @@ mod tests {
     }
 
     #[test]
+    fn malformed_source_still_loads_wellformed_definitions() {
+        // Resilience (exceeds the old pre-parsed-File API, which could not carry a
+        // parse error): a syntax error in one source surfaces as a diagnostic, yet
+        // the well-formed definitions across all sources still load.
+        let (schema, diags) = load_schema(&["model good:\n    name string\n", "model M:\n    @@@\n"]);
+        assert!(
+            schema.models.iter().any(|m| m.name == "good"),
+            "well-formed model still loads despite a sibling parse error"
+        );
+        assert!(
+            !errors(&diags).is_empty(),
+            "the parse error is surfaced as a diagnostic: {diags:?}"
+        );
+    }
+
+    #[test]
     fn test_clean_schema_no_diagnostics() {
-        let files = parse_all(&[
+        let (schema, diags) = load_schema(&[
             "enum status:\n    - \"on\"\n    - \"off\"\n\nmodel base:\n    name string\n",
             "model server is base:\n    status status\n",
         ]);
-        let (schema, diags) = load_schema(&files);
         assert!(
             diags.is_empty(),
             "clean schema should load silently: {diags:?}"

@@ -289,7 +289,7 @@ mod tests {
     }
 
     fn body_of(src: &str) -> Body {
-        let file = crate::parser::parse(src).unwrap();
+        let file = crate::cst::parse_to_ast(src).unwrap();
         match &file.declarations[0].kind {
             crate::ast::DeclarationKind::Block(b) => b.body.clone(),
             _ => panic!("expected block"),

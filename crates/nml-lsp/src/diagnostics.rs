@@ -59,55 +59,58 @@ pub fn compute(
     let mut diagnostics = Vec::new();
     let line_index = LineIndex::new(source);
 
-    match nml_core::parse(source) {
-        Ok(file) => {
-            let mut symbols = nml_core::symbols::SymbolTable::new();
-            symbols.register_file(&file);
+    // Resilient parse: always yields a best-effort AST plus the full set of
+    // syntactic + semantic errors (position-sorted, bounded). Reporting every
+    // error at once replaces the legacy first-error-only behaviour, and running
+    // the validators on the best-effort AST keeps feedback alive mid-edit
+    // instead of going dark on the first syntax error.
+    let (file, parse_errors) = nml_core::cst::parse_to_ast_all(source);
 
-            for err in symbols.find_duplicates() {
-                diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
+    for err in &parse_errors {
+        diagnostics.push(nml_error_to_diagnostic(err, &line_index));
+    }
+
+    let mut symbols = nml_core::symbols::SymbolTable::new();
+    symbols.register_file(&file);
+
+    for err in symbols.find_duplicates() {
+        diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
+    }
+
+    for err in symbols.find_unresolved_references(&file) {
+        diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
+    }
+
+    for err in symbols.find_const_cycles() {
+        diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
+    }
+
+    if !models.is_empty() || !enums.is_empty() || !oneofs.is_empty() {
+        let validator = SchemaValidator::new(models.to_vec(), enums.to_vec(), oneofs.to_vec())
+            .with_modifiers(config.modifiers.clone())
+            .with_membership_semantics(config.membership.clone());
+        for diag in validator.validate(&file) {
+            if let Some(span) = diag.span {
+                diagnostics.push(Diagnostic {
+                    range: line_index.range(span),
+                    severity: Some(match diag.severity {
+                        Severity::Error => DiagnosticSeverity::ERROR,
+                        Severity::Warning => DiagnosticSeverity::WARNING,
+                    }),
+                    message: diag.message,
+                    source: Some("nml".to_string()),
+                    ..Default::default()
+                });
             }
-
-            for err in symbols.find_unresolved_references(&file) {
-                diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
-            }
-
-            for err in symbols.find_const_cycles() {
-                diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
-            }
-
-            if !models.is_empty() || !enums.is_empty() || !oneofs.is_empty() {
-                let validator =
-                    SchemaValidator::new(models.to_vec(), enums.to_vec(), oneofs.to_vec())
-                        .with_modifiers(config.modifiers.clone())
-                        .with_membership_semantics(config.membership.clone());
-                for diag in validator.validate(&file) {
-                    if let Some(span) = diag.span {
-                        diagnostics.push(Diagnostic {
-                            range: line_index.range(span),
-                            severity: Some(match diag.severity {
-                                Severity::Error => DiagnosticSeverity::ERROR,
-                                Severity::Warning => DiagnosticSeverity::WARNING,
-                            }),
-                            message: diag.message,
-                            source: Some("nml".to_string()),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-
-            let ns: Vec<&str> = config
-                .template_namespaces
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-            validate_templates(&file, &ns, config, &line_index, &mut diagnostics);
-        }
-        Err(err) => {
-            diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
         }
     }
+
+    let ns: Vec<&str> = config
+        .template_namespaces
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    validate_templates(&file, &ns, config, &line_index, &mut diagnostics);
 
     diagnostics
 }
@@ -322,6 +325,63 @@ mod tests {
         assert!(diags
             .iter()
             .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)));
+    }
+
+    #[test]
+    fn validation_survives_syntax_error_in_another_decl() {
+        // The legacy parser went dark on the first syntax error, suppressing all
+        // semantic feedback. With resilient parsing the malformed declaration is
+        // recovered and the duplicate among the well-formed ones is still flagged.
+        let source = concat!(
+            "service @@@\n", // syntactic garbage — recovered, not fatal
+            "service Svc:\n    localMount = \"/\"\n\n",
+            "service Svc:\n    localMount = \"/other\"\n",
+        );
+        let diags = compute(source, &[], &[], &[], &default_config());
+        assert!(
+            diags.iter().any(|d| d.message.contains("duplicate")),
+            "duplicate must be reported despite an earlier syntax error: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn multiple_syntax_errors_all_reported() {
+        // All-errors: every syntax error surfaces at once rather than the user
+        // fixing one to reveal the next (legacy first-error whack-a-mole).
+        let source = "const = 1\nconst = 2\nconst = 3\n";
+        let errors: Vec<_> = compute(source, &[], &[], &[], &default_config())
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        assert!(
+            errors.len() >= 3,
+            "expected an error per malformed const, got {}: {:?}",
+            errors.len(),
+            errors
+        );
+    }
+
+    #[test]
+    fn schema_validation_survives_syntax_error_elsewhere() {
+        // Resilience with a configured schema: a required-field violation in a
+        // well-formed declaration is still reported even though another
+        // declaration has a hard syntax error. Legacy went dark on the first error.
+        let extracted = nml_core::cst::extract_schema("model svc:\n    port number\n").0;
+        let source = "svc A:\n    @@@\n\nsvc B:\n    other = \"x\"\n";
+        let diags = compute(
+            source,
+            &extracted.models,
+            &extracted.enums,
+            &extracted.oneofs,
+            &default_config(),
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("missing required field 'port'")),
+            "schema validation must run on the best-effort AST despite a syntax error: {diags:?}"
+        );
     }
 
     #[test]

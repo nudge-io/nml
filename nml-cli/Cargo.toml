@@ -15,6 +15,7 @@ name = "nml"
 path = "src/main.rs"
 
 [dependencies]
+# Adopts the RFC 0004 CST parser (via the shim) — the first consumer on the CST.
 nml-core = { workspace = true }
 nml-validate = { workspace = true }
 nml-fmt = { workspace = true }

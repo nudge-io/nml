@@ -1,6 +1,6 @@
 use nml_core::ast::*;
+use nml_core::cst::Comment;
 use nml_core::error::NmlResult;
-use nml_core::lexer::Comment;
 use nml_core::template;
 use nml_core::types::Value;
 
@@ -17,14 +17,15 @@ pub fn format(file: &File) -> String {
 }
 
 /// Parse and format NML source text into canonical form, preserving
-/// comments.
+/// comments. Parses via the lossless CST (so it accepts the full CST grammar,
+/// and comments are read from the tree rather than a side-channel).
 pub fn format_source(source: &str) -> NmlResult<String> {
-    let (file, comments) = nml_core::parse_with_comments(source)?;
+    let (file, comments) = nml_core::cst::parse_with_comments(source)?;
     Ok(format_with_comments(&file, &comments, source))
 }
 
 /// Format a parsed NML file into canonical form, re-interleaving the given
-/// comments (as returned by [`nml_core::parse_with_comments`]).
+/// comments (as returned by [`nml_core::cst::parse_with_comments`]).
 ///
 /// `source` must be the text the file and comments were parsed from; it is
 /// needed to map comment byte offsets to lines and columns. Own-line
@@ -573,8 +574,8 @@ mod tests {
     fn roundtrip_comments(source: &str) -> String {
         let formatted = format_source(source)
             .unwrap_or_else(|e| panic!("failed to format:\n{}\nerror: {}", source, e.message()));
-        let (_, original_comments) = nml_core::parse_with_comments(source).unwrap();
-        let (_, kept_comments) = nml_core::parse_with_comments(&formatted).unwrap_or_else(|e| {
+        let (_, original_comments) = nml_core::cst::parse_with_comments(source).unwrap();
+        let (_, kept_comments) = nml_core::cst::parse_with_comments(&formatted).unwrap_or_else(|e| {
             panic!(
                 "failed to reparse formatted output:\n{}\nerror: {}",
                 formatted,
@@ -777,6 +778,18 @@ mod tests {
     #[test]
     fn format_single_item_array() {
         roundtrip("service App:\n    tags = [\"web\"]\n");
+    }
+
+    #[test]
+    fn formats_cst_only_syntax() {
+        // `format_source` parses via the CST, which accepts syntax the legacy
+        // parser rejects (nested array types). The formatter must handle it and
+        // be idempotent — a capability the legacy-`parse`-based `roundtrip`
+        // helper can't cover (legacy can't parse this input).
+        let src = "model M:\n    grid [][]string\n    pairs [](string | int)\n";
+        let out = format_source(src).expect("CST-only syntax should format");
+        assert!(out.contains("grid [][]string"), "{out}");
+        assert_eq!(out, format_source(&out).unwrap(), "must be idempotent");
     }
 
     // -------------------------------------------------------------------

@@ -11,4 +11,5 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
+# Parses via the RFC 0004 CST (comments read from the lossless tree).
 nml-core = { workspace = true }

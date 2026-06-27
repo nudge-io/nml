@@ -11,4 +11,6 @@ categories.workspace = true
 readme = "../../README.md"
 
 [dependencies]
+# Schema extraction runs over the RFC 0004 CST (`cst::extract_schema`); the
+# inheritance/cycle passes operate on the resulting `ExtractedSchema` data.
 nml-core = { workspace = true }
