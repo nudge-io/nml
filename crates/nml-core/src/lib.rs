@@ -59,6 +59,7 @@ pub mod cst;
 pub mod de;
 pub mod defaults;
 pub mod error;
+pub mod identity;
 pub mod model;
 pub mod money;
 pub mod project;

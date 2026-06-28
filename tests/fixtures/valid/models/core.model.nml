@@ -1,3 +1,8 @@
+// RFC 0005 fixture: exercises the scalar shorthand marker (`!`), the `name`
+// identity field, and optional shorthand (`?!`), alongside inheritance, modifiers,
+// a nested block, and list fields. Guarded by a parse + extract test so it can no
+// longer rot. (This is an nml language fixture, not a copy of any consumer schema.)
+
 model accessControlled:
     |allow []role
     |deny []role
@@ -10,11 +15,11 @@ enum httpMethod:
     - "PATCH"
 
 model resource is accessControlled:
-    path path <shorthand>
+    path path!
     method httpMethod = "GET"
 
 model endpoint is accessControlled:
-    address string
+    address string!
 
     .healthCheck:
         path path
@@ -25,6 +30,10 @@ model service is accessControlled:
     endpoints []endpoint
 
 model role:
-    label string
+    name string!
     description string?
     members []role?
+
+model command:
+    name string
+    run string?!

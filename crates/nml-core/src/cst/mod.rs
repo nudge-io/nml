@@ -754,6 +754,41 @@ mod tests {
     }
 
     #[test]
+    fn core_model_fixture_parses_and_extracts_clean() {
+        // The repurposed RFC 0005 fixture parses + extracts with no errors, and its
+        // `!` / `?!` markers land. Guards the fixture against rot.
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/valid/models/core.model.nml"
+        ))
+        .unwrap();
+        parse_ok(&src); // no parse errors, lossless
+        let (schema, errors) = crate::cst::extract_schema(&src);
+        assert!(errors.is_empty(), "fixture should extract clean: {errors:?}");
+
+        let field = |model: &str, field: &str| {
+            schema
+                .models
+                .iter()
+                .find(|m| m.name == model)
+                .and_then(|m| m.fields.iter().find(|f| f.name == field))
+                .unwrap_or_else(|| panic!("{model}.{field} missing"))
+        };
+        assert!(field("resource", "path").shorthand);
+        assert!(field("role", "name").shorthand);
+        let run = field("command", "run");
+        assert!(run.shorthand && run.optional, "`run string?!` is shorthand + optional");
+    }
+
+    #[test]
+    fn scalar_list_item_with_body_parses_clean_and_lossless() {
+        // `- "/admin":` + indented body (scalar-key-with-body, RFC 0005 §9). parse_ok
+        // asserts no errors + losslessness; the item carries a scalar value and a body.
+        let p = parse_ok("[]resource resources:\n    - \"/admin\":\n        method = \"POST\"\n");
+        assert_eq!(count_kind(&p.syntax(), SyntaxKind::ListItem), 1);
+    }
+
+    #[test]
     fn kitchen_sink_parses_clean_and_lossless() {
         // Every construct in one document: the strongest completeness check.
         let src = "\

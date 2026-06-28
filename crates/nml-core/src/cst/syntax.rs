@@ -46,6 +46,7 @@ pub enum SyntaxKind {
     RParen,    // )
     Comma,     // ,
     Question,  // ?
+    Bang,      // !
 
     /// Unrecognized input, one character wide. Never dropped — every source
     /// byte lands in some token, so the tree is byte-faithful on any input.

@@ -413,6 +413,10 @@ impl FieldDef {
     pub fn optional(&self) -> bool {
         token(&self.0, SyntaxKind::Question).is_some()
     }
+    /// Whether the field is the model's scalar-shorthand field (`name type!`).
+    pub fn shorthand(&self) -> bool {
+        token(&self.0, SyntaxKind::Bang).is_some()
+    }
     pub fn default(&self) -> Option<ValueNode> {
         child(&self.0)
     }

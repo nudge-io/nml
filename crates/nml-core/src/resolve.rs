@@ -234,7 +234,10 @@ impl ValueResolver {
                 name: name.clone(),
                 body: self.resolve_body(body)?,
             },
-            ListItemKind::Shorthand(sv) => ListItemKind::Shorthand(self.resolve_spanned(sv)?),
+            ListItemKind::Shorthand { value, body } => ListItemKind::Shorthand {
+                value: self.resolve_spanned(value)?,
+                body: body.as_ref().map(|b| self.resolve_body(b)).transpose()?,
+            },
             ListItemKind::Reference(_) | ListItemKind::Role(_) => {
                 return Ok(item.clone());
             }
@@ -335,16 +338,24 @@ pub fn apply_array_shared_properties(array_body: &ArrayBody) -> Vec<ListItem> {
 
 fn merge_shared_into_item(item: &ListItem, shared: &[&SharedProperty]) -> ListItem {
     match &item.kind {
-        ListItemKind::Named { name, body } => {
-            let merged_body = merge_shared_into_body(body, shared);
-            ListItem {
-                kind: ListItemKind::Named {
-                    name: name.clone(),
-                    body: merged_body,
-                },
-                span: item.span,
-            }
-        }
+        ListItemKind::Named { name, body } => ListItem {
+            kind: ListItemKind::Named {
+                name: name.clone(),
+                body: merge_shared_into_body(body, shared),
+            },
+            span: item.span,
+        },
+        // A scalar *with a body* is a model instance (`- "/api": …`), so it merges
+        // shared defaults like a named item. A *bodyless* scalar is a bare value
+        // (`- "plain-item"`) with no fields, so shared properties don't apply to it —
+        // it passes through unchanged, as do references/links.
+        ListItemKind::Shorthand { value, body: Some(body) } => ListItem {
+            kind: ListItemKind::Shorthand {
+                value: value.clone(),
+                body: Some(merge_shared_into_body(body, shared)),
+            },
+            span: item.span,
+        },
         _ => item.clone(),
     }
 }
@@ -922,7 +933,8 @@ workflow W:
         };
 
         let merged = apply_shared_properties(body);
-        // Shorthand items should pass through unchanged
+        // A *bodyless* shorthand is a bare value — shared properties don't apply, and
+        // it passes through unchanged (no body is synthesized).
         let items: Vec<_> = merged
             .entries
             .iter()
@@ -930,8 +942,29 @@ workflow W:
             .collect();
         assert_eq!(items.len(), 1);
         if let BodyEntryKind::ListItem(item) = &items[0].kind {
-            assert!(matches!(&item.kind, ListItemKind::Shorthand(_)));
+            assert!(matches!(&item.kind, ListItemKind::Shorthand { body: None, .. }));
         }
+    }
+
+    #[test]
+    fn shared_property_merges_into_scalar_with_body() {
+        // A scalar *with a body* is a model instance, so shared defaults merge into it.
+        let nml = "[]resource resources:\n    .method = \"GET\"\n    - \"/api\":\n        tag = \"x\"\n";
+        let file = parse_to_ast(nml).unwrap();
+        let DeclarationKind::Array(arr) = &file.declarations[0].kind else {
+            panic!("expected array");
+        };
+        let items = apply_array_shared_properties(&arr.body);
+        let ListItemKind::Shorthand { body: Some(body), .. } = &items[0].kind else {
+            panic!("expected scalar-with-body");
+        };
+        let has = |n: &str| {
+            body.entries.iter().any(|e| {
+                matches!(&e.kind, BodyEntryKind::Property(p) if p.name.name == n)
+            })
+        };
+        assert!(has("tag"), "authored property kept");
+        assert!(has("method"), "shared property merged into the scalar's body");
     }
 
     #[test]

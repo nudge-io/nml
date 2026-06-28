@@ -365,7 +365,10 @@ impl<'a> Parser<'a> {
             m.complete(self, SyntaxKind::NestedBlock);
         } else if self.at_field_type() {
             self.type_expr();
+            // Suffixes: `?` (optional) and/or `!` (scalar shorthand). Canonical
+            // order is `?!`; the extracted flags are order-free (presence-based).
             self.eat(SyntaxKind::Question);
+            self.eat(SyntaxKind::Bang);
             if self.eat(SyntaxKind::Eq) {
                 self.value_block();
             }
@@ -414,7 +417,15 @@ impl<'a> Parser<'a> {
         let m = self.start();
         self.bump(); // -
         match self.current() {
-            SyntaxKind::String | SyntaxKind::Number => self.value(),
+            // A scalar key: `- "/api"` or, with a body, `- "/api":` + indented block
+            // (scalar-key-with-body — the shorthand fills the model's `!` field, the
+            // body fills the rest).
+            SyntaxKind::String | SyntaxKind::Number => {
+                self.value();
+                if self.eat(SyntaxKind::Colon) {
+                    self.body();
+                }
+            }
             SyntaxKind::Role | SyntaxKind::Secret => self.bump(),
             SyntaxKind::Ident => {
                 self.bump();

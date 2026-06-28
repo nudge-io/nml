@@ -37,6 +37,8 @@ pub struct FieldDefinition {
     pub name: Identifier,
     pub field_type: FieldTypeExpr,
     pub optional: bool,
+    /// The model's scalar-shorthand field (`name type!`) — RFC 0005 §6.
+    pub shorthand: bool,
     pub default_value: Option<SpannedValue>,
 }
 
@@ -226,10 +228,13 @@ pub struct ListItem {
 
 #[derive(Debug, Clone, Serialize)]
 pub enum ListItemKind {
-    /// `- Name: <body>`
+    /// `- Name: <body>` — an ident-keyed inline definition (always has a body).
     Named { name: Identifier, body: Body },
-    /// `- "string value"` (shorthand)
-    Shorthand(SpannedValue),
+    /// A scalar-keyed inline definition: `- "/api"` (no body) or, with a body,
+    /// `- "/api":` followed by an indented block. The scalar fills the element
+    /// model's shorthand (`!`) field; the optional body fills the rest. The body is
+    /// genuinely optional (unlike `Named`), so it is modeled as `Option<Body>`.
+    Shorthand { value: SpannedValue, body: Option<Body> },
     /// `- ReferenceName`
     Reference(Identifier),
     /// `- @role/ref`

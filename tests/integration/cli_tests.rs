@@ -188,7 +188,7 @@ fn test_check_schema_enforces_inherited_required_field() {
             "check",
             "--schema",
             "tests/fixtures/schema-check/schema",
-            "tests/fixtures/schema-check/widget-missing-name.nml",
+            "tests/fixtures/schema-check/widget-missing-required.nml",
         ])
         .output()
         .expect("failed to run nml");
@@ -198,8 +198,10 @@ fn test_check_schema_enforces_inherited_required_field() {
         "check should fail when an inherited required field is missing"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // `name` is filled by the block identifier (RFC 0005); `kind` is the inherited
+    // required field the instance omits.
     assert!(
-        stderr.contains("missing required field 'name'"),
+        stderr.contains("missing required field 'kind'"),
         "stderr should report the inherited field: {stderr}"
     );
 }

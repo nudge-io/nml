@@ -262,8 +262,13 @@ impl<'a> Formatter<'a> {
                 self.out.push_str(&f.name.name);
                 self.out.push(' ');
                 self.out.push_str(&f.field_type.to_string());
+                // Canonical suffix order is `?!` (RFC 0005 §7); the flags are
+                // order-free, so they always render canonically.
                 if f.optional {
                     self.out.push('?');
+                }
+                if f.shorthand {
+                    self.out.push('!');
                 }
                 if let Some(ref default) = f.default_value {
                     self.out.push_str(" = ");
@@ -358,10 +363,18 @@ impl<'a> Formatter<'a> {
                 self.out.push('\n');
                 self.body(body, depth + 1);
             }
-            ListItemKind::Shorthand(val) => {
-                format_value(&mut self.out, &val.value, depth);
-                self.emit_trailing_comment(item.span.end.saturating_sub(1));
-                self.out.push('\n');
+            ListItemKind::Shorthand { value, body } => {
+                format_value(&mut self.out, &value.value, depth);
+                if let Some(body) = body {
+                    // `- "/api":` + indented body (scalar-key-with-body).
+                    self.out.push(':');
+                    self.emit_trailing_comment(item.span.start);
+                    self.out.push('\n');
+                    self.body(body, depth + 1);
+                } else {
+                    self.emit_trailing_comment(item.span.end.saturating_sub(1));
+                    self.out.push('\n');
+                }
             }
             ListItemKind::Reference(ident) => {
                 self.out.push_str(&ident.name);
@@ -529,6 +542,29 @@ mod tests {
         let file2 = parse(&first).unwrap();
         let second = format(&file2);
         assert_eq!(first, second, "formatting is not idempotent");
+    }
+
+    #[test]
+    fn test_format_scalar_item_with_body_roundtrips() {
+        // `- "/admin":` + body survives formatting (scalar-key-with-body).
+        let source = "[]resource resources:\n    - \"/admin\":\n        method = \"POST\"\n";
+        let formatted = format(&parse(source).unwrap());
+        assert!(formatted.contains("- \"/admin\":"), "{formatted}");
+        assert!(formatted.contains("method = \"POST\""), "{formatted}");
+        roundtrip(source);
+        idempotent(source);
+    }
+
+    #[test]
+    fn test_format_shorthand_and_optional_suffixes_roundtrip() {
+        // `!` (shorthand), `?` (optional), and canonical `?!` survive formatting.
+        let source = "model resource:\n    name string?\n    path path!\n    slug string?!\n";
+        let formatted = format(&parse(source).unwrap());
+        assert!(formatted.contains("path path!"), "{formatted}");
+        assert!(formatted.contains("slug string?!"), "{formatted}");
+        assert!(formatted.contains("name string?"), "{formatted}");
+        roundtrip(source);
+        idempotent(source);
     }
 
     #[test]

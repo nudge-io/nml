@@ -363,9 +363,16 @@ impl<'de> SeqAccess<'de> for ListItemSeqAccess<'de> {
                     body,
                 })
                 .map(Some),
-            ListItemKind::Shorthand(val) => seed
-                .deserialize(ValueDeserializer { value: &val.value })
+            // A bare scalar deserializes as its value. A scalar *with a body* is a
+            // materialized shorthand item (the value already injected into the body by
+            // `apply_positional`); deserialize the body as a struct, exactly like a
+            // nested block — `de` need not know the shorthand field, the pass placed it.
+            ListItemKind::Shorthand { value, body: None } => seed
+                .deserialize(ValueDeserializer { value: &value.value })
                 .map(Some),
+            ListItemKind::Shorthand { body: Some(body), .. } => {
+                seed.deserialize(NestedBlockDeserializer { body }).map(Some)
+            }
             ListItemKind::Reference(ident) => seed
                 .deserialize(de::value::StrDeserializer::<Error>::new(&ident.name))
                 .map(Some),

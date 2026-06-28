@@ -226,8 +226,11 @@ fn validate_list_item_templates(
         ListItemKind::Named { body, .. } => {
             validate_body_templates(body, decl, valid_ns, config, line_index, diags);
         }
-        ListItemKind::Shorthand(val) => {
-            validate_value_templates(&val.value, decl, valid_ns, config, line_index, diags);
+        ListItemKind::Shorthand { value, body } => {
+            validate_value_templates(&value.value, decl, valid_ns, config, line_index, diags);
+            if let Some(body) = body {
+                validate_body_templates(body, decl, valid_ns, config, line_index, diags);
+            }
         }
         _ => {}
     }

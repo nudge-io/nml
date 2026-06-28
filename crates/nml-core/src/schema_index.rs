@@ -174,6 +174,7 @@ mod tests {
             name: name.to_string(),
             field_type: ty,
             optional: false,
+            shorthand: false,
             default_value: None,
             span: Span::empty(0),
         }

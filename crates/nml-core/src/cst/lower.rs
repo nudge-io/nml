@@ -119,12 +119,17 @@ impl Lower {
         }
     }
 
-    fn body_of(&mut self, body: Option<ast::Body>) -> Body {
+    /// Lower a present body's entries.
+    fn lower_body(&mut self, body: ast::Body) -> Body {
         Body {
-            entries: body
-                .map(|b| b.entries().map(|e| self.body_entry(e)).collect())
-                .unwrap_or_default(),
+            entries: body.entries().map(|e| self.body_entry(e)).collect(),
         }
+    }
+
+    /// Lower an *optional* body — an absent body lowers to an empty one. For callers
+    /// that already hold a body, use [`Self::lower_body`] directly.
+    fn body_of(&mut self, body: Option<ast::Body>) -> Body {
+        body.map(|b| self.lower_body(b)).unwrap_or_else(|| Body { entries: Vec::new() })
     }
 
     fn body_entry(&mut self, entry: ast::Entry) -> BodyEntry {
@@ -178,7 +183,7 @@ impl Lower {
 
     fn shared(&mut self, s: &ast::SharedProperty) -> SharedProperty {
         let kind = if let Some(body) = s.body() {
-            SharedPropertyKind::Block(self.body_of(Some(body)))
+            SharedPropertyKind::Block(self.lower_body(body))
         } else if let Some(v) = s.value() {
             SharedPropertyKind::Scalar(self.decode(&v))
         } else {
@@ -193,14 +198,18 @@ impl Lower {
     fn list_item(&mut self, l: &ast::ListItem) -> ListItem {
         let span = content_span(l.syntax());
         let kind = if let Some(v) = l.value() {
-            ListItemKind::Shorthand(self.decode(&v))
+            // `- "/api"` (no body) or `- "/api":` + body (scalar-key-with-body).
+            ListItemKind::Shorthand {
+                value: self.decode(&v),
+                body: l.body().map(|b| self.lower_body(b)),
+            }
         } else if let Some(role) = l.role() {
             ListItemKind::Role(role.text().to_string())
         } else if let Some(name) = l.name() {
             if let Some(body) = l.body() {
                 ListItemKind::Named {
                     name: ident(name),
-                    body: self.body_of(Some(body)),
+                    body: self.lower_body(body),
                 }
             } else {
                 ListItemKind::Reference(ident(name))
@@ -219,6 +228,7 @@ impl Lower {
                 .map(|t| type_expr(&t))
                 .unwrap_or_else(|| FieldTypeExpr::Named(empty_ident())),
             optional: f.optional(),
+            shorthand: f.shorthand(),
             default_value: f.default().map(|v| self.decode(&v)),
         }
     }

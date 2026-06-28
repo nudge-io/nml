@@ -193,6 +193,7 @@ impl<'a> Lexer<'a> {
             b')' => self.single(SyntaxKind::RParen),
             b',' => self.single(SyntaxKind::Comma),
             b'?' => self.single(SyntaxKind::Question),
+            b'!' => self.single(SyntaxKind::Bang),
             b'@' => self.scan_role(),
             b'$' => self.scan_secret(),
             c if is_ident_start(c) => {
@@ -419,12 +420,12 @@ mod tests {
     fn all_atom_and_punctuation_kinds() {
         use SyntaxKind::*;
         // A line exercising every atom and punctuation token.
-        let src = "x = \"s\" 12.5 @role/admin $ENV.KEY => : - | . [ ] ( ) , ?";
+        let src = "x = \"s\" 12.5 @role/admin $ENV.KEY => : - | . [ ] ( ) , ? !";
         assert_eq!(
             kinds(src),
             vec![
                 Ident, Eq, String, Number, Role, Secret, FatArrow, Colon, Dash, Pipe, Dot,
-                LBracket, RBracket, LParen, RParen, Comma, Question,
+                LBracket, RBracket, LParen, RParen, Comma, Question, Bang,
             ]
         );
         assert_lossless(src);

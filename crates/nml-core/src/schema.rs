@@ -108,6 +108,39 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<NmlError> {
     errors
 }
 
+/// Each model may declare **at most one** scalar-shorthand (`!`) field: a bare
+/// scalar list item supplies a single value, so it can fill only one field.
+///
+/// Run **after** [`resolve_model_inheritance`] so an inherited `!` and a child
+/// `!` are caught together (a child cannot add a second shorthand atop a
+/// parent's). RFC 0005 §8.
+pub fn find_shorthand_errors(schema: &ExtractedSchema) -> Vec<NmlError> {
+    let mut errors = Vec::new();
+    for model in &schema.models {
+        let shorthand: Vec<&str> = model
+            .fields
+            .iter()
+            .filter(|f| f.shorthand)
+            .map(|f| f.name.as_str())
+            .collect();
+        if shorthand.len() > 1 {
+            let names = shorthand
+                .iter()
+                .map(|n| format!("'{n}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            errors.push(NmlError::Validation {
+                message: format!(
+                    "model '{}' declares more than one shorthand field ({names}); a bare scalar fills a single field",
+                    model.name
+                ),
+                span: model.span,
+            });
+        }
+    }
+    errors
+}
+
 /// Detect cycles in the model dependency graph.
 ///
 /// Builds a directed graph of model-to-model edges via `FieldType::ModelRef`
@@ -400,6 +433,26 @@ mod tests {
     }
 
     #[test]
+    fn at_most_one_shorthand_field_per_model() {
+        // A single `!` field (alongside a non-shorthand `name`) is fine.
+        let ok = extract_src("model r:\n    name string\n    path path!\n");
+        assert!(find_shorthand_errors(&ok).is_empty());
+
+        // Two `!` fields is a schema error naming both.
+        let bad = extract_src("model r:\n    a string!\n    b path!\n");
+        let errs = find_shorthand_errors(&bad);
+        assert_eq!(errs.len(), 1);
+        match &errs[0] {
+            NmlError::Validation { message, .. } => {
+                assert!(message.contains("'a'"), "{message}");
+                assert!(message.contains("'b'"), "{message}");
+                assert!(message.contains("shorthand"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn deep_inheritance_chain_does_not_overflow_stack() {
         // A linear `is` chain far deeper than any call-stack limit. Fieldless
         // models keep the flattened output O(depth) — a chain *with* fields is
@@ -488,6 +541,7 @@ mod tests {
                 name: f.to_string(),
                 field_type: FieldType::Primitive(PrimitiveType::String),
                 optional: false,
+                shorthand: false,
                 default_value: None,
                 span: crate::span::Span::empty(0),
             }],
@@ -511,6 +565,7 @@ mod tests {
             name: name.to_string(),
             field_type: FieldType::Primitive(PrimitiveType::String),
             optional: false,
+            shorthand: false,
             default_value: None,
             span: crate::span::Span::empty(0),
         };

@@ -14,3 +14,7 @@ readme = "../../README.md"
 # Schema extraction runs over the RFC 0004 CST (`cst::extract_schema`); the
 # inheritance/cycle passes operate on the resulting `ExtractedSchema` data.
 nml-core = { workspace = true }
+
+[dev-dependencies]
+# Only the validator/`de` agreement test deserializes through `nml-core::de`.
+serde = { workspace = true }

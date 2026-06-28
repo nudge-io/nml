@@ -42,16 +42,19 @@ fn extract_model(block: &BlockDecl) -> ModelDef {
                         .map(|t| resolve_field_type(&t))
                         .unwrap_or_else(unknown_type),
                     optional: fd.optional(),
+                    shorthand: fd.shorthand(),
                     default_value: fd.default().and_then(|v| v.decode().ok()),
                     span: node_span(fd.syntax()),
                 }),
-                // A typed modifier (`|name type?`) declares a field too.
+                // A typed modifier (`|name type?`) declares a field too. Modifiers
+                // are never the scalar-shorthand field.
                 Entry::Modifier(m) => {
                     if let Some(te) = m.type_expr() {
                         fields.push(FieldDef {
                             name: token_text(m.name()),
                             field_type: FieldType::Modifier(Box::new(resolve_field_type(&te))),
                             optional: m.optional(),
+                            shorthand: false,
                             default_value: None,
                             span: node_span(m.syntax()),
                         });
@@ -179,6 +182,8 @@ trait Audited:
 model Plan is Base:
     name string
     tier string?
+    path path!
+    slug string?!
     region string = \"us\"
     tags []string
     mixed (string | []int)
@@ -199,7 +204,12 @@ oneof email by provider as providerKind = \"log\":
         let plan = schema.models.iter().find(|m| m.name == "Plan").unwrap();
         assert_eq!(plan.extends, vec!["Base".to_string()]);
         let field = |n: &str| plan.fields.iter().find(|f| f.name == n).unwrap();
-        assert!(field("tier").optional);
+        assert!(field("tier").optional && !field("tier").shorthand);
+        // `path path!` → shorthand, required.
+        assert!(field("path").shorthand && !field("path").optional);
+        // `slug string?!` → shorthand and optional (order-free flags).
+        assert!(field("slug").shorthand && field("slug").optional);
+        assert!(!field("name").shorthand && !field("name").optional);
         assert!(matches!(
             field("region").default_value.as_ref().map(|sv| &sv.value),
             Some(Value::String(s)) if s == "us"

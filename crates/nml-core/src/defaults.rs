@@ -60,7 +60,10 @@ pub fn from_body_defaulted<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
-    let shared = apply_shared_properties(body);
+    // Materialize scalar shorthand items into bodies *first*, so an item's own token
+    // beats a shared property and `de` can read it as a struct (RFC 0005 §10).
+    let positional = crate::identity::apply_positional(index, root, body);
+    let shared = apply_shared_properties(&positional);
     let defaulted = apply_defaults(index, root, &shared);
     let resolved = resolver.resolve_body(&defaulted)?;
     from_block(&resolved)
@@ -394,6 +397,36 @@ mod tests {
     use super::*;
     use crate::resolve::ValueResolver;
     use crate::types::Value;
+
+    #[test]
+    fn scalar_shorthand_deserializes_into_struct() {
+        // The de-path (RFC 0005 §10): a bare scalar and a scalar-with-body in a
+        // `[]resource` field deserialize into the element struct — the `!` field is
+        // filled from the scalar, the body fills the rest.
+        #[derive(serde::Deserialize)]
+        struct Resource {
+            path: String,
+            method: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Svc {
+            resources: Vec<Resource>,
+        }
+
+        let index = index_from(
+            "model resource:\n    path string!\n    method string?\n\nmodel svc:\n    resources []resource\n",
+        );
+        let body = body_of(
+            "svc s:\n    resources:\n        - \"/api\"\n        - \"/health\":\n            method = \"GET\"\n",
+        );
+        let svc: Svc = from_body_defaulted(&index, "svc", &body, &ValueResolver::env()).unwrap();
+
+        assert_eq!(svc.resources.len(), 2);
+        assert_eq!(svc.resources[0].path, "/api");
+        assert_eq!(svc.resources[0].method, None);
+        assert_eq!(svc.resources[1].path, "/health");
+        assert_eq!(svc.resources[1].method.as_deref(), Some("GET"));
+    }
 
     fn index_from(schema: &str) -> SchemaIndex {
         let mut ex = crate::cst::extract_schema(schema).0;

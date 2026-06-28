@@ -7,11 +7,14 @@ use nml_core::schema_index::{FieldTarget, SchemaIndex};
 use nml_core::span::Span;
 use nml_core::types::{PrimitiveType, Value};
 
-use crate::diagnostics::Diagnostic;
-#[cfg(test)]
-use crate::diagnostics::Severity;
+use crate::diagnostics::{Diagnostic, Severity};
 
 const MAX_VALIDATION_DEPTH: u32 = 64;
+
+/// Diagnostic for a scalar shorthand item on a union-typed list — out of scope
+/// (RFC 0005 §10), flagged here in both the top-level and nested list paths.
+const UNION_SHORTHAND_MSG: &str =
+    "shorthand is not supported on union-typed lists; specify the variant explicitly";
 
 /// Validates instance declarations against model definitions.
 ///
@@ -161,8 +164,24 @@ impl SchemaValidator {
         self.validate_members_builtin_refs(&block.body, keyword, diags);
 
         if !is_schema_def {
-            let resolved =
-                self.validate_ref_instance(keyword, &block.body, 0, Some(block.name.span), diags);
+            // A block declaration (`role editor:`) fills its model's `name` field from
+            // the block name — lenient: an explicit `name` in the body wins (RFC 0005
+            // §5). `oneof`/other targets keep the prior path.
+            let resolved = match self.index.resolve_ref(keyword) {
+                FieldTarget::Model(m) => {
+                    let result =
+                        nml_core::identity::materialize_named(&block.name, &block.body, m);
+                    self.validate_materialized(result, m, 0, Some(block.name.span), diags);
+                    true
+                }
+                other => self.validate_target_instance(
+                    other,
+                    &block.body,
+                    0,
+                    Some(block.name.span),
+                    diags,
+                ),
+            };
             if !resolved && self.strict_unknown_fields {
                 diags.push(
                     Diagnostic::error(format!("block keyword '{keyword}' has no model definition"))
@@ -188,13 +207,17 @@ impl SchemaValidator {
                 FieldTarget::Model(_) | FieldTarget::OneOf(_)
             );
 
-        let has_named_items = arr
-            .body
-            .items
-            .iter()
-            .any(|i| matches!(&i.kind, ListItemKind::Named { .. }));
+        // Inline definitions (named or scalar) need a model/oneof to validate against;
+        // references/links don't. A scalar `- "/api"` under an undefined keyword is as
+        // malformed as a named one, so both count toward the strict "no definition" check.
+        let has_inline_items = arr.body.items.iter().any(|i| {
+            matches!(
+                &i.kind,
+                ListItemKind::Named { .. } | ListItemKind::Shorthand { .. }
+            )
+        });
 
-        if !is_schema_def && !resolves && has_named_items && self.strict_unknown_fields {
+        if !is_schema_def && !resolves && has_inline_items && self.strict_unknown_fields {
             diags.push(
                 Diagnostic::error(format!(
                     "array item keyword '{keyword}' has no model or oneof definition"
@@ -204,14 +227,79 @@ impl SchemaValidator {
         }
 
         for item in &arr.body.items {
-            if let ListItemKind::Named { name, body } = &item.kind {
-                self.validate_body(body, is_schema_def, keyword, diags);
-                self.validate_members_builtin_refs(body, keyword, diags);
-
-                if !is_schema_def {
-                    self.validate_ref_instance(keyword, body, 0, Some(name.span), diags);
+            match &item.kind {
+                ListItemKind::Named { name, body } => {
+                    self.validate_body(body, is_schema_def, keyword, diags);
+                    self.validate_members_builtin_refs(body, keyword, diags);
+                    if !is_schema_def {
+                        self.validate_list_item(item, keyword, Some(name.span), diags);
+                    }
                 }
+                // A bare scalar (`- "/api"`) fills the element model's shorthand
+                // field; validate its materialized body (RFC 0005 §10).
+                ListItemKind::Shorthand { value, .. } if !is_schema_def => {
+                    self.validate_list_item(item, keyword, Some(value.span), diags);
+                }
+                _ => {}
             }
+        }
+    }
+
+    /// Validate a list item under `keyword` against its element model, after
+    /// **materializing the item's identity** into the body (RFC 0005 §10): a named
+    /// item's `name`, or a bare scalar's shorthand field, becomes a present property
+    /// so the required-field scan sees it. A scalar on a union list is out of scope
+    /// and flagged explicitly; other non-model targets keep the prior path.
+    fn validate_list_item(
+        &self,
+        item: &ListItem,
+        keyword: &str,
+        header_span: Option<Span>,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        let target = self.index.resolve_ref(keyword);
+        if let FieldTarget::Model(m) = target {
+            let result = nml_core::identity::materialize_item(item, m);
+            self.validate_materialized(result, m, 0, header_span, diags);
+            return;
+        }
+        match &item.kind {
+            // A union element's variant isn't known until its discriminator is
+            // resolved (after materialization), so scalar shorthand on a union is out
+            // of scope — flagged explicitly rather than silently dropped (§10).
+            ListItemKind::Shorthand { value, .. } if matches!(target, FieldTarget::OneOf(_)) => {
+                diags.push(Diagnostic::error(UNION_SHORTHAND_MSG.to_string()).with_span(value.span))
+            }
+            ListItemKind::Named { body, .. } => {
+                self.validate_target_instance(target, body, 0, header_span, diags);
+            }
+            _ => {}
+        }
+    }
+
+    /// Surface a materialization's diagnostics (the only one is dropped-key) and
+    /// validate the enriched body against `model` — unless the item is unplaceable (a
+    /// scalar with no shorthand field), in which case the required-field scan is
+    /// skipped so it doesn't pile noise on the dropped-key diagnostic. The single
+    /// "materialize → validate" path shared by list items (`materialize_item`) and
+    /// block declarations (`materialize_named`).
+    fn validate_materialized(
+        &self,
+        result: nml_core::identity::Materialized,
+        model: &ModelDef,
+        depth: u32,
+        header: Option<Span>,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        for err in result.diagnostics {
+            diags.push(Diagnostic {
+                message: err.message().to_string(),
+                severity: Severity::Error,
+                span: Some(err.span()),
+            });
+        }
+        if result.validatable {
+            self.validate_instance_against_model(&result.body, model, depth, header, diags);
         }
     }
 
@@ -341,30 +429,32 @@ impl SchemaValidator {
                     let BodyEntryKind::ListItem(item) = &entry.kind else {
                         continue;
                     };
-                    let ListItemKind::Named {
-                        name,
-                        body: item_body,
-                    } = &item.kind
-                    else {
-                        continue;
+                    let header = match &item.kind {
+                        ListItemKind::Named { name, .. } => Some(name.span),
+                        ListItemKind::Shorthand { value, .. } => Some(value.span),
+                        // References/links carry no inline instance to validate.
+                        ListItemKind::Reference(_) | ListItemKind::Role(_) => continue,
                     };
                     match inner.as_ref() {
-                        FieldTarget::Model(m) => self
-                            .validate_instance_against_model(
-                                item_body,
-                                m,
-                                depth,
-                                Some(name.span),
-                                diags,
+                        // Inline items (named or scalar) validate against the model
+                        // *after* identity materialization (RFC 0005 §10).
+                        FieldTarget::Model(m) => {
+                            let result = nml_core::identity::materialize_item(item, m);
+                            self.validate_materialized(result, m, depth, header, diags);
+                        }
+                        FieldTarget::OneOf(o) => match &item.kind {
+                            ListItemKind::Named { body: item_body, .. } => {
+                                self.validate_instance_against_oneof(
+                                    item_body, o, depth, header, diags,
+                                );
+                            }
+                            // Scalar shorthand on a union list is out of scope (§10).
+                            ListItemKind::Shorthand { value, .. } => diags.push(
+                                Diagnostic::error(UNION_SHORTHAND_MSG.to_string())
+                                    .with_span(value.span),
                             ),
-                        FieldTarget::OneOf(o) => self
-                            .validate_instance_against_oneof(
-                                item_body,
-                                o,
-                                depth,
-                                Some(name.span),
-                                diags,
-                            ),
+                            _ => {}
+                        },
                         _ => {}
                     }
                 }
@@ -668,7 +758,7 @@ impl SchemaValidator {
                 };
                 for item in items {
                     match &item.kind {
-                        ListItemKind::Shorthand(sv) => {
+                        ListItemKind::Shorthand { value: sv, .. } => {
                             self.validate_value_against_type(
                                 &sv.value,
                                 inner,
@@ -1162,6 +1252,157 @@ mod tests {
         let schema = nml_core::cst::extract_schema(schema_source).0;
         SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
             .with_modifiers(modifiers.iter().map(|s| s.to_string()).collect())
+    }
+
+    fn diags(schema: &str, source: &str) -> Vec<Diagnostic> {
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
+        make_validator(schema).validate(&file)
+    }
+
+    // ── RFC 0005: identity materialization ──
+
+    #[test]
+    fn named_item_satisfies_required_name_no_false_positive() {
+        // `- editor:` supplies the role's identity; the required `name` field is
+        // present after materialization, so there is no "missing required field".
+        let d = diags(
+            "model role:\n    name string\n    description string?\n",
+            "[]role roles:\n    - editor:\n        description = \"Editing\"\n",
+        );
+        assert!(
+            !d.iter().any(|x| x.message.contains("name")),
+            "unexpected name diagnostic: {:?}",
+            d.iter().map(|x| &x.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn scalar_shorthand_fills_marked_field() {
+        let d = diags(
+            "model resource:\n    name string?\n    path path!\n",
+            "[]resource resources:\n    - \"/api\"\n",
+        );
+        assert!(d.is_empty(), "unexpected diagnostics: {d:?}");
+    }
+
+    #[test]
+    fn name_is_shorthand_named_and_scalar_both_fill_it() {
+        // `name string!` — identity *is* the name, so both forms fill `name`:
+        // the named key (`- editor:`) and the scalar (`- "viewer"`).
+        let d = diags(
+            "model role:\n    name string!\n    description string?\n",
+            "[]role roles:\n    - editor:\n        description = \"x\"\n    - \"viewer\"\n",
+        );
+        assert!(d.is_empty(), "unexpected diagnostics: {d:?}");
+    }
+
+    #[test]
+    fn validator_and_de_agree_on_scalar_shorthand() {
+        // Agreement guardrail (RFC §11.10): the *same* instance validates clean AND
+        // deserializes clean with matching fields — the de-path closed the transitional
+        // "validates but de errors" gap.
+        let schema = "model resource:\n    path string!\n    method string?\n\nmodel svc:\n    resources []resource\n";
+        let instance = "svc s:\n    resources:\n        - \"/api\"\n        - \"/health\":\n            method = \"GET\"\n";
+
+        // (1) validates clean.
+        assert!(diags(schema, instance).is_empty(), "should validate clean");
+
+        // (2) deserializes clean, same fields.
+        #[derive(serde::Deserialize)]
+        struct Resource {
+            path: String,
+            method: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Svc {
+            resources: Vec<Resource>,
+        }
+
+        let mut ex = nml_core::cst::extract_schema(schema).0;
+        nml_core::schema::resolve_model_inheritance(&mut ex);
+        let index = nml_core::SchemaIndex::build(ex.models, ex.enums, ex.oneofs);
+        let file = nml_core::cst::parse_to_ast(instance).unwrap();
+        let nml_core::ast::DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("expected block");
+        };
+        let svc: Svc =
+            nml_core::from_body_defaulted(&index, "svc", &block.body, &nml_core::ValueResolver::env())
+                .expect("should deserialize");
+        assert_eq!(svc.resources[0].path, "/api");
+        assert_eq!(svc.resources[0].method, None);
+        assert_eq!(svc.resources[1].path, "/health");
+        assert_eq!(svc.resources[1].method.as_deref(), Some("GET"));
+    }
+
+    #[test]
+    fn scalar_shorthand_with_body_fills_field_and_validates() {
+        // `- "/admin":` + body: the scalar fills `path!`, the body sets `method`.
+        let d = diags(
+            "enum httpMethod:\n    - \"GET\"\n    - \"POST\"\nmodel resource:\n    path path!\n    method httpMethod = \"GET\"\n",
+            "[]resource resources:\n    - \"/admin\":\n        method = \"POST\"\n",
+        );
+        assert!(d.is_empty(), "scalar-with-body should validate: {d:?}");
+    }
+
+    #[test]
+    fn scalar_shorthand_with_body_type_checks_the_body() {
+        // The body is validated too: an unknown enum value is caught.
+        let d = diags(
+            "enum httpMethod:\n    - \"GET\"\n    - \"POST\"\nmodel resource:\n    path path!\n    method httpMethod = \"GET\"\n",
+            "[]resource resources:\n    - \"/admin\":\n        method = \"BOGUS\"\n",
+        );
+        assert!(!d.is_empty(), "invalid method in the body should be flagged");
+    }
+
+    #[test]
+    fn scalar_without_shorthand_field_is_dropped_key_without_noise() {
+        // The dropped-key diagnostic is the *only* one — no spurious "missing
+        // required field" piled on from validating an empty body.
+        let d = diags(
+            "model role:\n    name string\n    label string\n",
+            "[]role roles:\n    - \"/api\"\n",
+        );
+        assert_eq!(d.len(), 1, "expected only the dropped-key diagnostic: {d:?}");
+        assert!(d[0].message.contains("no shorthand field"), "{d:?}");
+    }
+
+    #[test]
+    fn scalar_shorthand_on_union_list_is_flagged() {
+        let schema = "model a:\n    x string?\nmodel b:\n    y string?\noneof u by kind:\n    \"a\" => a\n    \"b\" => b\n";
+        let d = diags(schema, "[]u items:\n    - \"foo\"\n");
+        assert!(d.iter().any(|x| x.message.contains("union-typed lists")), "{d:?}");
+    }
+
+    #[test]
+    fn explicit_name_wins_over_key_lenient() {
+        // Lenient (matches `de`): an explicit `name` overrides the key — no error.
+        let d = diags(
+            "model role:\n    name string\n",
+            "[]role roles:\n    - editor:\n        name = \"other\"\n",
+        );
+        assert!(d.is_empty(), "explicit name should win, not error: {d:?}");
+    }
+
+    #[test]
+    fn block_declaration_name_satisfies_required_name() {
+        // `role editor:` (block) fills `name` from the block name — no false
+        // "missing required field 'name'".
+        let d = diags(
+            "model role:\n    name string\n    description string?\n",
+            "role editor:\n    description = \"Editing\"\n",
+        );
+        assert!(d.is_empty(), "block name should satisfy `name`: {d:?}");
+    }
+
+    #[test]
+    fn block_explicit_name_wins_over_block_name() {
+        // Lenient: an explicit `name` overrides the block identifier (the identifier
+        // stays the reference handle) — no error.
+        let d = diags(
+            "model widget:\n    name string\n    size number?\n",
+            "widget Gizmo:\n    name = \"gizmo\"\n    size = 2\n",
+        );
+        assert!(d.is_empty(), "explicit name should win over block name: {d:?}");
     }
 
     #[test]
@@ -2390,6 +2631,21 @@ workflow W:
                 .contains("array item keyword 'bogus' has no model or oneof definition")),
             "strict mode should reject unmodeled array with named items; diags: {:?}",
             diags
+        );
+    }
+
+    #[test]
+    fn test_strict_unmodeled_array_keyword_with_scalar_items() {
+        // A scalar inline item is as malformed as a named one under an undefined
+        // keyword — the strict "no definition" check covers both.
+        let validator = make_strict_validator("model server:\n    port number?\n");
+        let file = nml_core::cst::parse_to_ast("[]bogus items:\n    - \"/api\"\n").unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("array item keyword 'bogus' has no model or oneof definition")),
+            "strict mode should reject unmodeled array with scalar items; diags: {diags:?}"
         );
     }
 

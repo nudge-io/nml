@@ -13,7 +13,8 @@ use nml_core::error::NmlError;
 // Import the passes by name (not the module) so the bare `schema` identifier stays
 // free for the local `ExtractedSchema` value and our own `crate::schema` module.
 use nml_core::schema::{
-    find_extends_cycles, find_model_cycles, find_oneof_errors, resolve_model_inheritance,
+    find_extends_cycles, find_model_cycles, find_oneof_errors, find_shorthand_errors,
+    resolve_model_inheritance,
     ExtractedSchema,
 };
 
@@ -56,6 +57,12 @@ pub fn load_schema(sources: &[&str]) -> (ExtractedSchema, Vec<Diagnostic>) {
     }
 
     resolve_model_inheritance(&mut schema);
+
+    // At most one scalar-shorthand (`!`) field per model — checked post-inheritance
+    // so an inherited `!` and a child `!` are caught together (RFC 0005 §8).
+    for err in find_shorthand_errors(&schema) {
+        diagnostics.push(to_diagnostic(&err, Severity::Error));
+    }
 
     // `oneof` integrity (arm models exist, unique values, name collisions) is
     // an error: a malformed union cannot be validated against.
@@ -141,8 +148,10 @@ mod tests {
 
     #[test]
     fn test_inherited_required_field_enforced_by_validator() {
+        // `id` (not `name`) is the inherited required field, so block-name injection
+        // (which fills `name` from the block identifier) doesn't mask the enforcement.
         let (schema, diags) = load_schema(&[
-            "model base:\n    name string\n\nmodel child is base:\n    extra string\n",
+            "model base:\n    id string\n\nmodel child is base:\n    extra string\n",
         ]);
         assert!(errors(&diags).is_empty(), "unexpected errors: {diags:?}");
 
@@ -152,7 +161,7 @@ mod tests {
         assert!(
             result
                 .iter()
-                .any(|d| d.message.contains("missing required field 'name'")),
+                .any(|d| d.message.contains("missing required field 'id'")),
             "inherited required field should be enforced; diags: {result:?}"
         );
     }
