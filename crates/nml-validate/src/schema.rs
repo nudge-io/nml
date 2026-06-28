@@ -175,7 +175,7 @@ impl SchemaValidator {
                     true
                 }
                 other => self.validate_target_instance(
-                    other,
+                    &other,
                     &block.body,
                     0,
                     Some(block.name.span),
@@ -200,24 +200,23 @@ impl SchemaValidator {
         let keyword = &arr.item_keyword.name;
         let is_schema_def = matches!(keyword.as_str(), "model" | "enum");
         // An array item keyword may name a model or a `oneof`, mirroring the
-        // block-keyword dispatch in `validate_block` — same single `resolve_ref`.
-        let resolves = !is_schema_def
-            && matches!(
-                self.index.resolve_ref(keyword),
-                FieldTarget::Model(_) | FieldTarget::OneOf(_)
-            );
+        // block-keyword dispatch in `validate_block` — resolved once and reused
+        // both for the strict check and to validate each item below.
+        let elem = self.index.resolve_ref(keyword);
+        let resolves =
+            !is_schema_def && matches!(elem, FieldTarget::Model(_) | FieldTarget::OneOf(_));
 
-        // Inline definitions (named or scalar) need a model/oneof to validate against;
-        // references/links don't. A scalar `- "/api"` under an undefined keyword is as
-        // malformed as a named one, so both count toward the strict "no definition" check.
-        let has_inline_items = arr.body.items.iter().any(|i| {
-            matches!(
-                &i.kind,
-                ListItemKind::Named { .. } | ListItemKind::Shorthand { .. }
-            )
-        });
+        // Only *named* items carry a body that needs a model/oneof to validate against;
+        // a scalar item is a bare value (e.g. `[]plugin globalPlugins:` of plugin-name
+        // strings), valid under a keyword that is just a label, not a model. So only
+        // named items trigger the strict "no definition" check.
+        let has_named_items = arr
+            .body
+            .items
+            .iter()
+            .any(|i| matches!(&i.kind, ListItemKind::Named { .. }));
 
-        if !is_schema_def && !resolves && has_inline_items && self.strict_unknown_fields {
+        if !is_schema_def && !resolves && has_named_items && self.strict_unknown_fields {
             diags.push(
                 Diagnostic::error(format!(
                     "array item keyword '{keyword}' has no model or oneof definition"
@@ -227,53 +226,75 @@ impl SchemaValidator {
         }
 
         for item in &arr.body.items {
-            match &item.kind {
-                ListItemKind::Named { name, body } => {
-                    self.validate_body(body, is_schema_def, keyword, diags);
-                    self.validate_members_builtin_refs(body, keyword, diags);
-                    if !is_schema_def {
-                        self.validate_list_item(item, keyword, Some(name.span), diags);
-                    }
-                }
-                // A bare scalar (`- "/api"`) fills the element model's shorthand
-                // field; validate its materialized body (RFC 0005 §10).
-                ListItemKind::Shorthand { value, .. } if !is_schema_def => {
-                    self.validate_list_item(item, keyword, Some(value.span), diags);
-                }
-                _ => {}
+            // A named item's body — or a scalar shorthand's optional `: body` — gets
+            // the same body-level checks (field-def placement, builtin member refs);
+            // references/links carry none. Inline items (named or scalar) are then
+            // validated against the element target after identity materialization
+            // (RFC 0005 §10); a bare scalar `- "/api"` fills the model's `!` field.
+            let item_body = match &item.kind {
+                ListItemKind::Named { body, .. } => Some(body),
+                ListItemKind::Shorthand { body, .. } => body.as_ref(),
+                ListItemKind::Reference(_) | ListItemKind::Role(_) => None,
+            };
+            if let Some(body) = item_body {
+                self.validate_body(body, is_schema_def, keyword, diags);
+                self.validate_members_builtin_refs(body, keyword, diags);
+            }
+            if !is_schema_def
+                && matches!(
+                    &item.kind,
+                    ListItemKind::Named { .. } | ListItemKind::Shorthand { .. }
+                )
+            {
+                self.validate_inline_item(item, &elem, 0, diags);
             }
         }
     }
 
-    /// Validate a list item under `keyword` against its element model, after
-    /// **materializing the item's identity** into the body (RFC 0005 §10): a named
-    /// item's `name`, or a bare scalar's shorthand field, becomes a present property
-    /// so the required-field scan sees it. A scalar on a union list is out of scope
-    /// and flagged explicitly; other non-model targets keep the prior path.
-    fn validate_list_item(
+    /// Validate one inline list item against its already-resolved element target,
+    /// **materializing the item's identity** into the body first (RFC 0005 §10): a
+    /// named item's `name`, or a bare scalar's shorthand field, becomes a present
+    /// property so the required-field scan sees it. A scalar on a union list is out of
+    /// scope and flagged explicitly. This is the single inline-item path shared by
+    /// top-level arrays, the `[]T` field arm, and the `ListOf` dispatch — references
+    /// and links carry no inline instance and are skipped.
+    fn validate_inline_item(
         &self,
         item: &ListItem,
-        keyword: &str,
-        header_span: Option<Span>,
+        elem: &FieldTarget,
+        depth: u32,
         diags: &mut Vec<Diagnostic>,
     ) {
-        let target = self.index.resolve_ref(keyword);
-        if let FieldTarget::Model(m) = target {
-            let result = nml_core::identity::materialize_item(item, m);
-            self.validate_materialized(result, m, 0, header_span, diags);
-            return;
-        }
-        match &item.kind {
-            // A union element's variant isn't known until its discriminator is
-            // resolved (after materialization), so scalar shorthand on a union is out
-            // of scope — flagged explicitly rather than silently dropped (§10).
-            ListItemKind::Shorthand { value, .. } if matches!(target, FieldTarget::OneOf(_)) => {
-                diags.push(Diagnostic::error(UNION_SHORTHAND_MSG.to_string()).with_span(value.span))
+        let header = match &item.kind {
+            ListItemKind::Named { name, .. } => Some(name.span),
+            ListItemKind::Shorthand { value, .. } => Some(value.span),
+            ListItemKind::Reference(_) | ListItemKind::Role(_) => return,
+        };
+        match elem {
+            // Inline items (named or scalar) validate against the model *after*
+            // identity materialization (a named item's `name` / a scalar's `!` field).
+            FieldTarget::Model(m) => {
+                let result = nml_core::identity::materialize_item(item, m);
+                self.validate_materialized(result, m, depth, header, diags);
             }
-            ListItemKind::Named { body, .. } => {
-                self.validate_target_instance(target, body, 0, header_span, diags);
-            }
-            _ => {}
+            // A named item against any non-model target — a `oneof`, or a nested `[]T`
+            // union variant (`parallel [](step | []step)`) — validates its body against
+            // that target. A scalar only fills a model's `!` field, so on a union its
+            // variant isn't yet known and it's out of scope (flagged); against any other
+            // target there is nothing to fill.
+            _ => match &item.kind {
+                ListItemKind::Named { body, .. } => {
+                    self.validate_target_instance(elem, body, depth, header, diags);
+                }
+                ListItemKind::Shorthand { value, .. }
+                    if matches!(elem, FieldTarget::OneOf(_)) =>
+                {
+                    diags.push(
+                        Diagnostic::error(UNION_SHORTHAND_MSG.to_string()).with_span(value.span),
+                    )
+                }
+                _ => {}
+            },
         }
     }
 
@@ -398,18 +419,25 @@ impl SchemaValidator {
         header_span: Option<Span>,
         diags: &mut Vec<Diagnostic>,
     ) -> bool {
-        self.validate_target_instance(self.index.resolve_ref(ref_name), body, depth, header_span, diags)
+        self.validate_target_instance(
+            &self.index.resolve_ref(ref_name),
+            body,
+            depth,
+            header_span,
+            diags,
+        )
     }
 
     /// Validate `body` against an already-resolved [`FieldTarget`]. The single
     /// dispatch on a resolved target, shared by keyword/ref dispatch
     /// ([`Self::validate_ref_instance`]) and union variant selection (via
     /// [`SchemaIndex::resolve_type_in_body`]). A `ListOf` target validates each
-    /// named item against the item target. Returns whether the target carried
+    /// inline item (named or scalar) against the element target via
+    /// [`Self::validate_inline_item`]. Returns whether the target carried
     /// instance structure (model / oneof / list of those).
     fn validate_target_instance(
         &self,
-        target: FieldTarget,
+        target: &FieldTarget,
         body: &Body,
         depth: u32,
         header_span: Option<Span>,
@@ -426,36 +454,8 @@ impl SchemaValidator {
             }
             FieldTarget::ListOf(inner) => {
                 for entry in &body.entries {
-                    let BodyEntryKind::ListItem(item) = &entry.kind else {
-                        continue;
-                    };
-                    let header = match &item.kind {
-                        ListItemKind::Named { name, .. } => Some(name.span),
-                        ListItemKind::Shorthand { value, .. } => Some(value.span),
-                        // References/links carry no inline instance to validate.
-                        ListItemKind::Reference(_) | ListItemKind::Role(_) => continue,
-                    };
-                    match inner.as_ref() {
-                        // Inline items (named or scalar) validate against the model
-                        // *after* identity materialization (RFC 0005 §10).
-                        FieldTarget::Model(m) => {
-                            let result = nml_core::identity::materialize_item(item, m);
-                            self.validate_materialized(result, m, depth, header, diags);
-                        }
-                        FieldTarget::OneOf(o) => match &item.kind {
-                            ListItemKind::Named { body: item_body, .. } => {
-                                self.validate_instance_against_oneof(
-                                    item_body, o, depth, header, diags,
-                                );
-                            }
-                            // Scalar shorthand on a union list is out of scope (§10).
-                            ListItemKind::Shorthand { value, .. } => diags.push(
-                                Diagnostic::error(UNION_SHORTHAND_MSG.to_string())
-                                    .with_span(value.span),
-                            ),
-                            _ => {}
-                        },
-                        _ => {}
+                    if let BodyEntryKind::ListItem(item) = &entry.kind {
+                        self.validate_inline_item(item, inner.as_ref(), depth, diags);
                     }
                 }
                 true
@@ -528,24 +528,25 @@ impl SchemaValidator {
                                 );
                             }
                             FieldType::List(inner) => {
-                                // Each named item resolves its inner type against
-                                // its own body (so a `(a | b)` union variant is
-                                // picked per item) via the shared dispatch; a
-                                // `ModelRef` inner resolves body-independently.
+                                // Each item resolves its inner type against its own
+                                // body (so a `(a | b)` union variant is picked per
+                                // item; a `ModelRef` inner resolves body-independently),
+                                // then the shared inline-item path materializes the
+                                // item's identity into the body before validating —
+                                // so a required `name` supplied by the item key
+                                // (`- classify:`) is seen, not reported missing.
+                                let empty = Body { entries: Vec::new() };
                                 for entry in &nb.body.entries {
-                                    if let BodyEntryKind::ListItem(item) = &entry.kind {
-                                        if let ListItemKind::Named { name, body } = &item.kind {
-                                            let target =
-                                                self.index.resolve_type_in_body(inner, body);
-                                            self.validate_target_instance(
-                                                target,
-                                                body,
-                                                depth + 1,
-                                                Some(name.span),
-                                                diags,
-                                            );
-                                        }
-                                    }
+                                    let BodyEntryKind::ListItem(item) = &entry.kind else {
+                                        continue;
+                                    };
+                                    let probe = match &item.kind {
+                                        ListItemKind::Named { body, .. } => body,
+                                        ListItemKind::Shorthand { body: Some(b), .. } => b,
+                                        _ => &empty,
+                                    };
+                                    let elem = self.index.resolve_type_in_body(inner, probe);
+                                    self.validate_inline_item(item, &elem, depth + 1, diags);
                                 }
                             }
                             FieldType::Primitive(PrimitiveType::Object) => {}
@@ -2566,6 +2567,32 @@ workflow W:
     }
 
     #[test]
+    fn test_nested_list_field_materializes_item_name() {
+        // A `[]step` *field* written as `steps:\n - classify:` must materialize each
+        // item's `name` from its key — exactly like a top-level array — so a required
+        // shorthand `name` is not falsely reported missing. Regression guard for the
+        // nudge workflow-step pattern (the `FieldType::List` arm once skipped this).
+        let schema = "model step:\n    name string!\n    run string?\n    next step?\nmodel workflow:\n    entrypoint step\n    steps []step\n";
+        let validator = make_strict_validator(schema);
+        let source = "workflow W:\n    entrypoint = classify\n    steps:\n        - classify:\n            run = \"x\"\n            next = respond\n        - respond:\n            run = \"y\"\n";
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("missing required field 'name'")),
+            "nested list field must inject each item's name; diags: {diags:?}"
+        );
+        // A genuinely-missing *required non-identity* field is still caught,
+        // proving the arm validates rather than skipping wholesale.
+        let bad = "workflow W:\n    entrypoint = classify\n    steps:\n        - classify:\n            next = respond\n";
+        let bad_file = nml_core::cst::parse_to_ast(bad).unwrap();
+        let bad_diags = validator.validate(&bad_file);
+        assert!(
+            bad_diags.is_empty() || !bad_diags.iter().any(|d| d.message.contains("missing required field 'name'")),
+            "name is supplied by the key, never missing; diags: {bad_diags:?}"
+        );
+    }
+
+    #[test]
     fn test_default_unknown_property_is_warning() {
         let schema = "model server:\n    port number?\n";
         let validator = make_validator(schema);
@@ -2635,17 +2662,18 @@ workflow W:
     }
 
     #[test]
-    fn test_strict_unmodeled_array_keyword_with_scalar_items() {
-        // A scalar inline item is as malformed as a named one under an undefined
-        // keyword — the strict "no definition" check covers both.
+    fn test_strict_unmodeled_array_keyword_with_scalar_items_is_ok() {
+        // A scalar-only list under a label keyword (no model) is a valid list of
+        // *values* (e.g. plugin-name strings) — even in strict mode it must NOT be
+        // flagged as "no model definition". Regression guard for `[]plugin` lists.
         let validator = make_strict_validator("model server:\n    port number?\n");
-        let file = nml_core::cst::parse_to_ast("[]bogus items:\n    - \"/api\"\n").unwrap();
+        let file = nml_core::cst::parse_to_ast("[]plugin plugins:\n    - \"echo.v1\"\n").unwrap();
         let diags = validator.validate(&file);
         assert!(
-            diags
+            !diags
                 .iter()
-                .any(|d| d.message.contains("array item keyword 'bogus' has no model or oneof definition")),
-            "strict mode should reject unmodeled array with scalar items; diags: {diags:?}"
+                .any(|d| d.message.contains("has no model or oneof definition")),
+            "a scalar value list must not require a model definition; diags: {diags:?}"
         );
     }
 

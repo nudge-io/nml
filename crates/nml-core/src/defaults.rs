@@ -428,6 +428,48 @@ mod tests {
         assert_eq!(svc.resources[1].method.as_deref(), Some("GET"));
     }
 
+    #[test]
+    fn apply_positional_recurses_into_oneof_variant() {
+        // A scalar shorthand nested inside a `oneof` variant is materialized too — the
+        // de-path recurses into the resolved variant, matching the validator (closes a
+        // validator/`de` agreement gap).
+        let index = index_from(
+            "model resource:\n    path string!\n\nmodel deployAction:\n    kind string\n    resources []resource\noneof action by kind:\n    \"deploy\" => deployAction\nmodel wrapper:\n    action action\n",
+        );
+        let body = body_of(
+            "wrapper w:\n    action:\n        kind = \"deploy\"\n        resources:\n            - \"/api\"\n",
+        );
+        let out = crate::identity::apply_positional(&index, "wrapper", &body);
+
+        let nested = |b: &Body, name: &str| {
+            b.entries
+                .iter()
+                .find_map(|e| match &e.kind {
+                    BodyEntryKind::NestedBlock(nb) if nb.name.name == name => Some(nb.body.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no nested block '{name}'"))
+        };
+        let resources = nested(&nested(&out, "action"), "resources");
+        let item = resources
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::ListItem(i) => Some(i),
+                _ => None,
+            })
+            .expect("a list item");
+        let ListItemKind::Shorthand { body: Some(b), .. } = &item.kind else {
+            panic!("scalar inside the oneof variant should be materialized");
+        };
+        assert!(
+            b.entries
+                .iter()
+                .any(|e| matches!(&e.kind, BodyEntryKind::Property(p) if p.name.name == "path")),
+            "`path` materialized inside the oneof variant"
+        );
+    }
+
     fn index_from(schema: &str) -> SchemaIndex {
         let mut ex = crate::cst::extract_schema(schema).0;
         crate::schema::resolve_model_inheritance(&mut ex);

@@ -22,7 +22,7 @@ use crate::ast::{
     Body, BodyEntry, BodyEntryKind, Identifier, ListItem, ListItemKind, NestedBlock, Property,
 };
 use crate::error::NmlError;
-use crate::model::{FieldType, ModelDef};
+use crate::model::{FieldType, ModelDef, OneOfDef};
 use crate::schema_index::{FieldTarget, SchemaIndex};
 use crate::span::Span;
 use crate::types::{SpannedValue, Value};
@@ -203,7 +203,32 @@ impl Positionalizer<'_> {
         }
         match self.index.resolve_field(field) {
             FieldTarget::Model(m) => self.model_body(m, body, depth + 1),
+            FieldTarget::OneOf(o) => self.oneof_body(o, body, depth + 1),
             _ => body.clone(),
+        }
+    }
+
+    /// Recurse into a `oneof` instance's selected variant so nested shorthand lists
+    /// materialize. The variant is resolved from the authored discriminator, else the
+    /// union's default arm — mirroring the defaulter's `oneof_body` (the discriminator
+    /// itself is injected later, by `apply_defaults`). An unresolvable discriminator
+    /// leaves the body unchanged.
+    fn oneof_body(&self, oneof: &OneOfDef, body: &Body, depth: u32) -> Body {
+        let authored = body.entries.iter().find_map(|e| match &e.kind {
+            BodyEntryKind::Property(p) if p.name.name == oneof.discriminator => p.value.value.as_str(),
+            _ => None,
+        });
+        let Some(disc) = authored.or(oneof.default_discriminator.as_deref()) else {
+            return body.clone();
+        };
+        match oneof
+            .variants
+            .iter()
+            .find(|(v, _)| v.as_str() == disc)
+            .and_then(|(_, m)| self.index.model(m))
+        {
+            Some(variant) => self.model_body(variant, body, depth),
+            None => body.clone(),
         }
     }
 
