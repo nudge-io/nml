@@ -180,10 +180,15 @@ impl<'a> Lexer<'a> {
             }
             b'"' => self.scan_string(),
             b'=' if self.bytes.get(start + 1) == Some(&b'>') => {
+                // Rejected by every production; kept lexable so the parser can
+                // point old syntax at the one-character fix (RFC 0006).
                 self.fixed(SyntaxKind::FatArrow, 2)
             }
             b'=' => self.single(SyntaxKind::Eq),
             b':' => self.single(SyntaxKind::Colon),
+            b'-' if self.bytes.get(start + 1) == Some(&b'>') => {
+                self.fixed(SyntaxKind::Arrow, 2)
+            }
             b'-' => self.single(SyntaxKind::Dash),
             b'|' => self.single(SyntaxKind::Pipe),
             b'.' => self.single(SyntaxKind::Dot),
@@ -193,7 +198,10 @@ impl<'a> Lexer<'a> {
             b')' => self.single(SyntaxKind::RParen),
             b',' => self.single(SyntaxKind::Comma),
             b'?' => self.single(SyntaxKind::Question),
-            b'!' => self.single(SyntaxKind::Bang),
+            // The positional-field marker (RFC 0005 §16). A bare `+` outside a
+            // `@role` (where it is a role-continue char, consumed by `scan_role`)
+            // or a string literal is only ever this marker.
+            b'+' => self.single(SyntaxKind::Plus),
             b'@' => self.scan_role(),
             b'$' => self.scan_secret(),
             c if is_ident_start(c) => {
@@ -419,16 +427,27 @@ mod tests {
     #[test]
     fn all_atom_and_punctuation_kinds() {
         use SyntaxKind::*;
-        // A line exercising every atom and punctuation token.
-        let src = "x = \"s\" 12.5 @role/admin $ENV.KEY => : - | . [ ] ( ) , ? !";
+        // A line exercising every atom and punctuation token. `=>` stays
+        // lexable (reject-with-guidance, RFC 0006) alongside the arrow.
+        let src = "x = \"s\" 12.5 @role/admin $ENV.KEY -> => : - | . [ ] ( ) , ? +";
         assert_eq!(
             kinds(src),
             vec![
-                Ident, Eq, String, Number, Role, Secret, FatArrow, Colon, Dash, Pipe, Dot,
-                LBracket, RBracket, LParen, RParen, Comma, Question, Bang,
+                Ident, Eq, String, Number, Role, Secret, Arrow, FatArrow, Colon, Dash, Pipe,
+                Dot, LBracket, RBracket, LParen, RParen, Comma, Question, Plus,
             ]
         );
         assert_lossless(src);
+    }
+
+    /// RFC 0006: `->` is one token and only forms on the immediate two-byte
+    /// sequence (negative numbers and list dashes are pinned by
+    /// `context_free_negative_number_and_array_prefix`).
+    #[test]
+    fn arrow_lexes_without_disturbing_dash() {
+        use SyntaxKind::*;
+        assert_eq!(kinds("\"log\" -> emailLog"), vec![String, Arrow, Ident]);
+        assert_lossless("\"log\" -> emailLog");
     }
 
     #[test]
@@ -444,6 +463,26 @@ mod tests {
         // `my-svc` is one Ident; a leading `-` (list dash) is Dash.
         assert_eq!(kinds("my-svc"), vec![SyntaxKind::Ident]);
         assert_eq!(kinds("- item"), vec![SyntaxKind::Dash, SyntaxKind::Ident]);
+    }
+
+    #[test]
+    fn plus_is_the_positional_marker_and_does_not_disturb_roles_or_strings() {
+        // RFC 0005 §16: `+` is the positional-field marker. This is the pinned
+        // collision check that justified choosing `+` over `!`.
+        // A bare `+` after a type is its own token (the marker):
+        assert_eq!(
+            kinds("string+"),
+            vec![SyntaxKind::Ident, SyntaxKind::Plus]
+        );
+        assert_eq!(
+            kinds("string?+"),
+            vec![SyntaxKind::Ident, SyntaxKind::Question, SyntaxKind::Plus]
+        );
+        // `+` *inside* a role is a role-continue char — the whole thing is one
+        // Role token, untouched by the new marker arm:
+        assert_eq!(kinds("@read+write"), vec![SyntaxKind::Role]);
+        // `+` inside a string literal is ordinary content:
+        assert_eq!(kinds("\"a+b\""), vec![SyntaxKind::String]);
     }
 
     #[test]

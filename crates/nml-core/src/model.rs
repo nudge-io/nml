@@ -46,8 +46,9 @@ pub struct FieldDef {
     pub name: String,
     pub field_type: FieldType,
     pub optional: bool,
-    /// The model's scalar-shorthand field (`name type!`): the one field a bare
-    /// scalar list item fills. At most one per model (enforced at schema load).
+    /// The model's positional/scalar-shorthand field (`name type+`, RFC 0005
+    /// §16): the one field a bare scalar list item fills. At most one per model
+    /// (enforced at schema load).
     pub shorthand: bool,
     /// The declared default, retaining its parsed type and source span. `None`
     /// when the field has no `= value`. The span points at the default literal so

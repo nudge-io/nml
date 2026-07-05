@@ -182,8 +182,8 @@ trait Audited:
 model Plan is Base:
     name string
     tier string?
-    path path!
-    slug string?!
+    path path+
+    slug string?+
     region string = \"us\"
     tags []string
     mixed (string | []int)
@@ -192,8 +192,8 @@ model Plan is Base:
     |visibility role?
 
 oneof email by provider as providerKind = \"log\":
-    \"log\" => emailLog
-    \"postmark\" => emailPostmark
+    \"log\" -> emailLog
+    \"postmark\" -> emailPostmark
 ";
         let schema = extract(&Root::cast(parse(src).syntax()).unwrap());
         // `trait` is not a schema definition, so only `model`/`enum` extract.
@@ -205,9 +205,9 @@ oneof email by provider as providerKind = \"log\":
         assert_eq!(plan.extends, vec!["Base".to_string()]);
         let field = |n: &str| plan.fields.iter().find(|f| f.name == n).unwrap();
         assert!(field("tier").optional && !field("tier").shorthand);
-        // `path path!` → shorthand, required.
+        // `path path+` → shorthand, required.
         assert!(field("path").shorthand && !field("path").optional);
-        // `slug string?!` → shorthand and optional (order-free flags).
+        // `slug string?+` → shorthand and optional (order-free flags).
         assert!(field("slug").shorthand && field("slug").optional);
         assert!(!field("name").shorthand && !field("name").optional);
         assert!(matches!(

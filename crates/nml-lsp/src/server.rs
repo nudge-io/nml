@@ -3457,7 +3457,7 @@ workflow VoiceAgent:
 
     #[test]
     fn oneof_discriminator_completion_offers_arm_keys() {
-        let schema = "model emailLog:\n    x string?\n\nmodel emailPostmark:\n    y string?\n\noneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let schema = "model emailLog:\n    x string?\n\nmodel emailPostmark:\n    y string?\n\noneof email by provider:\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n";
         let source = "email Outbound:\n    provider = \"log\"\n";
         assert_eq!(
             discriminator_arm_keys(schema, source, Position::new(1, 20)),
@@ -3467,7 +3467,7 @@ workflow VoiceAgent:
 
     #[test]
     fn oneof_discriminator_completion_ignores_non_discriminator_field() {
-        let schema = "model emailLog:\n    fromAddress string?\n\noneof email by provider:\n    \"log\" => emailLog\n";
+        let schema = "model emailLog:\n    fromAddress string?\n\noneof email by provider:\n    \"log\" -> emailLog\n";
         // `fromAddress` is a variant field, not the discriminator — no arm-key completion.
         let source = "email Outbound:\n    fromAddress = \"x\"\n";
         assert!(discriminator_arm_keys(schema, source, Position::new(1, 19)).is_none());
@@ -3615,7 +3615,7 @@ workflow VoiceAgent:
         let index = field_index(concat!(
             "model emailLog:\n    path string?\n\n",
             "model emailPostmark:\n    apiKey string?\n    fromAddress string?\n\n",
-            "oneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n\n",
+            "oneof email by provider:\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n\n",
             "model config:\n    email email?\n",
         ));
         let source =

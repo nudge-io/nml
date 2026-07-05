@@ -35,7 +35,10 @@ pub enum SyntaxKind {
 
     // ── punctuation ──
     Eq,        // =
-    FatArrow,  // =>
+    Arrow,     // -> (the arm arrow: `oneof` arms and every future arm form — RFC 0006)
+    /// `=>` — lexed ONLY so the parser can reject it with targeted guidance
+    /// ("'=>' was replaced by '->'"); accepted by no production (RFC 0006).
+    FatArrow,
     Colon,     // :
     Dash,      // -
     Pipe,      // |
@@ -46,7 +49,7 @@ pub enum SyntaxKind {
     RParen,    // )
     Comma,     // ,
     Question,  // ?
-    Bang,      // !
+    Plus,      // +  (positional-field marker — RFC 0005 §16)
 
     /// Unrecognized input, one character wide. Never dropped — every source
     /// byte lands in some token, so the tree is byte-faithful on any input.

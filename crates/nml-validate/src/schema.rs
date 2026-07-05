@@ -230,7 +230,7 @@ impl SchemaValidator {
             // the same body-level checks (field-def placement, builtin member refs);
             // references/links carry none. Inline items (named or scalar) are then
             // validated against the element target after identity materialization
-            // (RFC 0005 §10); a bare scalar `- "/api"` fills the model's `!` field.
+            // (RFC 0005 §10); a bare scalar `- "/api"` fills the model's `+` field.
             let item_body = match &item.kind {
                 ListItemKind::Named { body, .. } => Some(body),
                 ListItemKind::Shorthand { body, .. } => body.as_ref(),
@@ -272,14 +272,14 @@ impl SchemaValidator {
         };
         match elem {
             // Inline items (named or scalar) validate against the model *after*
-            // identity materialization (a named item's `name` / a scalar's `!` field).
+            // identity materialization (a named item's `name` / a scalar's `+` field).
             FieldTarget::Model(m) => {
                 let result = nml_core::identity::materialize_item(item, m);
                 self.validate_materialized(result, m, depth, header, diags);
             }
             // A named item against any non-model target — a `oneof`, or a nested `[]T`
             // union variant (`parallel [](step | []step)`) — validates its body against
-            // that target. A scalar only fills a model's `!` field, so on a union its
+            // that target. A scalar only fills a model's `+` field, so on a union its
             // variant isn't yet known and it's out of scope (flagged); against any other
             // target there is nothing to fill.
             _ => match &item.kind {
@@ -1280,7 +1280,7 @@ mod tests {
     #[test]
     fn scalar_shorthand_fills_marked_field() {
         let d = diags(
-            "model resource:\n    name string?\n    path path!\n",
+            "model resource:\n    name string?\n    path path+\n",
             "[]resource resources:\n    - \"/api\"\n",
         );
         assert!(d.is_empty(), "unexpected diagnostics: {d:?}");
@@ -1288,10 +1288,10 @@ mod tests {
 
     #[test]
     fn name_is_shorthand_named_and_scalar_both_fill_it() {
-        // `name string!` — identity *is* the name, so both forms fill `name`:
+        // `name string+` — identity *is* the name, so both forms fill `name`:
         // the named key (`- editor:`) and the scalar (`- "viewer"`).
         let d = diags(
-            "model role:\n    name string!\n    description string?\n",
+            "model role:\n    name string+\n    description string?\n",
             "[]role roles:\n    - editor:\n        description = \"x\"\n    - \"viewer\"\n",
         );
         assert!(d.is_empty(), "unexpected diagnostics: {d:?}");
@@ -1302,7 +1302,7 @@ mod tests {
         // Agreement guardrail (RFC §11.10): the *same* instance validates clean AND
         // deserializes clean with matching fields — the de-path closed the transitional
         // "validates but de errors" gap.
-        let schema = "model resource:\n    path string!\n    method string?\n\nmodel svc:\n    resources []resource\n";
+        let schema = "model resource:\n    path string+\n    method string?\n\nmodel svc:\n    resources []resource\n";
         let instance = "svc s:\n    resources:\n        - \"/api\"\n        - \"/health\":\n            method = \"GET\"\n";
 
         // (1) validates clean.
@@ -1337,9 +1337,9 @@ mod tests {
 
     #[test]
     fn scalar_shorthand_with_body_fills_field_and_validates() {
-        // `- "/admin":` + body: the scalar fills `path!`, the body sets `method`.
+        // `- "/admin":` + body: the scalar fills `path+`, the body sets `method`.
         let d = diags(
-            "enum httpMethod:\n    - \"GET\"\n    - \"POST\"\nmodel resource:\n    path path!\n    method httpMethod = \"GET\"\n",
+            "enum httpMethod:\n    - \"GET\"\n    - \"POST\"\nmodel resource:\n    path path+\n    method httpMethod = \"GET\"\n",
             "[]resource resources:\n    - \"/admin\":\n        method = \"POST\"\n",
         );
         assert!(d.is_empty(), "scalar-with-body should validate: {d:?}");
@@ -1349,7 +1349,7 @@ mod tests {
     fn scalar_shorthand_with_body_type_checks_the_body() {
         // The body is validated too: an unknown enum value is caught.
         let d = diags(
-            "enum httpMethod:\n    - \"GET\"\n    - \"POST\"\nmodel resource:\n    path path!\n    method httpMethod = \"GET\"\n",
+            "enum httpMethod:\n    - \"GET\"\n    - \"POST\"\nmodel resource:\n    path path+\n    method httpMethod = \"GET\"\n",
             "[]resource resources:\n    - \"/admin\":\n        method = \"BOGUS\"\n",
         );
         assert!(!d.is_empty(), "invalid method in the body should be flagged");
@@ -1369,7 +1369,7 @@ mod tests {
 
     #[test]
     fn scalar_shorthand_on_union_list_is_flagged() {
-        let schema = "model a:\n    x string?\nmodel b:\n    y string?\noneof u by kind:\n    \"a\" => a\n    \"b\" => b\n";
+        let schema = "model a:\n    x string?\nmodel b:\n    y string?\noneof u by kind:\n    \"a\" -> a\n    \"b\" -> b\n";
         let d = diags(schema, "[]u items:\n    - \"foo\"\n");
         assert!(d.iter().any(|x| x.message.contains("union-typed lists")), "{d:?}");
     }
@@ -2572,7 +2572,7 @@ workflow W:
         // item's `name` from its key — exactly like a top-level array — so a required
         // shorthand `name` is not falsely reported missing. Regression guard for the
         // nudge workflow-step pattern (the `FieldType::List` arm once skipped this).
-        let schema = "model step:\n    name string!\n    run string?\n    next step?\nmodel workflow:\n    entrypoint step\n    steps []step\n";
+        let schema = "model step:\n    name string+\n    run string?\n    next step?\nmodel workflow:\n    entrypoint step\n    steps []step\n";
         let validator = make_strict_validator(schema);
         let source = "workflow W:\n    entrypoint = classify\n    steps:\n        - classify:\n            run = \"x\"\n            next = respond\n        - respond:\n            run = \"y\"\n";
         let file = nml_core::cst::parse_to_ast(source).unwrap();
@@ -3067,7 +3067,7 @@ workflow W:
     const ONEOF_SCHEMA: &str = concat!(
         "model emailLog:\n    fromAddress string?\n\n",
         "model emailPostmark:\n    fromAddress string?\n    serverToken secret\n\n",
-        "oneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n\n",
+        "oneof email by provider:\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n\n",
         "model server:\n    email email?\n\n",
         "model providers:\n    items []email?\n",
     );
@@ -3186,7 +3186,7 @@ workflow W:
         // A `oneof` with a default arm: omitting the discriminator is valid (the
         // defaulter injects it), so the validator must agree and check the default
         // variant rather than reporting a missing discriminator.
-        let schema = "model emailLog:\n    level string?\n\nmodel emailPostmark:\n    serverToken string\n\noneof email by provider = \"log\":\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let schema = "model emailLog:\n    level string?\n\nmodel emailPostmark:\n    serverToken string\n\noneof email by provider = \"log\":\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n";
         let validator = make_validator(schema);
         let doc = nml_core::cst::parse_to_ast("email Outbound:\n    level = \"info\"\n").unwrap();
         let errors: Vec<_> = validator
@@ -3203,7 +3203,7 @@ workflow W:
     #[test]
     fn oneof_omitted_discriminator_without_default_still_errors() {
         // Without a default, an omitted discriminator remains an error.
-        let schema = "model emailLog:\n    level string?\n\noneof email by provider:\n    \"log\" => emailLog\n";
+        let schema = "model emailLog:\n    level string?\n\noneof email by provider:\n    \"log\" -> emailLog\n";
         let validator = make_validator(schema);
         let doc = nml_core::cst::parse_to_ast("email Outbound:\n    level = \"info\"\n").unwrap();
         assert!(

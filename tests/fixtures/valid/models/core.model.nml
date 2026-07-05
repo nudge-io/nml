@@ -15,11 +15,11 @@ enum httpMethod:
     - "PATCH"
 
 model resource is accessControlled:
-    path path!
+    path path+
     method httpMethod = "GET"
 
 model endpoint is accessControlled:
-    address string!
+    address string+
 
     .healthCheck:
         path path
@@ -30,10 +30,10 @@ model service is accessControlled:
     endpoints []endpoint
 
 model role:
-    name string!
+    name string+
     description string?
     members []role?
 
 model command:
     name string
-    run string?!
+    run string?+

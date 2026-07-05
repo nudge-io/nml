@@ -353,8 +353,8 @@ model Plan is Base, Audited:
     |visibility role?
 
 oneof email by provider as providerKind = \"log\":
-    \"log\" => emailLog
-    \"postmark\" => emailPostmark
+    \"log\" -> emailLog
+    \"postmark\" -> emailPostmark
 
 []mount mounts:
     |allow = [@authenticated, \"x\"]

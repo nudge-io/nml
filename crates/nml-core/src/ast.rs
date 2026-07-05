@@ -37,7 +37,7 @@ pub struct FieldDefinition {
     pub name: Identifier,
     pub field_type: FieldTypeExpr,
     pub optional: bool,
-    /// The model's scalar-shorthand field (`name type!`) — RFC 0005 §6.
+    /// The model's positional/scalar-shorthand field (`name type+`) — RFC 0005 §6, §16.
     pub shorthand: bool,
     pub default_value: Option<SpannedValue>,
 }
@@ -65,15 +65,15 @@ pub enum DeclarationKind {
     Const(ConstDecl),
     /// A template: `template Name: <string value>`
     Template(TemplateDecl),
-    /// A discriminated union of models: `oneof Name by <field>: "v" => Model ...`
+    /// A discriminated union of models: `oneof Name by <field>: "v" -> Model ...`
     OneOf(OneOfDecl),
 }
 
 /// A discriminated-union declaration:
 /// ```text
 /// oneof email by provider:
-///     "log"      => emailLog
-///     "postmark" => emailPostmark
+///     "log"      -> emailLog
+///     "postmark" -> emailPostmark
 /// ```
 /// Each arm binds a discriminator value to a variant model. The discriminator
 /// field is owned by the union; an instance block carries it flat alongside the
@@ -92,7 +92,7 @@ pub struct OneOfDecl {
     pub arms: Vec<OneOfArm>,
 }
 
-/// One `"value" => ModelName` arm of a [`OneOfDecl`].
+/// One `"value" -> ModelName` arm of a [`OneOfDecl`].
 #[derive(Debug, Clone, Serialize)]
 pub struct OneOfArm {
     /// Discriminator value that selects this variant.

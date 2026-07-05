@@ -207,7 +207,7 @@ impl<'a> Formatter<'a> {
                 self.emit_trailing_comment(decl.span.start);
                 self.out.push('\n');
 
-                // Align the `=>` arrows on the widest quoted value so arms
+                // Align the `->` arrows on the widest quoted value so arms
                 // read as a tidy table.
                 let quoted: Vec<String> =
                     oneof.arms.iter().map(|a| quote_string(&a.value)).collect();
@@ -219,7 +219,7 @@ impl<'a> Formatter<'a> {
                     for _ in 0..(max_w - q.chars().count()) {
                         self.out.push(' ');
                     }
-                    self.out.push_str(" => ");
+                    self.out.push_str(" -> ");
                     self.out.push_str(&arm.model.name);
                     self.emit_trailing_comment(arm.model.span.start);
                     self.out.push('\n');
@@ -262,13 +262,13 @@ impl<'a> Formatter<'a> {
                 self.out.push_str(&f.name.name);
                 self.out.push(' ');
                 self.out.push_str(&f.field_type.to_string());
-                // Canonical suffix order is `?!` (RFC 0005 §7); the flags are
-                // order-free, so they always render canonically.
+                // Canonical suffix order is `?+` (RFC 0005 §7, §16); the flags
+                // are independent, so they always render canonically.
                 if f.optional {
                     self.out.push('?');
                 }
                 if f.shorthand {
-                    self.out.push('!');
+                    self.out.push('+');
                 }
                 if let Some(ref default) = f.default_value {
                     self.out.push_str(" = ");
@@ -557,11 +557,11 @@ mod tests {
 
     #[test]
     fn test_format_shorthand_and_optional_suffixes_roundtrip() {
-        // `!` (shorthand), `?` (optional), and canonical `?!` survive formatting.
-        let source = "model resource:\n    name string?\n    path path!\n    slug string?!\n";
+        // `+` (positional shorthand), `?` (optional), and canonical `?+` survive formatting.
+        let source = "model resource:\n    name string?\n    path path+\n    slug string?+\n";
         let formatted = format(&parse(source).unwrap());
-        assert!(formatted.contains("path path!"), "{formatted}");
-        assert!(formatted.contains("slug string?!"), "{formatted}");
+        assert!(formatted.contains("path path+"), "{formatted}");
+        assert!(formatted.contains("slug string?+"), "{formatted}");
         assert!(formatted.contains("name string?"), "{formatted}");
         roundtrip(source);
         idempotent(source);
@@ -569,21 +569,21 @@ mod tests {
 
     #[test]
     fn test_format_oneof_aligns_arrows_and_roundtrips() {
-        let source = "oneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let source = "oneof email by provider:\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n";
         let formatted = format(&parse(source).unwrap());
         // Arrows are aligned on the widest quoted value ("postmark" = 10 cols).
         assert!(
-            formatted.contains("    \"log\"      => emailLog\n"),
+            formatted.contains("    \"log\"      -> emailLog\n"),
             "arrows should be aligned:\n{formatted}"
         );
-        assert!(formatted.contains("    \"postmark\" => emailPostmark\n"));
+        assert!(formatted.contains("    \"postmark\" -> emailPostmark\n"));
         roundtrip(source);
         idempotent(source);
     }
 
     #[test]
     fn test_format_oneof_default_discriminator_roundtrips() {
-        let source = "oneof email by provider = \"log\":\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let source = "oneof email by provider = \"log\":\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n";
         let formatted = format(&parse(source).unwrap());
         assert!(
             formatted.contains("oneof email by provider = \"log\":"),
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_format_oneof_enum_typed_discriminator_roundtrips() {
-        let source = "oneof email by provider as providerKind = \"log\":\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let source = "oneof email by provider as providerKind = \"log\":\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n";
         let formatted = format(&parse(source).unwrap());
         assert!(
             formatted.contains("oneof email by provider as providerKind = \"log\":"),
@@ -651,7 +651,7 @@ mod tests {
         // Own-line comment before an arm, trailing comment on the header, and
         // trailing comment on an arm must all survive and be idempotent.
         roundtrip_comments(
-            "// email transport\noneof email by provider: // tagged\n    // dev default\n    \"log\" => emailLog // no delivery\n    \"postmark\" => emailPostmark\n",
+            "// email transport\noneof email by provider: // tagged\n    // dev default\n    \"log\" -> emailLog // no delivery\n    \"postmark\" -> emailPostmark\n",
         );
     }
 

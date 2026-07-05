@@ -360,8 +360,8 @@ model emailPostmark:
     messageStream string = "outbound"
 
 oneof email by provider:
-    "log"      => emailLog
-    "postmark" => emailPostmark
+    "log"      -> emailLog
+    "postmark" -> emailPostmark
 ```
 
 A matching instance sets the discriminator and the chosen variant's fields:
@@ -387,8 +387,8 @@ block needs no discriminator at all:
 
 ```
 oneof email by provider = "log":
-    "log"      => emailLog
-    "postmark" => emailPostmark
+    "log"      -> emailLog
+    "postmark" -> emailPostmark
 ```
 
 The default value must name one of the arms (checked at schema load), and must be
@@ -406,8 +406,8 @@ enum providerKind:
     - "postmark"
 
 oneof email by provider as providerKind = "log":
-    "log"      => emailLog
-    "postmark" => emailPostmark
+    "log"      -> emailLog
+    "postmark" -> emailPostmark
 ```
 
 The clauses compose left to right: `by <field> [as <enum>] [= <default>]`.

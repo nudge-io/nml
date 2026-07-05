@@ -435,11 +435,11 @@ mod tests {
     #[test]
     fn at_most_one_shorthand_field_per_model() {
         // A single `!` field (alongside a non-shorthand `name`) is fine.
-        let ok = extract_src("model r:\n    name string\n    path path!\n");
+        let ok = extract_src("model r:\n    name string\n    path path+\n");
         assert!(find_shorthand_errors(&ok).is_empty());
 
         // Two `!` fields is a schema error naming both.
-        let bad = extract_src("model r:\n    a string!\n    b path!\n");
+        let bad = extract_src("model r:\n    a string+\n    b path+\n");
         let errs = find_shorthand_errors(&bad);
         assert_eq!(errs.len(), 1);
         match &errs[0] {
@@ -605,7 +605,7 @@ mod tests {
     #[test]
     fn test_extract_oneof() {
         let schema = extract_src(
-            "model emailLog:\n    fromAddress string?\n\nmodel emailPostmark:\n    serverToken secret\n\noneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n",
+            "model emailLog:\n    fromAddress string?\n\nmodel emailPostmark:\n    serverToken secret\n\noneof email by provider:\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n",
         );
         assert_eq!(schema.oneofs.len(), 1);
         let o = &schema.oneofs[0];
@@ -624,7 +624,7 @@ mod tests {
     #[test]
     fn test_oneof_unknown_arm_model_rejected() {
         let schema = extract_src(
-            "model emailLog:\n    x string?\n\noneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n",
+            "model emailLog:\n    x string?\n\noneof email by provider:\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n",
         );
         let errs = find_oneof_errors(&schema);
         assert!(
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn test_oneof_duplicate_value_rejected() {
         let schema = extract_src(
-            "model a:\n    x string?\n\nmodel b:\n    y string?\n\noneof u by kind:\n    \"k\" => a\n    \"k\" => b\n",
+            "model a:\n    x string?\n\nmodel b:\n    y string?\n\noneof u by kind:\n    \"k\" -> a\n    \"k\" -> b\n",
         );
         let errs = find_oneof_errors(&schema);
         assert!(
@@ -648,7 +648,7 @@ mod tests {
     #[test]
     fn test_oneof_default_discriminator_must_match_arm() {
         let schema = extract_src(
-            "model a:\n    x string?\n\noneof u by kind = \"bogus\":\n    \"k\" => a\n",
+            "model a:\n    x string?\n\noneof u by kind = \"bogus\":\n    \"k\" -> a\n",
         );
         let errs = find_oneof_errors(&schema);
         assert!(
@@ -662,7 +662,7 @@ mod tests {
     #[test]
     fn test_oneof_valid_default_discriminator_accepted() {
         let schema = extract_src(
-            "model a:\n    x string?\n\noneof u by kind = \"k\":\n    \"k\" => a\n",
+            "model a:\n    x string?\n\noneof u by kind = \"k\":\n    \"k\" -> a\n",
         );
         assert!(
             find_oneof_errors(&schema).is_empty(),
@@ -674,7 +674,7 @@ mod tests {
     #[test]
     fn test_oneof_enum_typed_discriminator_exhaustive_ok() {
         let schema = extract_src(
-            "enum kind:\n    - \"log\"\n    - \"postmark\"\n\nmodel a:\n    x string?\n\nmodel b:\n    y string?\n\noneof email by provider as kind:\n    \"log\" => a\n    \"postmark\" => b\n",
+            "enum kind:\n    - \"log\"\n    - \"postmark\"\n\nmodel a:\n    x string?\n\nmodel b:\n    y string?\n\noneof email by provider as kind:\n    \"log\" -> a\n    \"postmark\" -> b\n",
         );
         assert!(
             find_oneof_errors(&schema).is_empty(),
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn test_oneof_enum_typed_missing_arm_rejected() {
         let schema = extract_src(
-            "enum kind:\n    - \"log\"\n    - \"postmark\"\n\nmodel a:\n    x string?\n\noneof email by provider as kind:\n    \"log\" => a\n",
+            "enum kind:\n    - \"log\"\n    - \"postmark\"\n\nmodel a:\n    x string?\n\noneof email by provider as kind:\n    \"log\" -> a\n",
         );
         let errs = find_oneof_errors(&schema);
         assert!(
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn test_oneof_enum_typed_extra_arm_rejected() {
         let schema = extract_src(
-            "enum kind:\n    - \"log\"\n\nmodel a:\n    x string?\n\nmodel b:\n    y string?\n\noneof email by provider as kind:\n    \"log\" => a\n    \"postmark\" => b\n",
+            "enum kind:\n    - \"log\"\n\nmodel a:\n    x string?\n\nmodel b:\n    y string?\n\noneof email by provider as kind:\n    \"log\" -> a\n    \"postmark\" -> b\n",
         );
         let errs = find_oneof_errors(&schema);
         assert!(
@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn test_oneof_discriminator_type_must_be_enum() {
         let schema = extract_src(
-            "model a:\n    x string?\n\noneof email by provider as notAnEnum:\n    \"log\" => a\n",
+            "model a:\n    x string?\n\noneof email by provider as notAnEnum:\n    \"log\" -> a\n",
         );
         let errs = find_oneof_errors(&schema);
         assert!(
@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn test_oneof_name_collision_with_model_rejected() {
         let schema = extract_src(
-            "model email:\n    x string?\n\nmodel emailLog:\n    y string?\n\noneof email by provider:\n    \"log\" => emailLog\n",
+            "model email:\n    x string?\n\nmodel emailLog:\n    y string?\n\noneof email by provider:\n    \"log\" -> emailLog\n",
         );
         let errs = find_oneof_errors(&schema);
         assert!(
@@ -737,7 +737,7 @@ mod tests {
     fn test_cycle_detection_traverses_oneof_variants() {
         // a -> (field u: oneof) -> variant b -> field a  => cycle a,b
         let schema = extract_src(
-            "model a:\n    u u?\n\nmodel b:\n    parent a?\n\noneof u by kind:\n    \"b\" => b\n",
+            "model a:\n    u u?\n\nmodel b:\n    parent a?\n\noneof u by kind:\n    \"b\" -> b\n",
         );
         let cycles = find_model_cycles(&schema);
         assert!(

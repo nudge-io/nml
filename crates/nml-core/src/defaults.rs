@@ -414,7 +414,7 @@ mod tests {
         }
 
         let index = index_from(
-            "model resource:\n    path string!\n    method string?\n\nmodel svc:\n    resources []resource\n",
+            "model resource:\n    path string+\n    method string?\n\nmodel svc:\n    resources []resource\n",
         );
         let body = body_of(
             "svc s:\n    resources:\n        - \"/api\"\n        - \"/health\":\n            method = \"GET\"\n",
@@ -434,7 +434,7 @@ mod tests {
         // de-path recurses into the resolved variant, matching the validator (closes a
         // validator/`de` agreement gap).
         let index = index_from(
-            "model resource:\n    path string!\n\nmodel deployAction:\n    kind string\n    resources []resource\noneof action by kind:\n    \"deploy\" => deployAction\nmodel wrapper:\n    action action\n",
+            "model resource:\n    path string+\n\nmodel deployAction:\n    kind string\n    resources []resource\noneof action by kind:\n    \"deploy\" => deployAction\nmodel wrapper:\n    action action\n",
         );
         let body = body_of(
             "wrapper w:\n    action:\n        kind = \"deploy\"\n        resources:\n            - \"/api\"\n",
@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn oneof_root_defaults_selected_variant() {
         let idx = index_from(
-            "model emailLog:\n    level string = \"info\"\n\nmodel emailPostmark:\n    serverToken string\n\noneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n",
+            "model emailLog:\n    level string = \"info\"\n\nmodel emailPostmark:\n    serverToken string\n\noneof email by provider:\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n",
         );
         let out = apply_defaults(&idx, "email", &body_of("email E:\n    provider = \"log\"\n"));
         assert_eq!(prop(&out, "provider"), Some(&Value::String("log".into())));
@@ -634,7 +634,7 @@ mod tests {
         // `oneof email by provider = "log"`: an instance omitting `provider` gets
         // the default tag injected, then the selected variant's fields defaulted.
         let idx = index_from(
-            "model emailLog:\n    level string = \"info\"\n\nmodel emailPostmark:\n    serverToken string\n\noneof email by provider = \"log\":\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n",
+            "model emailLog:\n    level string = \"info\"\n\nmodel emailPostmark:\n    serverToken string\n\noneof email by provider = \"log\":\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n",
         );
         let out = apply_defaults(&idx, "email", &body_of("email E:\n    unrelated = \"z\"\n"));
         assert_eq!(prop(&out, "provider"), Some(&Value::String("log".into())));
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn oneof_present_discriminator_wins_over_default() {
         let idx = index_from(
-            "model emailLog:\n    level string = \"info\"\n\nmodel emailPostmark:\n    serverToken string = \"t\"\n\noneof email by provider = \"log\":\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n",
+            "model emailLog:\n    level string = \"info\"\n\nmodel emailPostmark:\n    serverToken string = \"t\"\n\noneof email by provider = \"log\":\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n",
         );
         // Authored `provider = "postmark"` must win over the default `"log"`.
         let out = apply_defaults(&idx, "email", &body_of("email E:\n    provider = \"postmark\"\n"));
@@ -658,7 +658,7 @@ mod tests {
         // A present-but-non-string discriminator is left for validation; the default
         // must NOT be injected — that would produce a duplicate `provider` property.
         let idx = index_from(
-            "model emailLog:\n    level string = \"info\"\n\noneof email by provider = \"log\":\n    \"log\" => emailLog\n",
+            "model emailLog:\n    level string = \"info\"\n\noneof email by provider = \"log\":\n    \"log\" -> emailLog\n",
         );
         let out = apply_defaults(&idx, "email", &body_of("email E:\n    provider = 5\n"));
         let provider_count = out
@@ -679,7 +679,7 @@ mod tests {
         // default discriminator injected and variant defaulted — exercising the
         // recurse_nested → OneOf → oneof_body composition.
         let idx = index_from(
-            "model emailLog:\n    level string = \"info\"\n\noneof email by provider = \"log\":\n    \"log\" => emailLog\n\nmodel config:\n    notify email\n",
+            "model emailLog:\n    level string = \"info\"\n\noneof email by provider = \"log\":\n    \"log\" -> emailLog\n\nmodel config:\n    notify email\n",
         );
         let out = apply_defaults(
             &idx,
@@ -694,7 +694,7 @@ mod tests {
     #[test]
     fn oneof_absent_discriminator_is_noop() {
         let idx = index_from(
-            "model emailLog:\n    level string = \"info\"\n\noneof email by provider:\n    \"log\" => emailLog\n",
+            "model emailLog:\n    level string = \"info\"\n\noneof email by provider:\n    \"log\" -> emailLog\n",
         );
         let out = apply_defaults(&idx, "email", &body_of("email E:\n    unrelated = \"z\"\n"));
         assert!(prop(&out, "level").is_none(), "no variant chosen without a discriminator");

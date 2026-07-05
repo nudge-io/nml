@@ -228,7 +228,7 @@ impl OneOfDecl {
     }
 }
 
-ast_node!(/// `"value" => Model`
+ast_node!(/// `"value" -> Model`
     OneOfArm => OneOfArm);
 
 impl OneOfArm {
@@ -413,9 +413,11 @@ impl FieldDef {
     pub fn optional(&self) -> bool {
         token(&self.0, SyntaxKind::Question).is_some()
     }
-    /// Whether the field is the model's scalar-shorthand field (`name type!`).
+    /// Whether the field is the model's positional/scalar-shorthand field
+    /// (`name type+`, RFC 0005 §16). The single point where the marker token is
+    /// inspected — every other consumer reads this `bool`.
     pub fn shorthand(&self) -> bool {
-        token(&self.0, SyntaxKind::Bang).is_some()
+        token(&self.0, SyntaxKind::Plus).is_some()
     }
     pub fn default(&self) -> Option<ValueNode> {
         child(&self.0)
@@ -660,7 +662,7 @@ mod tests {
     #[test]
     fn oneof_accessors() {
         let r = root(
-            "oneof email by provider as kind = \"log\":\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n",
+            "oneof email by provider as kind = \"log\":\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n",
         );
         let Decl::OneOf(o) = r.decls().next().unwrap() else {
             panic!("expected oneof")

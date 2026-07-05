@@ -692,6 +692,45 @@ mod tests {
         }
     }
 
+    /// RFC 0006: `=>` is rejected with the one-character fix named, the
+    /// parse recovers (every stale arrow surfaces in a single pass), and
+    /// the arms still lower — so `nml fmt` on strict=false pipelines can
+    /// even auto-heal a legacy file into `->`.
+    #[test]
+    fn legacy_fat_arrow_gets_guidance_and_recovers() {
+        let src = "oneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n";
+        let parsed = parse(src);
+        // Recovery is lossless and kept the structure: both arms present.
+        assert_eq!(tree_text(&parsed), src, "rejected-arrow file round-trips");
+        assert_eq!(count_kind(&parsed.syntax(), SyntaxKind::OneOfArm), 2);
+        // The rejected token lives under an Error node, like every recovery.
+        assert!(has(&parsed.syntax(), SyntaxKind::Error));
+        match parsed.ok() {
+            Ok(_) => panic!("'=>' must be rejected"),
+            Err(errors) => {
+                assert_eq!(errors.len(), 2, "one guidance error per stale arrow");
+                for e in &errors {
+                    assert!(
+                        e.to_string().contains("'=>' was replaced by '->'"),
+                        "guidance must name the fix: {e}"
+                    );
+                }
+            }
+        }
+
+        // Truncated arm: a stale arrow as the final token (no model name)
+        // still recovers without panic — guidance plus the cascading
+        // missing-name error, and the tree stays lossless.
+        let truncated = "oneof email by provider:\n    \"log\" =>";
+        let parsed = parse(truncated);
+        assert_eq!(tree_text(&parsed), truncated, "truncated arm round-trips");
+        let errors = parsed.ok().expect_err("truncated stale arm must error");
+        assert!(
+            errors.iter().any(|e| e.to_string().contains("'=>' was replaced by '->'")),
+            "guidance survives truncation"
+        );
+    }
+
     #[test]
     fn declarations_const_template_oneof_array() {
         let const_d = parse_ok("const MaxRetries = 3\n");
@@ -701,7 +740,7 @@ mod tests {
         assert!(has(&tmpl.syntax(), SyntaxKind::TemplateDecl));
 
         let oneof = parse_ok(
-            "oneof email by provider as providerKind = \"log\":\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n",
+            "oneof email by provider as providerKind = \"log\":\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n",
         );
         let root = oneof.syntax();
         assert!(has(&root, SyntaxKind::OneOfDecl));
@@ -798,7 +837,7 @@ template Greeting:
     \"Hello\"
 
 oneof email by provider:
-    \"log\" => emailLog
+    \"log\" -> emailLog
 
 model Plan:
     name string
@@ -956,7 +995,7 @@ service App is Base:
             // role list items with rich role syntax
             "role admin:\n    members:\n        - @role/editor\n        - @user/test@example.com\n",
             // discriminated unions
-            "oneof email by provider:\n    \"log\" => emailLog\n    \"postmark\" => emailPostmark\n",
+            "oneof email by provider:\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n",
             // const + template
             "const MaxRetries = 3\n",
             "template Greeting:\n    \"Hello\"\n",
@@ -1099,7 +1138,7 @@ service App is Base:
         // path — so losslessness/termination/no-panic hold across the *whole* byte
         // space, not just the syntactic subset (RFC 0004 §9).
         let alphabet = [
-            "service", "App", ":", "=", "=>", " ", "    ", "\n", "\r\n", "\"", "\"\"\"", "\\",
+            "service", "App", ":", "=", "=>", "->", " ", "    ", "\n", "\r\n", "\"", "\"\"\"", "\\",
             "//c", "x", "1", "12.5", "@role/x", "$ENV.K", "-", "|", ".", "[", "]", "(", ")", ",",
             "?", "\t", "é", "\0", "\u{1}", "🎉", "\u{2028}",
         ];

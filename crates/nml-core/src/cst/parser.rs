@@ -292,11 +292,24 @@ impl<'a> Parser<'a> {
         m.complete(self, SyntaxKind::OneOfDecl);
     }
 
-    /// `"value" => Model`
+    /// The arm arrow, with migration guidance (RFC 0006): accepts `->`; a
+    /// stale `=>` gets the one-character fix named and is wrapped in an
+    /// `Error` node like every other recovery, so the whole file's stale
+    /// arrows surface in one parse. Every arm-shaped production calls this
+    /// — the guidance is owned once, not re-remembered per production.
+    fn expect_arrow(&mut self) {
+        if self.at(SyntaxKind::FatArrow) {
+            self.err_recover("'=>' was replaced by '->' (RFC 0006)");
+        } else {
+            self.expect(SyntaxKind::Arrow, "'->'");
+        }
+    }
+
+    /// `"value" -> Model`
     fn oneof_arm(&mut self) {
         let m = self.start();
         self.expect(SyntaxKind::String, "a quoted discriminator value");
-        self.expect(SyntaxKind::FatArrow, "'=>'");
+        self.expect_arrow();
         self.expect(SyntaxKind::Ident, "a variant model name");
         m.complete(self, SyntaxKind::OneOfArm);
     }
@@ -365,10 +378,11 @@ impl<'a> Parser<'a> {
             m.complete(self, SyntaxKind::NestedBlock);
         } else if self.at_field_type() {
             self.type_expr();
-            // Suffixes: `?` (optional) and/or `!` (scalar shorthand). Canonical
-            // order is `?!`; the extracted flags are order-free (presence-based).
+            // Suffixes: `?` (optional) and/or `+` (positional shorthand, RFC 0005
+            // §16). Canonical order is `?+` — `?` is eaten first — and the
+            // extracted flags are independent booleans (order in the AST is free).
             self.eat(SyntaxKind::Question);
-            self.eat(SyntaxKind::Bang);
+            self.eat(SyntaxKind::Plus);
             if self.eat(SyntaxKind::Eq) {
                 self.value_block();
             }
