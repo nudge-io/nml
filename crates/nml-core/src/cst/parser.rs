@@ -361,9 +361,42 @@ impl<'a> Parser<'a> {
             SyntaxKind::Pipe => self.modifier(),
             SyntaxKind::Dot => self.shared_property(),
             SyntaxKind::Dash => self.list_item(),
+            // A routing arm (house idiom): `@selector -> Target` or
+            // `else -> Target`. The selector — a `Role` token or the `else`
+            // contextual keyword — is an arm ONLY when immediately followed by
+            // the arrow (the token stream is trivia-free, so `nth(1)` is the next
+            // real token). This keeps `else` usable as a property name AND lets a
+            // stray `@…` with no arrow fall through to graceful error recovery
+            // instead of an over-eager arm parse. A `FatArrow` still routes here
+            // so `@x => y` gets the "'=>' was replaced by '->'" guidance.
+            SyntaxKind::Role
+                if matches!(self.nth(1), SyntaxKind::Arrow | SyntaxKind::FatArrow) =>
+            {
+                self.arm()
+            }
+            SyntaxKind::Ident
+                if self.current_text() == "else"
+                    && matches!(self.nth(1), SyntaxKind::Arrow | SyntaxKind::FatArrow) =>
+            {
+                self.arm()
+            }
             SyntaxKind::Ident => self.ident_entry(),
             _ => self.err_recover("unexpected token in block body"),
         }
+    }
+
+    /// `(@selector | else) -> Target` — a routing arm (RFC 0006 arrow). The
+    /// selector is a `Role` token or the `else` keyword; the RHS is the target
+    /// identifier. The grammar is permissive about *where* arms appear — the
+    /// schema restricts them (e.g. RFC 0018's `denial:` block) and validates the
+    /// selector shape.
+    fn arm(&mut self) {
+        let m = self.start();
+        // selector: a role token (`@plan/Pro`) or `else` (a plain ident).
+        self.bump();
+        self.expect_arrow();
+        self.expect(SyntaxKind::Ident, "an arm target");
+        m.complete(self, SyntaxKind::Arm);
     }
 
     /// `name = value` | `name : body` | `name TypeExpr ? (= value)?`
@@ -468,7 +501,7 @@ impl<'a> Parser<'a> {
         !self.newline_before() && self.at_type_start()
     }
 
-    /// `[]TypeExpr` | `(TypeExpr (| TypeExpr)*)` | Name
+    /// `[]TypeExpr` | `(TypeExpr (| TypeExpr)*)` | `(TypeExpr -> TypeExpr)` | Name
     fn type_expr(&mut self) {
         if self.depth_guarded_type() {
             return;
@@ -479,8 +512,18 @@ impl<'a> Parser<'a> {
             self.type_expr();
         } else if self.eat(SyntaxKind::LParen) {
             self.type_expr();
-            while self.eat(SyntaxKind::Pipe) {
+            // `(K -> V)` — a typed arm set (RFC 0007). The arrow, like the
+            // union pipe, is only ever consumed *inside* the parens: a bare
+            // `K -> V` at type position is a parse error, which is what keeps
+            // the field-suffix `?` unambiguous (it always binds to the field).
+            // `expect_arrow` gives a `=>` the RFC 0006 guidance error.
+            if matches!(self.current(), SyntaxKind::Arrow | SyntaxKind::FatArrow) {
+                self.expect_arrow();
                 self.type_expr();
+            } else {
+                while self.eat(SyntaxKind::Pipe) {
+                    self.type_expr();
+                }
             }
             self.expect(SyntaxKind::RParen, "')'");
         } else {

@@ -189,7 +189,11 @@ impl ValueResolver {
                 BodyEntryKind::SharedProperty(self.resolve_shared_property(sp)?)
             }
             BodyEntryKind::ListItem(item) => BodyEntryKind::ListItem(self.resolve_list_item(item)?),
-            BodyEntryKind::Modifier(_) | BodyEntryKind::FieldDefinition(_) => {
+            // Arms carry only literal selector/target tokens — nothing to
+            // template-resolve — so they pass through unchanged, like modifiers.
+            BodyEntryKind::Modifier(_)
+            | BodyEntryKind::FieldDefinition(_)
+            | BodyEntryKind::Arm(_) => {
                 return Ok(entry.clone());
             }
         };

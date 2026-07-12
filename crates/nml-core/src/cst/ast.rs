@@ -128,21 +128,29 @@ impl Decl {
     /// correct comment attachment: a comment written above a declaration becomes
     /// its hover documentation.
     pub fn doc_comment(&self) -> Option<String> {
-        let mut lines = Vec::new();
-        for child in self.syntax().children_with_tokens() {
-            match child.into_token() {
-                Some(t) if t.kind() == SyntaxKind::Comment => {
-                    let raw = t.text();
-                    lines.push(raw.strip_prefix("//").unwrap_or(raw).trim().to_string());
-                }
-                // Whitespace/newlines between leading comments are skipped; the
-                // first real token (or child node) ends the doc block.
-                Some(t) if t.kind().is_trivia() => {}
-                _ => break,
-            }
-        }
-        (!lines.is_empty()).then(|| lines.join("\n"))
+        leading_doc_comment(self.syntax())
     }
+}
+
+/// The leading own-line comment block attached to `node` (RFC 0004 §4.3
+/// comment attachment), as documentation text with each `//` marker stripped.
+/// Attachment places a leading comment *inside* the node it documents, so the
+/// same walk serves declarations and array items alike.
+fn leading_doc_comment(node: &SyntaxNode) -> Option<String> {
+    let mut lines = Vec::new();
+    for child in node.children_with_tokens() {
+        match child.into_token() {
+            Some(t) if t.kind() == SyntaxKind::Comment => {
+                let raw = t.text();
+                lines.push(raw.strip_prefix("//").unwrap_or(raw).trim().to_string());
+            }
+            // Whitespace/newlines between leading comments are skipped; the
+            // first real token (or child node) ends the doc block.
+            Some(t) if t.kind().is_trivia() => {}
+            _ => break,
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 ast_node!(/// `keyword name (is …)? : body`
@@ -240,6 +248,32 @@ impl OneOfArm {
     }
 }
 
+ast_node!(/// `(@selector | else) -> Target`
+    Arm => Arm);
+
+impl Arm {
+    /// The selector token — a `Role` (`@plan/Pro`) or the `else` keyword (an
+    /// `Ident`), whichever comes first, before the arrow. The caller inspects
+    /// its kind/text to tell a role selector from the `else` catch-all.
+    pub fn selector(&self) -> Option<SyntaxToken> {
+        self.0
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| matches!(t.kind(), SyntaxKind::Role | SyntaxKind::Ident))
+    }
+    /// The target identifier (the experience name) — the first `Ident` *after*
+    /// the arrow, so it is never confused with an `else` selector's `Ident`.
+    pub fn target(&self) -> Option<SyntaxToken> {
+        let mut toks = self
+            .0
+            .children_with_tokens()
+            .filter_map(|e| e.into_token());
+        toks.by_ref()
+            .find(|t| matches!(t.kind(), SyntaxKind::Arrow | SyntaxKind::FatArrow))?;
+        toks.find(|t| t.kind() == SyntaxKind::Ident)
+    }
+}
+
 ast_node!(/// A declaration/property name.
     Name => Name);
 
@@ -288,6 +322,7 @@ pub enum Entry {
     SharedProperty(SharedProperty),
     ListItem(ListItem),
     FieldDef(FieldDef),
+    Arm(Arm),
 }
 
 impl AstNode for Entry {
@@ -299,6 +334,7 @@ impl AstNode for Entry {
             SyntaxKind::SharedProperty => Entry::SharedProperty(SharedProperty(node)),
             SyntaxKind::ListItem => Entry::ListItem(ListItem(node)),
             SyntaxKind::FieldDef => Entry::FieldDef(FieldDef(node)),
+            SyntaxKind::Arm => Entry::Arm(Arm(node)),
             _ => return None,
         })
     }
@@ -310,6 +346,7 @@ impl AstNode for Entry {
             Entry::SharedProperty(e) => e.syntax(),
             Entry::ListItem(e) => e.syntax(),
             Entry::FieldDef(e) => e.syntax(),
+            Entry::Arm(e) => e.syntax(),
         }
     }
 }
@@ -386,6 +423,39 @@ impl ListItem {
     pub fn name(&self) -> Option<SyntaxToken> {
         token(&self.0, SyntaxKind::Ident)
     }
+    /// The leading own-line comment block documenting this item (RFC 0004
+    /// §4.3) — a `- Name:` item documents exactly like a declaration, so an
+    /// arm target's hover (RFC 0007 §4.1) surfaces the comment above the item.
+    ///
+    /// Attachment nuance: a comment above the body's FIRST item precedes the
+    /// item's opening `Indent`, so it attaches to the enclosing `Body`, not
+    /// the item — the fallback walks the immediately preceding siblings for
+    /// that contiguous comment block (skipping whitespace and the zero-width
+    /// `Indent`).
+    pub fn doc_comment(&self) -> Option<String> {
+        if let Some(doc) = leading_doc_comment(&self.0) {
+            return Some(doc);
+        }
+        let mut lines = Vec::new();
+        let mut cursor = self.0.prev_sibling_or_token();
+        while let Some(element) = cursor {
+            let next = element.prev_sibling_or_token();
+            match element.into_token() {
+                Some(t) if t.kind() == SyntaxKind::Comment => {
+                    let raw = t.text();
+                    lines.push(raw.strip_prefix("//").unwrap_or(raw).trim().to_string());
+                }
+                Some(t) if t.kind().is_trivia() || t.kind() == SyntaxKind::Indent => {}
+                // Any other token or node ends the block (e.g. a previous
+                // item — its trailing comments are its own, never this
+                // item's docs).
+                _ => break,
+            }
+            cursor = next;
+        }
+        lines.reverse();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
     /// The nested body (named form `- Name: …`).
     pub fn body(&self) -> Option<Body> {
         child(&self.0)
@@ -426,7 +496,7 @@ impl FieldDef {
 
 // ── type expressions ──────────────────────────────────────────────────────
 
-ast_node!(/// `Name` | `[]TypeExpr` | `(TypeExpr (| TypeExpr)*)`
+ast_node!(/// `Name` | `[]TypeExpr` | `(TypeExpr (| TypeExpr)*)` | `(TypeExpr -> TypeExpr)`
     TypeExpr => TypeExpr);
 
 /// The shape of a [`TypeExpr`].
@@ -435,6 +505,9 @@ pub enum TypeExprKind {
     Named,
     Array,
     Union,
+    /// `(K -> V)` — a typed arm set (RFC 0007). `children()` yields exactly
+    /// key then target.
+    Arms,
 }
 
 impl TypeExpr {
@@ -442,7 +515,18 @@ impl TypeExpr {
         if token(&self.0, SyntaxKind::LBracket).is_some() {
             TypeExprKind::Array
         } else if token(&self.0, SyntaxKind::LParen).is_some() {
-            TypeExprKind::Union
+            // The arrow is a *direct* token of this node (a nested arm set's
+            // arrow lives inside its own child node), so its presence
+            // distinguishes `(K -> V)` from a union. `FatArrow` counts too:
+            // the parser consumed it with RFC 0006 guidance but it remains in
+            // the lossless tree.
+            if token(&self.0, SyntaxKind::Arrow).is_some()
+                || token(&self.0, SyntaxKind::FatArrow).is_some()
+            {
+                TypeExprKind::Arms
+            } else {
+                TypeExprKind::Union
+            }
         } else {
             TypeExprKind::Named
         }

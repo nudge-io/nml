@@ -208,9 +208,12 @@ impl<'a> Defaulter<'a> {
         match self.index.resolve_field(field) {
             FieldTarget::Model(m) => self.model_body(m, nb_body, depth + 1),
             FieldTarget::OneOf(o) => self.oneof_body(o, nb_body, depth + 1),
+            // Arm bodies carry only selectors and reference targets (RFC
+            // 0007) — nothing to default.
             FieldTarget::ListOf(_)
             | FieldTarget::Object
             | FieldTarget::Union
+            | FieldTarget::Arms { .. }
             | FieldTarget::Leaf => nb_body.clone(),
         }
     }
@@ -238,7 +241,10 @@ impl<'a> Defaulter<'a> {
                 FieldTarget::OneOf(o) => self.oneof_body(o, item_body, depth + 1),
                 _ => item_body.clone(),
             }),
-            FieldTarget::Object | FieldTarget::Union | FieldTarget::Leaf => body.clone(),
+            FieldTarget::Object
+            | FieldTarget::Union
+            | FieldTarget::Arms { .. }
+            | FieldTarget::Leaf => body.clone(),
         }
     }
 

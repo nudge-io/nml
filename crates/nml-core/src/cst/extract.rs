@@ -138,6 +138,20 @@ fn resolve_field_type(te: &TypeExpr) -> FieldType {
         TypeExprKind::Union => {
             FieldType::Union(te.children().map(|v| resolve_field_type(&v)).collect())
         }
+        TypeExprKind::Arms => {
+            // `(K -> V)`: exactly two child type exprs, key then target.
+            let mut children = te.children();
+            let mut next = || {
+                children
+                    .next()
+                    .map(|t| resolve_field_type(&t))
+                    .unwrap_or_else(unknown_type)
+            };
+            FieldType::Arms {
+                key: Box::new(next()),
+                target: Box::new(next()),
+            }
+        }
     }
 }
 

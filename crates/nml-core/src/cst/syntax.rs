@@ -77,6 +77,10 @@ pub enum SyntaxKind {
     SharedProperty,
     ListItem,
     FieldDef,
+    /// A routing arm inside a plain block: `(@role/selector | else) -> Target`
+    /// (the house arm idiom, RFC 0006 arrow). Generic in the grammar; the schema
+    /// restricts where arms are valid (e.g. RFC 0018 `denial:`).
+    Arm,
     TypeExpr,
     // values
     Value,

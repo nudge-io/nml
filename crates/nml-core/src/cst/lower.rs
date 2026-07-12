@@ -82,8 +82,9 @@ impl Lower {
                     ast::Entry::SharedProperty(s) => shared_properties.push(self.shared(&s)),
                     ast::Entry::Property(p) => properties.push(self.property(&p)),
                     ast::Entry::ListItem(l) => items.push(self.list_item(&l)),
-                    // Nested blocks / field defs aren't valid in an array body.
-                    ast::Entry::NestedBlock(_) | ast::Entry::FieldDef(_) => {}
+                    // Nested blocks / field defs / arms aren't valid in an array
+                    // body (arms belong to a plain `name:` block, e.g. `denial:`).
+                    ast::Entry::NestedBlock(_) | ast::Entry::FieldDef(_) | ast::Entry::Arm(_) => {}
                 }
             }
         }
@@ -144,6 +145,22 @@ impl Lower {
             ast::Entry::SharedProperty(s) => BodyEntryKind::SharedProperty(self.shared(&s)),
             ast::Entry::ListItem(l) => BodyEntryKind::ListItem(self.list_item(&l)),
             ast::Entry::FieldDef(f) => BodyEntryKind::FieldDefinition(self.field_def(&f)),
+            ast::Entry::Arm(a) => {
+                let selector_tok = a.selector();
+                // A `Role` token is a `@…` selector (stored verbatim); anything
+                // else at that position is the `else` catch-all keyword.
+                let selector = match &selector_tok {
+                    Some(t) if t.kind() == crate::cst::syntax::SyntaxKind::Role => {
+                        ArmSelector::Role(t.text().to_string())
+                    }
+                    _ => ArmSelector::Else,
+                };
+                BodyEntryKind::Arm(Arm {
+                    selector,
+                    selector_span: selector_tok.map(|t| token_span(&t)).unwrap_or(EMPTY_SPAN),
+                    target: ident_of(a.target()),
+                })
+            }
         };
         BodyEntry { kind, span }
     }
@@ -285,6 +302,22 @@ fn type_expr(te: &ast::TypeExpr) -> FieldTypeExpr {
         ast::TypeExprKind::Union => {
             FieldTypeExpr::Union(te.children().map(|t| type_expr(&t)).collect())
         }
+        ast::TypeExprKind::Arms => {
+            // `(K -> V)`: exactly two child type exprs, key then target
+            // (source order). Recovery may leave one missing; the empty-ident
+            // fallback matches the `Array` arm above.
+            let mut children = te.children();
+            let mut next = || {
+                children
+                    .next()
+                    .map(|t| type_expr(&t))
+                    .unwrap_or_else(|| FieldTypeExpr::Named(empty_ident()))
+            };
+            FieldTypeExpr::Arms {
+                key: Box::new(next()),
+                target: Box::new(next()),
+            }
+        }
     }
 }
 
@@ -323,6 +356,105 @@ mod tests {
 
     fn cst_ast(src: &str) -> File {
         to_ast(&ast::Root::cast(parse(src).syntax()).unwrap())
+    }
+
+    /// RFC 0018 §4.4 arms: `(@selector | else) -> Target` under a plain block
+    /// parse and lower with the right selector kind + target, and `else` stays a
+    /// usable property name when it is not an arm (contextual keyword).
+    #[test]
+    fn arms_lower_with_role_and_else_selectors() {
+        use crate::ast::{ArmSelector, BodyEntryKind, DeclarationKind};
+        let file = cst_ast(
+            "service App:\n    denial:\n        @plan/Pro -> ProUpsell\n        else -> Generic\n",
+        );
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("expected a block decl");
+        };
+        let BodyEntryKind::NestedBlock(nb) = &block.body.entries[0].kind else {
+            panic!("expected a `denial:` nested block");
+        };
+        assert_eq!(nb.name.name, "denial");
+        let arms: Vec<_> = nb
+            .body
+            .entries
+            .iter()
+            .map(|e| match &e.kind {
+                BodyEntryKind::Arm(a) => a,
+                other => panic!("expected an arm, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(arms.len(), 2);
+        assert!(matches!(&arms[0].selector, ArmSelector::Role(r) if r == "@plan/Pro"));
+        assert_eq!(arms[0].target.name, "ProUpsell");
+        assert!(matches!(arms[1].selector, ArmSelector::Else));
+        assert_eq!(arms[1].target.name, "Generic");
+
+        // `else` is an arm ONLY when followed by `->`; as a property name it
+        // still parses as a property (contextual keyword, not reserved).
+        let prop = cst_ast("service App:\n    else = 5\n");
+        let DeclarationKind::Block(b) = &prop.declarations[0].kind else {
+            panic!("block");
+        };
+        assert!(matches!(
+            &b.body.entries[0].kind,
+            BodyEntryKind::Property(p) if p.name.name == "else"
+        ));
+    }
+
+    /// RFC 0007 arm-set field types: `(K -> V)` lowers to `FieldTypeExpr::Arms`,
+    /// composes with unions on either side, and the field-suffix `?` binds to
+    /// the field (never the target type).
+    #[test]
+    fn arm_set_field_types_lower() {
+        use crate::ast::{BodyEntryKind, DeclarationKind, FieldTypeExpr};
+        let file = cst_ast(
+            "model mount:\n    denial (string | (role -> denial))?\n    route (role -> (a | b))\n",
+        );
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("expected a block decl");
+        };
+        let fields: Vec<_> = block
+            .body
+            .entries
+            .iter()
+            .map(|e| match &e.kind {
+                BodyEntryKind::FieldDefinition(f) => f,
+                other => panic!("expected a field def, got {other:?}"),
+            })
+            .collect();
+
+        // `denial (string | (role -> denial))?` — union of scalar and arm set,
+        // optional on the FIELD.
+        assert!(fields[0].optional, "the ? binds to the field");
+        let FieldTypeExpr::Union(variants) = &fields[0].field_type else {
+            panic!("expected a union, got {}", fields[0].field_type);
+        };
+        assert!(matches!(&variants[0], FieldTypeExpr::Named(n) if n.name == "string"));
+        let FieldTypeExpr::Arms { key, target } = &variants[1] else {
+            panic!("expected an arm set, got {}", variants[1]);
+        };
+        assert!(matches!(key.as_ref(), FieldTypeExpr::Named(n) if n.name == "role"));
+        assert!(matches!(target.as_ref(), FieldTypeExpr::Named(n) if n.name == "denial"));
+        assert_eq!(fields[0].field_type.to_string(), "(string | (role -> denial))");
+
+        // `route (role -> (a | b))` — arm set whose target is a union.
+        let FieldTypeExpr::Arms { target, .. } = &fields[1].field_type else {
+            panic!("expected an arm set, got {}", fields[1].field_type);
+        };
+        assert!(matches!(target.as_ref(), FieldTypeExpr::Union(v) if v.len() == 2));
+    }
+
+    /// RFC 0007 §3: a BARE `K -> V` at field-type position is a parse error —
+    /// the arrow, like the union pipe, is only consumed inside parens. This is
+    /// what keeps the field-suffix `?` unambiguous.
+    #[test]
+    fn bare_arm_set_type_is_a_parse_error() {
+        let parsed = parse("model mount:\n    denial role -> denial\n");
+        assert!(
+            !parsed.errors().is_empty(),
+            "bare `K -> V` must not parse as a type: {:?}",
+            parsed.errors()
+        );
     }
 
     /// Breadth: the lowering must accept every construct — all declaration kinds,

@@ -15,8 +15,10 @@ use crate::types::PrimitiveType;
 
 /// What a model field resolves to, for schema-guided traversal.
 ///
-/// Borrows the referenced definition from the owning [`SchemaIndex`]; the field
-/// argument is only inspected, never borrowed into the result.
+/// Borrows the referenced definition from the owning [`SchemaIndex`]. Most
+/// variants borrow only from the index; [`FieldTarget::Arms`] borrows the
+/// key/target types from the field type itself (both live in the index's
+/// models in practice).
 #[derive(Debug)]
 pub enum FieldTarget<'a> {
     /// A nested model instance — recurse into its body with this model.
@@ -29,6 +31,13 @@ pub enum FieldTarget<'a> {
     Object,
     /// A type union — ambiguous without a discriminator; not recursed.
     Union,
+    /// A typed arm set `(K -> V)` (RFC 0007) — the body holds routing arms;
+    /// keys validate against `key`, targets are typed by `target` (reference
+    /// targets are consumer-resolved; `target` drives editor intelligence).
+    Arms {
+        key: &'a FieldType,
+        target: &'a FieldType,
+    },
     /// A primitive scalar, enum, or unknown reference — a leaf value.
     Leaf,
 }
@@ -89,9 +98,10 @@ impl SchemaIndex {
     }
 
     /// Classify a field by the target it resolves to. Pure dispatch shared by
-    /// validation and defaulting; the field is only read, never borrowed into
-    /// the result, so its lifetime is independent of the index.
-    pub fn resolve_field<'a>(&'a self, field: &FieldDef) -> FieldTarget<'a> {
+    /// validation and defaulting. An [`FieldTarget::Arms`] result borrows the
+    /// key/target types from the field itself; every other variant borrows
+    /// only from the index.
+    pub fn resolve_field<'a>(&'a self, field: &'a FieldDef) -> FieldTarget<'a> {
         self.resolve_type(&field.field_type)
     }
 
@@ -102,7 +112,7 @@ impl SchemaIndex {
     /// `resolve_field`/`resolve_type`. This is the single definition of the
     /// body-dependent variant selection, shared by the validator's walk and the
     /// defaulter's walk so neither re-derives it.
-    pub fn resolve_type_in_body<'a>(&'a self, ty: &FieldType, body: &Body) -> FieldTarget<'a> {
+    pub fn resolve_type_in_body<'a>(&'a self, ty: &'a FieldType, body: &Body) -> FieldTarget<'a> {
         let FieldType::Union(variants) = ty else {
             return self.resolve_type(ty);
         };
@@ -110,11 +120,20 @@ impl SchemaIndex {
             .entries
             .iter()
             .any(|e| matches!(e.kind, BodyEntryKind::ListItem(_)));
-        // A list-shaped body selects the list variant; otherwise the scalar /
+        let has_arms = body
+            .entries
+            .iter()
+            .any(|e| matches!(e.kind, BodyEntryKind::Arm(_)));
+        // Body shape selects the variant: arm entries → the arm-set variant
+        // (RFC 0007); list items → the list variant; otherwise the scalar /
         // model-ref variant. First matching variant wins (source order).
         variants
             .iter()
-            .find(|variant| matches!(variant, FieldType::List(_)) == has_list_items)
+            .find(|variant| match variant {
+                FieldType::Arms { .. } => has_arms,
+                FieldType::List(_) => !has_arms && has_list_items,
+                _ => !has_arms && !has_list_items,
+            })
             .map(|variant| self.resolve_type(variant))
             .unwrap_or(FieldTarget::Leaf)
     }
@@ -132,7 +151,7 @@ impl SchemaIndex {
         }
     }
 
-    fn resolve_type<'a>(&'a self, ty: &FieldType) -> FieldTarget<'a> {
+    fn resolve_type<'a>(&'a self, ty: &'a FieldType) -> FieldTarget<'a> {
         match ty {
             FieldType::Primitive(PrimitiveType::Object) => FieldTarget::Object,
             FieldType::Primitive(_) => FieldTarget::Leaf,
@@ -140,6 +159,7 @@ impl SchemaIndex {
             // A modifier field carries its declared inner type; classify by it.
             FieldType::Modifier(inner) => self.resolve_type(inner),
             FieldType::Union(_) => FieldTarget::Union,
+            FieldType::Arms { key, target } => FieldTarget::Arms { key, target },
             FieldType::ModelRef(name) => self.resolve_ref(name),
         }
     }

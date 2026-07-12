@@ -229,9 +229,57 @@ impl<'a> Formatter<'a> {
     }
 
     fn body(&mut self, body: &Body, depth: usize) {
-        for entry in &body.entries {
+        let entries = &body.entries;
+        let mut i = 0;
+        while i < entries.len() {
+            // A run of consecutive arms formats as one aligned table
+            // (RFC 0007), matching `oneof` arm alignment.
+            if matches!(entries[i].kind, BodyEntryKind::Arm(_)) {
+                let run = entries[i..]
+                    .iter()
+                    .take_while(|e| matches!(e.kind, BodyEntryKind::Arm(_)))
+                    .count();
+                self.arm_run(&entries[i..i + run], depth);
+                i += run;
+            } else {
+                self.emit_comments_before(entries[i].span.start, depth);
+                self.body_entry(&entries[i], depth);
+                i += 1;
+            }
+        }
+    }
+
+    /// Emit a run of consecutive arms with the `->` arrows aligned on the
+    /// widest selector, so a routing block reads as a tidy table — the same
+    /// treatment `oneof` arms get.
+    fn arm_run(&mut self, entries: &[BodyEntry], depth: usize) {
+        let selector_text = |arm: &Arm| match &arm.selector {
+            ArmSelector::Role(r) => r.clone(),
+            ArmSelector::Else => "else".to_string(),
+        };
+        let max_w = entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                BodyEntryKind::Arm(a) => Some(selector_text(a).chars().count()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        for entry in entries {
+            let BodyEntryKind::Arm(arm) = &entry.kind else {
+                continue;
+            };
             self.emit_comments_before(entry.span.start, depth);
-            self.body_entry(entry, depth);
+            self.write_indent(depth);
+            let selector = selector_text(arm);
+            self.out.push_str(&selector);
+            for _ in 0..(max_w - selector.chars().count()) {
+                self.out.push(' ');
+            }
+            self.out.push_str(" -> ");
+            self.out.push_str(&arm.target.name);
+            self.emit_trailing_comment(arm.target.span.start);
+            self.out.push('\n');
         }
     }
 
@@ -256,6 +304,11 @@ impl<'a> Formatter<'a> {
             }
             BodyEntryKind::ListItem(item) => {
                 self.list_item(item, depth);
+            }
+            // Arms are grouped and aligned by `body()`; a lone arm reaching
+            // here formats as a run of one.
+            BodyEntryKind::Arm(_) => {
+                self.arm_run(std::slice::from_ref(entry), depth);
             }
             BodyEntryKind::FieldDefinition(f) => {
                 self.write_indent(depth);
@@ -577,6 +630,45 @@ mod tests {
             "arrows should be aligned:\n{formatted}"
         );
         assert!(formatted.contains("    \"postmark\" -> emailPostmark\n"));
+        roundtrip(source);
+        idempotent(source);
+    }
+
+    #[test]
+    fn test_format_arm_set_field_types_roundtrip() {
+        // RFC 0007 §5: the arm-set TYPE renders canonically as `(K -> V)`,
+        // composes with unions on either side, keeps the field-suffix `?`
+        // outside the parens, round-trips, and is idempotent.
+        let source = "model mount:\n    denial (string | (role -> denial))?\n    route (role -> (a | b))\n";
+        let formatted = format(&parse(source).unwrap());
+        assert!(
+            formatted.contains("denial (string | (role -> denial))?"),
+            "union-of-scalar-and-arm-set renders canonically:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("route (role -> (a | b))"),
+            "arm set to a union target renders canonically:\n{formatted}"
+        );
+        roundtrip(source);
+        idempotent(source);
+    }
+
+    #[test]
+    fn test_format_denial_arms_roundtrip() {
+        // Arms inside a plain block (RFC 0007): a homogeneous run aligns its
+        // arrows on the widest selector (matching `oneof` arm alignment),
+        // survives a round-trip, and is idempotent.
+        let source =
+            "service App:\n    denial:\n        @plan/Pro -> ProUpsell\n        else -> Generic\n";
+        let formatted = format(&parse(source).unwrap());
+        assert!(
+            formatted.contains("        @plan/Pro -> ProUpsell\n"),
+            "widest arm sets the column:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("        else      -> Generic\n"),
+            "'else' pads to the widest selector (@plan/Pro = 9 cols):\n{formatted}"
+        );
         roundtrip(source);
         idempotent(source);
     }

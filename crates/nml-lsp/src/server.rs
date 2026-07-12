@@ -1235,6 +1235,74 @@ fn find_model_body_at<'i, 'f>(
     descend_to_cursor(model, &block.body, pos, index, line_index)
 }
 
+/// RFC 0007 arm-target completion: when `pos` sits inside a nested block whose
+/// field is typed as an arm set `(K -> V)`, return the declaration keywords
+/// named by `V` (a union target contributes every variant). The completion
+/// candidates are then the workspace's declarations of those keywords —
+/// including `[]keyword` array items — via
+/// [`collect_declarations_by_keyword`].
+fn find_arm_target_types_at(
+    file: &File,
+    pos: Position,
+    index: &SchemaIndex,
+    line_index: &LineIndex,
+) -> Option<Vec<String>> {
+    let block = file.declarations.iter().find_map(|decl| {
+        let range = span_to_range(decl.span, line_index);
+        if pos.line > range.start.line && pos.line <= range.end.line {
+            if let DeclarationKind::Block(b) = &decl.kind {
+                return Some(b);
+            }
+        }
+        None
+    })?;
+    let FieldTarget::Model(model) = index.resolve_ref(&block.keyword.name) else {
+        return None;
+    };
+    arm_target_descend(model, &block.body, pos, index, line_index)
+}
+
+/// The descent half of [`find_arm_target_types_at`]: walk nested blocks to the
+/// cursor; an arm-set field (selected body-aware, so `(string | (K -> V))`
+/// resolves through its union) yields `V`'s names, a model-typed field
+/// recurses.
+fn arm_target_descend(
+    model: &ModelDef,
+    body: &Body,
+    pos: Position,
+    index: &SchemaIndex,
+    line_index: &LineIndex,
+) -> Option<Vec<String>> {
+    for entry in &body.entries {
+        let BodyEntryKind::NestedBlock(nested) = &entry.kind else {
+            continue;
+        };
+        let range = span_to_range(entry.span, line_index);
+        if pos.line <= range.start.line || pos.line > range.end.line {
+            continue;
+        }
+        let field = model.fields.iter().find(|f| f.name == nested.name.name)?;
+        return match index.resolve_type_in_body(&field.field_type, &nested.body) {
+            FieldTarget::Arms { target, .. } => Some(named_type_names(target)),
+            FieldTarget::Model(child) => {
+                arm_target_descend(child, &nested.body, pos, index, line_index)
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+/// The named type references inside a type expression: a ref is itself, a
+/// union contributes each variant; primitives contribute nothing.
+fn named_type_names(ty: &FieldType) -> Vec<String> {
+    match ty {
+        FieldType::ModelRef(name) => vec![name.clone()],
+        FieldType::Union(variants) => variants.iter().flat_map(named_type_names).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// From a `(model, body)` known to contain the cursor, descend to the innermost body the
 /// cursor is in and the model whose fields are valid there. Recurses through nested
 /// model-typed fields and list-of-model items. Returns `None` (no field suggestions) if the
@@ -1430,6 +1498,116 @@ fn collect_declarations_by_keyword(
         }
     }
     results
+}
+
+/// The declaration-hover lookup across the open documents: a top-level
+/// declaration named `word` — or a **named array item** (`- ProUpsell:` in
+/// `[]denial denials:`), the form arm targets (RFC 0007 §4.1) and other item
+/// references name — rendered as hover markdown with its leading-comment
+/// documentation, body summary, and source file. A declaration **outranks** a
+/// same-named item (first pass finds only declarations; items resolve in a
+/// second pass). Extracted from `hover` so the lookup is unit-testable
+/// without a server.
+fn find_declaration_hover(
+    docs: &HashMap<Url, String>,
+    word: &str,
+    model_ref_type: Option<&str>,
+) -> Option<String> {
+    let mut item_hover: Option<String> = None;
+    for (doc_uri, source) in docs.iter() {
+        let file = nml_core::cst::parse_best_effort(source);
+        for decl in &file.declarations {
+            let (kw, decl_name, body_summary) = match &decl.kind {
+                DeclarationKind::Block(block) if block.name.name == word => {
+                    let summary = summarize_body(&block.body);
+                    (block.keyword.name.clone(), block.name.name.clone(), summary)
+                }
+                DeclarationKind::Array(arr) if arr.name.name == word => (
+                    format!("[]{}", arr.item_keyword.name),
+                    arr.name.name.clone(),
+                    String::new(),
+                ),
+                // A named item hovers like a declaration of the array's item
+                // keyword — `- ProUpsell:` in `[]denial denials:` reads
+                // `**denial** \`ProUpsell\`` — but only as the FALLBACK: a
+                // top-level declaration of the same name wins, so the first
+                // item hover is held rather than returned.
+                DeclarationKind::Array(arr) => {
+                    if item_hover.is_none() {
+                        if let Some(item_body) =
+                            arr.body.items.iter().find_map(|item| match &item.kind {
+                                ListItemKind::Named { name, body } if name.name == word => {
+                                    Some(body)
+                                }
+                                _ => None,
+                            })
+                        {
+                            item_hover = Some(render_declaration_hover(
+                                &arr.item_keyword.name,
+                                word,
+                                &summarize_body(item_body),
+                                model_ref_type,
+                                source,
+                                doc_uri,
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                DeclarationKind::Const(c) if c.name.name == word => {
+                    let val = format_named_value(&c.name.name, &c.value.value);
+                    ("const".into(), c.name.name.clone(), val)
+                }
+                DeclarationKind::Template(t) if t.name.name == word => {
+                    let val = format_named_value(&t.name.name, &t.value.value);
+                    ("template".into(), t.name.name.clone(), val)
+                }
+                _ => continue,
+            };
+            return Some(render_declaration_hover(
+                &kw,
+                &decl_name,
+                &body_summary,
+                model_ref_type,
+                source,
+                doc_uri,
+            ));
+        }
+    }
+    item_hover
+}
+
+/// Assemble one hover text: `**keyword** \`name\``, the reference context, the
+/// leading-comment documentation (declaration or named array item — RFC 0004
+/// §4.3 via `doc_comment_for`), the body summary, and the source file. The
+/// single renderer for declaration and item hovers, so the two can never
+/// drift.
+fn render_declaration_hover(
+    kw: &str,
+    decl_name: &str,
+    body_summary: &str,
+    model_ref_type: Option<&str>,
+    source: &str,
+    doc_uri: &Url,
+) -> String {
+    let mut text = format!("**{kw}** `{decl_name}`");
+    if let Some(ref_type) = model_ref_type {
+        text.push_str(&format!(" *(referenced as {ref_type})*"));
+    }
+    if let Some(doc) = nml_core::cst::doc_comment_for(source, decl_name) {
+        text.push_str("\n\n");
+        text.push_str(&doc);
+    }
+    if !body_summary.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(body_summary);
+    }
+    let file_name = doc_uri
+        .path_segments()
+        .and_then(|mut s| s.next_back())
+        .unwrap_or("unknown");
+    text.push_str(&format!("\n\n*Source: {file_name}*"));
+    text
 }
 
 /// Whether the *byte* column `byte_col` sits on a property name.
@@ -1866,6 +2044,35 @@ impl LanguageServer for NmlLanguageServer {
                 let (models, enums, oneofs) = self.models_for_file(&uri);
                 let index = SchemaIndex::build(models, enums, oneofs);
                 let line_index = LineIndex::new(source);
+                // Arm-target position (RFC 0007): after the `->` on an arm
+                // line, offer declarations of the arm set's target type `V`
+                // instead of field names.
+                let after_arrow = position::line_at(source, pos.line)
+                    .map(|line| {
+                        let end = position::utf16_to_byte(line, pos.character);
+                        line[..end].contains("->")
+                    })
+                    .unwrap_or(false);
+                if after_arrow {
+                    if let Some(target_keywords) =
+                        find_arm_target_types_at(&file, pos, &index, &line_index)
+                    {
+                        for keyword in &target_keywords {
+                            for (name, kw, file_name) in
+                                collect_declarations_by_keyword(&docs, keyword)
+                            {
+                                items.push(CompletionItem {
+                                    label: name.clone(),
+                                    kind: Some(CompletionItemKind::REFERENCE),
+                                    detail: Some(format!("{kw} (from {file_name})")),
+                                    sort_text: Some(format!("0_{name}")),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                        return Ok(Some(CompletionResponse::Array(items)));
+                    }
+                }
                 if let Some((model, body)) = find_model_body_at(&file, pos, &index, &line_index) {
                     let present = present_field_names(body);
                     for (idx, field) in model.fields.iter().enumerate() {
@@ -2119,59 +2326,14 @@ impl LanguageServer for NmlLanguageServer {
             };
 
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-            for (doc_uri, source) in docs.iter() {
-                let file = nml_core::cst::parse_best_effort(source);
-                for decl in &file.declarations {
-                    let (kw, decl_name, body_summary) = match &decl.kind {
-                        DeclarationKind::Block(block) if block.name.name == word => {
-                            let summary = summarize_body(&block.body);
-                            (block.keyword.name.clone(), block.name.name.clone(), summary)
-                        }
-                        DeclarationKind::Array(arr) if arr.name.name == word => (
-                            format!("[]{}", arr.item_keyword.name),
-                            arr.name.name.clone(),
-                            String::new(),
-                        ),
-                        DeclarationKind::Const(c) if c.name.name == word => {
-                            let val = format_named_value(&c.name.name, &c.value.value);
-                            ("const".into(), c.name.name.clone(), val)
-                        }
-                        DeclarationKind::Template(t) if t.name.name == word => {
-                            let val = format_named_value(&t.name.name, &t.value.value);
-                            ("template".into(), t.name.name.clone(), val)
-                        }
-                        _ => continue,
-                    };
-
-                    let mut text = format!("**{kw}** `{decl_name}`");
-                    if let Some(ref ref_type) = model_ref_type {
-                        text.push_str(&format!(" *(referenced as {ref_type})*"));
-                    }
-                    // A comment written above the declaration is its documentation
-                    // (RFC 0004 §4.3 comment attachment — the hover-on-comment payoff).
-                    if let Some(doc) = nml_core::cst::doc_comment_for(source, &decl_name) {
-                        text.push_str("\n\n");
-                        text.push_str(&doc);
-                    }
-                    if !body_summary.is_empty() {
-                        text.push_str("\n\n");
-                        text.push_str(&body_summary);
-                    }
-
-                    let file_name = doc_uri
-                        .path_segments()
-                        .and_then(|mut s| s.next_back())
-                        .unwrap_or("unknown");
-                    text.push_str(&format!("\n\n*Source: {file_name}*"));
-
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: text,
-                        }),
-                        range: None,
-                    }));
-                }
+            if let Some(text) = find_declaration_hover(&docs, &word, model_ref_type.as_deref()) {
+                return Ok(Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: text,
+                    }),
+                    range: None,
+                }));
             }
         }
 
@@ -3606,6 +3768,124 @@ workflow VoiceAgent:
             .map(|f| f.name.as_str())
             .collect();
         assert_eq!(offered, vec!["user"]); // `system` already present
+    }
+
+    #[test]
+    fn arm_target_completion_resolves_the_target_type() {
+        // RFC 0007: cursor after `->` inside an arm-set-typed block resolves
+        // `V` — through the `(string | (role -> denial))` union, body-aware.
+        let index = field_index(
+            "model denialCard:\n    title string?\n\nmodel mount:\n    path string\n    denial (string | (role -> denial))?\n",
+        );
+        let source = "mount M:\n    path = \"/x\"\n    denial:\n        @plan/Pro -> Pro\n";
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
+        let line_index = LineIndex::new(source);
+        // Cursor on the arm line (line 3), after the arrow.
+        let targets =
+            find_arm_target_types_at(&file, Position::new(3, 22), &index, &line_index).unwrap();
+        assert_eq!(targets, vec!["denial".to_string()]);
+        // The scalar `string` union member contributes no reference keyword.
+    }
+
+    #[test]
+    fn hover_resolves_named_array_items() {
+        // RFC 0007 §4.1: hovering an arm target (`-> ProUpsell`) shows the
+        // `[]denial` item it names — with its leading-comment docs and body
+        // summary — exactly like any other declaration. The item form is
+        // generic: any `- Name:` array item hovers, not just denial targets.
+        let mut docs = HashMap::new();
+        docs.insert(
+            make_uri("nudge.nml"),
+            concat!(
+                "[]denial denials:\n",
+                "    // The paywall for gated reports.\n",
+                "    - ProUpsell:\n",
+                "        title = \"Go Pro\"\n",
+                "    // The neutral fallback.\n",
+                "    - Generic:\n",
+                "        title = \"No access\"\n",
+            )
+            .to_string(),
+        );
+        let text = find_declaration_hover(&docs, "ProUpsell", None).expect("item hover present");
+        assert!(
+            text.contains("**denial** `ProUpsell`"),
+            "hovers as the array's item keyword: {text}"
+        );
+        assert!(
+            text.contains("The paywall for gated reports."),
+            "the item's leading comment is its documentation (RFC 0004 §4.3): {text}"
+        );
+        assert!(
+            text.contains("title") && text.contains("*Source: nudge.nml*"),
+            "carries the body summary and source: {text}"
+        );
+        // A MID-LIST item's comment reaches it through the other attachment
+        // path (deferred past the previous item's dedent, INTO this item —
+        // the in-node walk), and the previous item's content never bleeds in.
+        let second = find_declaration_hover(&docs, "Generic", None).expect("mid-list item hovers");
+        assert!(
+            second.contains("The neutral fallback."),
+            "a mid-list item surfaces its own leading comment: {second}"
+        );
+        assert!(
+            !second.contains("paywall") && !second.contains("Go Pro"),
+            "the previous item's docs/content never bleed in: {second}"
+        );
+        // The array declaration itself still hovers as before.
+        let arr = find_declaration_hover(&docs, "denials", None).expect("array hover present");
+        assert!(arr.contains("**[]denial** `denials`"), "{arr}");
+        // An unknown name hovers nothing.
+        assert!(find_declaration_hover(&docs, "Ghost", None).is_none());
+    }
+
+    #[test]
+    fn hover_prefers_a_declaration_over_a_same_named_item() {
+        // Priority pin: when an array ITEM and a top-level DECLARATION share a
+        // name, the declaration wins — even when the array is declared first.
+        let mut docs = HashMap::new();
+        docs.insert(
+            make_uri("nudge.nml"),
+            concat!(
+                "[]denial denials:\n",
+                "    - Shared:\n",
+                "        title = \"item\"\n",
+                "\n",
+                "workflow Shared:\n",
+                "    steps = []\n",
+            )
+            .to_string(),
+        );
+        let text = find_declaration_hover(&docs, "Shared", None).expect("hover present");
+        assert!(
+            text.contains("**workflow** `Shared`"),
+            "the declaration outranks the item: {text}"
+        );
+    }
+
+    #[test]
+    fn hover_prefers_a_declaration_over_an_item_across_documents() {
+        // The CROSS-DOCUMENT priority pin: `HashMap` iteration order is
+        // nondeterministic, so this is the case that actually exercises the
+        // held-item-fallback — a return-first-match regression would pass or
+        // fail here depending on hash order, while the two-tier lookup is
+        // deterministic. Run against both insertion orders for good measure.
+        for (first, second) in [("a.nml", "b.nml"), ("b.nml", "a.nml")] {
+            let item_doc = "[]denial denials:\n    - Shared:\n        title = \"item\"\n";
+            let decl_doc = "workflow Shared:\n    steps = []\n";
+            let mut docs = HashMap::new();
+            docs.insert(make_uri(first), item_doc.to_string());
+            docs.insert(make_uri(second), decl_doc.to_string());
+            // Which file holds which content is fixed by NAME, not insertion
+            // order: a.nml always has the item, b.nml always the declaration.
+            docs.insert(make_uri("a.nml"), item_doc.to_string());
+            docs.insert(make_uri("b.nml"), decl_doc.to_string());
+            let text = find_declaration_hover(&docs, "Shared", None).expect("hover present");
+            assert!(
+                text.contains("**workflow** `Shared`") && text.contains("*Source: b.nml*"),
+                "the declaration wins across documents (insertion order {first}/{second}): {text}"
+            );
+        }
     }
 
     #[test]

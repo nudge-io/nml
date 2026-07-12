@@ -67,6 +67,16 @@ pub enum FieldType {
     /// declared type of the modifier's value.
     Modifier(Box<FieldType>),
     Union(Vec<FieldType>),
+    /// `(K -> V)` — a typed arm set (RFC 0007): the field's body is ordered,
+    /// first-match `(@selector | else) -> Target` arms. `key` types the
+    /// selectors (`role`, `string`, or an enum; `else` is always legal);
+    /// `target` types the arm targets — completion/intent for reference
+    /// targets (consumer-resolved, never existence-checked; RFC 0007 §4.1),
+    /// full validation for inline-block targets.
+    Arms {
+        key: Box<FieldType>,
+        target: Box<FieldType>,
+    },
 }
 
 /// Renders the type in NML source syntax: `[]string`, `(step | []step)`,
@@ -91,6 +101,7 @@ impl std::fmt::Display for FieldType {
                 }
                 f.write_str(")")
             }
+            FieldType::Arms { key, target } => write!(f, "({key} -> {target})"),
         }
     }
 }

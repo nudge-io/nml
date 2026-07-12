@@ -8,10 +8,19 @@ pub enum FieldTypeExpr {
     Named(Identifier),
     Array(Box<FieldTypeExpr>),
     Union(Vec<FieldTypeExpr>),
+    /// `(K -> V)` — a typed arm set (RFC 0007): the field's body is ordered,
+    /// first-match [`Arm`]s whose keys conform to `K` and whose targets are
+    /// `V`-typed. Reference targets are consumer-resolved, never
+    /// existence-checked by nml (RFC 0007 §4.1); `else` is always a legal key.
+    /// Not a map: ordering is significant and matching is the consumer's.
+    Arms {
+        key: Box<FieldTypeExpr>,
+        target: Box<FieldTypeExpr>,
+    },
 }
 
 /// Renders the type expression in NML source syntax: `string`, `[]route`,
-/// `(step | []step)`.
+/// `(step | []step)`, `(role -> denial)`.
 impl std::fmt::Display for FieldTypeExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -27,6 +36,7 @@ impl std::fmt::Display for FieldTypeExpr {
                 }
                 f.write_str(")")
             }
+            FieldTypeExpr::Arms { key, target } => write!(f, "({key} -> {target})"),
         }
     }
 }
@@ -103,6 +113,29 @@ pub struct OneOfArm {
     pub model: Identifier,
 }
 
+/// A routing arm inside a plain block body: `(@selector | else) -> Target`
+/// (the house arm idiom). Generic in the grammar; a schema restricts which
+/// blocks accept arms — e.g. RFC 0018's `denial:` routes by which access door a
+/// denied principal is missing.
+#[derive(Debug, Clone, Serialize)]
+pub struct Arm {
+    pub selector: ArmSelector,
+    /// Span of the selector token (for diagnostics).
+    pub selector_span: Span,
+    /// The arm's target identifier (an experience name for a `denial:` arm).
+    pub target: Identifier,
+}
+
+/// An [`Arm`] selector: a reference token or the `else` catch-all.
+#[derive(Debug, Clone, Serialize)]
+pub enum ArmSelector {
+    /// A selector token, e.g. `@plan/Pro` — stored verbatim (with the leading
+    /// `@`), matching [`ListItemKind::Role`]; the consumer parses its shape.
+    Role(String),
+    /// The `else` catch-all (a contextual keyword, never a role).
+    Else,
+}
+
 /// A constant declaration: `const Name = value`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConstDecl {
@@ -161,6 +194,8 @@ pub enum BodyEntryKind {
     ListItem(ListItem),
     /// A field definition in a model/trait: `name type[?] [= default]`
     FieldDefinition(FieldDefinition),
+    /// A routing arm: `(@selector | else) -> Target` (house arm idiom).
+    Arm(Arm),
 }
 
 /// A key-value property: `key = value`.

@@ -375,6 +375,17 @@ impl SchemaValidator {
                         .with_span(entry.span),
                     );
                 }
+                // RFC 0007 §4.2: a schema declaration declares an arm set via
+                // the field *type* '(K -> V)'; arm entries belong in instances.
+                BodyEntryKind::Arm(_) if is_schema_def => {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "routing arms are not allowed in '{keyword}' declarations; declare \
+                             the field as '(K -> V)' and write the arms in the instance block"
+                        ))
+                        .with_span(entry.span),
+                    );
+                }
                 BodyEntryKind::NestedBlock(nb) => {
                     self.validate_body(&nb.body, is_schema_def, keyword, diags);
                 }
@@ -460,7 +471,83 @@ impl SchemaValidator {
                 }
                 true
             }
+            FieldTarget::Arms { key, .. } => {
+                self.validate_instance_against_arms(body, key, diags);
+                true
+            }
             FieldTarget::Object | FieldTarget::Union | FieldTarget::Leaf => false,
+        }
+    }
+
+    /// Validate an arm-set instance (`(K -> V)`, RFC 0007 §4.2–§4.3): every
+    /// entry must be an arm; keys must conform to `K` (`else` is always
+    /// legal); `else` is single and last (first-match ordering makes a
+    /// non-last `else` dead code); exact-duplicate keys error. **Reference
+    /// targets are deliberately not existence-checked** (§4.1): consumer
+    /// resolution is cross-scope (e.g. an app-level arm targeting a
+    /// deployment-level declaration), so an in-file check would false-positive
+    /// on legitimate cross-file references — the target type drives editor
+    /// intelligence and the consumer's own load-time resolution instead.
+    fn validate_instance_against_arms(
+        &self,
+        body: &Body,
+        key: &FieldType,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        let mut else_seen = false;
+        let mut keys_seen: Vec<&str> = Vec::new();
+        for entry in &body.entries {
+            let BodyEntryKind::Arm(arm) = &entry.kind else {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "expected a routing arm ('@selector -> Target' or 'else -> Target'); \
+                         this field is typed '({key} -> …)' and holds only arms"
+                    ))
+                    .with_span(entry.span),
+                );
+                continue;
+            };
+            match &arm.selector {
+                ArmSelector::Else => {
+                    if else_seen {
+                        diags.push(
+                            Diagnostic::error(
+                                "duplicate 'else' arm; an arm set has at most one catch-all"
+                                    .to_string(),
+                            )
+                            .with_span(arm.selector_span),
+                        );
+                    }
+                    else_seen = true;
+                }
+                ArmSelector::Role(selector) => {
+                    if else_seen {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "arm '{selector}' is unreachable: arms match first-to-last, \
+                                 so 'else' must be the final arm"
+                            ))
+                            .with_span(arm.selector_span),
+                        );
+                    }
+                    if !matches!(key, FieldType::Primitive(PrimitiveType::Role)) {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "arm key '{selector}' does not conform to the declared key \
+                                 type '{key}'"
+                            ))
+                            .with_span(arm.selector_span),
+                        );
+                    }
+                    if keys_seen.contains(&selector.as_str()) {
+                        diags.push(
+                            Diagnostic::error(format!("duplicate arm key '{selector}'"))
+                                .with_span(arm.selector_span),
+                        );
+                    }
+                    keys_seen.push(selector);
+                }
+            }
         }
     }
 
@@ -549,6 +636,25 @@ impl SchemaValidator {
                                     self.validate_inline_item(item, &elem, depth + 1, diags);
                                 }
                             }
+                            FieldType::Arms { key, .. } => {
+                                self.validate_instance_against_arms(&nb.body, key, diags);
+                            }
+                            FieldType::Union(_) => {
+                                // Body shape (arms / list items / neither)
+                                // selects the union variant — e.g. RFC 0007's
+                                // `(string | (role -> denial))` picks the arm
+                                // set when the block holds arms.
+                                let target = self
+                                    .index
+                                    .resolve_type_in_body(&field_def.field_type, &nb.body);
+                                self.validate_target_instance(
+                                    &target,
+                                    &nb.body,
+                                    depth + 1,
+                                    Some(nb.name.span),
+                                    diags,
+                                );
+                            }
                             FieldType::Primitive(PrimitiveType::Object) => {}
                             _ => {}
                         }
@@ -569,6 +675,20 @@ impl SchemaValidator {
                     if let Some(field_def) = model.fields.iter().find(|f| f.name == m.name.name) {
                         self.validate_modifier_value(m, field_def, diags);
                     }
+                }
+                // RFC 0007 §4.2 placement rule: arms are legal only inside a
+                // field typed as an arm set '(K -> V)'. A bare arm in a
+                // model-typed block would otherwise parse and silently do
+                // nothing — a latent trap.
+                BodyEntryKind::Arm(_) => {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "routing arms are not allowed here: '{}' holds fields, not arms; \
+                             arms belong under a field typed '(K -> V)'",
+                            model.name
+                        ))
+                        .with_span(entry.span),
+                    );
                 }
                 _ => {}
             }
@@ -871,6 +991,17 @@ impl SchemaValidator {
             FieldType::Modifier(declared) => {
                 self.validate_value_against_type(value, declared, field_name, context, span, diags);
             }
+            FieldType::Arms { .. } => {
+                // An arm set is a block of arms, never a scalar value.
+                diags.push(
+                    Diagnostic::error(format!(
+                        "type mismatch {context} '{field_name}': expected an arm block \
+                         ('{field_type}'), got {}",
+                        value_type_name(value)
+                    ))
+                    .with_span(span),
+                );
+            }
         }
     }
 
@@ -910,6 +1041,8 @@ impl SchemaValidator {
                 .iter()
                 .any(|variant| self.value_matches_type(value, variant)),
             FieldType::Modifier(declared) => self.value_matches_type(value, declared),
+            // An arm set is a block of arms; no scalar value satisfies it.
+            FieldType::Arms { .. } => false,
         }
     }
 
@@ -2762,6 +2895,129 @@ workflow W:
                 .any(|d| d.message.contains("expected one of string, []number")),
             "array of wrong element type should not match union; diags: {:?}",
             diags
+        );
+    }
+
+    // --- RFC 0007: typed arm-set fields `(K -> V)` ---
+
+    /// The full happy path: a `(string | (role -> denial))?` union accepts the
+    /// scalar form, and an arm-shaped body selects the arm-set variant and
+    /// validates cleanly — including a REFERENCE target that resolves nowhere
+    /// in this file (negative existence-check pin, §4.1: consumer-resolved,
+    /// cross-scope refs must not false-positive).
+    #[test]
+    fn arm_set_union_accepts_scalar_and_arm_forms() {
+        let schema = "model mount:\n    path string\n    denial (string | (role -> denial))?\n";
+        let scalar = diags(schema, "mount M:\n    path = \"/x\"\n    denial = \"ProUpsell\"\n");
+        assert!(scalar.is_empty(), "scalar form: {scalar:?}");
+
+        let arms = diags(
+            schema,
+            "mount M:\n    path = \"/x\"\n    denial:\n        @plan/Pro -> ProUpsell\n        else -> Generic\n",
+        );
+        assert!(
+            arms.is_empty(),
+            "arm form (with an unresolvable reference target) must validate: {arms:?}"
+        );
+    }
+
+    /// §4.3: `else` is single and last — a duplicate or non-final `else` errors.
+    #[test]
+    fn arm_set_else_must_be_single_and_last() {
+        let schema = "model mount:\n    denial (role -> denial)?\n";
+        let after_else = diags(
+            schema,
+            "mount M:\n    denial:\n        else -> Generic\n        @plan/Pro -> ProUpsell\n",
+        );
+        assert!(
+            after_else.iter().any(|d| d.message.contains("unreachable")
+                && d.message.contains("'else' must be the final arm")),
+            "an arm after 'else' is dead code: {after_else:?}"
+        );
+
+        let dup_else = diags(
+            schema,
+            "mount M:\n    denial:\n        else -> A\n        else -> B\n",
+        );
+        assert!(
+            dup_else
+                .iter()
+                .any(|d| d.message.contains("duplicate 'else' arm")),
+            "{dup_else:?}"
+        );
+    }
+
+    /// §4.3: exact-duplicate keys error; distinct keys pass (semantic overlap
+    /// is the consumer's domain, not nml's).
+    #[test]
+    fn arm_set_duplicate_keys_error() {
+        let schema = "model mount:\n    denial (role -> denial)?\n";
+        let d = diags(
+            schema,
+            "mount M:\n    denial:\n        @plan/Pro -> A\n        @plan/Pro -> B\n",
+        );
+        assert!(
+            d.iter()
+                .any(|d| d.message.contains("duplicate arm key '@plan/Pro'")),
+            "{d:?}"
+        );
+    }
+
+    /// §4.3: a role selector only conforms to a `role` key type.
+    #[test]
+    fn arm_set_key_must_conform_to_declared_key_type() {
+        let schema = "model mount:\n    handlers (string -> handler)?\n";
+        let d = diags(
+            schema,
+            "mount M:\n    handlers:\n        @plan/Pro -> A\n",
+        );
+        assert!(
+            d.iter().any(|d| d.message.contains("does not conform")
+                && d.message.contains("key type 'string'")),
+            "{d:?}"
+        );
+    }
+
+    /// §4.2 placement: an arm inside a model-typed block (not arm-typed)
+    /// errors instead of silently doing nothing.
+    #[test]
+    fn arm_outside_an_arm_typed_field_errors() {
+        let schema = "model mount:\n    path string\n    pipeline pipe?\nmodel pipe:\n    input string?\n";
+        let d = diags(
+            schema,
+            "mount M:\n    path = \"/x\"\n    pipeline:\n        @plan/Pro -> A\n",
+        );
+        assert!(
+            d.iter()
+                .any(|d| d.message.contains("routing arms are not allowed here")),
+            "{d:?}"
+        );
+    }
+
+    /// A non-arm entry inside an arm-typed block errors (the type says the
+    /// body holds only arms).
+    #[test]
+    fn arm_set_rejects_non_arm_entries() {
+        let schema = "model mount:\n    denial (role -> denial)?\n";
+        let d = diags(
+            schema,
+            "mount M:\n    denial:\n        title = \"nope\"\n",
+        );
+        assert!(
+            d.iter()
+                .any(|d| d.message.contains("expected a routing arm")),
+            "{d:?}"
+        );
+    }
+
+    /// A scalar value on an arms-only (non-union) field is a type mismatch.
+    #[test]
+    fn arm_set_scalar_value_mismatch() {
+        let schema = "model mount:\n    denial (role -> denial)?\n";
+        let d = diags(schema, "mount M:\n    denial = 42\n");
+        assert!(
+            d.iter().any(|d| d.message.contains("expected an arm block")),
+            "{d:?}"
         );
     }
 

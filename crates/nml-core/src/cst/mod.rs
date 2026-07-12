@@ -152,15 +152,32 @@ pub fn extract_schema(source: &str) -> (crate::schema::ExtractedSchema, Vec<NmlE
 }
 
 /// The leading documentation comment of the top-level declaration named `name`
-/// (RFC 0004 §4.3 comment attachment), or `None`. A convenience for tooling (LSP
-/// hover) that surfaces comments as docs by name without holding the `!Send` tree.
+/// — or, failing that, of the **named array item** (`- Name:`) so called (a
+/// declaration outranks a same-named item) — per RFC 0004 §4.3 comment
+/// attachment, or `None`. A convenience for tooling (LSP hover) that surfaces
+/// comments as docs by name without holding the `!Send` tree; the item arm is
+/// what documents an arm target's experience (RFC 0007 §4.1).
 pub fn doc_comment_for(source: &str, name: &str) -> Option<String> {
     use ast::AstNode as _;
     let root = ast::Root::cast(parse(source).syntax())?;
-    let decl = root
+    if let Some(decl) = root
         .decls()
-        .find(|d| d.name().and_then(|n| n.text()).as_deref() == Some(name))?;
-    decl.doc_comment()
+        .find(|d| d.name().and_then(|n| n.text()).as_deref() == Some(name))
+    {
+        return decl.doc_comment();
+    }
+    let item = root.decls().find_map(|d| {
+        let ast::Decl::Array(arr) = d else {
+            return None;
+        };
+        arr.body()?.entries().find_map(|e| match e {
+            ast::Entry::ListItem(item) if item.name().is_some_and(|n| n.text() == name) => {
+                Some(item)
+            }
+            _ => None,
+        })
+    })?;
+    item.doc_comment()
 }
 
 /// A source comment extracted from the CST (RFC 0004 §4.3). Comments are not part
