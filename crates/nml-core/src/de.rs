@@ -221,7 +221,21 @@ fn collect_body_map_entries<'a>(body: &'a Body) -> Vec<BodyMapEntry<'a>> {
                     value: sv,
                 }),
             },
-            _ => None,
+            // `ListItem`s are handled by the list deserializer, not the map
+            // path. `Modifier`, `FieldDefinition`, and `Arm` are
+            // serde-invisible by design — there is no generic serde target for
+            // an ACL, a schema field def, or an ordered routing table. Each is
+            // a **hand-parsed** construct: the consumer marks its field
+            // `#[serde(skip)]` and reads the `BodyEntryKind` directly (e.g.
+            // `|allow`/`|grant` and RFC 0007 arm sets — see nudge's
+            // `DenialBinding::parse_from_body`, which walks
+            // `BodyEntryKind::Arm`). A shorthand-filled arm block (RFC 0007
+            // §4.3 ⑤) deserializes identically to an authored one: the block
+            // is visible here, its arms hand-read past serde.
+            BodyEntryKind::ListItem(_)
+            | BodyEntryKind::Modifier(_)
+            | BodyEntryKind::FieldDefinition(_)
+            | BodyEntryKind::Arm(_) => None,
         })
         .collect()
 }
