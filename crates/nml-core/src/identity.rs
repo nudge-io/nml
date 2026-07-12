@@ -19,7 +19,8 @@
 //! no `name` is **not** a drop: it is the `de` runtime fallback, so it is silent.
 
 use crate::ast::{
-    Body, BodyEntry, BodyEntryKind, Identifier, ListItem, ListItemKind, NestedBlock, Property,
+    Arm, ArmSelector, ArmTarget, Body, BodyEntry, BodyEntryKind, Identifier, ListItem,
+    ListItemKind, NestedBlock, Property,
 };
 use crate::error::NmlError;
 use crate::model::{FieldType, ModelDef, OneOfDef};
@@ -80,6 +81,41 @@ pub fn materialize_item(item: &ListItem, model: &ModelDef) -> Materialized {
         // optional `- "/api": <body>` form) or a fresh one. No `!` field ⇒ dropped key,
         // and the item has no placement, so it is not validatable.
         ListItemKind::Shorthand { value, body } => match model.fields.iter().find(|f| f.shorthand) {
+            // A bare arm-set shorthand field (RFC 0007 §4.3 ⑤): the scalar
+            // fills it via the canonical embedding `s ⇒ [else -> s]` — a
+            // one-arm block whose `else` target mirrors the scalar's form,
+            // exactly as the arm block itself distinguishes `-> Foo` from
+            // `-> "foo"`. A scalar with no name/string form (e.g. a number)
+            // is surfaced as loudly as the plain-scalar path's downstream
+            // type error would be — never a silent empty target.
+            Some(field) if matches!(field.field_type, FieldType::Arms { .. }) => {
+                match arm_fill_target(value) {
+                    Some(target) => Materialized {
+                        body: inject_arm(
+                            body.as_ref().unwrap_or(&EMPTY_BODY),
+                            &field.name,
+                            target,
+                            value.span,
+                        ),
+                        diagnostics: Vec::new(),
+                        validatable: true,
+                    },
+                    None => Materialized {
+                        body: Body { entries: Vec::new() },
+                        diagnostics: vec![error(
+                            format!(
+                                "a {} cannot fill the arm-set shorthand field '{}' on model \
+                                 '{}' (an arm target is a name or a string)",
+                                value.value.type_name(),
+                                field.name,
+                                model.name
+                            ),
+                            value.span,
+                        )],
+                        validatable: false,
+                    },
+                }
+            }
             Some(field) => Materialized {
                 body: inject(
                     body.as_ref().unwrap_or(&EMPTY_BODY),
@@ -134,6 +170,62 @@ fn inject(body: &Body, field: &str, value: SpannedValue) -> Body {
             value,
         }),
     });
+    Body { entries }
+}
+
+/// The `else`-arm target a scalar fill produces (RFC 0007 §4.3 ⑤), mirroring
+/// the arm grammar's own name-vs-string split. NOTE: in *parsed* source a
+/// bare `- Name` list item is a Reference **link** (RFC 0005) and a `- @x`
+/// item is a Role link — neither reaches the shorthand fill — so the
+/// `Reference` arm here serves programmatically built bodies (`identity` is a
+/// public API over arbitrary `Body`s); parsed fills always produce literals.
+/// `None` when the scalar has no name/string form (a number, a bool…) — the
+/// caller turns that into a loud diagnostic, never a lossy default.
+fn arm_fill_target(value: &SpannedValue) -> Option<ArmTarget> {
+    match &value.value {
+        Value::Reference(name) => Some(ArmTarget::Reference(Identifier::new(
+            name.clone(),
+            value.span,
+        ))),
+        other => String::try_from(other).ok().map(|s| ArmTarget::Literal {
+            value: s,
+            span: value.span,
+        }),
+    }
+}
+
+/// Fill a bare arm-set shorthand field with the canonical `[else -> s]`
+/// embedding (RFC 0007 §4.3 ⑤): synthesize `field: { else -> <target> }`
+/// unless the body already declares `field` **in any form** (an explicit arm
+/// block wins; an explicit property is left alone too — the validator flags
+/// it against the arms type, and injecting alongside it would only double the
+/// noise). The same leniency as [`inject`].
+fn inject_arm(body: &Body, field: &str, target: ArmTarget, span: Span) -> Body {
+    let already_set = body.entries.iter().any(|e| match &e.kind {
+        BodyEntryKind::NestedBlock(nb) => nb.name.name == field,
+        BodyEntryKind::Property(p) => p.name.name == field,
+        _ => false,
+    });
+    if already_set {
+        return body.clone(); // explicit declaration wins
+    }
+    let arm = BodyEntry {
+        span,
+        kind: BodyEntryKind::Arm(Arm {
+            selector: ArmSelector::Else,
+            selector_span: span,
+            target,
+        }),
+    };
+    let block = BodyEntry {
+        span,
+        kind: BodyEntryKind::NestedBlock(NestedBlock {
+            name: Identifier::new(field.to_string(), span),
+            body: Body { entries: vec![arm] },
+        }),
+    };
+    let mut entries = body.entries.clone();
+    entries.push(block);
     Body { entries }
 }
 
@@ -392,6 +484,136 @@ mod tests {
             _ => None,
         });
         assert!(matches!(path, Some(Value::String(s)) if s == "/api"));
+    }
+
+    #[test]
+    fn scalar_fills_arm_set_shorthand_as_an_else_arm() {
+        // RFC 0007 §4.3 ⑤: a bare arm-set shorthand field is filled by the
+        // canonical `s ⇒ [else -> s]` embedding — a quoted scalar → a literal
+        // target, a bare name → a reference target, each mirroring the arm
+        // grammar's own name-vs-string distinction.
+        let mut arm_field = fd("dispatch", true);
+        arm_field.field_type = FieldType::Arms {
+            key: Box::new(FieldType::Primitive(PrimitiveType::Role)),
+            target: Box::new(FieldType::Primitive(PrimitiveType::Path)),
+        };
+        let m = model(vec![fd("name", false), arm_field]);
+
+        let arm_of = |body: &Body| -> Arm {
+            let BodyEntryKind::NestedBlock(nb) = &body
+                .entries
+                .iter()
+                .find(|e| matches!(&e.kind, BodyEntryKind::NestedBlock(nb) if nb.name.name == "dispatch"))
+                .expect("dispatch block synthesized")
+                .kind
+            else {
+                unreachable!()
+            };
+            match &nb.body.entries[0].kind {
+                BodyEntryKind::Arm(a) => a.clone(),
+                _ => panic!("expected an arm"),
+            }
+        };
+
+        // Quoted scalar → `else -> "x.workflow.nml"` (literal).
+        let lit_item = ListItem {
+            span: s(),
+            kind: ListItemKind::Shorthand {
+                value: SpannedValue::new(Value::String("x.workflow.nml".into()), s()),
+                body: None,
+            },
+        };
+        let r = materialize_item(&lit_item, &m);
+        assert!(r.diagnostics.is_empty() && r.validatable);
+        let arm = arm_of(&r.body);
+        assert!(matches!(arm.selector, ArmSelector::Else));
+        assert!(matches!(arm.target, ArmTarget::Literal { value, .. } if value == "x.workflow.nml"));
+
+        // Bare name → `else -> Fallback` (reference).
+        let ref_item = ListItem {
+            span: s(),
+            kind: ListItemKind::Shorthand {
+                value: SpannedValue::new(Value::Reference("Fallback".into()), s()),
+                body: None,
+            },
+        };
+        let arm = arm_of(&materialize_item(&ref_item, &m).body);
+        assert!(matches!(arm.target, ArmTarget::Reference(id) if id.name == "Fallback"));
+
+        // Explicit arm block wins (leniency).
+        let explicit = ListItem {
+            span: s(),
+            kind: ListItemKind::Shorthand {
+                value: SpannedValue::new(Value::String("ignored".into()), s()),
+                body: Some(Body {
+                    entries: vec![BodyEntry {
+                        span: s(),
+                        kind: BodyEntryKind::NestedBlock(NestedBlock {
+                            name: Identifier::new("dispatch", s()),
+                            body: Body {
+                                entries: vec![BodyEntry {
+                                    span: s(),
+                                    kind: BodyEntryKind::Arm(Arm {
+                                        selector: ArmSelector::Else,
+                                        selector_span: s(),
+                                        target: ArmTarget::Literal {
+                                            value: "kept.workflow.nml".into(),
+                                            span: s(),
+                                        },
+                                    }),
+                                }],
+                            },
+                        }),
+                    }],
+                }),
+            },
+        };
+        let arm = arm_of(&materialize_item(&explicit, &m).body);
+        assert!(
+            matches!(arm.target, ArmTarget::Literal { value, .. } if value == "kept.workflow.nml"),
+            "explicit arm block wins over the scalar fill"
+        );
+
+        // A scalar with no name/string form (`- 42`) is a LOUD diagnostic,
+        // never a silent empty target — matching the plain-scalar path's
+        // downstream type-error loudness.
+        let numeric = ListItem {
+            span: s(),
+            kind: ListItemKind::Shorthand {
+                value: SpannedValue::new(Value::number(42), s()),
+                body: None,
+            },
+        };
+        let r = materialize_item(&numeric, &m);
+        assert!(!r.validatable);
+        assert_eq!(r.diagnostics.len(), 1);
+        let NmlError::Validation { message, .. } = &r.diagnostics[0] else {
+            panic!()
+        };
+        assert!(
+            message.contains("cannot fill the arm-set shorthand"),
+            "{message}"
+        );
+
+        // An explicit PROPERTY named like the field also suppresses the fill
+        // (the validator flags it against the arms type; no doubled noise).
+        let with_prop = ListItem {
+            span: s(),
+            kind: ListItemKind::Shorthand {
+                value: SpannedValue::new(Value::String("ignored".into()), s()),
+                body: Some(Body {
+                    entries: vec![prop("dispatch", "explicit")],
+                }),
+            },
+        };
+        let r = materialize_item(&with_prop, &m);
+        assert!(
+            !r.body
+                .entries
+                .iter()
+                .any(|e| matches!(&e.kind, BodyEntryKind::NestedBlock(_))),
+            "no arm block synthesized beside an explicit property"
+        );
     }
 
     #[test]

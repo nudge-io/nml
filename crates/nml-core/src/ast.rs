@@ -122,8 +122,30 @@ pub struct Arm {
     pub selector: ArmSelector,
     /// Span of the selector token (for diagnostics).
     pub selector_span: Span,
-    /// The arm's target identifier (an experience name for a `denial:` arm).
-    pub target: Identifier,
+    /// The arm's target (a declared name, or a string/path/url literal).
+    pub target: ArmTarget,
+}
+
+/// An [`Arm`]'s right-hand side (RFC 0007 §6): a **reference** to a declared
+/// item (`-> ProUpsell`, consumer-resolved), or a **literal** (`-> "workflows/
+/// pro.workflow.nml"`) for flat routers whose targets are paths/URLs rather
+/// than declared names. Which form a schema accepts follows from `V`:
+/// a reference needs a referenceable `V`, a literal needs a scalar-capable
+/// `V` (checked by nml-validate).
+#[derive(Debug, Clone, Serialize)]
+pub enum ArmTarget {
+    Reference(Identifier),
+    Literal { value: String, span: Span },
+}
+
+impl ArmTarget {
+    /// The target's source span (for diagnostics / trailing-comment anchors).
+    pub fn span(&self) -> Span {
+        match self {
+            ArmTarget::Reference(id) => id.span,
+            ArmTarget::Literal { span, .. } => *span,
+        }
+    }
 }
 
 /// An [`Arm`] selector: a reference token or the `else` catch-all.

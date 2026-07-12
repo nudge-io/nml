@@ -155,10 +155,22 @@ impl Lower {
                     }
                     _ => ArmSelector::Else,
                 };
+                // Target: a `String` token is a path/url LITERAL (RFC 0007
+                // §6, decoded like a oneof arm value); anything else is a
+                // declared-name reference.
+                let target = match a.target() {
+                    Some(t) if t.kind() == crate::cst::syntax::SyntaxKind::String => {
+                        ArmTarget::Literal {
+                            value: self.string_token(&t),
+                            span: token_span(&t),
+                        }
+                    }
+                    other => ArmTarget::Reference(ident_of(other)),
+                };
                 BodyEntryKind::Arm(Arm {
                     selector,
                     selector_span: selector_tok.map(|t| token_span(&t)).unwrap_or(EMPTY_SPAN),
-                    target: ident_of(a.target()),
+                    target,
                 })
             }
         };
@@ -363,7 +375,7 @@ mod tests {
     /// usable property name when it is not an arm (contextual keyword).
     #[test]
     fn arms_lower_with_role_and_else_selectors() {
-        use crate::ast::{ArmSelector, BodyEntryKind, DeclarationKind};
+        use crate::ast::{ArmSelector, ArmTarget, BodyEntryKind, DeclarationKind};
         let file = cst_ast(
             "service App:\n    denial:\n        @plan/Pro -> ProUpsell\n        else -> Generic\n",
         );
@@ -385,9 +397,34 @@ mod tests {
             .collect();
         assert_eq!(arms.len(), 2);
         assert!(matches!(&arms[0].selector, ArmSelector::Role(r) if r == "@plan/Pro"));
-        assert_eq!(arms[0].target.name, "ProUpsell");
+        assert!(matches!(&arms[0].target, ArmTarget::Reference(id) if id.name == "ProUpsell"));
         assert!(matches!(arms[1].selector, ArmSelector::Else));
-        assert_eq!(arms[1].target.name, "Generic");
+        assert!(matches!(&arms[1].target, ArmTarget::Reference(id) if id.name == "Generic"));
+
+        // RFC 0007 §6: a STRING literal after the arrow is a path/url target
+        // (for flat routers), decoded like a oneof arm value.
+        let file = cst_ast(
+            "service App:\n    dispatch:\n        @role/admin -> \"admin.workflow.nml\"\n        else -> \"default.workflow.nml\"\n",
+        );
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("block");
+        };
+        let BodyEntryKind::NestedBlock(nb) = &block.body.entries[0].kind else {
+            panic!("nested block");
+        };
+        let lit: Vec<_> = nb
+            .body
+            .entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                BodyEntryKind::Arm(a) => Some(&a.target),
+                _ => None,
+            })
+            .collect();
+        assert!(matches!(lit[0], ArmTarget::Literal { value, .. } if value == "admin.workflow.nml"));
+        assert!(
+            matches!(lit[1], ArmTarget::Literal { value, .. } if value == "default.workflow.nml")
+        );
 
         // `else` is an arm ONLY when followed by `->`; as a property name it
         // still parses as a property (contextual keyword, not reserved).

@@ -261,8 +261,9 @@ impl Arm {
             .filter_map(|e| e.into_token())
             .find(|t| matches!(t.kind(), SyntaxKind::Role | SyntaxKind::Ident))
     }
-    /// The target identifier (the experience name) — the first `Ident` *after*
-    /// the arrow, so it is never confused with an `else` selector's `Ident`.
+    /// The target token — the first `Ident` (a declared-name reference) or
+    /// `String` (a path/url literal, RFC 0007 §6) *after* the arrow, so it is
+    /// never confused with an `else` selector's `Ident`.
     pub fn target(&self) -> Option<SyntaxToken> {
         let mut toks = self
             .0
@@ -270,7 +271,7 @@ impl Arm {
             .filter_map(|e| e.into_token());
         toks.by_ref()
             .find(|t| matches!(t.kind(), SyntaxKind::Arrow | SyntaxKind::FatArrow))?;
-        toks.find(|t| t.kind() == SyntaxKind::Ident)
+        toks.find(|t| matches!(t.kind(), SyntaxKind::Ident | SyntaxKind::String))
     }
 }
 

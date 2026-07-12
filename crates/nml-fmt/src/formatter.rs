@@ -277,8 +277,13 @@ impl<'a> Formatter<'a> {
                 self.out.push(' ');
             }
             self.out.push_str(" -> ");
-            self.out.push_str(&arm.target.name);
-            self.emit_trailing_comment(arm.target.span.start);
+            match &arm.target {
+                ArmTarget::Reference(id) => self.out.push_str(&id.name),
+                // A path/url literal (RFC 0007 §6) renders quoted, like a
+                // `oneof` arm's string key.
+                ArmTarget::Literal { value, .. } => self.out.push_str(&quote_string(value)),
+            }
+            self.emit_trailing_comment(arm.target.span().start);
             self.out.push('\n');
         }
     }
@@ -668,6 +673,25 @@ mod tests {
         assert!(
             formatted.contains("        else      -> Generic\n"),
             "'else' pads to the widest selector (@plan/Pro = 9 cols):\n{formatted}"
+        );
+        roundtrip(source);
+        idempotent(source);
+    }
+
+    #[test]
+    fn test_format_arm_literal_targets_roundtrip() {
+        // RFC 0007 §6: a string-literal arm target (path/url for flat routers)
+        // renders quoted, aligns like any arm, round-trips, and is idempotent.
+        let source =
+            "service App:\n    dispatch:\n        @role/admin -> \"admin.workflow.nml\"\n        else -> \"default.workflow.nml\"\n";
+        let formatted = format(&parse(source).unwrap());
+        assert!(
+            formatted.contains("        @role/admin -> \"admin.workflow.nml\"\n"),
+            "literal target renders quoted:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("        else        -> \"default.workflow.nml\"\n"),
+            "'else' pads to the widest selector (@role/admin = 11 cols):\n{formatted}"
         );
         roundtrip(source);
         idempotent(source);

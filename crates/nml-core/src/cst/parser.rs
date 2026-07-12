@@ -386,16 +386,22 @@ impl<'a> Parser<'a> {
     }
 
     /// `(@selector | else) -> Target` — a routing arm (RFC 0006 arrow). The
-    /// selector is a `Role` token or the `else` keyword; the RHS is the target
-    /// identifier. The grammar is permissive about *where* arms appear — the
-    /// schema restricts them (e.g. RFC 0018's `denial:` block) and validates the
-    /// selector shape.
+    /// selector is a `Role` token or the `else` keyword; the RHS is a target
+    /// identifier (`-> Name`, a declared-item reference) or a string literal
+    /// (`-> "workflows/pro.workflow.nml"` — RFC 0007 §6, for flat routers
+    /// whose targets are paths/URLs). The grammar is permissive about *where*
+    /// arms appear — the schema restricts them (e.g. RFC 0018's `denial:`
+    /// block) and validates the selector and target shapes.
     fn arm(&mut self) {
         let m = self.start();
         // selector: a role token (`@plan/Pro`) or `else` (a plain ident).
         self.bump();
         self.expect_arrow();
-        self.expect(SyntaxKind::Ident, "an arm target");
+        if matches!(self.current(), SyntaxKind::Ident | SyntaxKind::String) {
+            self.bump();
+        } else {
+            self.error("expected an arm target (a name or a string literal)");
+        }
         m.complete(self, SyntaxKind::Arm);
     }
 

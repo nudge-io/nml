@@ -489,8 +489,8 @@ impl SchemaValidator {
                 }
                 true
             }
-            FieldTarget::Arms { key, .. } => {
-                self.validate_instance_against_arms(body, key, diags);
+            FieldTarget::Arms { key, target } => {
+                self.validate_instance_against_arms(body, key, target, diags);
                 true
             }
             FieldTarget::Object | FieldTarget::Union | FieldTarget::Leaf => false,
@@ -510,6 +510,7 @@ impl SchemaValidator {
         &self,
         body: &Body,
         key: &FieldType,
+        target: &FieldType,
         diags: &mut Vec<Diagnostic>,
     ) {
         let mut else_seen = false;
@@ -525,6 +526,7 @@ impl SchemaValidator {
                 );
                 continue;
             };
+            self.validate_arm_target(&arm.target, target, diags);
             match &arm.selector {
                 ArmSelector::Else => {
                     if else_seen {
@@ -566,6 +568,60 @@ impl SchemaValidator {
                     keys_seen.push(selector);
                 }
             }
+        }
+    }
+
+    /// Validate one arm target against the arm set's `V` (RFC 0007 §6):
+    /// - a **reference** (`-> Name`) is never existence-checked (§4.1,
+    ///   consumer-resolved cross-scope) — its form is legal for any `V`;
+    /// - a **literal** (`-> "path/url"`) requires a *scalar-capable* `V` (you
+    ///   cannot write a string where a model instance is expected), and its
+    ///   string value is checked against a concrete primitive/enum `V`.
+    fn validate_arm_target(
+        &self,
+        arm_target: &ArmTarget,
+        v: &FieldType,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        let ArmTarget::Literal { value, span } = arm_target else {
+            return; // a reference is shape-legal for any V
+        };
+        if self.field_type_admits_a_literal(v) {
+            // Concrete scalar/enum V → type-check the literal string value.
+            self.validate_value_against_type(
+                &Value::String(value.clone()),
+                v,
+                "arm target",
+                "for",
+                *span,
+                diags,
+            );
+        } else {
+            diags.push(
+                Diagnostic::error(format!(
+                    "a string-literal arm target requires a scalar target type, but this arm \
+                     set targets '{v}'; use a declared name ('-> {v}Name') instead"
+                ))
+                .with_span(*span),
+            );
+        }
+    }
+
+    /// Whether a string-literal arm target is admissible for `V` — true for a
+    /// primitive, an enum reference, an unknown name (consumer-resolved leaf),
+    /// or a union with any such variant; false for a model/`oneof`/list/arms
+    /// `V` (a literal can't stand in for a declared instance).
+    fn field_type_admits_a_literal(&self, v: &FieldType) -> bool {
+        match v {
+            FieldType::Primitive(_) => true,
+            FieldType::Modifier(inner) => self.field_type_admits_a_literal(inner),
+            FieldType::Union(variants) => {
+                variants.iter().any(|t| self.field_type_admits_a_literal(t))
+            }
+            FieldType::ModelRef(name) => {
+                self.find_model(name).is_none() && self.find_oneof(name).is_none()
+            }
+            FieldType::List(_) | FieldType::Arms { .. } => false,
         }
     }
 
@@ -654,8 +710,8 @@ impl SchemaValidator {
                                     self.validate_inline_item(item, &elem, depth + 1, diags);
                                 }
                             }
-                            FieldType::Arms { key, .. } => {
-                                self.validate_instance_against_arms(&nb.body, key, diags);
+                            FieldType::Arms { key, target } => {
+                                self.validate_instance_against_arms(&nb.body, key, target, diags);
                             }
                             FieldType::Union(_) => {
                                 // Body shape (arms / list items / neither)
@@ -3027,12 +3083,16 @@ workflow W:
                 "{schema:?}: {d:?}"
             );
         }
-        // The legitimate shapes stay clean.
+        // Shorthand (+) on an arm-set type is now SUPPORTED (RFC 0007 §4.3 ⑤:
+        // the canonical `s ⇒ [else -> s]` fill) — bare and union-wrapped alike.
         for schema in [
+            "model m:\n    f (role -> path)+\n",
             "model m:\n    f (string | (role -> denial))?\n",
+            "model m:\n    f (string | (role -> denial))+\n",
             "model m:\n    f (role -> (a | b))\n",
             "model m:\n    f []string?\n    g (a | []b)?\n",
             "model m:\n    |allow []role?\n    f string?\n",
+            "model m:\n    f string+\n    g (role -> denial)?\n",
         ] {
             let d = diags_for(schema);
             assert!(d.is_empty(), "{schema:?} must be clean: {d:?}");
@@ -3115,6 +3175,38 @@ workflow W:
                 && d.message.contains("key type 'string'")),
             "{d:?}"
         );
+    }
+
+    /// RFC 0007 §6 arm targets: a string LITERAL (`-> "path"`) is legal only
+    /// for a scalar-capable `V`; a reference (`-> Name`) is legal for any `V`
+    /// (never existence-checked, §4.1). A literal where a model/oneof target
+    /// is expected is a category error.
+    #[test]
+    fn arm_literal_targets_require_a_scalar_target_type() {
+        // V = path → a literal path target validates; a reference is also fine.
+        let ok = diags(
+            "model route:\n    dispatch (role -> path)?\n",
+            "route R:\n    dispatch:\n        @role/admin -> \"admin.workflow.nml\"\n        else -> Fallback\n",
+        );
+        assert!(ok.is_empty(), "literal + reference on a path target: {ok:?}");
+
+        // V = a oneof (denial) → a literal target is a category error; a
+        // reference is the natural form.
+        let schema =
+            "model denialCard:\n    title string?\noneof denial by kind = \"card\":\n    \"card\" -> denialCard\nmodel mount:\n    denial (role -> denial)?\n";
+        let bad = diags(
+            schema,
+            "mount M:\n    denial:\n        @role/admin -> \"oops\"\n",
+        );
+        assert!(
+            bad.iter().any(|d| d.message.contains("string-literal arm target requires a scalar")),
+            "{bad:?}"
+        );
+        let good = diags(
+            schema,
+            "mount M:\n    denial:\n        @role/admin -> ProCard\n",
+        );
+        assert!(good.is_empty(), "reference target on a oneof V: {good:?}");
     }
 
     /// §4.2 placement: an arm inside a model-typed block (not arm-typed)
