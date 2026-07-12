@@ -366,6 +366,18 @@ impl SchemaValidator {
                 BodyEntryKind::Modifier(m) => {
                     self.validate_modifier_name(m, diags);
                     self.validate_modifier_content(m, diags);
+                    // RFC 0007 §4.3: a modifier's instance value is an inline
+                    // value or a list block — an arm body can never appear
+                    // under a modifier, so an arm set ANYWHERE in a modifier's
+                    // declared type has no instance form.
+                    if let ModifierValue::TypeAnnotation { field_type, .. } = &m.value {
+                        field_type_shape_errors(
+                            field_type,
+                            Some("a modifier's declared type"),
+                            entry.span,
+                            diags,
+                        );
+                    }
                 }
                 BodyEntryKind::FieldDefinition(_) if !is_schema_def => {
                     diags.push(
@@ -374,6 +386,12 @@ impl SchemaValidator {
                         ))
                         .with_span(entry.span),
                     );
+                }
+                // RFC 0007 §4.3 arm-set shape rules: the grammar is
+                // deliberately permissive about type composition, so the
+                // schema layer rejects the shapes that have no instance form.
+                BodyEntryKind::FieldDefinition(f) => {
+                    field_type_shape_errors(&f.field_type, None, entry.span, diags);
                 }
                 // RFC 0007 §4.2: a schema declaration declares an arm set via
                 // the field *type* '(K -> V)'; arm entries belong in instances.
@@ -1353,6 +1371,68 @@ fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
         PrimitiveType::Secret => false,
         PrimitiveType::Object => false,
         PrimitiveType::Role => matches!(value, Value::Role(_)),
+    }
+}
+
+/// RFC 0007 §4.3 arm-set shape rules, checked at schema-definition time. An
+/// arm set describes a field's **body**, so two compositions the type grammar
+/// parses have no instance form and are rejected here rather than silently
+/// accepted-and-unvalidated:
+///
+/// - `(K -> V)` under `[]` (directly or through a union, at any depth) —
+///   arms are body entries, not list items, so an array of arm sets can
+///   never be written.
+/// - `(K -> V)` inside another arm set's key or target — an arm's target is
+///   a bare reference identifier, so a nested arm set can never be written.
+/// - A union with more than one arm-set variant — the union variant is
+///   selected by body *shape*, and an arms-shaped body always selects the
+///   first arm-set variant, so a second would be silently unreachable.
+///
+/// `forbidden_context` names the enclosing position that makes an arm set
+/// illegal (`None` at the top of a field type).
+fn field_type_shape_errors(
+    field_type: &FieldTypeExpr,
+    forbidden_context: Option<&'static str>,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match field_type {
+        FieldTypeExpr::Named(_) => {}
+        FieldTypeExpr::Array(inner) => {
+            field_type_shape_errors(inner, Some("an array element"), span, diags);
+        }
+        FieldTypeExpr::Union(variants) => {
+            let arm_sets = variants
+                .iter()
+                .filter(|v| matches!(v, FieldTypeExpr::Arms { .. }))
+                .count();
+            if arm_sets > 1 {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "'{field_type}': a union may carry at most one arm-set variant — the \
+                         variant is selected by body shape, and an arms-shaped body always \
+                         selects the first, so the others would be unreachable"
+                    ))
+                    .with_span(span),
+                );
+            }
+            for variant in variants {
+                field_type_shape_errors(variant, forbidden_context, span, diags);
+            }
+        }
+        FieldTypeExpr::Arms { key, target } => {
+            if let Some(context) = forbidden_context {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "'{field_type}': an arm set describes a field's body and cannot be \
+                         {context} (it has no instance form there)"
+                    ))
+                    .with_span(span),
+                );
+            }
+            field_type_shape_errors(key, Some("an arm-set key"), span, diags);
+            field_type_shape_errors(target, Some("an arm-set target"), span, diags);
+        }
     }
 }
 
@@ -2899,6 +2979,65 @@ workflow W:
     }
 
     // --- RFC 0007: typed arm-set fields `(K -> V)` ---
+
+    /// §4.3 shape rules at schema-definition time: the type grammar parses
+    /// arm sets under `[]`, inside other arm sets, and duplicated in a union
+    /// — but none of those have an instance form, so declaring them is a
+    /// schema error, not a silently-unvalidated field.
+    #[test]
+    fn arm_set_type_shapes_without_an_instance_form_are_rejected() {
+        let diags_for = |schema: &str| {
+            let file = nml_core::cst::parse_to_ast(schema).unwrap();
+            make_validator(schema).validate(&file)
+        };
+        // Arms under an array — directly, and through a union.
+        for schema in [
+            "model m:\n    f [](role -> denial)?\n",
+            "model m:\n    f [](string | (role -> denial))?\n",
+        ] {
+            let d = diags_for(schema);
+            assert!(
+                d.iter().any(|d| d.message.contains("cannot be an array element")),
+                "{schema:?}: {d:?}"
+            );
+        }
+        // Arms nested inside an arm set's target.
+        let d = diags_for("model m:\n    f (role -> (plan -> x))?\n");
+        assert!(
+            d.iter().any(|d| d.message.contains("an arm-set target")),
+            "{d:?}"
+        );
+        // A union with two arm-set variants — the second is unreachable.
+        let d = diags_for("model m:\n    f ((role -> a) | (plan -> b))?\n");
+        assert!(
+            d.iter().any(|d| d.message.contains("at most one arm-set variant")),
+            "{d:?}"
+        );
+        // Arms anywhere in a MODIFIER's declared type — modifier values are
+        // inline values or list blocks, so an arm body can never be written
+        // under one (top-level and via a union).
+        for schema in [
+            "model m:\n    |gate (role -> denial)?\n",
+            "model m:\n    |gate (string | (role -> denial))?\n",
+        ] {
+            let d = diags_for(schema);
+            assert!(
+                d.iter()
+                    .any(|d| d.message.contains("a modifier's declared type")),
+                "{schema:?}: {d:?}"
+            );
+        }
+        // The legitimate shapes stay clean.
+        for schema in [
+            "model m:\n    f (string | (role -> denial))?\n",
+            "model m:\n    f (role -> (a | b))\n",
+            "model m:\n    f []string?\n    g (a | []b)?\n",
+            "model m:\n    |allow []role?\n    f string?\n",
+        ] {
+            let d = diags_for(schema);
+            assert!(d.is_empty(), "{schema:?} must be clean: {d:?}");
+        }
+    }
 
     /// The full happy path: a `(string | (role -> denial))?` union accepts the
     /// scalar form, and an arm-shaped body selects the arm-set variant and
