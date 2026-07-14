@@ -1177,9 +1177,15 @@ impl SchemaValidator {
         match value {
             Value::String(s) | Value::Reference(s) => {
                 if !enum_def.variants.iter().any(|v| v == s) {
+                    // Acceptance stays exact; the suggestion is fuzzy (a wrong-
+                    // cased or lightly-typo'd value gets a `did you mean` hint).
+                    let hint = match suggest_variant(s, &enum_def.variants) {
+                        Some(v) => format!(" (did you mean \"{v}\"?)"),
+                        None => String::new(),
+                    };
                     diags.push(
                         Diagnostic::error(format!(
-                            "invalid value '{s}' for '{field_name}': expected one of {}",
+                            "invalid value '{s}' for '{field_name}': expected one of {}{hint}",
                             variants()
                         ))
                         .with_span(span),
@@ -1509,6 +1515,43 @@ fn value_type_name(value: &Value) -> &'static str {
     }
 }
 
+/// The nearest enum variant to `input`, for a "did you mean" hint on an invalid
+/// value. A case-insensitive match wins outright (the overwhelmingly common
+/// near-miss is wrong casing); otherwise the closest variant by edit distance,
+/// but only when it is "close enough" — within a third of the longer string's
+/// length (short values demand near-exact, long values tolerate a typo or two).
+/// This is a **diagnostics-only** helper: acceptance stays exact-match, so a
+/// suggestion never widens what the language accepts.
+fn suggest_variant<'a>(input: &str, variants: &'a [String]) -> Option<&'a str> {
+    if let Some(v) = variants.iter().find(|v| v.eq_ignore_ascii_case(input)) {
+        return Some(v.as_str());
+    }
+    variants
+        .iter()
+        .map(|v| (levenshtein(input, v), v.as_str()))
+        .filter(|(dist, v)| *dist <= (input.chars().count().max(v.chars().count()) / 3).max(1))
+        .min_by_key(|(dist, _)| *dist)
+        .map(|(_, v)| v)
+}
+
+/// Levenshtein edit distance (two-row DP). Used only to rank "did you mean"
+/// suggestions, never to accept a value.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1832,6 +1875,42 @@ mod tests {
         assert!(diags
             .iter()
             .any(|d| d.message.contains("invalid value 'gemini'")));
+    }
+
+    #[test]
+    fn test_enum_invalid_suggests_nearest_variant() {
+        // Diagnostics are fuzzy (case-insensitive first, then edit distance);
+        // acceptance stays exact — the value is still rejected.
+        let schema =
+            "enum sameSite:\n    - \"Strict\"\n    - \"Lax\"\n    - \"None\"\n\nmodel c:\n    policy sameSite\n";
+        let validator = make_validator(schema);
+
+        // Wrong casing → suggest the canonical spelling.
+        let file = nml_core::cst::parse_to_ast("c C:\n    policy = \"lax\"\n").unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("invalid value 'lax'")
+                    && d.message.contains("did you mean \"Lax\"?")),
+            "case-only miss must suggest the canonical variant: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // A light typo → nearest by edit distance.
+        let file = nml_core::cst::parse_to_ast("c C:\n    policy = \"Stric\"\n").unwrap();
+        assert!(validator
+            .validate(&file)
+            .iter()
+            .any(|d| d.message.contains("did you mean \"Strict\"?")));
+
+        // Something far from every variant → no (misleading) suggestion.
+        let file = nml_core::cst::parse_to_ast("c C:\n    policy = \"whatever\"\n").unwrap();
+        assert!(validator
+            .validate(&file)
+            .iter()
+            .any(|d| d.message.contains("invalid value 'whatever'")
+                && !d.message.contains("did you mean")));
     }
 
     #[test]
