@@ -1185,7 +1185,7 @@ impl SchemaValidator {
                     };
                     diags.push(
                         Diagnostic::error(format!(
-                            "invalid value '{s}' for '{field_name}': expected one of {}{hint}",
+                            "invalid value \"{s}\" for '{field_name}': expected one of {}{hint}",
                             variants()
                         ))
                         .with_span(span),
@@ -1874,7 +1874,7 @@ mod tests {
         let diags = validator.validate(&file);
         assert!(diags
             .iter()
-            .any(|d| d.message.contains("invalid value 'gemini'")));
+            .any(|d| d.message.contains("invalid value \"gemini\"")));
     }
 
     #[test]
@@ -1891,7 +1891,7 @@ mod tests {
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("invalid value 'lax'")
+                .any(|d| d.message.contains("invalid value \"lax\"")
                     && d.message.contains("did you mean \"Lax\"?")),
             "case-only miss must suggest the canonical variant: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
@@ -1909,7 +1909,7 @@ mod tests {
         assert!(validator
             .validate(&file)
             .iter()
-            .any(|d| d.message.contains("invalid value 'whatever'")
+            .any(|d| d.message.contains("invalid value \"whatever\"")
                 && !d.message.contains("did you mean")));
     }
 
