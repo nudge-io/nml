@@ -282,11 +282,18 @@ impl SchemaPackage {
         format!("blake3:{}", hasher.finalize().to_hex())
     }
 
-    /// Build the validator for one binding: the composed schema set named by
-    /// `binding.schemas`, with the package's profile applied (strictness,
-    /// modifiers, membership). Binding is exclusive by construction — only
-    /// the package's own sources participate.
-    pub fn validator(&self, binding: &ValidatorBinding) -> Result<SchemaValidator, PackageError> {
+    /// The composed, inheritance-resolved schema set for one binding: the
+    /// models/enums/oneofs named by `binding.schemas`, merged and with
+    /// `extends` resolved — exactly what [`Self::validator`] builds from.
+    /// Exposed for consumers that need the schema *itself* rather than a
+    /// validator (e.g. a config differ / reload classifier), so they share the
+    /// manifest as the single source of truth and cannot drift from validation.
+    /// Binding is exclusive by construction — only the package's own sources
+    /// participate.
+    pub fn composed_schema(
+        &self,
+        binding: &ValidatorBinding,
+    ) -> Result<nml_core::schema::ExtractedSchema, PackageError> {
         let selected: Vec<(&str, &str)> = self
             .sources
             .iter()
@@ -301,6 +308,13 @@ impl SchemaPackage {
         if !errors.is_empty() {
             return Err(PackageError::Sources { errors });
         }
+        Ok(schema)
+    }
+
+    /// Build the validator for one binding: the [`Self::composed_schema`] set
+    /// with the package's profile applied (strictness, modifiers, membership).
+    pub fn validator(&self, binding: &ValidatorBinding) -> Result<SchemaValidator, PackageError> {
+        let schema = self.composed_schema(binding)?;
         let mut validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
             .with_modifiers(self.manifest.modifiers.clone())
             .with_membership_semantics(self.manifest.membership.clone());
