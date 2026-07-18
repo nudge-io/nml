@@ -22,8 +22,11 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::ast::{Body, BodyEntryKind, ListItem, ListItemKind, ModifierValue};
-use crate::model::{FieldDef, FieldType};
+use crate::ast::{
+    Body, BodyEntry, BodyEntryKind, DeclarationKind, File, ListItem, ListItemKind, ModifierValue,
+    NestedBlock,
+};
+use crate::model::{FieldDef, FieldType, ModelDef};
 use crate::schema_index::{FieldTarget, SchemaIndex};
 use crate::span::Span;
 use crate::types::{Directive, PrimitiveType, SpannedValue, Value};
@@ -96,6 +99,137 @@ pub fn diff_config(
     };
     diff_model(index, model, old, new, "", 0, &mut out);
     out
+}
+
+// ---------------------------------------------------------------------------
+// Multi-root (RFC 0032): a config *file* is itself a model instance — its
+// top-level declarations are the fields of an implicit root model. Synthesize
+// that root and wrap each file's declarations as one body, and the ENTIRE diff
+// machinery above (`diff_config` → `diff_model` → `diff_field` → collections,
+// oneofs, arms, secrets, origins) classifies EVERY top-level change — server
+// blocks AND `[]role`/`[]plan`/`[]app`/`[]install` arrays — with no new diff
+// logic. The synth root's own fields carry no directives, so classification
+// passes straight through to the referenced models' schema directives.
+// ---------------------------------------------------------------------------
+
+/// How a top-level declaration maps onto a synth-root field.
+pub enum ConfigFieldKind {
+    /// `keyword Name:` → a single instance of model `keyword`.
+    Block,
+    /// `[]item name:` → an ordered list of model `item`.
+    Array,
+}
+
+/// One synthesized field of the implicit config root — one per top-level
+/// declaration. For a block, `name` and `model` are both the keyword; for an
+/// array, `name` is the author-chosen array name and `model` is the item
+/// keyword (the schema model each element validates against).
+pub struct ConfigRootField {
+    pub name: String,
+    pub model: String,
+    pub kind: ConfigFieldKind,
+}
+
+/// Derive the config-root fields from a set of config files (pass the union of
+/// the old and new sides so a declaration present on only one side still gets a
+/// field). Each unique top-level block/array becomes one field; `const`,
+/// `template`, and `oneof` declarations are authoring constructs — not config
+/// instances — so they are skipped. Deduplicated by field name (the same block
+/// keyword or array name spanning multiple files is one field; the differ
+/// overlays the per-file bodies).
+pub fn config_root_fields_from_files(files: &[&File]) -> Vec<ConfigRootField> {
+    let mut out: Vec<ConfigRootField> = Vec::new();
+    for file in files {
+        for decl in &file.declarations {
+            let field = match &decl.kind {
+                DeclarationKind::Block(b) => ConfigRootField {
+                    name: b.keyword.name.clone(),
+                    model: b.keyword.name.clone(),
+                    kind: ConfigFieldKind::Block,
+                },
+                DeclarationKind::Array(a) => ConfigRootField {
+                    name: a.name.name.clone(),
+                    model: a.item_keyword.name.clone(),
+                    kind: ConfigFieldKind::Array,
+                },
+                _ => continue,
+            };
+            if !out.iter().any(|f| f.name == field.name) {
+                out.push(field);
+            }
+        }
+    }
+    out
+}
+
+/// Synthesize the implicit root model whose fields are a config's top-level
+/// declarations. The root's fields carry no directives (classification passes
+/// through to the referenced models). The result must be added to the
+/// `SchemaIndex`'s model set for `diff_config`/`classify` to resolve it.
+pub fn synthesize_config_root(root_name: &str, fields: &[ConfigRootField]) -> ModelDef {
+    let nospan = Span { start: 0, end: 0 };
+    let fields = fields
+        .iter()
+        .map(|f| {
+            let inner = FieldType::ModelRef(f.model.clone());
+            let field_type = match f.kind {
+                ConfigFieldKind::Block => inner,
+                ConfigFieldKind::Array => FieldType::List(Box::new(inner)),
+            };
+            FieldDef {
+                name: f.name.clone(),
+                field_type,
+                optional: true,
+                shorthand: false,
+                default_value: None,
+                directives: Vec::new(),
+                doc: None,
+                span: nospan,
+            }
+        })
+        .collect();
+    ModelDef {
+        name: root_name.to_string(),
+        extends: Vec::new(),
+        fields,
+        span: nospan,
+    }
+}
+
+/// Wrap a config file's top-level declarations as a single `Body` matching the
+/// synthesized root: each block/array becomes a `NestedBlock` keyed by its
+/// synth field name (block keyword / array name). Shared properties are
+/// materialized here (block bodies via `apply_shared_properties`, array items
+/// via `apply_array_shared_properties`) so the differ sees real values (RFC
+/// 0032 P3 contract). `$ENV` is left UNresolved — secret values never transit
+/// the diff (`Value::Secret` compares by variable name).
+pub fn wrap_file_as_body(file: &File) -> Body {
+    let mut entries = Vec::new();
+    for decl in &file.declarations {
+        let (name, body) = match &decl.kind {
+            DeclarationKind::Block(b) => (
+                b.keyword.clone(),
+                crate::resolve::apply_shared_properties(&b.body),
+            ),
+            DeclarationKind::Array(a) => {
+                let items = crate::resolve::apply_array_shared_properties(&a.body);
+                let entries = items
+                    .into_iter()
+                    .map(|i| BodyEntry {
+                        span: i.span,
+                        kind: BodyEntryKind::ListItem(i),
+                    })
+                    .collect();
+                (a.name.clone(), Body { entries })
+            }
+            _ => continue,
+        };
+        entries.push(BodyEntry {
+            span: decl.span,
+            kind: BodyEntryKind::NestedBlock(NestedBlock { name, body }),
+        });
+    }
+    Body { entries }
 }
 
 fn diff_model(
@@ -574,33 +708,47 @@ fn diff_collections(
         // Same-identity elements have no inner structure to diff in a set of
         // scalars; named/bodied pairs recurse below via the ordered path.
     }
-    // Pair by identity (LCS for ordered stability; identity pairing for named)
-    // and recurse into paired bodies for precise leaf paths.
+    // Pair by identity and recurse into paired bodies for precise leaf paths.
+    // Both NAMED elements (`- Google:`) and scalar-shorthand elements that carry
+    // a body (`- "[vendor]-x.v1": egressRate: …`, e.g. `[]install`) recurse: the
+    // element's native identity supplies the path segment. A body present on
+    // only one side diffs against an empty overlay, so an edit that adds or
+    // removes an element's sub-block reports precise leaf add/removes.
     for n in new {
-        if let (ElemId::Name(name), Some(n_body)) = (&n.id, n.body) {
-            if let Some(o) = old.iter().find(|o| o.id.eq(&n.id)) {
-                if let Some(o_body) = o.body {
-                    let elem_path = format!("{path}.{name}");
-                    let o_files = vec![(o.file.map(Path::to_path_buf).unwrap_or_default(), o_body)];
-                    let n_files = vec![(n.file.map(Path::to_path_buf).unwrap_or_default(), n_body)];
-                    if let Some(model) = resolve_instance_model(
-                        index,
-                        elem_type(&field.field_type),
-                        &n_files,
-                        &o_files,
-                    ) {
-                        diff_model(index, model, &o_files, &n_files, &elem_path, depth + 1, out);
-                    }
-                }
-            } else if !is_set(&field.field_type) {
+        let Some(o) = old.iter().find(|o| o.id.eq(&n.id)) else {
+            // A brand-new NAMED element reports as an Added at its leaf path
+            // (unchanged behavior); new scalar elements — bodied or not — fall
+            // to the ordered LCS path below as a whole-element Added, so they
+            // are not double-reported here.
+            if matches!(n.id, ElemId::Name(_)) && !is_set(&field.field_type) {
                 push(
                     field,
-                    &format!("{path}.{name}"),
+                    &format!("{path}.{}", elem_path_seg(&n.id)),
                     ChangeKind::Added { new: n.id.render() },
                     elem_origin(n),
                     out,
                 );
             }
+            continue;
+        };
+        // A paired element with a body on either side recurses (identity is
+        // stable, so this is not an add/remove — the LCS/set passes skip it).
+        if n.body.is_none() && o.body.is_none() {
+            continue;
+        }
+        let elem_path = format!("{path}.{}", elem_path_seg(&n.id));
+        let o_files: Vec<(PathBuf, &Body)> = o
+            .body
+            .map(|b| vec![(o.file.map(Path::to_path_buf).unwrap_or_default(), b)])
+            .unwrap_or_default();
+        let n_files: Vec<(PathBuf, &Body)> = n
+            .body
+            .map(|b| vec![(n.file.map(Path::to_path_buf).unwrap_or_default(), b)])
+            .unwrap_or_default();
+        if let Some(model) =
+            resolve_instance_model(index, elem_type(&field.field_type), &n_files, &o_files)
+        {
+            diff_model(index, model, &o_files, &n_files, &elem_path, depth + 1, out);
         }
     }
     if !is_set(&field.field_type) {
@@ -713,6 +861,20 @@ fn elem_origin(e: &Elem<'_>) -> Origin {
             span: e.span,
         },
         None => Origin::Default,
+    }
+}
+
+/// The dotted-path segment for an element's identity: a name verbatim, a
+/// string-ish scalar by its content (e.g. an `[]install` package key), any
+/// other scalar by its debug form. Used to build precise leaf paths when
+/// recursing into a body-carrying element.
+fn elem_path_seg(id: &ElemId) -> String {
+    match id {
+        ElemId::Name(n) => (*n).to_string(),
+        ElemId::Val(v) => match v {
+            Value::String(s) | Value::Path(s) | Value::Role(s) | Value::Duration(s) => s.clone(),
+            other => format!("{other:?}"),
+        },
     }
 }
 
@@ -1039,6 +1201,130 @@ mod tests {
         assert!(
             d.iter()
                 .any(|c| matches!(&c.kind, ChangeKind::Removed { .. })),
+            "{d:?}"
+        );
+    }
+
+    // -- Multi-root (RFC 0032): whole-config diff via the synthesized root. ----
+
+    const MULTI_SCHEMA: &str = "model egressRate:\n    rate number\n    burst number\n\nmodel install:\n    package string+\n    egressRate egressRate? #live\n\nmodel role:\n    name string+\n    description string?\n\nmodel server:\n    port number = 8080\n    token secret?\n";
+
+    /// The synth root + wrap adapters turn a whole config file (a `server`
+    /// block AND `[]install`/`[]role` arrays) into one `diff_config` call:
+    /// server-block edits, install `egressRate` edits (through a
+    /// scalar-shorthand element body), and role edits all report with
+    /// declaration-prefixed paths and their models' directives — no new diff
+    /// logic, one uniform walk.
+    #[test]
+    fn multi_root_diffs_blocks_and_arrays_uniformly() {
+        let (sch, errs) = crate::cst::extract_schema(MULTI_SCHEMA);
+        assert!(errs.is_empty(), "{errs:?}");
+
+        let old_src = "server Main:\n    port = 8080\n\n[]install plugins:\n    - \"[acme]-x.v1\":\n        egressRate:\n            rate = 100\n            burst = 200\n\n[]role roles:\n    - admin:\n        description = \"a\"\n";
+        let new_src = "server Main:\n    port = 9090\n\n[]install plugins:\n    - \"[acme]-x.v1\":\n        egressRate:\n            rate = 500\n            burst = 200\n\n[]role roles:\n    - admin:\n        description = \"b\"\n";
+        let old_f = parse_doc(old_src);
+        let new_f = parse_doc(new_src);
+
+        let fields = config_root_fields_from_files(&[&old_f, &new_f]);
+        // server (block), plugins (array of install), roles (array of role).
+        assert_eq!(fields.len(), 3, "one field per top-level decl");
+        let root = synthesize_config_root("config", &fields);
+        let mut models = sch.models.clone();
+        models.push(root);
+        let index = SchemaIndex::build(models, sch.enums, sch.oneofs);
+
+        let old_body = wrap_file_as_body(&old_f);
+        let new_body = wrap_file_as_body(&new_f);
+        let d = diff_config(
+            &index,
+            "config",
+            &[(PathBuf::from("nudge.nml"), &old_body)],
+            &[(PathBuf::from("nudge.nml"), &new_body)],
+        );
+
+        // server.port changed (declaration-prefixed).
+        let port = d.iter().find(|c| c.path == "server.port").expect("port");
+        assert!(matches!(&port.kind, ChangeKind::Modified { .. }));
+
+        // install egressRate.rate reported at a precise leaf through the
+        // scalar-shorthand element body. (The #live directive sits on the
+        // `egressRate` container field, so LEAF changes carry no directive of
+        // their own — the consumer classifies leaves by the nearest-directive
+        // walk, `classify_path`, exercised on the nudge side.)
+        let rate = d
+            .iter()
+            .find(|c| c.path == "plugins.[acme]-x.v1.egressRate.rate")
+            .unwrap_or_else(|| panic!("install leaf path missing: {d:?}"));
+        assert!(matches!(&rate.kind, ChangeKind::Modified { .. }));
+
+        // role edit reports (restart-class — no directive rides).
+        let role = d
+            .iter()
+            .find(|c| c.path == "roles.admin.description")
+            .unwrap_or_else(|| panic!("role leaf path missing: {d:?}"));
+        assert!(matches!(&role.kind, ChangeKind::Modified { .. }));
+        assert!(role.directives.is_empty());
+
+        // Exactly those three semantic changes — nothing spurious (burst
+        // unchanged, package identity stable).
+        assert_eq!(d.len(), 3, "{d:?}");
+    }
+
+    /// Adding an `egressRate` sub-block to a previously bare `[]install` entry
+    /// (body on the NEW side only) reports its leaves as Added — the
+    /// one-sided-body overlay path.
+    #[test]
+    fn multi_root_install_body_added_to_bare_entry() {
+        let (sch, errs) = crate::cst::extract_schema(MULTI_SCHEMA);
+        assert!(errs.is_empty(), "{errs:?}");
+        let old_f = parse_doc("[]install plugins:\n    - \"[acme]-x.v1\"\n");
+        let new_f = parse_doc(
+            "[]install plugins:\n    - \"[acme]-x.v1\":\n        egressRate:\n            rate = 5\n            burst = 10\n",
+        );
+        let fields = config_root_fields_from_files(&[&old_f, &new_f]);
+        let root = synthesize_config_root("config", &fields);
+        let mut models = sch.models.clone();
+        models.push(root);
+        let index = SchemaIndex::build(models, sch.enums, sch.oneofs);
+        let (ob, nb) = (wrap_file_as_body(&old_f), wrap_file_as_body(&new_f));
+        let d = diff_config(
+            &index,
+            "config",
+            &[(PathBuf::from("nudge.nml"), &ob)],
+            &[(PathBuf::from("nudge.nml"), &nb)],
+        );
+        assert!(
+            d.iter()
+                .any(|c| c.path == "plugins.[acme]-x.v1.egressRate.rate"
+                    && matches!(&c.kind, ChangeKind::Added { .. })),
+            "bare→bodied install add reports leaf Added: {d:?}"
+        );
+    }
+
+    /// A brand-new whole `[]install` entry reports as one Added at the array
+    /// field (whole-element, not itemized) — ordered-list semantics preserved.
+    #[test]
+    fn multi_root_new_install_entry_is_one_added() {
+        let (sch, errs) = crate::cst::extract_schema(MULTI_SCHEMA);
+        assert!(errs.is_empty(), "{errs:?}");
+        let old_f = parse_doc("[]install plugins:\n    - \"[acme]-x.v1\"\n");
+        let new_f = parse_doc("[]install plugins:\n    - \"[acme]-x.v1\"\n    - \"[acme]-y.v1\"\n");
+        let fields = config_root_fields_from_files(&[&old_f, &new_f]);
+        let root = synthesize_config_root("config", &fields);
+        let mut models = sch.models.clone();
+        models.push(root);
+        let index = SchemaIndex::build(models, sch.enums, sch.oneofs);
+        let (ob, nb) = (wrap_file_as_body(&old_f), wrap_file_as_body(&new_f));
+        let d = diff_config(
+            &index,
+            "config",
+            &[(PathBuf::from("nudge.nml"), &ob)],
+            &[(PathBuf::from("nudge.nml"), &nb)],
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].path, "plugins");
+        assert!(
+            matches!(&d[0].kind, ChangeKind::Added { new } if new.semantic_eq(&Value::String("[acme]-y.v1".into()))),
             "{d:?}"
         );
     }
