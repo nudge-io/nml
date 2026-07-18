@@ -58,6 +58,7 @@ pub mod ast;
 pub mod cst;
 pub mod de;
 pub mod defaults;
+pub mod diff;
 pub mod error;
 pub mod identity;
 pub mod model;

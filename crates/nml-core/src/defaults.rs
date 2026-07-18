@@ -202,7 +202,9 @@ impl<'a> Defaulter<'a> {
         let Some(field) = model.fields.iter().find(|f| f.name == field_name) else {
             return nb_body.clone();
         };
-        if let FieldType::List(inner) = &field.field_type {
+        // A set's items default exactly like a list's (RFC 0032): element
+        // instances get their model defaults; uniqueness is validation's job.
+        if let FieldType::List(inner) | FieldType::Set(inner) = &field.field_type {
             return self.list_body(inner, nb_body, depth + 1);
         }
         match self.index.resolve_field(field) {
@@ -211,6 +213,7 @@ impl<'a> Defaulter<'a> {
             // Arm bodies carry only selectors and reference targets (RFC
             // 0007) — nothing to default.
             FieldTarget::ListOf(_)
+            | FieldTarget::SetOf(_)
             | FieldTarget::Object
             | FieldTarget::Union
             | FieldTarget::Arms { .. }
@@ -236,11 +239,13 @@ impl<'a> Defaulter<'a> {
         match target {
             FieldTarget::Model(m) => self.model_body(m, body, depth),
             FieldTarget::OneOf(o) => self.oneof_body(o, body, depth),
-            FieldTarget::ListOf(inner) => map_named_items(body, |item_body| match inner.as_ref() {
-                FieldTarget::Model(m) => self.model_body(m, item_body, depth + 1),
-                FieldTarget::OneOf(o) => self.oneof_body(o, item_body, depth + 1),
-                _ => item_body.clone(),
-            }),
+            FieldTarget::ListOf(inner) | FieldTarget::SetOf(inner) => {
+                map_named_items(body, |item_body| match inner.as_ref() {
+                    FieldTarget::Model(m) => self.model_body(m, item_body, depth + 1),
+                    FieldTarget::OneOf(o) => self.oneof_body(o, item_body, depth + 1),
+                    _ => item_body.clone(),
+                })
+            }
             FieldTarget::Object
             | FieldTarget::Union
             | FieldTarget::Arms { .. }
@@ -260,7 +265,9 @@ impl<'a> Defaulter<'a> {
         }
         // The authored discriminator *value*, if the property is present at all.
         let authored = body.entries.iter().find_map(|e| match &e.kind {
-            BodyEntryKind::Property(p) if p.name.name == oneof.discriminator => Some(&p.value.value),
+            BodyEntryKind::Property(p) if p.name.name == oneof.discriminator => {
+                Some(&p.value.value)
+            }
             _ => None,
         });
         // Resolve the effective discriminator and whether it must be injected.
@@ -519,21 +526,37 @@ mod tests {
         let idx = index_from(
             "model prompt:\n    outputFormat string = \"text\"\n    temperature number = 0.7\n",
         );
-        let out = apply_defaults(&idx, "prompt", &body_of("prompt P:\n    temperature = 0.9\n"));
-        assert_eq!(prop(&out, "outputFormat"), Some(&Value::String("text".into())));
+        let out = apply_defaults(
+            &idx,
+            "prompt",
+            &body_of("prompt P:\n    temperature = 0.9\n"),
+        );
+        assert_eq!(
+            prop(&out, "outputFormat"),
+            Some(&Value::String("text".into()))
+        );
         assert_eq!(prop(&out, "temperature"), Some(&Value::number(0.9)));
     }
 
     #[test]
     fn explicit_value_wins_over_default() {
         let idx = index_from("model prompt:\n    outputFormat string = \"text\"\n");
-        let out = apply_defaults(&idx, "prompt", &body_of("prompt P:\n    outputFormat = \"json\"\n"));
-        assert_eq!(prop(&out, "outputFormat"), Some(&Value::String("json".into())));
+        let out = apply_defaults(
+            &idx,
+            "prompt",
+            &body_of("prompt P:\n    outputFormat = \"json\"\n"),
+        );
+        assert_eq!(
+            prop(&out, "outputFormat"),
+            Some(&Value::String("json".into()))
+        );
         // Exactly one outputFormat entry — the default did not duplicate it.
         let count = out
             .entries
             .iter()
-            .filter(|e| matches!(&e.kind, BodyEntryKind::Property(p) if p.name.name == "outputFormat"))
+            .filter(
+                |e| matches!(&e.kind, BodyEntryKind::Property(p) if p.name.name == "outputFormat"),
+            )
             .count();
         assert_eq!(count, 1);
     }
@@ -584,12 +607,19 @@ mod tests {
         let idx = index_from(
             "model inner:\n    required string\n    a string = \"x\"\n\nmodel outer:\n    sub inner\n",
         );
-        let out = apply_defaults(&idx, "outer", &body_of("outer O:\n    sub:\n        required = \"r\"\n"));
+        let out = apply_defaults(
+            &idx,
+            "outer",
+            &body_of("outer O:\n    sub:\n        required = \"r\"\n"),
+        );
         // Present sub recurses (a injected), but an absent sub would NOT be materialized.
         assert!(nested(&out, "sub").is_some());
 
         let out2 = apply_defaults(&idx, "outer", &body_of("outer O:\n    other = \"z\"\n"));
-        assert!(nested(&out2, "sub").is_none(), "non-defaultable model must not be materialized");
+        assert!(
+            nested(&out2, "sub").is_none(),
+            "non-defaultable model must not be materialized"
+        );
     }
 
     #[test]
@@ -600,8 +630,14 @@ mod tests {
         let src = "flow F:\n    steps:\n        - StepA:\n            retries = 5\n        - StepB:\n            other = \"x\"\n";
         let out = apply_defaults(&idx, "flow", &body_of(src));
         let steps = nested(&out, "steps").expect("steps block");
-        assert_eq!(prop(item(steps, "StepA").unwrap(), "retries"), Some(&Value::number(5.0)));
-        assert_eq!(prop(item(steps, "StepB").unwrap(), "retries"), Some(&Value::number(3.0)));
+        assert_eq!(
+            prop(item(steps, "StepA").unwrap(), "retries"),
+            Some(&Value::number(5.0))
+        );
+        assert_eq!(
+            prop(item(steps, "StepB").unwrap(), "retries"),
+            Some(&Value::number(3.0))
+        );
     }
 
     #[test]
@@ -630,7 +666,11 @@ mod tests {
         let idx = index_from(
             "model emailLog:\n    level string = \"info\"\n\nmodel emailPostmark:\n    serverToken string\n\noneof email by provider:\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n",
         );
-        let out = apply_defaults(&idx, "email", &body_of("email E:\n    provider = \"log\"\n"));
+        let out = apply_defaults(
+            &idx,
+            "email",
+            &body_of("email E:\n    provider = \"log\"\n"),
+        );
         assert_eq!(prop(&out, "provider"), Some(&Value::String("log".into())));
         assert_eq!(prop(&out, "level"), Some(&Value::String("info".into())));
     }
@@ -653,10 +693,20 @@ mod tests {
             "model emailLog:\n    level string = \"info\"\n\nmodel emailPostmark:\n    serverToken string = \"t\"\n\noneof email by provider = \"log\":\n    \"log\" -> emailLog\n    \"postmark\" -> emailPostmark\n",
         );
         // Authored `provider = "postmark"` must win over the default `"log"`.
-        let out = apply_defaults(&idx, "email", &body_of("email E:\n    provider = \"postmark\"\n"));
-        assert_eq!(prop(&out, "provider"), Some(&Value::String("postmark".into())));
+        let out = apply_defaults(
+            &idx,
+            "email",
+            &body_of("email E:\n    provider = \"postmark\"\n"),
+        );
+        assert_eq!(
+            prop(&out, "provider"),
+            Some(&Value::String("postmark".into()))
+        );
         assert_eq!(prop(&out, "serverToken"), Some(&Value::String("t".into())));
-        assert!(prop(&out, "level").is_none(), "log-variant field must not appear");
+        assert!(
+            prop(&out, "level").is_none(),
+            "log-variant field must not appear"
+        );
     }
 
     #[test]
@@ -672,7 +722,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(&e.kind, BodyEntryKind::Property(p) if p.name.name == "provider"))
             .count();
-        assert_eq!(provider_count, 1, "must not inject a duplicate discriminator");
+        assert_eq!(
+            provider_count, 1,
+            "must not inject a duplicate discriminator"
+        );
         assert!(
             prop(&out, "level").is_none(),
             "no variant defaulting for an invalid discriminator"
@@ -703,7 +756,10 @@ mod tests {
             "model emailLog:\n    level string = \"info\"\n\noneof email by provider:\n    \"log\" -> emailLog\n",
         );
         let out = apply_defaults(&idx, "email", &body_of("email E:\n    unrelated = \"z\"\n"));
-        assert!(prop(&out, "level").is_none(), "no variant chosen without a discriminator");
+        assert!(
+            prop(&out, "level").is_none(),
+            "no variant chosen without a discriminator"
+        );
     }
 
     #[test]
@@ -718,7 +774,11 @@ mod tests {
     #[test]
     fn object_field_is_passed_through() {
         let idx = index_from("model cfg:\n    meta object\n");
-        let out = apply_defaults(&idx, "cfg", &body_of("cfg C:\n    meta:\n        anything = \"x\"\n"));
+        let out = apply_defaults(
+            &idx,
+            "cfg",
+            &body_of("cfg C:\n    meta:\n        anything = \"x\"\n"),
+        );
         let meta = nested(&out, "meta").expect("meta preserved");
         assert_eq!(prop(meta, "anything"), Some(&Value::String("x".into())));
     }
@@ -732,12 +792,20 @@ mod tests {
         let depth = 40;
         let mut src = format!("model l{depth}:\n    v string = \"x\"\n\n");
         for i in (0..depth).rev() {
-            src.push_str(&format!("model l{i}:\n    a l{}\n    b l{}\n\n", i + 1, i + 1));
+            src.push_str(&format!(
+                "model l{i}:\n    a l{}\n    b l{}\n\n",
+                i + 1,
+                i + 1
+            ));
         }
         let idx = index_from(&src);
         // l0 is fully defaultable; materializing an empty instance must terminate
         // and stay within the budget rather than emitting 2^40 blocks.
-        let out = apply_defaults(&idx, "l0", &body_of("l0 X:\n    a:\n        v = \"keep\"\n"));
+        let out = apply_defaults(
+            &idx,
+            "l0",
+            &body_of("l0 X:\n    a:\n        v = \"keep\"\n"),
+        );
         let nodes = count_nested(&out);
         assert!(
             nodes <= MAX_MATERIALIZED_MODELS as usize + 8,
@@ -776,12 +844,15 @@ mod tests {
         let idx = index_from(
             "model svc:\n    apiKey string = $ENV.DEFAULT_KEY\n    region string = \"us\"\n",
         );
-        let resolver = ValueResolver::new(|k| {
-            (k == "DEFAULT_KEY").then(|| "resolved-secret".to_string())
-        });
-        let svc: Svc =
-            from_body_defaulted(&idx, "svc", &body_of("svc S:\n    region = \"eu\"\n"), &resolver)
-                .unwrap();
+        let resolver =
+            ValueResolver::new(|k| (k == "DEFAULT_KEY").then(|| "resolved-secret".to_string()));
+        let svc: Svc = from_body_defaulted(
+            &idx,
+            "svc",
+            &body_of("svc S:\n    region = \"eu\"\n"),
+            &resolver,
+        )
+        .unwrap();
         assert_eq!(svc.api_key, "resolved-secret");
         assert_eq!(svc.region, "eu");
     }
@@ -840,7 +911,10 @@ mod tests {
             "workflow W:\n    .token = $ENV.MISSING\n    - StepA:\n        token = \"explicit\"\n",
         );
         let resolver = ValueResolver::new(|_| None);
-        assert!(resolver.resolve_body(&body).is_err(), "resolve-first fails on the shared secret");
+        assert!(
+            resolver.resolve_body(&body).is_err(),
+            "resolve-first fails on the shared secret"
+        );
         let shared = apply_shared_properties(&body);
         assert!(
             resolver.resolve_body(&shared).is_ok(),

@@ -14,6 +14,16 @@ readme = "../../README.md"
 # Schema extraction runs over the RFC 0004 CST (`cst::extract_schema`); the
 # inheritance/cycle passes operate on the resulting `ExtractedSchema` data.
 nml-core = { workspace = true }
+# Content-addressed package identity (RFC 0030): the store, pins, and parity
+# checks compare blake3 hashes of the framed manifest+sources byte stream.
+blake3 = "1"
+# Locates the per-user schema-package store (XDG / Application Support).
+dirs = "5"
+
+[features]
+# Shared test fixtures (demo package manifest/sources, publish helpers) for
+# downstream crates' test suites. Never enabled in production builds.
+test-support = []
 
 [dev-dependencies]
 # Only the validator/`de` agreement test deserializes through `nml-core::de`.

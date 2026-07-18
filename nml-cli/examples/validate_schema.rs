@@ -23,7 +23,7 @@ service MyApp:
 
     // `load_schema` runs the full pipeline over the CST (extraction, inheritance,
     // cycle/duplicate detection) and reports any schema problem as a diagnostic.
-    let (schema, schema_diags) = load_schema(&[schema_source]);
+    let (schema, schema_diags) = load_schema(&[("schema.model.nml", schema_source)]);
     for d in &schema_diags {
         println!("schema: [{}] {}", d.severity, d.message);
     }
@@ -33,8 +33,7 @@ service MyApp:
         schema.enums.len()
     );
 
-    let config_file =
-        nml_core::cst::parse_to_ast(config_source).expect("failed to parse config");
+    let config_file = nml_core::cst::parse_to_ast(config_source).expect("failed to parse config");
     let validator = SchemaValidator::from(schema);
     let diagnostics = validator.validate(&config_file);
 

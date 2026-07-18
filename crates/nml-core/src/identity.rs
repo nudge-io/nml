@@ -33,7 +33,9 @@ const NAME_FIELD: &str = "name";
 
 /// Seed for a bodyless scalar item (`- "/api"`): the shorthand value is injected into
 /// this empty body, producing a one-property instance.
-const EMPTY_BODY: Body = Body { entries: Vec::new() };
+const EMPTY_BODY: Body = Body {
+    entries: Vec::new(),
+};
 
 /// Bounds recursion into nested structure, mirroring the defaulter's
 /// `MAX_DEFAULT_DEPTH`. The pass runs on untrusted instance bodies.
@@ -70,7 +72,11 @@ pub fn materialize_named(name: &Identifier, body: &Body, model: &ModelDef) -> Ma
     } else {
         body.clone()
     };
-    Materialized { body, diagnostics: Vec::new(), validatable: true }
+    Materialized {
+        body,
+        diagnostics: Vec::new(),
+        validatable: true,
+    }
 }
 
 /// Materialize `item`'s identity into its body against `model`. See the module docs.
@@ -80,66 +86,74 @@ pub fn materialize_item(item: &ListItem, model: &ModelDef) -> Materialized {
         // Scalar key → the shorthand (`!`) field, injected into the item's body (the
         // optional `- "/api": <body>` form) or a fresh one. No `!` field ⇒ dropped key,
         // and the item has no placement, so it is not validatable.
-        ListItemKind::Shorthand { value, body } => match model.fields.iter().find(|f| f.shorthand) {
-            // A bare arm-set shorthand field (RFC 0007 §4.3 ⑤): the scalar
-            // fills it via the canonical embedding `s ⇒ [else -> s]` — a
-            // one-arm block whose `else` target mirrors the scalar's form,
-            // exactly as the arm block itself distinguishes `-> Foo` from
-            // `-> "foo"`. A scalar with no name/string form (e.g. a number)
-            // is surfaced as loudly as the plain-scalar path's downstream
-            // type error would be — never a silent empty target.
-            Some(field) if matches!(field.field_type, FieldType::Arms { .. }) => {
-                match arm_fill_target(value) {
-                    Some(target) => Materialized {
-                        body: inject_arm(
-                            body.as_ref().unwrap_or(&EMPTY_BODY),
-                            &field.name,
-                            target,
-                            value.span,
-                        ),
-                        diagnostics: Vec::new(),
-                        validatable: true,
-                    },
-                    None => Materialized {
-                        body: Body { entries: Vec::new() },
-                        diagnostics: vec![error(
-                            format!(
-                                "a {} cannot fill the arm-set shorthand field '{}' on model \
-                                 '{}' (an arm target is a name or a string)",
-                                value.value.type_name(),
-                                field.name,
-                                model.name
+        ListItemKind::Shorthand { value, body } => {
+            match model.fields.iter().find(|f| f.shorthand) {
+                // A bare arm-set shorthand field (RFC 0007 §4.3 ⑤): the scalar
+                // fills it via the canonical embedding `s ⇒ [else -> s]` — a
+                // one-arm block whose `else` target mirrors the scalar's form,
+                // exactly as the arm block itself distinguishes `-> Foo` from
+                // `-> "foo"`. A scalar with no name/string form (e.g. a number)
+                // is surfaced as loudly as the plain-scalar path's downstream
+                // type error would be — never a silent empty target.
+                Some(field) if matches!(field.field_type, FieldType::Arms { .. }) => {
+                    match arm_fill_target(value) {
+                        Some(target) => Materialized {
+                            body: inject_arm(
+                                body.as_ref().unwrap_or(&EMPTY_BODY),
+                                &field.name,
+                                target,
+                                value.span,
                             ),
-                            value.span,
-                        )],
-                        validatable: false,
-                    },
+                            diagnostics: Vec::new(),
+                            validatable: true,
+                        },
+                        None => Materialized {
+                            body: Body {
+                                entries: Vec::new(),
+                            },
+                            diagnostics: vec![error(
+                                format!(
+                                    "a {} cannot fill the arm-set shorthand field '{}' on model \
+                                 '{}' (an arm target is a name or a string)",
+                                    value.value.type_name(),
+                                    field.name,
+                                    model.name
+                                ),
+                                value.span,
+                            )],
+                            validatable: false,
+                        },
+                    }
                 }
-            }
-            Some(field) => Materialized {
-                body: inject(
-                    body.as_ref().unwrap_or(&EMPTY_BODY),
-                    &field.name,
-                    value.clone(),
-                ),
-                diagnostics: Vec::new(),
-                validatable: true,
-            },
-            None => Materialized {
-                body: Body { entries: Vec::new() },
-                diagnostics: vec![error(
-                    format!(
-                        "the value has no shorthand field on model '{}' and would be dropped",
-                        model.name
+                Some(field) => Materialized {
+                    body: inject(
+                        body.as_ref().unwrap_or(&EMPTY_BODY),
+                        &field.name,
+                        value.clone(),
                     ),
-                    value.span,
-                )],
-                validatable: false,
-            },
-        },
+                    diagnostics: Vec::new(),
+                    validatable: true,
+                },
+                None => Materialized {
+                    body: Body {
+                        entries: Vec::new(),
+                    },
+                    diagnostics: vec![error(
+                        format!(
+                            "the value has no shorthand field on model '{}' and would be dropped",
+                            model.name
+                        ),
+                        value.span,
+                    )],
+                    validatable: false,
+                },
+            }
+        }
         // Links — never materialized, never validated as inline instances.
         ListItemKind::Reference(_) | ListItemKind::Role(_) => Materialized {
-            body: Body { entries: Vec::new() },
+            body: Body {
+                entries: Vec::new(),
+            },
             diagnostics: Vec::new(),
             validatable: false,
         },
@@ -307,7 +321,9 @@ impl Positionalizer<'_> {
     /// leaves the body unchanged.
     fn oneof_body(&self, oneof: &OneOfDef, body: &Body, depth: u32) -> Body {
         let authored = body.entries.iter().find_map(|e| match &e.kind {
-            BodyEntryKind::Property(p) if p.name.name == oneof.discriminator => p.value.value.as_str(),
+            BodyEntryKind::Property(p) if p.name.name == oneof.discriminator => {
+                p.value.value.as_str()
+            }
             _ => None,
         });
         let Some(disc) = authored.or(oneof.default_discriminator.as_deref()) else {
@@ -343,7 +359,9 @@ impl Positionalizer<'_> {
         // Resolve the element model. For a union list this is body-dependent; a
         // bodyless scalar can't select a variant, so it falls through unchanged
         // (scalar-on-union is out of scope, flagged by the validator — §10).
-        let empty = Body { entries: Vec::new() };
+        let empty = Body {
+            entries: Vec::new(),
+        };
         let probe = item_body(item).unwrap_or(&empty);
         let FieldTarget::Model(m) = self.index.resolve_type_in_body(inner, probe) else {
             return item.clone();
@@ -406,18 +424,28 @@ mod tests {
             optional: false,
             shorthand,
             default_value: None,
+            directives: Vec::new(),
+            doc: None,
             span: s(),
         }
     }
 
     fn model(fields: Vec<FieldDef>) -> ModelDef {
-        ModelDef { name: "m".into(), extends: vec![], fields, span: s() }
+        ModelDef {
+            name: "m".into(),
+            extends: vec![],
+            fields,
+            span: s(),
+        }
     }
 
     fn named(name: &str, body: Body) -> ListItem {
         ListItem {
             span: s(),
-            kind: ListItemKind::Named { name: Identifier::new(name, s()), body },
+            kind: ListItemKind::Named {
+                name: Identifier::new(name, s()),
+                body,
+            },
         }
     }
 
@@ -464,7 +492,12 @@ mod tests {
         // Lenient: an explicit `name` overrides the key — no diagnostic, explicit value
         // retained (matching `de`'s `has_explicit_name`).
         let m = model(vec![fd("name", false)]);
-        let item = named("editor", Body { entries: vec![prop("name", "other")] });
+        let item = named(
+            "editor",
+            Body {
+                entries: vec![prop("name", "other")],
+            },
+        );
         let r = materialize_item(&item, &m);
         assert!(r.diagnostics.is_empty() && r.validatable);
         assert_eq!(name_value(&r.body), Some("other"));
@@ -475,7 +508,10 @@ mod tests {
         let m = model(vec![fd("name", false), fd("path", true)]);
         let item = ListItem {
             span: s(),
-            kind: ListItemKind::Shorthand { value: SpannedValue::new(Value::String("/api".into()), s()), body: None },
+            kind: ListItemKind::Shorthand {
+                value: SpannedValue::new(Value::String("/api".into()), s()),
+                body: None,
+            },
         };
         let r = materialize_item(&item, &m);
         assert!(r.diagnostics.is_empty() && r.validatable);
@@ -527,7 +563,9 @@ mod tests {
         assert!(r.diagnostics.is_empty() && r.validatable);
         let arm = arm_of(&r.body);
         assert!(matches!(arm.selector, ArmSelector::Else));
-        assert!(matches!(arm.target, ArmTarget::Literal { value, .. } if value == "x.workflow.nml"));
+        assert!(
+            matches!(arm.target, ArmTarget::Literal { value, .. } if value == "x.workflow.nml")
+        );
 
         // Bare name → `else -> Fallback` (reference).
         let ref_item = ListItem {
@@ -621,13 +659,18 @@ mod tests {
         let m = model(vec![fd("name", false)]);
         let item = ListItem {
             span: s(),
-            kind: ListItemKind::Shorthand { value: SpannedValue::new(Value::String("/api".into()), s()), body: None },
+            kind: ListItemKind::Shorthand {
+                value: SpannedValue::new(Value::String("/api".into()), s()),
+                body: None,
+            },
         };
         let r = materialize_item(&item, &m);
         // Dropped key → flagged AND not validatable (so the caller won't add noise).
         assert!(!r.validatable);
         assert_eq!(r.diagnostics.len(), 1);
-        let NmlError::Validation { message, .. } = &r.diagnostics[0] else { panic!() };
+        let NmlError::Validation { message, .. } = &r.diagnostics[0] else {
+            panic!()
+        };
         assert!(message.contains("no shorthand field"), "{message}");
     }
 }

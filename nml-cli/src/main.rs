@@ -77,8 +77,8 @@ fn cmd_parse(args: &[String]) -> Result<(), String> {
     let source = read_file(&path)?;
 
     let file = parse_or_report_all(&path, &source)?;
-    let json = serde_json::to_string_pretty(&file)
-        .map_err(|e| format!("serialization error: {e}"))?;
+    let json =
+        serde_json::to_string_pretty(&file).map_err(|e| format!("serialization error: {e}"))?;
     println!("{json}");
     Ok(())
 }
@@ -238,8 +238,21 @@ fn load_schema_dir(dir: &PathBuf) -> Result<(ExtractedSchema, Vec<Diagnostic>), 
     // Read every schema source; `load_schema` parses over the CST and surfaces
     // any parse error as a diagnostic (reported alongside cycle/duplicate
     // diagnostics) rather than aborting on the first malformed file.
-    let sources = paths.iter().map(read_file).collect::<Result<Vec<String>, _>>()?;
-    let refs: Vec<&str> = sources.iter().map(String::as_str).collect();
+    let sources = paths
+        .iter()
+        .map(read_file)
+        .collect::<Result<Vec<String>, _>>()?;
+    // Named sources (RFC 0030): diagnostics attribute the offending file.
+    let refs: Vec<(&str, &str)> = paths
+        .iter()
+        .zip(&sources)
+        .map(|(p, s)| {
+            (
+                p.file_name().and_then(|n| n.to_str()).unwrap_or("schema"),
+                s.as_str(),
+            )
+        })
+        .collect();
     Ok(nml_validate::loader::load_schema(&refs))
 }
 

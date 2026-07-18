@@ -16,9 +16,11 @@
 //!
 //! Public surface: `parse` (→ lossless `Parse`), `parse_to_ast` /
 //! `parse_to_ast_all` (→ semantic `ast`), `parse_with_comments`,
-//! `extract_schema`, and the `ast` / `extract` / `lower` layers.
+//! `extract_schema`, the `ast` / `extract` / `lower` layers, and `edit`
+//! (structural green-tree splicing, RFC 0030 P2).
 
 pub mod ast;
+pub mod edit;
 pub mod extract;
 mod lexer;
 pub mod lower;
@@ -229,9 +231,9 @@ fn is_own_line(tok: &SyntaxToken) -> bool {
     let mut prev = tok.prev_token();
     while let Some(t) = prev {
         match t.kind() {
-            SyntaxKind::Newline => return true,        // reached line start
+            SyntaxKind::Newline => return true, // reached line start
             SyntaxKind::Whitespace => prev = t.prev_token(),
-            _ => return false,                         // code precedes it → trailing
+            _ => return false, // code precedes it → trailing
         }
     }
     true // start of file
@@ -285,7 +287,10 @@ mod tests {
         // Valid input → semantic AST.
         let file = parse_to_ast("service App:\n    port = 8080\n").unwrap();
         assert_eq!(file.declarations.len(), 1);
-        assert!(matches!(file.declarations[0].kind, DeclarationKind::Block(_)));
+        assert!(matches!(
+            file.declarations[0].kind,
+            DeclarationKind::Block(_)
+        ));
         // Invalid input → Err (the first error).
         assert!(parse_to_ast("service App:\n    @@@\n").is_err());
     }
@@ -295,9 +300,9 @@ mod tests {
         // The CST defers value validation to decode; the drop-in re-surfaces it,
         // so these all error.
         for src in [
-            "service App:\n    p = 9.999 USD\n",  // money precision (USD has 2 dp)
+            "service App:\n    p = 9.999 USD\n", // money precision (USD has 2 dp)
             "service App:\n    s = \"bad \\q\"\n", // unknown escape
-            "service App:\n    k = $NOPE.X\n",    // unknown secret namespace
+            "service App:\n    k = $NOPE.X\n",   // unknown secret namespace
             "service App:\n    items = [9.999 USD]\n", // nested (inside an array)
         ] {
             assert!(parse_to_ast(src).is_err(), "should error: {src:?}");
@@ -311,7 +316,11 @@ mod tests {
         // no number) are each ONE problem → ONE error.
         for src in ["service App:\n    x =\n", "service App:\n    y = -\n"] {
             let (_ast, errors) = parse_to_ast_all(src);
-            assert_eq!(errors.len(), 1, "one problem → one error for {src:?}: {errors:?}");
+            assert_eq!(
+                errors.len(),
+                1,
+                "one problem → one error for {src:?}: {errors:?}"
+            );
             // The single error is the parser's syntactic one, not a duplicate
             // "empty value" decode error (which would be earlier by position).
             assert!(!errors[0].message().contains("empty value"));
@@ -371,10 +380,25 @@ mod tests {
         // leading of the FOLLOWING declaration, not trapped in the preceding body.
         let src = "service A:\n    p = 1\n// between\nservice B:\n    q = 2\n";
         let p = parse(src);
-        assert_eq!(p.syntax().text().to_string(), src, "deferral stays lossless");
-        let parent = comment_with(&p.syntax(), "between").parent().unwrap().kind();
-        assert_ne!(parent, SyntaxKind::Body, "must not attach to the closing body");
-        assert_eq!(parent, SyntaxKind::BlockDecl, "own-line → following declaration");
+        assert_eq!(
+            p.syntax().text().to_string(),
+            src,
+            "deferral stays lossless"
+        );
+        let parent = comment_with(&p.syntax(), "between")
+            .parent()
+            .unwrap()
+            .kind();
+        assert_ne!(
+            parent,
+            SyntaxKind::Body,
+            "must not attach to the closing body"
+        );
+        assert_eq!(
+            parent,
+            SyntaxKind::BlockDecl,
+            "own-line → following declaration"
+        );
     }
 
     #[test]
@@ -392,7 +416,10 @@ mod tests {
             "same-line trailing → preceding value"
         );
         assert_eq!(
-            comment_with(&p.syntax(), "between").parent().unwrap().kind(),
+            comment_with(&p.syntax(), "between")
+                .parent()
+                .unwrap()
+                .kind(),
             SyntaxKind::BlockDecl,
             "own-line before dedent → following declaration"
         );
@@ -420,11 +447,19 @@ mod tests {
         // middle-level property) — not fall through to the outermost following decl.
         let src = "service A:\n    group:\n        x = 1\n    // mid\n    y = 2\n";
         let p = parse(src);
-        assert_eq!(p.syntax().text().to_string(), src, "multi-level deferral is lossless");
+        assert_eq!(
+            p.syntax().text().to_string(),
+            src,
+            "multi-level deferral is lossless"
+        );
         let parent = comment_with(&p.syntax(), "mid").parent().unwrap();
         // It leads the following middle-scope property `y` — having escaped the
         // inner (col-8) body but stopped short of the outermost following decl.
-        assert_eq!(parent.kind(), SyntaxKind::Property, "own-line → following property");
+        assert_eq!(
+            parent.kind(),
+            SyntaxKind::Property,
+            "own-line → following property"
+        );
         assert!(
             parent.text().to_string().contains("y = 2"),
             "must lead the middle-scope property y, got: {:?}",
@@ -439,11 +474,11 @@ mod tests {
         // deferred comment were stranded (its scope never reopening), tree text
         // would diverge from source — assert it never does.
         for src in [
-            "a:\n    b:\n        x = 1\n// c",       // col-0, deep nesting, no trailing nl
-            "a:\n    b:\n        x = 1\n// c\n",      // …with trailing nl
-            "a:\n    b:\n        x = 1\n    // mid",  // mid-column comment at EOF
-            "a:\n    p = 1\n// c1\n// c2",            // multi-line block at EOF
-            "a:\n    b:\n        x = 1\n  // c\n",    // comment at an unaligned column
+            "a:\n    b:\n        x = 1\n// c", // col-0, deep nesting, no trailing nl
+            "a:\n    b:\n        x = 1\n// c\n", // …with trailing nl
+            "a:\n    b:\n        x = 1\n    // mid", // mid-column comment at EOF
+            "a:\n    p = 1\n// c1\n// c2",     // multi-line block at EOF
+            "a:\n    b:\n        x = 1\n  // c\n", // comment at an unaligned column
         ] {
             let p = parse(src);
             assert_eq!(
@@ -482,9 +517,14 @@ mod tests {
         let src = "model m:\n    x number = 9.999 USD\n";
         let errors = extract_schema(src).1;
         assert!(
-            errors.iter().any(|e| e.message().contains("decimal places")),
+            errors
+                .iter()
+                .any(|e| e.message().contains("decimal places")),
             "semantic default error must surface: {:?}",
-            errors.iter().map(|e| e.message().to_string()).collect::<Vec<_>>()
+            errors
+                .iter()
+                .map(|e| e.message().to_string())
+                .collect::<Vec<_>>()
         );
         // Parity with the canonical all-errors entry point.
         assert_eq!(errors.len(), parse_to_ast_all(src).1.len());
@@ -511,8 +551,7 @@ mod tests {
     fn parse_with_comments_extracts_from_tree() {
         // Same fixture as the legacy lexer's comment test — own-line vs trailing
         // placement must match.
-        let src =
-            "// header\nservice App: // trailing\n    // indented\n    port = 8080 // why\n";
+        let src = "// header\nservice App: // trailing\n    // indented\n    port = 8080 // why\n";
         let (file, comments) = parse_with_comments(src).unwrap();
         assert_eq!(file.declarations.len(), 1);
         assert_eq!(comments.len(), 4);
@@ -535,7 +574,11 @@ mod tests {
             src.push_str(&format!("    k{i} = 9.999 USD\n"));
         }
         let (_ast, errors) = parse_to_ast_all(&src);
-        assert!(errors.len() <= MAX_ERRORS, "unbounded error output: {}", errors.len());
+        assert!(
+            errors.len() <= MAX_ERRORS,
+            "unbounded error output: {}",
+            errors.len()
+        );
     }
 
     #[test]
@@ -544,13 +587,22 @@ mod tests {
         // surfaced at once (exceeding legacy's first-error-only), position-sorted.
         let src = "service App:\n    p = 9.999 USD\n    q = $NOPE.X\n    @@@\n";
         let (_ast, errors) = parse_to_ast_all(src);
-        assert!(errors.len() >= 3, "expected ≥3 errors, got {}: {errors:?}", errors.len());
         assert!(
-            errors.windows(2).all(|w| w[0].span().start <= w[1].span().start),
+            errors.len() >= 3,
+            "expected ≥3 errors, got {}: {errors:?}",
+            errors.len()
+        );
+        assert!(
+            errors
+                .windows(2)
+                .all(|w| w[0].span().start <= w[1].span().start),
             "errors must be position-sorted"
         );
         // And the single-error drop-in returns exactly the first of them.
-        assert_eq!(parse_to_ast(src).unwrap_err().span().start, errors[0].span().start);
+        assert_eq!(
+            parse_to_ast(src).unwrap_err().span().start,
+            errors[0].span().start
+        );
     }
 
     #[test]
@@ -599,9 +651,17 @@ mod tests {
     /// signal a grammar gap that losslessness alone cannot catch).
     fn parse_ok(src: &str) -> Parse {
         let p = assert_lossless(src);
-        assert!(p.errors().is_empty(), "unexpected errors for {src:?}: {:?}", p.errors());
+        assert!(
+            p.errors().is_empty(),
+            "unexpected errors for {src:?}: {:?}",
+            p.errors()
+        );
         let root = p.syntax();
-        assert_eq!(count_kind(&root, SyntaxKind::Error), 0, "no Error nodes for {src:?}");
+        assert_eq!(
+            count_kind(&root, SyntaxKind::Error),
+            0,
+            "no Error nodes for {src:?}"
+        );
         let orphan = root
             .children_with_tokens()
             .filter_map(|e| e.into_token())
@@ -743,7 +803,9 @@ mod tests {
         assert_eq!(tree_text(&parsed), truncated, "truncated arm round-trips");
         let errors = parsed.ok().expect_err("truncated stale arm must error");
         assert!(
-            errors.iter().any(|e| e.to_string().contains("'=>' was replaced by '->'")),
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("'=>' was replaced by '->'")),
             "guidance survives truncation"
         );
     }
@@ -805,7 +867,9 @@ mod tests {
 
     #[test]
     fn list_item_forms_named_shorthand_reference() {
-        let p = parse_ok("[]route r:\n    - Home:\n        path = \"/\"\n    - \"shorthand\"\n    - SomeRef\n");
+        let p = parse_ok(
+            "[]route r:\n    - Home:\n        path = \"/\"\n    - \"shorthand\"\n    - SomeRef\n",
+        );
         assert_eq!(count_kind(&p.syntax(), SyntaxKind::ListItem), 3);
     }
 
@@ -820,7 +884,10 @@ mod tests {
         .unwrap();
         parse_ok(&src); // no parse errors, lossless
         let (schema, errors) = crate::cst::extract_schema(&src);
-        assert!(errors.is_empty(), "fixture should extract clean: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "fixture should extract clean: {errors:?}"
+        );
 
         let field = |model: &str, field: &str| {
             schema
@@ -833,7 +900,10 @@ mod tests {
         assert!(field("resource", "path").shorthand);
         assert!(field("role", "name").shorthand);
         let run = field("command", "run");
-        assert!(run.shorthand && run.optional, "`run string?!` is shorthand + optional");
+        assert!(
+            run.shorthand && run.optional,
+            "`run string?!` is shorthand + optional"
+        );
     }
 
     #[test]
@@ -924,17 +994,29 @@ service App is Base:
     #[test]
     fn value_decode_scalars_correct() {
         use crate::types::{Number, Value};
-        assert_eq!(decode_first("\"a\\nb\\t!\""), Value::String("a\nb\t!".into()));
+        assert_eq!(
+            decode_first("\"a\\nb\\t!\""),
+            Value::String("a\nb\t!".into())
+        );
         assert_eq!(decode_first("42"), Value::Number(Number::Int(42)));
         assert_eq!(decode_first("-5"), Value::Number(Number::Int(-5)));
         assert_eq!(decode_first("2.5"), Value::Number(Number::Float(2.5)));
         assert_eq!(decode_first("true"), Value::Bool(true));
         assert_eq!(decode_first("false"), Value::Bool(false));
-        assert_eq!(decode_first("GroqFast"), Value::Reference("GroqFast".into()));
-        assert_eq!(decode_first("@role/admin"), Value::Role("@role/admin".into()));
+        assert_eq!(
+            decode_first("GroqFast"),
+            Value::Reference("GroqFast".into())
+        );
+        assert_eq!(
+            decode_first("@role/admin"),
+            Value::Role("@role/admin".into())
+        );
         assert_eq!(decode_first("$ENV.X"), Value::Secret("$ENV.X".into()));
         assert!(matches!(decode_first("100 USD"), Value::Money(_)));
-        assert!(matches!(decode_first("\"hi {{n}}\""), Value::TemplateString(_)));
+        assert!(matches!(
+            decode_first("\"hi {{n}}\""),
+            Value::TemplateString(_)
+        ));
     }
 
     #[test]
@@ -985,7 +1067,11 @@ service App is Base:
         let src = wrap("$NOPE.X");
         let node = first_value_node(&parse(&src).syntax());
         let err = decode_value(&node).unwrap_err();
-        assert!(err.message().contains("unknown variable source"), "{}", err.message());
+        assert!(
+            err.message().contains("unknown variable source"),
+            "{}",
+            err.message()
+        );
     }
 
     #[test]
@@ -1032,7 +1118,10 @@ service App is Base:
         // `count` decodes to a plain number, not money.
         assert!(matches!(decode_first("5"), crate::types::Value::Number(_)));
         // Same-line currency still parses as money.
-        assert!(matches!(decode_first("5 USD"), crate::types::Value::Money(_)));
+        assert!(matches!(
+            decode_first("5 USD"),
+            crate::types::Value::Money(_)
+        ));
     }
 
     #[test]
@@ -1069,14 +1158,14 @@ service App is Base:
     #[test]
     fn valid_edge_cases_parse_clean() {
         let corpus = [
-            "service App:\n",                                    // empty body
-            "service App:\n    tags = []\n",                     // empty array literal
-            "service App:\n    matrix = [[1, 2], [3, 4]]\n",     // nested arrays
-            "service App:\n    greeting =\n        \"hi\"\n",     // indented (block) value
-            "model M:\n    f string?\n    g (a | b)?\n",         // optional field + optional union
-            "service App:\n    |field string?\n",                // modifier type annotation
-            "service App:\n    items = [1, 2, 3,]\n",            // trailing comma in array
-            "const C = a | b | c\n",                             // const with fallback chain
+            "service App:\n",                                        // empty body
+            "service App:\n    tags = []\n",                         // empty array literal
+            "service App:\n    matrix = [[1, 2], [3, 4]]\n",         // nested arrays
+            "service App:\n    greeting =\n        \"hi\"\n",        // indented (block) value
+            "model M:\n    f string?\n    g (a | b)?\n", // optional field + optional union
+            "service App:\n    |field string?\n",        // modifier type annotation
+            "service App:\n    items = [1, 2, 3,]\n",    // trailing comma in array
+            "const C = a | b | c\n",                     // const with fallback chain
             "[]x ys:\n    .shared = 1\n    - One:\n        a = 1\n", // array decl: shared + named item
         ];
         for src in corpus {
@@ -1089,7 +1178,9 @@ service App is Base:
         // The block-form value (`= <newline> <indent> value`) must decode like
         // an inline value.
         let src = "service App:\n    greeting =\n        \"hi\"\n";
-        let v = decode_value(&first_value_node(&parse(src).syntax())).unwrap().value;
+        let v = decode_value(&first_value_node(&parse(src).syntax()))
+            .unwrap()
+            .value;
         assert_eq!(v, crate::types::Value::String("hi".into()));
     }
 
@@ -1155,9 +1246,9 @@ service App is Base:
         // path — so losslessness/termination/no-panic hold across the *whole* byte
         // space, not just the syntactic subset (RFC 0004 §9).
         let alphabet = [
-            "service", "App", ":", "=", "=>", "->", " ", "    ", "\n", "\r\n", "\"", "\"\"\"", "\\",
-            "//c", "x", "1", "12.5", "@role/x", "$ENV.K", "-", "|", ".", "[", "]", "(", ")", ",",
-            "?", "\t", "é", "\0", "\u{1}", "🎉", "\u{2028}",
+            "service", "App", ":", "=", "=>", "->", " ", "    ", "\n", "\r\n", "\"", "\"\"\"",
+            "\\", "//c", "x", "1", "12.5", "@role/x", "$ENV.K", "-", "|", ".", "[", "]", "(", ")",
+            ",", "?", "\t", "é", "\0", "\u{1}", "🎉", "\u{2028}",
         ];
         let mut state: u64 = 0x2545_F491_4F6C_DD1D;
         let mut next = || {
@@ -1202,5 +1293,235 @@ service App is Base:
             let _ = parse_with_comments(&src);
             let _ = extract_schema(&src);
         }
+    }
+
+    // ── RFC 0032: field directives ──
+
+    /// `#name` / `#name(value)` parse, stay lossless, and extract onto
+    /// `FieldDef.directives` in source order with decoded args and spans.
+    #[test]
+    fn directives_parse_losslessly_and_extract() {
+        let src = "model server:\n    ceiling capabilitySet #live\n    hosts set<string> #live #key(\"host\")\n";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "parse errors: {:?}", p.errors());
+
+        let (schema, errs) = extract_schema(src);
+        assert!(errs.is_empty(), "extract errors: {errs:?}");
+        let fields = &schema.models[0].fields;
+        assert_eq!(fields[0].directives.len(), 1);
+        assert_eq!(fields[0].directives[0].name, "live");
+        assert!(
+            fields[0].directives[0].arg.is_none(),
+            "bare directive has no arg"
+        );
+
+        assert_eq!(fields[1].directives.len(), 2, "source order, both kept");
+        assert_eq!(fields[1].directives[0].name, "live");
+        assert_eq!(fields[1].directives[1].name, "key");
+        match &fields[1].directives[1].arg {
+            Some(sv) => assert_eq!(
+                sv.value,
+                crate::types::Value::String("host".to_string()),
+                "argument decodes"
+            ),
+            None => panic!("#key(\"host\") must carry its argument"),
+        }
+        // A field with no directives extracts empty (control).
+        let (plain, _) = extract_schema("model m:\n    x string\n");
+        assert!(plain.models[0].fields[0].directives.is_empty());
+    }
+
+    /// Directive syntax rules: duplicates are one-per-key errors, a bare `#`
+    /// needs a name, and a NEXT-LINE `#` never attaches to the previous field
+    /// (line significance) — it is an error where it stands.
+    #[test]
+    fn directive_syntax_rules_are_enforced() {
+        let msgs = |src: &str| {
+            parse(src)
+                .errors()
+                .iter()
+                .map(|e| e.message().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            msgs("model m:\n    x string #live #live\n")
+                .iter()
+                .any(|m| m.contains("duplicate directive")),
+            "same key twice on one field is an error"
+        );
+        assert!(
+            msgs("model m:\n    x string #\n")
+                .iter()
+                .any(|m| m.contains("expected a directive name")),
+            "bare '#' needs a name"
+        );
+        // Next-line '#' does not silently attach: the field parses clean and
+        // the stray line errors on its own.
+        let next_line = "model m:\n    x string\n    #live\n";
+        assert!(
+            !msgs(next_line).is_empty(),
+            "a next-line directive must not attach silently"
+        );
+        let (schema, _) = extract_schema(next_line);
+        assert!(
+            schema.models[0].fields[0].directives.is_empty(),
+            "the previous field must NOT have picked the directive up"
+        );
+    }
+
+    /// Modifier TYPE declarations are fields too (nudge's reloadable `|block`
+    /// is one), so they take directives — parsed, extracted onto the modifier
+    /// FieldDef, dup-checked like any field.
+    #[test]
+    fn modifier_declarations_take_directives() {
+        let src = "model sandboxCeiling:\n    |block []string? #live\n";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "parse errors: {:?}", p.errors());
+        let (schema, errs) = extract_schema(src);
+        assert!(errs.is_empty(), "extract errors: {errs:?}");
+        let field = &schema.models[0].fields[0];
+        assert_eq!(field.name, "block");
+        assert_eq!(field.directives.len(), 1);
+        assert_eq!(field.directives[0].name, "live");
+        // Dup rule applies to modifiers too.
+        assert!(
+            parse("model m:\n    |b []string #live #live\n")
+                .errors()
+                .iter()
+                .any(|e| e.message().contains("duplicate directive")),
+            "modifier dup-directive is an error"
+        );
+    }
+
+    // ── RFC 0032: the `set<T>` type constructor ──
+
+    /// Adversarial edges: malformed constructor syntax must error *sanely*
+    /// (diagnostics, never a panic), pathological nesting must hit the depth
+    /// guard (never the stack — untrusted config reaches this parser), and
+    /// every form must stay lossless + extractable.
+    #[test]
+    fn set_adversarial_edges_error_sanely_never_panic() {
+        let cases = [
+            "model m:\n    xs set<>\n",               // empty angles
+            "model m:\n    xs set<string\n",          // unclosed
+            "model m:\n    xs set<string, number>\n", // comma is not a separator
+            "model m:\n    xs set<string>>\n",        // stray closer
+            "model m:\n    xs set<set<string>\n",     // half-closed nesting
+            "model m:\n    xs set\n",                 // bare `set` = model ref, no error here
+        ];
+        for src in cases {
+            let p = parse(src);
+            let _ = extract_schema(src); // must not panic either
+            if src.contains("xs set\n") {
+                assert!(p.errors().is_empty(), "bare `set` is a legal model ref");
+            } else {
+                assert!(!p.errors().is_empty(), "{src:?} must produce a diagnostic");
+            }
+        }
+        // Depth bomb: deeply nested constructors trip the recursion guard with
+        // a diagnostic — the guard, not the stack, is the bound.
+        let deep = format!(
+            "model m:\n    xs {}string{}\n",
+            "set<".repeat(300),
+            ">".repeat(300)
+        );
+        let p = parse(&deep);
+        assert!(
+            p.errors()
+                .iter()
+                .any(|e| e.message().contains("nesting depth")),
+            "deep nesting must be depth-guarded"
+        );
+    }
+
+    /// `set<T>` parses without errors, stays byte-faithful in the lossless
+    /// tree, and extracts to `FieldType::Set`.
+    #[test]
+    fn set_type_parses_losslessly_and_extracts() {
+        use crate::model::FieldType;
+        use crate::types::PrimitiveType;
+        let src = "model m:\n    tags set<string>\n";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "parse errors: {:?}", p.errors());
+
+        let (schema, errs) = extract_schema(src);
+        assert!(errs.is_empty(), "extract errors: {errs:?}");
+        let ft = &schema.models[0].fields[0].field_type;
+        assert!(
+            matches!(ft, FieldType::Set(inner)
+                if matches!(**inner, FieldType::Primitive(PrimitiveType::String))),
+            "expected set<string>, got {ft}"
+        );
+        assert_eq!(ft.to_string(), "set<string>", "canonical Display");
+    }
+
+    /// Bare unions are canonical inside the angles (`set<a | b>`), and the
+    /// redundantly-parenthesized form extracts to the SAME type (fmt strips
+    /// the parens; the type system never sees a difference).
+    #[test]
+    fn set_union_bare_and_parenthesized_extract_identically() {
+        let shape = |src: &str| {
+            let (schema, errs) = extract_schema(src);
+            assert!(errs.is_empty(), "{src}: {errs:?}");
+            schema.models[0].fields[0].field_type.to_string()
+        };
+        let bare = shape("model m:\n    xs set<string | number>\n");
+        let parens = shape("model m:\n    xs set<(string | number)>\n");
+        assert_eq!(bare, "set<string | number>", "bare union is canonical");
+        assert_eq!(bare, parens, "grouping parens are semantically inert");
+    }
+
+    /// Nesting composes (`set<set<string>>` — no `>>` munch hazard), and a
+    /// spaced `set <string>` parses identically (fmt canonicalizes).
+    #[test]
+    fn set_nesting_and_spacing_parse() {
+        for src in [
+            "model m:\n    xs set<set<string>>\n",
+            "model m:\n    xs set <string>\n",
+            "model m:\n    xs []set<string>\n",
+            "model m:\n    xs set<[]string>\n",
+            "model m:\n    xs set<string>?\n",
+        ] {
+            let p = parse(src);
+            assert!(p.errors().is_empty(), "{src}: {:?}", p.errors());
+        }
+    }
+
+    /// Constructor-name errors are targeted: unknown names and the reserved
+    /// `map` get their own guidance, and the arms-parens rule inside angles
+    /// points at the fix.
+    #[test]
+    fn set_constructor_errors_are_targeted() {
+        let msgs = |src: &str| {
+            parse(src)
+                .errors()
+                .iter()
+                .map(|e| e.message().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            msgs("model m:\n    xs foo<string>\n")
+                .iter()
+                .any(|m| m.contains("unknown type constructor")),
+            "unknown constructor gets a targeted error"
+        );
+        assert!(
+            msgs("model m:\n    xs map<string>\n")
+                .iter()
+                .any(|m| m.contains("reserved for a future map type")),
+            "map is reserved with its own guidance"
+        );
+        assert!(
+            msgs("model m:\n    xs set<string, number>\n")
+                .iter()
+                .any(|m| m.contains("separated by '|'")),
+            "comma (the map-habit typo) points at the pipe fix"
+        );
+        assert!(
+            msgs("model m:\n    xs set<role -> denial>\n")
+                .iter()
+                .any(|m| m.contains("set<(K -> V)>")),
+            "bare arms inside angles point at the parenthesized fix"
+        );
     }
 }

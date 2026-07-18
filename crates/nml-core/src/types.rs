@@ -138,6 +138,67 @@ impl SpannedValue {
     }
 }
 
+/// A field directive (RFC 0032): `#name` / `#name(value)` trailing a field
+/// definition. **Opaque to nml-core** — the language parses and syntax-checks
+/// directives (one per key per field) but assigns no meaning; consumers (e.g.
+/// nudge's `#live`/`#restart` reload classes, `#key` element identity)
+/// interpret them. The single definition shared by the schema layer
+/// (`model::FieldDef`) and the AST layer (`ast::FieldDefinition`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Directive {
+    pub name: String,
+    /// `#name(value)`'s argument, `None` for a bare `#name`.
+    pub arg: Option<SpannedValue>,
+    /// The whole directive's source span (`#` through the close).
+    pub span: Span,
+}
+
+impl Value {
+    /// Span-insensitive semantic equality (RFC 0032): compares **values only**,
+    /// never source locations — two values are `semantic_eq` iff they mean the
+    /// same thing, regardless of where (or in which file) they were written.
+    ///
+    /// The derived `PartialEq` is *span-sensitive* (`Array(Vec<SpannedValue>)`
+    /// and `Fallback` recurse through `SpannedValue`, whose derived eq compares
+    /// `Span`; a `TemplateString` expression segment carries a `span` and its
+    /// `raw` source text), so `==` flags a value merely *moved to another line*
+    /// as different — exactly the cosmetic false-positive a semantic diff or a
+    /// set-uniqueness check must not produce. Use this instead for any
+    /// meaning-level comparison.
+    pub fn semantic_eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Array(a), Value::Array(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.value.semantic_eq(&y.value))
+            }
+            (Value::Fallback(ap, af), Value::Fallback(bp, bf)) => {
+                ap.value.semantic_eq(&bp.value) && af.value.semantic_eq(&bf.value)
+            }
+            (Value::TemplateString(a), Value::TemplateString(b)) => {
+                a.len() == b.len()
+                    && a.iter().zip(b).all(|(x, y)| match (x, y) {
+                        (TemplateSegment::Literal(l), TemplateSegment::Literal(r)) => l == r,
+                        (
+                            TemplateSegment::Expression {
+                                namespace: ln,
+                                path: lp,
+                                ..
+                            },
+                            TemplateSegment::Expression {
+                                namespace: rn,
+                                path: rp,
+                                ..
+                            },
+                        ) => ln == rn && lp == rp,
+                        _ => false,
+                    })
+            }
+            // Every remaining variant is span-free, so derived equality IS
+            // semantic there; mixed variants compare unequal, as they should.
+            (a, b) => a == b,
+        }
+    }
+}
+
 /// The primitive type names recognized in model definitions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum PrimitiveType {

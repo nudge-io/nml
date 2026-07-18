@@ -27,3 +27,13 @@ nml-fmt = { workspace = true }
 serde_json = { workspace = true }
 tower-lsp = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+nml-validate = { workspace = true, features = ["test-support"] }
+# In-process duplex harness (tests/harness.rs): `tower` drives the LspService
+# as a plain `tower::Service` (`service.ready().await.call(..)`), `futures`
+# drains the ClientSocket stream and answers server->client requests via its
+# Sink half. Both are already in the tree as tower-lsp dependencies (same
+# versions), so this adds no new compiles to a full build.
+futures = "0.3"
+tower = { version = "0.4", features = ["util"] }

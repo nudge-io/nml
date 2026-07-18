@@ -103,10 +103,12 @@ impl ValueResolver {
             return Err(ResolveError::ReferenceCycle);
         }
         match value {
-            Value::Fallback(primary, fallback) => match self.resolve_at(&primary.value, depth + 1) {
-                Ok(val) => Ok(val),
-                Err(_) => self.resolve_at(&fallback.value, depth + 1),
-            },
+            Value::Fallback(primary, fallback) => {
+                match self.resolve_at(&primary.value, depth + 1) {
+                    Ok(val) => Ok(val),
+                    Err(_) => self.resolve_at(&fallback.value, depth + 1),
+                }
+            }
             Value::Secret(s) => {
                 let Some(key) = s.strip_prefix("$ENV.") else {
                     return Err(ResolveError::UnknownSource(s.clone()));
@@ -132,7 +134,12 @@ impl ValueResolver {
             Value::Array(items) => {
                 let resolved = items
                     .iter()
-                    .map(|sv| Ok(SpannedValue::new(self.resolve_at(&sv.value, depth + 1)?, sv.span)))
+                    .map(|sv| {
+                        Ok(SpannedValue::new(
+                            self.resolve_at(&sv.value, depth + 1)?,
+                            sv.span,
+                        ))
+                    })
                     .collect::<Result<Vec<_>, ResolveError>>()?;
                 Ok(Value::Array(resolved))
             }
@@ -353,7 +360,10 @@ fn merge_shared_into_item(item: &ListItem, shared: &[&SharedProperty]) -> ListIt
         // shared defaults like a named item. A *bodyless* scalar is a bare value
         // (`- "plain-item"`) with no fields, so shared properties don't apply to it —
         // it passes through unchanged, as do references/links.
-        ListItemKind::Shorthand { value, body: Some(body) } => ListItem {
+        ListItemKind::Shorthand {
+            value,
+            body: Some(body),
+        } => ListItem {
             kind: ListItemKind::Shorthand {
                 value: value.clone(),
                 body: Some(merge_shared_into_body(body, shared)),
@@ -946,29 +956,39 @@ workflow W:
             .collect();
         assert_eq!(items.len(), 1);
         if let BodyEntryKind::ListItem(item) = &items[0].kind {
-            assert!(matches!(&item.kind, ListItemKind::Shorthand { body: None, .. }));
+            assert!(matches!(
+                &item.kind,
+                ListItemKind::Shorthand { body: None, .. }
+            ));
         }
     }
 
     #[test]
     fn shared_property_merges_into_scalar_with_body() {
         // A scalar *with a body* is a model instance, so shared defaults merge into it.
-        let nml = "[]resource resources:\n    .method = \"GET\"\n    - \"/api\":\n        tag = \"x\"\n";
+        let nml =
+            "[]resource resources:\n    .method = \"GET\"\n    - \"/api\":\n        tag = \"x\"\n";
         let file = parse_to_ast(nml).unwrap();
         let DeclarationKind::Array(arr) = &file.declarations[0].kind else {
             panic!("expected array");
         };
         let items = apply_array_shared_properties(&arr.body);
-        let ListItemKind::Shorthand { body: Some(body), .. } = &items[0].kind else {
+        let ListItemKind::Shorthand {
+            body: Some(body), ..
+        } = &items[0].kind
+        else {
             panic!("expected scalar-with-body");
         };
         let has = |n: &str| {
-            body.entries.iter().any(|e| {
-                matches!(&e.kind, BodyEntryKind::Property(p) if p.name.name == n)
-            })
+            body.entries
+                .iter()
+                .any(|e| matches!(&e.kind, BodyEntryKind::Property(p) if p.name.name == n))
         };
         assert!(has("tag"), "authored property kept");
-        assert!(has("method"), "shared property merged into the scalar's body");
+        assert!(
+            has("method"),
+            "shared property merged into the scalar's body"
+        );
     }
 
     #[test]

@@ -112,7 +112,10 @@ impl Lower {
             arms: o
                 .arms()
                 .map(|arm| OneOfArm {
-                    value: arm.value().map(|t| self.string_token(&t)).unwrap_or_default(),
+                    value: arm
+                        .value()
+                        .map(|t| self.string_token(&t))
+                        .unwrap_or_default(),
                     value_span: arm.value().map(|t| token_span(&t)).unwrap_or(EMPTY_SPAN),
                     model: ident_of(arm.model()),
                 })
@@ -130,7 +133,9 @@ impl Lower {
     /// Lower an *optional* body — an absent body lowers to an empty one. For callers
     /// that already hold a body, use [`Self::lower_body`] directly.
     fn body_of(&mut self, body: Option<ast::Body>) -> Body {
-        body.map(|b| self.lower_body(b)).unwrap_or_else(|| Body { entries: Vec::new() })
+        body.map(|b| self.lower_body(b)).unwrap_or_else(|| Body {
+            entries: Vec::new(),
+        })
     }
 
     fn body_entry(&mut self, entry: ast::Entry) -> BodyEntry {
@@ -200,6 +205,14 @@ impl Lower {
             ModifierValue::TypeAnnotation {
                 field_type: type_expr(&te),
                 optional: m.optional(),
+                directives: m
+                    .directives()
+                    .map(|d| crate::types::Directive {
+                        name: d.name().map(|t| t.text().to_string()).unwrap_or_default(),
+                        arg: d.value().map(|v| self.decode(&v)),
+                        span: super::syntax::node_span(d.syntax()),
+                    })
+                    .collect(),
             }
         } else {
             ModifierValue::Block(Vec::new())
@@ -240,6 +253,18 @@ impl Lower {
                     name: ident(name),
                     body: self.lower_body(body),
                 }
+            } else if l.has_colon() {
+                // `- Name:` with no entries — the colon marks an inline
+                // instance with an (empty) body, not a reference. Lowering it
+                // as Named keeps it visible to instance validation (its
+                // missing required fields must fail loud), where collapsing
+                // it into `Reference` made it structurally invisible.
+                ListItemKind::Named {
+                    name: ident(name),
+                    body: Body {
+                        entries: Vec::new(),
+                    },
+                }
             } else {
                 ListItemKind::Reference(ident(name))
             }
@@ -259,6 +284,14 @@ impl Lower {
             optional: f.optional(),
             shorthand: f.shorthand(),
             default_value: f.default().map(|v| self.decode(&v)),
+            directives: f
+                .directives()
+                .map(|d| crate::types::Directive {
+                    name: d.name().map(|t| t.text().to_string()).unwrap_or_default(),
+                    arg: d.value().map(|v| self.decode(&v)),
+                    span: super::syntax::node_span(d.syntax()),
+                })
+                .collect(),
         }
     }
 
@@ -330,6 +363,18 @@ fn type_expr(te: &ast::TypeExpr) -> FieldTypeExpr {
                 target: Box::new(next()),
             }
         }
+        ast::TypeExprKind::Set => {
+            // `set<T>` (RFC 0032): several children = a bare union's variants
+            // (canonical `set<a | b>`); one = the element type. Recovery may
+            // leave none; the empty-ident fallback matches `Array` above.
+            let mut children: Vec<FieldTypeExpr> = te.children().map(|t| type_expr(&t)).collect();
+            let element = match children.len() {
+                0 => FieldTypeExpr::Named(empty_ident()),
+                1 => children.pop().expect("len checked"),
+                _ => FieldTypeExpr::Union(children),
+            };
+            FieldTypeExpr::Set(Box::new(element))
+        }
     }
 }
 
@@ -347,7 +392,9 @@ fn ident_of(tok: Option<SyntaxToken>) -> Identifier {
 }
 
 fn name_of(name: Option<ast::Name>) -> Identifier {
-    name.and_then(|n| n.ident()).map(ident).unwrap_or_else(empty_ident)
+    name.and_then(|n| n.ident())
+        .map(ident)
+        .unwrap_or_else(empty_ident)
 }
 
 fn empty_ident() -> Identifier {
@@ -368,6 +415,45 @@ mod tests {
 
     fn cst_ast(src: &str) -> File {
         to_ast(&ast::Root::cast(parse(src).syntax()).unwrap())
+    }
+
+    /// RFC 0030: `- Name:` (trailing colon, no entries) lowers as a Named item
+    /// with an empty body — an inline instance visible to validation — while
+    /// `- Name` (no colon) stays a Reference link. Collapsing the colon form
+    /// into Reference made missing-required errors structurally impossible.
+    #[test]
+    fn empty_colon_item_lowers_named_bare_stays_reference() {
+        use crate::ast::{BodyEntryKind, DeclarationKind, ListItemKind};
+        let items_of = |src: &str| {
+            let file = cst_ast(src);
+            let DeclarationKind::Array(arr) = &file.declarations[0].kind else {
+                panic!("expected array");
+            };
+            arr.body.items.clone()
+        };
+        let with_colon = items_of("[]role roles:\n    - admin:\n");
+        assert!(
+            matches!(&with_colon[0].kind, ListItemKind::Named { name, body }
+                if name.name == "admin" && body.entries.is_empty()),
+            "{with_colon:?}"
+        );
+        let bare = items_of("[]role roles:\n    - admin\n");
+        assert!(
+            matches!(&bare[0].kind, ListItemKind::Reference(id) if id.name == "admin"),
+            "{bare:?}"
+        );
+        // Same distinction holds for nested list items inside a block body.
+        let file = cst_ast("plan Pro:\n    includes:\n        - Free\n");
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("expected block");
+        };
+        let BodyEntryKind::NestedBlock(nb) = &block.body.entries[0].kind else {
+            panic!("expected nested block");
+        };
+        assert!(matches!(
+            &nb.body.entries[0].kind,
+            BodyEntryKind::ListItem(item) if matches!(&item.kind, ListItemKind::Reference(_))
+        ));
     }
 
     /// RFC 0018 §4.4 arms: `(@selector | else) -> Target` under a plain block
@@ -421,7 +507,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(matches!(lit[0], ArmTarget::Literal { value, .. } if value == "admin.workflow.nml"));
+        assert!(
+            matches!(lit[0], ArmTarget::Literal { value, .. } if value == "admin.workflow.nml")
+        );
         assert!(
             matches!(lit[1], ArmTarget::Literal { value, .. } if value == "default.workflow.nml")
         );
@@ -472,7 +560,10 @@ mod tests {
         };
         assert!(matches!(key.as_ref(), FieldTypeExpr::Named(n) if n.name == "role"));
         assert!(matches!(target.as_ref(), FieldTypeExpr::Named(n) if n.name == "denial"));
-        assert_eq!(fields[0].field_type.to_string(), "(string | (role -> denial))");
+        assert_eq!(
+            fields[0].field_type.to_string(),
+            "(string | (role -> denial))"
+        );
 
         // `route (role -> (a | b))` — arm set whose target is a union.
         let FieldTypeExpr::Arms { target, .. } = &fields[1].field_type else {

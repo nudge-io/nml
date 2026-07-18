@@ -11,7 +11,9 @@
 //! preserved, not reinvented. (At P7 the legacy lexer's copies are deleted,
 //! leaving this the single source of truth.)
 
-use crate::cst::syntax::{content_span, node_span, text_offset, SyntaxKind, SyntaxNode, SyntaxToken};
+use crate::cst::syntax::{
+    content_span, node_span, text_offset, SyntaxKind, SyntaxNode, SyntaxToken,
+};
 
 /// Decode a bare string-literal token (`"…"`) to its value — used where the
 /// grammar guarantees a string (oneof discriminator/arm values) so there is no
@@ -185,10 +187,16 @@ fn decode_escapes(inner: &str, inner_start: usize) -> Result<String, NmlError> {
 /// blank first/last lines (mirrors the legacy `dedent_multiline_string`).
 fn dedent_multiline(raw: &str) -> String {
     let mut lines: Vec<&str> = raw.split('\n').collect();
-    if lines.first().is_some_and(|l| l.chars().all(char::is_whitespace)) {
+    if lines
+        .first()
+        .is_some_and(|l| l.chars().all(char::is_whitespace))
+    {
         lines.remove(0);
     }
-    if lines.last().is_some_and(|l| l.chars().all(char::is_whitespace)) {
+    if lines
+        .last()
+        .is_some_and(|l| l.chars().all(char::is_whitespace))
+    {
         lines.pop();
     }
     if lines.is_empty() {
@@ -222,7 +230,10 @@ fn parse_number(raw: &str, span: Span) -> Result<Number, NmlError> {
             .map_err(|_| NmlError::parse(format!("invalid number: \"{raw}\""), span))
     } else {
         raw.parse().map(Number::Int).map_err(|_| {
-            NmlError::parse(format!("integer \"{raw}\" out of range for 64-bit integer"), span)
+            NmlError::parse(
+                format!("integer \"{raw}\" out of range for 64-bit integer"),
+                span,
+            )
         })
     }
 }
@@ -232,7 +243,10 @@ fn parse_number(raw: &str, span: Span) -> Result<Number, NmlError> {
 fn validate_secret(text: &str, span: Span) -> Result<(), NmlError> {
     let body = text.strip_prefix('$').unwrap_or(text);
     let (ns, key) = body.split_once('.').ok_or_else(|| {
-        NmlError::parse("expected '.' after the variable namespace (e.g. $ENV.MY_VAR)", span)
+        NmlError::parse(
+            "expected '.' after the variable namespace (e.g. $ENV.MY_VAR)",
+            span,
+        )
     })?;
     if !KNOWN_NAMESPACES.contains(&ns) {
         return Err(NmlError::parse(

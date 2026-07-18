@@ -27,6 +27,10 @@ pub enum FieldTarget<'a> {
     OneOf(&'a OneOfDef),
     /// A list whose items resolve to the boxed target.
     ListOf(Box<FieldTarget<'a>>),
+    /// A `set<T>` whose items resolve to the boxed target (RFC 0032). Shape
+    /// validation is exactly `ListOf`; the validator additionally rejects
+    /// duplicate elements (value-level identity) at load.
+    SetOf(Box<FieldTarget<'a>>),
     /// Free-form `object` — accepts arbitrary keys; no schema to recurse into.
     Object,
     /// A type union — ambiguous without a discriminator; not recursed.
@@ -156,6 +160,7 @@ impl SchemaIndex {
             FieldType::Primitive(PrimitiveType::Object) => FieldTarget::Object,
             FieldType::Primitive(_) => FieldTarget::Leaf,
             FieldType::List(inner) => FieldTarget::ListOf(Box::new(self.resolve_type(inner))),
+            FieldType::Set(inner) => FieldTarget::SetOf(Box::new(self.resolve_type(inner))),
             // A modifier field carries its declared inner type; classify by it.
             FieldType::Modifier(inner) => self.resolve_type(inner),
             FieldType::Union(_) => FieldTarget::Union,
@@ -196,6 +201,8 @@ mod tests {
             optional: false,
             shorthand: false,
             default_value: None,
+            directives: Vec::new(),
+            doc: None,
             span: Span::empty(0),
         }
     }
@@ -204,8 +211,14 @@ mod tests {
     fn lookup_is_first_wins() {
         let idx = SchemaIndex::build(
             vec![
-                model("dup", vec![field("a", FieldType::Primitive(PrimitiveType::String))]),
-                model("dup", vec![field("b", FieldType::Primitive(PrimitiveType::String))]),
+                model(
+                    "dup",
+                    vec![field("a", FieldType::Primitive(PrimitiveType::String))],
+                ),
+                model(
+                    "dup",
+                    vec![field("b", FieldType::Primitive(PrimitiveType::String))],
+                ),
             ],
             vec![],
             vec![],
@@ -227,11 +240,7 @@ mod tests {
 
     #[test]
     fn resolve_field_dispatch() {
-        let idx = SchemaIndex::build(
-            vec![model("inner", vec![])],
-            vec![],
-            vec![],
-        );
+        let idx = SchemaIndex::build(vec![model("inner", vec![])], vec![], vec![]);
 
         assert!(matches!(
             idx.resolve_field(&field("x", FieldType::Primitive(PrimitiveType::String))),
