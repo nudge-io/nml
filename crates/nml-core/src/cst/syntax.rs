@@ -34,22 +34,31 @@ pub enum SyntaxKind {
     Secret,
 
     // ── punctuation ──
-    Eq,        // =
-    Arrow,     // -> (the arm arrow: `oneof` arms and every future arm form — RFC 0006)
+    Eq,    // =
+    Arrow, // -> (the arm arrow: `oneof` arms and every future arm form — RFC 0006)
     /// `=>` — lexed ONLY so the parser can reject it with targeted guidance
     /// ("'=>' was replaced by '->'"); accepted by no production (RFC 0006).
     FatArrow,
-    Colon,     // :
-    Dash,      // -
-    Pipe,      // |
-    Dot,       // .
-    LBracket,  // [
-    RBracket,  // ]
-    LParen,    // (
-    RParen,    // )
-    Comma,     // ,
-    Question,  // ?
-    Plus,      // +  (positional-field marker — RFC 0005 §16)
+    Colon,    // :
+    Dash,     // -
+    Pipe,     // |
+    Dot,      // .
+    LBracket, // [
+    RBracket, // ]
+    LParen,   // (
+    RParen,   // )
+    Comma,    // ,
+    Question, // ?
+    Plus,     // +  (positional-field marker — RFC 0005 §16)
+    /// `<` — opens a type-constructor argument list (`set<cidr>`, RFC 0032).
+    /// `set` is a contextual keyword: an `Ident` is a constructor only when
+    /// immediately followed by `Lt` in type position; bare `set` stays a name.
+    Lt, // <
+    Gt,       // >  (closes a type-constructor argument list)
+    /// `#` — opens a field directive (`#live`, `#key("host")` — RFC 0032).
+    /// Directives are schema metadata the language parses but never
+    /// interprets; consumers (e.g. nudge) assign meaning.
+    Hash, // #
 
     /// Unrecognized input, one character wide. Never dropped — every source
     /// byte lands in some token, so the tree is byte-faithful on any input.
@@ -77,6 +86,10 @@ pub enum SyntaxKind {
     SharedProperty,
     ListItem,
     FieldDef,
+
+    /// A field directive `#name` / `#name(value)` trailing a FieldDef (RFC
+    /// 0032). Opaque to nml-core beyond syntax (name + optional value).
+    Directive,
     /// A routing arm inside a plain block: `(@role/selector | else) -> Target`
     /// (the house arm idiom, RFC 0006 arrow). Generic in the grammar; the schema
     /// restricts where arms are valid (e.g. RFC 0018 `denial:`).

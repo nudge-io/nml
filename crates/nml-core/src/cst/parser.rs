@@ -111,7 +111,9 @@ impl<'a> Parser<'a> {
     }
 
     fn nth(&self, n: usize) -> SyntaxKind {
-        self.toks.get(self.pos + n).map_or(SyntaxKind::Eof, |t| t.kind)
+        self.toks
+            .get(self.pos + n)
+            .map_or(SyntaxKind::Eof, |t| t.kind)
     }
 
     fn current_text(&self) -> &'a str {
@@ -369,9 +371,7 @@ impl<'a> Parser<'a> {
             // stray `@…` with no arrow fall through to graceful error recovery
             // instead of an over-eager arm parse. A `FatArrow` still routes here
             // so `@x => y` gets the "'=>' was replaced by '->'" guidance.
-            SyntaxKind::Role
-                if matches!(self.nth(1), SyntaxKind::Arrow | SyntaxKind::FatArrow) =>
-            {
+            SyntaxKind::Role if matches!(self.nth(1), SyntaxKind::Arrow | SyntaxKind::FatArrow) => {
                 self.arm()
             }
             SyntaxKind::Ident
@@ -425,6 +425,7 @@ impl<'a> Parser<'a> {
             if self.eat(SyntaxKind::Eq) {
                 self.value_block();
             }
+            self.field_directives();
             m.complete(self, SyntaxKind::FieldDef);
         } else {
             self.error("expected '=', ':', or a type");
@@ -444,10 +445,42 @@ impl<'a> Parser<'a> {
         } else if self.at_field_type() {
             self.type_expr();
             self.eat(SyntaxKind::Question);
+            // A modifier TYPE declaration is a field declaration (`|block
+            // []string? #live`) — it takes directives like any field.
+            self.field_directives();
         } else {
             self.error("expected '=', ':', or a type after a modifier");
         }
         m.complete(self, SyntaxKind::Modifier);
+    }
+
+    /// Trailing field directives (RFC 0032): `#name` / `#name(value)`,
+    /// same-line only (a next-line `#` must not be pulled out of the following
+    /// entry — the standard line-significance rule). Names are opaque to the
+    /// language; duplicates are a syntax error (one meaning per key),
+    /// consumers interpret the rest. Shared by plain fields and modifier type
+    /// declarations.
+    fn field_directives(&mut self) {
+        let mut seen: Vec<String> = Vec::new();
+        while self.at(SyntaxKind::Hash) && !self.newline_before() {
+            let d = self.start();
+            self.bump(); // #
+            if self.at(SyntaxKind::Ident) {
+                let name = self.current_text().to_string();
+                if seen.contains(&name) {
+                    self.error("duplicate directive — each directive may appear once per field");
+                }
+                seen.push(name);
+                self.bump();
+            } else {
+                self.error("expected a directive name after '#'");
+            }
+            if self.eat(SyntaxKind::LParen) {
+                self.value();
+                self.expect(SyntaxKind::RParen, "')'");
+            }
+            d.complete(self, SyntaxKind::Directive);
+        }
     }
 
     /// `. name (: body | = value)`
@@ -532,6 +565,40 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect(SyntaxKind::RParen, "')'");
+        } else if self.at(SyntaxKind::Ident) && self.nth(1) == SyntaxKind::Lt {
+            // `set<T>` — a type constructor (RFC 0032). `set` is a *contextual*
+            // keyword: an ident is a constructor only when directly followed by
+            // `<`, so a model named `set` referenced bare stays a plain type
+            // name (model refs never take angles). Unknown/reserved names get a
+            // targeted error but the payload still parses (recovery keeps the
+            // tree structured and the diagnostic singular).
+            if self.current_text() != "set" {
+                if self.current_text() == "map" {
+                    self.error("'map' is reserved for a future map type — only 'set' takes type arguments today");
+                } else {
+                    self.error("unknown type constructor (only 'set' takes type arguments)");
+                }
+            }
+            self.bump(); // constructor name
+            self.bump(); // <
+                         // Inside the angles the union is already bounded, so variants are
+                         // bare and canonical: `set<a | b>`. Grouping parens also parse
+                         // (`set<(a | b)>`) — fmt strips them as redundant.
+            self.type_expr();
+            while self.eat(SyntaxKind::Pipe) {
+                self.type_expr();
+            }
+            // Arms keep their parens even here — `(K -> V)` parens are part of
+            // the arms construct (RFC 0007), never grouping.
+            if matches!(self.current(), SyntaxKind::Arrow | SyntaxKind::FatArrow) {
+                self.error("arm types keep their parens: write set<(K -> V)>");
+            }
+            // A comma is the map-habit typo (`set<a, b>`); point at the fix
+            // rather than a bare "expected '>'".
+            if self.at(SyntaxKind::Comma) {
+                self.error("set elements are alternatives separated by '|', not ','");
+            }
+            self.expect(SyntaxKind::Gt, "'>'");
         } else {
             self.expect(SyntaxKind::Ident, "a type name");
         }
@@ -854,7 +921,10 @@ impl TreeBuilder<'_> {
     /// of attachment precision for the foundational losslessness invariant, since
     /// re-ordering the held groups would move non-zero-width tokens.)
     fn release_deferred(&mut self) {
-        let top = *self.indent_stack.last().expect("indent stack is never empty");
+        let top = *self
+            .indent_stack
+            .last()
+            .expect("indent stack is never empty");
         while self.deferred.first().is_some_and(|d| d.column >= top) {
             let d = self.deferred.remove(0);
             for idx in d.tokens {
@@ -870,7 +940,11 @@ impl TreeBuilder<'_> {
         let col = self.column_at(self.cursor);
         self.is_own_line(self.cursor)
             && self.dedent_follows(self.cursor)
-            && col < *self.indent_stack.last().expect("indent stack is never empty")
+            && col
+                < *self
+                    .indent_stack
+                    .last()
+                    .expect("indent stack is never empty")
     }
 
     /// Hold the cursor comment and its trailing layout (up to the next comment or

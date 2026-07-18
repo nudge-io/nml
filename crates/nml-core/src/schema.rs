@@ -175,7 +175,14 @@ pub fn find_model_cycles(schema: &ExtractedSchema) -> Vec<NmlError> {
     report_graph_cycles(
         schema.models.iter().map(|m| m.name.as_str()),
         &edges,
-        |cycle| push_cycle_errors(schema, cycle, "circular dependency in model definitions", &mut errors),
+        |cycle| {
+            push_cycle_errors(
+                schema,
+                cycle,
+                "circular dependency in model definitions",
+                &mut errors,
+            )
+        },
     );
     errors
 }
@@ -208,9 +215,7 @@ fn collect_refs_from_type<'a>(
                 refs.extend(variants.iter().copied());
             }
         }
-        FieldType::List(inner) => {
-            collect_refs_from_type(inner, known_models, oneof_variants, refs)
-        }
+        FieldType::List(inner) => collect_refs_from_type(inner, known_models, oneof_variants, refs),
         FieldType::Union(variants) => {
             for v in variants {
                 collect_refs_from_type(v, known_models, oneof_variants, refs);
@@ -251,7 +256,10 @@ pub fn report_graph_cycles<'a>(
                 Work::Enter(name) => {
                     if on_path.contains(name) {
                         // Back-edge to an ancestor → the cycle is from it to here.
-                        let pos = path.iter().position(|n| *n == name).expect("on_path ⇒ in path");
+                        let pos = path
+                            .iter()
+                            .position(|n| *n == name)
+                            .expect("on_path ⇒ in path");
                         on_cycle(&path[pos..]);
                         continue;
                     }
@@ -417,7 +425,14 @@ pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<NmlError> {
     report_graph_cycles(
         schema.models.iter().map(|m| m.name.as_str()),
         &edges,
-        |cycle| push_cycle_errors(schema, cycle, "circular inheritance in model definitions", &mut errors),
+        |cycle| {
+            push_cycle_errors(
+                schema,
+                cycle,
+                "circular inheritance in model definitions",
+                &mut errors,
+            )
+        },
     );
     errors
 }
@@ -543,6 +558,8 @@ mod tests {
                 optional: false,
                 shorthand: false,
                 default_value: None,
+                directives: Vec::new(),
+                doc: None,
                 span: crate::span::Span::empty(0),
             }],
             span: crate::span::Span::empty(0),
@@ -553,7 +570,10 @@ mod tests {
             oneofs: vec![],
         };
         resolve_model_inheritance(&mut schema); // must not hang or panic
-        assert!(schema.models.iter().all(|m| m.fields.iter().any(|f| f.name.starts_with('f'))));
+        assert!(schema
+            .models
+            .iter()
+            .all(|m| m.fields.iter().any(|f| f.name.starts_with('f'))));
     }
 
     #[test]
@@ -567,6 +587,8 @@ mod tests {
             optional: false,
             shorthand: false,
             default_value: None,
+            directives: Vec::new(),
+            doc: None,
             span: crate::span::Span::empty(0),
         };
         let model = |name: &str, extends: &[&str], f: &str| ModelDef {
@@ -640,7 +662,8 @@ mod tests {
         );
         let errs = find_oneof_errors(&schema);
         assert!(
-            errs.iter().any(|e| e.message().contains("duplicate discriminator value")),
+            errs.iter()
+                .any(|e| e.message().contains("duplicate discriminator value")),
             "expected duplicate-value error; got {errs:?}"
         );
     }
@@ -661,9 +684,8 @@ mod tests {
 
     #[test]
     fn test_oneof_valid_default_discriminator_accepted() {
-        let schema = extract_src(
-            "model a:\n    x string?\n\noneof u by kind = \"k\":\n    \"k\" -> a\n",
-        );
+        let schema =
+            extract_src("model a:\n    x string?\n\noneof u by kind = \"k\":\n    \"k\" -> a\n");
         assert!(
             find_oneof_errors(&schema).is_empty(),
             "a default matching an arm should be accepted"
@@ -703,8 +725,9 @@ mod tests {
         );
         let errs = find_oneof_errors(&schema);
         assert!(
-            errs.iter().any(|e| e.message().contains("not a variant of enum")
-                && e.message().contains("postmark")),
+            errs.iter()
+                .any(|e| e.message().contains("not a variant of enum")
+                    && e.message().contains("postmark")),
             "arm outside the enum should be reported; got {errs:?}"
         );
     }
@@ -716,7 +739,8 @@ mod tests {
         );
         let errs = find_oneof_errors(&schema);
         assert!(
-            errs.iter().any(|e| e.message().contains("is not a declared enum")),
+            errs.iter()
+                .any(|e| e.message().contains("is not a declared enum")),
             "unknown discriminator type should be reported; got {errs:?}"
         );
     }
@@ -728,7 +752,8 @@ mod tests {
         );
         let errs = find_oneof_errors(&schema);
         assert!(
-            errs.iter().any(|e| e.message().contains("both a oneof and a model")),
+            errs.iter()
+                .any(|e| e.message().contains("both a oneof and a model")),
             "expected name-collision error; got {errs:?}"
         );
     }

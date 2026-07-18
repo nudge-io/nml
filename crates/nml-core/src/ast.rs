@@ -17,6 +17,10 @@ pub enum FieldTypeExpr {
         key: Box<FieldTypeExpr>,
         target: Box<FieldTypeExpr>,
     },
+    /// `set<T>` — an unordered, unique-element collection (RFC 0032). A bare
+    /// union argument (`set<a | b>`) is the canonical spelling; the element
+    /// here is then `Union`.
+    Set(Box<FieldTypeExpr>),
 }
 
 /// Renders the type expression in NML source syntax: `string`, `[]route`,
@@ -37,6 +41,22 @@ impl std::fmt::Display for FieldTypeExpr {
                 f.write_str(")")
             }
             FieldTypeExpr::Arms { key, target } => write!(f, "({key} -> {target})"),
+            FieldTypeExpr::Set(inner) => {
+                // Canonical: bare union inside the angles (RFC 0032 Decision 4).
+                f.write_str("set<")?;
+                match inner.as_ref() {
+                    FieldTypeExpr::Union(variants) => {
+                        for (i, v) in variants.iter().enumerate() {
+                            if i > 0 {
+                                f.write_str(" | ")?;
+                            }
+                            write!(f, "{v}")?;
+                        }
+                    }
+                    other => write!(f, "{other}")?,
+                }
+                f.write_str(">")
+            }
         }
     }
 }
@@ -50,6 +70,8 @@ pub struct FieldDefinition {
     /// The model's positional/scalar-shorthand field (`name type+`) — RFC 0005 §6, §16.
     pub shorthand: bool,
     pub default_value: Option<SpannedValue>,
+    /// Trailing `#name`/`#name(value)` directives (RFC 0032), source order.
+    pub directives: Vec<crate::types::Directive>,
 }
 
 /// A parsed NML file.
@@ -248,6 +270,8 @@ pub enum ModifierValue {
     TypeAnnotation {
         field_type: FieldTypeExpr,
         optional: bool,
+        /// Trailing `#name`/`#name(value)` directives (RFC 0032), source order.
+        directives: Vec<crate::types::Directive>,
     },
 }
 
@@ -291,7 +315,10 @@ pub enum ListItemKind {
     /// `- "/api":` followed by an indented block. The scalar fills the element
     /// model's shorthand (`!`) field; the optional body fills the rest. The body is
     /// genuinely optional (unlike `Named`), so it is modeled as `Option<Body>`.
-    Shorthand { value: SpannedValue, body: Option<Body> },
+    Shorthand {
+        value: SpannedValue,
+        body: Option<Body>,
+    },
     /// `- ReferenceName`
     Reference(Identifier),
     /// `- @role/ref`

@@ -13,16 +13,41 @@ use nml_core::types::Value;
 use nml_core::{FieldTarget, SchemaIndex};
 use nml_validate::schema::MembershipSemantics;
 
-use crate::diagnostics::{self, LanguageExtension};
+use crate::diagnostics::{self, LanguageExtension, SchemaMode};
+use crate::packages::{self, Resolution, WorkspaceView};
 use crate::position::{self, LineIndex};
 
 const MAX_DIR_DEPTH: usize = 20;
 const MAX_FILE_COUNT: usize = 10_000;
 
-pub struct NmlLanguageServer {
-    client: Client,
+/// How often the background freshness poll re-reads store pointer contents
+/// (RFC 0030 "Freshness"): low-frequency on purpose — the per-validation-pass
+/// re-resolution already heals on the next keystroke; the poll only has to
+/// heal the *idle* editor within seconds of `nudge schema sync`.
+const STORE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The server's shared state, held behind `Arc` so the background
+/// freshness-poll task (spawned at `initialize`) reads the exact same
+/// documents/resolver the request handlers mutate. `NmlLanguageServer`
+/// `Deref`s to this: every pre-existing `self.field` and `self.method()`
+/// call site compiles unchanged, and the split is enforced by the compiler —
+/// anything needing the `Client` cannot live here, so state-only methods are
+/// exactly the ones the poll task may call.
+pub struct Inner {
     documents: Mutex<HashMap<Url, String>>,
     indexed_uris: Mutex<HashSet<Url>>,
+    /// Documents currently open in the editor (didOpen without a matching
+    /// didClose). The freshness poll's fan-out revalidates only these —
+    /// indexed-but-closed files have no visible squiggles to heal.
+    open_docs: Mutex<HashSet<Url>>,
+    /// Last client-reported version per OPEN document (didOpen/didChange;
+    /// removed on didClose — closed docs have no client version). Every
+    /// `publish_diagnostics` passes the version captured for the text it
+    /// validated, so the client can discard a stale set on its own: the
+    /// sweep's text compare-guard avoids wasted validates, but between that
+    /// compare and the publish the document can change again (TOCTOU) — the
+    /// version closes that window client-side per the LSP contract.
+    doc_versions: Mutex<HashMap<Url, i32>>,
     scoped_models: Mutex<HashMap<String, Vec<ModelDef>>>,
     scoped_enums: Mutex<HashMap<String, Vec<EnumDef>>>,
     scoped_oneofs: Mutex<HashMap<String, Vec<OneOfDef>>>,
@@ -32,22 +57,65 @@ pub struct NmlLanguageServer {
     workspace_roots: Mutex<Vec<PathBuf>>,
     language_extension: Option<Arc<dyn LanguageExtension>>,
     membership: MembershipSemantics,
+    /// Schema-package resolution (RFC 0030): pins > auto-association >
+    /// unbound fallback, definitions from workspace manifests > store >
+    /// builtins. Owns its own caches; per-root pin config is resolved inside
+    /// (never through the global `project_config`).
+    resolver: packages::PackageResolver,
+    /// Client capability: `completionItem.insertReplaceSupport` (LSP 3.16) —
+    /// gates `InsertReplaceEdit` vs plain `TextEdit` value completions.
+    insert_replace_support: std::sync::atomic::AtomicBool,
+    /// Wakes the background broad-revalidation sweep (third arm of the
+    /// notifier/poll task). Handlers whose edits invalidate OTHER documents
+    /// (manifest/model edits, project-config changes, deletions) notify
+    /// instead of fanning out inline — a workspace can hold up to 10k
+    /// documents, and serial revalidation inside a request handler blocks
+    /// the editor. `Notify` coalesces bursts by design: N notifications
+    /// while a sweep is pending collapse into one stored permit ⇒ one sweep
+    /// covers them all.
+    sweep: tokio::sync::Notify,
+}
+
+pub struct NmlLanguageServer {
+    client: Client,
+    inner: Arc<Inner>,
+    /// Parked until `initialize` spawns the notifier/freshness task (the
+    /// only guaranteed-async, guaranteed-once seam). Never spawning (an
+    /// embedder that skips initialize) is benign: the bounded channel fills
+    /// and drops. The task holds only a `Weak<Inner>`, so it cannot keep the
+    /// server alive: when the server drops, the sender (in the resolver)
+    /// drops and every `upgrade()` fails — either path breaks the task's
+    /// loop. No abort handle, nothing to remember at shutdown.
+    store_events: Mutex<Option<tokio::sync::mpsc::Receiver<packages::StoreEvent>>>,
+}
+
+impl std::ops::Deref for NmlLanguageServer {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.inner
+    }
 }
 
 impl NmlLanguageServer {
     pub fn new(client: Client) -> Self {
-        Self {
+        // Production wiring: the per-user schema-package store (may be absent
+        // on exotic platforms; treated as an empty store, never an error).
+        Self::build(
             client,
-            documents: Mutex::new(HashMap::new()),
-            indexed_uris: Mutex::new(HashSet::new()),
-            scoped_models: Mutex::new(HashMap::new()),
-            scoped_enums: Mutex::new(HashMap::new()),
-            scoped_oneofs: Mutex::new(HashMap::new()),
-            project_config: Mutex::new(nml_core::ProjectConfig::default()),
-            workspace_roots: Mutex::new(Vec::new()),
-            language_extension: None,
-            membership: MembershipSemantics::default(),
-        }
+            nml_validate::store::Store::user(),
+            None,
+            MembershipSemantics::default(),
+        )
+    }
+
+    /// Embedder/test seam, parallel to [`Self::with_extension`]: identical to
+    /// [`Self::new`] except the schema-package store is supplied by the
+    /// caller instead of resolved from the user environment
+    /// (`NML_SCHEMA_STORE_DIR` / platform data dir). The in-process test
+    /// harness injects a tempdir store here; an embedder may inject its own
+    /// store, or `None` to run storeless.
+    pub fn with_store(client: Client, store: Option<nml_validate::store::Store>) -> Self {
+        Self::build(client, store, None, MembershipSemantics::default())
     }
 
     /// Create a server with an embedder-supplied language extension.
@@ -56,13 +124,47 @@ impl NmlLanguageServer {
         extension: Arc<dyn LanguageExtension>,
         membership: MembershipSemantics,
     ) -> Self {
-        Self {
-            language_extension: Some(extension),
+        Self::build(
+            client,
+            nml_validate::store::Store::user(),
+            Some(extension),
             membership,
-            ..Self::new(client)
-        }
+        )
     }
 
+    /// Shared constructor body: the public constructors differ only in where
+    /// the store/extension/membership come from.
+    fn build(
+        client: Client,
+        store: Option<nml_validate::store::Store>,
+        language_extension: Option<Arc<dyn LanguageExtension>>,
+        membership: MembershipSemantics,
+    ) -> Self {
+        let (store_events_tx, store_events_rx) = tokio::sync::mpsc::channel(64);
+        Self {
+            client,
+            inner: Arc::new(Inner {
+                documents: Mutex::new(HashMap::new()),
+                indexed_uris: Mutex::new(HashSet::new()),
+                open_docs: Mutex::new(HashSet::new()),
+                doc_versions: Mutex::new(HashMap::new()),
+                scoped_models: Mutex::new(HashMap::new()),
+                scoped_enums: Mutex::new(HashMap::new()),
+                scoped_oneofs: Mutex::new(HashMap::new()),
+                project_config: Mutex::new(nml_core::ProjectConfig::default()),
+                workspace_roots: Mutex::new(Vec::new()),
+                language_extension,
+                membership,
+                resolver: packages::PackageResolver::new(store, store_events_tx),
+                insert_replace_support: std::sync::atomic::AtomicBool::new(false),
+                sweep: tokio::sync::Notify::new(),
+            }),
+            store_events: Mutex::new(Some(store_events_rx)),
+        }
+    }
+}
+
+impl Inner {
     fn find_nml_files(dir: &Path, files: &mut Vec<std::path::PathBuf>, depth: usize) {
         if depth > MAX_DIR_DEPTH || files.len() >= MAX_FILE_COUNT {
             return;
@@ -151,7 +253,10 @@ impl NmlLanguageServer {
                 .entry(scope.clone())
                 .or_default()
                 .extend(schema.enums);
-            scoped_oneofs.entry(scope).or_default().extend(schema.oneofs);
+            scoped_oneofs
+                .entry(scope)
+                .or_default()
+                .extend(schema.oneofs);
         }
 
         *self.scoped_models.lock().unwrap_or_else(|e| e.into_inner()) = scoped_models;
@@ -227,6 +332,61 @@ impl NmlLanguageServer {
         (models, enums, oneofs)
     }
 
+    /// Per-document diagnostic config (RFC 0030): tooling fields resolve at
+    /// the document's nearest-ancestor `nml-project.nml` — per root, nearest
+    /// wins wholesale — falling back to the workspace-root config (and its
+    /// embedder defaults) when no ancestor file exists. The last-edit-wins
+    /// global clobber is gone: per-document resolution reads the tree.
+    fn diagnostic_config_for(&self, uri: &Url) -> diagnostics::DiagnosticConfig {
+        let nearest = uri.to_file_path().ok().and_then(|p| {
+            let p = p.canonicalize().unwrap_or(p);
+            let roots = self
+                .workspace_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let doc_text = |path: &Path| -> Option<String> {
+                let uri = Url::from_file_path(path).ok()?;
+                self.documents
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&uri)
+                    .cloned()
+            };
+            let view = WorkspaceView {
+                roots: &roots,
+                manifests: &[],
+                doc_text: &doc_text,
+            };
+            packages::nearest_project_config(&p, &view).map(|(_, config)| config)
+        });
+        match nearest {
+            Some(pc) => self.config_from_project(&pc),
+            None => self.diagnostic_config(),
+        }
+    }
+
+    fn config_from_project(&self, pc: &nml_core::ProjectConfig) -> diagnostics::DiagnosticConfig {
+        let membership = if pc.member_keywords.is_empty()
+            && pc.builtin_refs.is_empty()
+            && pc.user_ref_prefix.is_none()
+        {
+            self.membership.clone()
+        } else {
+            MembershipSemantics {
+                member_keywords: pc.member_keywords.clone(),
+                builtin_refs: pc.builtin_refs.clone(),
+                user_ref_prefix: pc.user_ref_prefix.clone(),
+            }
+        };
+        diagnostics::DiagnosticConfig {
+            template_namespaces: pc.template_namespaces.clone(),
+            modifiers: pc.modifiers.clone(),
+            membership,
+            language_extension: self.language_extension.clone(),
+        }
+    }
+
     fn diagnostic_config(&self) -> diagnostics::DiagnosticConfig {
         let pc = self
             .project_config
@@ -254,11 +414,237 @@ impl NmlLanguageServer {
         }
     }
 
+    /// Resolve a document against the schema-package machinery (RFC 0030).
+    /// `None` for non-file URIs; a `Resolved` otherwise, whose resolution may
+    /// be `Unbound` (today's scope-token behavior applies).
+    fn resolve_document(&self, uri: &Url) -> Option<packages::Resolved> {
+        self.with_workspace_view(uri, |path, view| self.resolver.resolve(path, view))
+    }
+
+    /// The directive vocabulary covering a `.model.nml` document (RFC 0030),
+    /// through the same workspace view resolution uses. A non-file URI has
+    /// nothing to scan, so it is definitively `Opaque`, not undetermined.
+    fn vocabulary_for_document(&self, uri: &Url) -> packages::VocabularyOutcome {
+        self.with_workspace_view(uri, |path, view| self.resolver.vocabulary_for(path, view))
+            .unwrap_or(packages::VocabularyOutcome::Opaque)
+    }
+
+    /// Build the resolver's [`WorkspaceView`] for one document and run `f`
+    /// against it. One owner for the view construction: `resolve_document`
+    /// and `vocabulary_for_document` must see the identical workspace or
+    /// binding and vocabulary could disagree about coverage.
+    fn with_workspace_view<R>(
+        &self,
+        uri: &Url,
+        f: impl FnOnce(&Path, &WorkspaceView<'_>) -> R,
+    ) -> Option<R> {
+        let path = uri.to_file_path().ok()?;
+        // Roots are canonicalized at initialize; an un-canonicalized document
+        // path (macOS /tmp → /private/tmp, symlinked checkouts) would fail
+        // every starts_with, silently unrooting resolution — and letting the
+        // ancestor walk escape the workspace.
+        let path = path.canonicalize().unwrap_or(path);
+        let roots = self
+            .workspace_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let manifests: Vec<(PathBuf, String)> = {
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            docs.iter()
+                .filter(|(u, _)| u.as_str().ends_with(".package.nml"))
+                .filter_map(|(u, text)| {
+                    let p = u.to_file_path().ok()?;
+                    // Canonicalized like the resolved document path — a
+                    // symlinked workspace must not break is_self/root checks.
+                    Some((p.canonicalize().unwrap_or(p), text.clone()))
+                })
+                .collect()
+        };
+        let doc_text = |p: &Path| -> Option<String> {
+            let uri = Url::from_file_path(p).ok()?;
+            self.documents
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&uri)
+                .cloned()
+        };
+        let view = WorkspaceView {
+            roots: &roots,
+            manifests: &manifests,
+            doc_text: &doc_text,
+        };
+        Some(f(&path, &view))
+    }
+
+    /// The schema definitions a document's editor surfaces must use:
+    /// package-bound files get the package's exclusive index (RFC 0030 —
+    /// exclusivity applies to completion and hover exactly as it does to
+    /// diagnostics; a stray same-name workspace model must not leak into any
+    /// surface), unbound files get the merged scope registry.
+    ///
+    /// Callers must not hold the `documents` lock: resolution reads it.
+    fn schema_index_for(&self, uri: &Url) -> IndexHandle {
+        match self.resolve_document(uri).map(|r| r.resolution) {
+            Some(Resolution::Bound(b)) => IndexHandle::Bound(b.validator),
+            _ => {
+                let (models, enums, oneofs) = self.models_for_file(uri);
+                IndexHandle::Registry(Box::new(SchemaIndex::build(models, enums, oneofs)))
+            }
+        }
+    }
+
+    /// Full validation of one document: package-bound (exclusive validator +
+    /// binding identity) when a package claims it, the scope-registry path
+    /// otherwise, plus any degraded-state notes pinned to the top of file.
+    fn validate_document(&self, uri: &Url, text: &str) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+        let dc = self.diagnostic_config_for(uri);
+        let resolved = self.resolve_document(uri);
+        let mut diags = match resolved.as_ref().map(|r| &r.resolution) {
+            Some(Resolution::Bound(b)) => {
+                let identity = b.identity();
+                diagnostics::compute(
+                    text,
+                    &SchemaMode::Package {
+                        validator: &b.validator,
+                        identity,
+                    },
+                    &dc,
+                )
+            }
+            _ => {
+                let (models, enums, oneofs) = self.models_for_file(uri);
+                diagnostics::compute(
+                    text,
+                    &SchemaMode::Registry {
+                        models: &models,
+                        enums: &enums,
+                        oneofs: &oneofs,
+                    },
+                    &dc,
+                )
+            }
+        };
+        if let Some(resolved) = &resolved {
+            let top = tower_lsp::lsp_types::Range::new(
+                tower_lsp::lsp_types::Position::new(0, 0),
+                tower_lsp::lsp_types::Position::new(0, 0),
+            );
+            for note in &resolved.notes {
+                let line_index = LineIndex::new(text);
+                let range = note.span.map(|sp| line_index.range(sp)).unwrap_or(top);
+                diags.push(tower_lsp::lsp_types::Diagnostic {
+                    range,
+                    severity: Some(if note.warning {
+                        tower_lsp::lsp_types::DiagnosticSeverity::WARNING
+                    } else {
+                        tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION
+                    }),
+                    message: note.message.clone(),
+                    source: Some("nml".to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+        // Schema-source pass (RFC 0030): a covered `.model.nml` is validated
+        // *as a schema* — extraction errors, directive vocabulary, sibling
+        // info. Uncovered model files stay opaque (no vocabulary_for match ⇒
+        // nothing appended). The pass re-derives extraction errors that
+        // `compute` already emitted as parse errors, so exact duplicates
+        // (same range, message, severity) are suppressed rather than
+        // double-squiggled.
+        if uri.as_str().ends_with(".model.nml") {
+            match self.vocabulary_for_document(uri) {
+                packages::VocabularyOutcome::Covered(vocab) => {
+                    for diag in diagnostics::schema_source_pass(text, &vocab) {
+                        let duplicate = diags.iter().any(|d| {
+                            d.range == diag.range
+                                && d.message == diag.message
+                                && d.severity == diag.severity
+                        });
+                        if !duplicate {
+                            diags.push(diag);
+                        }
+                    }
+                }
+                // The bounded claims walk hit its cap: coverage is honestly
+                // unknown, so say so ONCE (info, top of file) and name the
+                // remedy — declaring the file makes coverage walk-free.
+                // Multiple candidates ⇒ no name (guessing one would mislead).
+                packages::VocabularyOutcome::Undetermined { candidates } => {
+                    let name = match candidates.as_slice() {
+                        [single] => format!("'{single}'? "),
+                        _ => String::new(),
+                    };
+                    diags.push(tower_lsp::lsp_types::Diagnostic {
+                        range: tower_lsp::lsp_types::Range::new(
+                            tower_lsp::lsp_types::Position::new(0, 0),
+                            tower_lsp::lsp_types::Position::new(0, 0),
+                        ),
+                        severity: Some(tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION),
+                        message: format!(
+                            "package coverage undetermined ({name}root exceeds the scan bound); \
+                             declare this file in the package's []schema to get directive vocabulary"
+                        ),
+                        source: Some("nml".to_string()),
+                        ..Default::default()
+                    });
+                }
+                // Definitively uncovered files stay silent — plain-nml
+                // schema authors are never punished for the mechanism.
+                packages::VocabularyOutcome::Opaque => {}
+            }
+        }
+        diags
+    }
+
+    /// The `(uri, text, version)` batch a revalidation fan-out walks: every
+    /// tracked document, or (`open_only`) just the ones currently open in the
+    /// editor. One owner for the filter so the freshness poll's fan-out and
+    /// the background sweep cannot drift apart. Model files are
+    /// included on both paths: `validate_document` runs the schema-source
+    /// pass for covered model files, and their directive diagnostics depend
+    /// on manifest/`[]directive` edits and store state.
+    ///
+    /// The version is captured HERE, at batch time, alongside the text it
+    /// belongs to: a fan-out publishing later must pass the version of the
+    /// text it validated (not whatever is current by then), so a client
+    /// holding a newer buffer discards the stale diagnostic set.
+    fn revalidation_batch(&self, open_only: bool) -> Vec<(Url, String, Option<i32>)> {
+        let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+        let versions = self.doc_versions.lock().unwrap_or_else(|e| e.into_inner());
+        if open_only {
+            let open = self.open_docs.lock().unwrap_or_else(|e| e.into_inner());
+            open.iter()
+                .filter_map(|u| {
+                    docs.get(u)
+                        .map(|s| (u.clone(), s.clone(), versions.get(u).copied()))
+                })
+                .collect()
+        } else {
+            docs.iter()
+                .map(|(u, s)| (u.clone(), s.clone(), versions.get(u).copied()))
+                .collect()
+        }
+    }
+}
+
+impl NmlLanguageServer {
     async fn on_change(&self, uri: Url, text: String) {
         self.documents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(uri.clone(), text.clone());
+        // The version for THIS text: didOpen/didChange recorded it before
+        // calling here, so "current" is exactly the validated text's version.
+        // Non-open documents (watched-file adoption) have none — publish
+        // versionless, as before.
+        let version = self
+            .doc_versions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&uri)
+            .copied();
 
         if uri.as_str().ends_with("nml-project.nml") {
             let file = nml_core::cst::parse_best_effort(&text);
@@ -267,7 +653,12 @@ impl NmlLanguageServer {
                 .project_config
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = config;
-            self.revalidate_all_documents().await;
+            // The edited document itself gets immediate diagnostics; the
+            // workspace-wide fan-out the config change implies runs on the
+            // background sweep, off this request's critical path.
+            let diags = self.validate_document(&uri, &text);
+            self.client.publish_diagnostics(uri, diags, version).await;
+            self.sweep.notify_one();
             return;
         }
 
@@ -275,37 +666,26 @@ impl NmlLanguageServer {
         if is_model_file {
             self.rebuild_schema_registry();
         }
+        // A manifest edit changes a workspace package's definition; a model
+        // edit may change a workspace package's sources. Both invalidate
+        // other documents' bound validation, so both fan out.
+        let affects_packages = is_model_file || uri.as_str().ends_with(".package.nml");
 
-        let (models, enums, oneofs) = self.models_for_file(&uri);
-        let dc = self.diagnostic_config();
-        let diags = diagnostics::compute(&text, &models, &enums, &oneofs, &dc);
-
+        let diags = self.validate_document(&uri, &text);
         self.client
-            .publish_diagnostics(uri.clone(), diags, None)
+            .publish_diagnostics(uri.clone(), diags, version)
             .await;
 
-        if is_model_file {
-            self.revalidate_all_documents().await;
+        if affects_packages {
+            // Other documents' diagnostics are stale now, but revalidating
+            // them here would serialize the whole workspace inside this
+            // handler — the background sweep does it instead.
+            self.sweep.notify_one();
         }
     }
+}
 
-    async fn revalidate_all_documents(&self) {
-        let docs: Vec<(Url, String)> = {
-            let d = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-            d.iter().map(|(u, s)| (u.clone(), s.clone())).collect()
-        };
-
-        let dc = self.diagnostic_config();
-        for (uri, source) in docs {
-            if uri.as_str().ends_with(".model.nml") {
-                continue;
-            }
-            let (models, enums, oneofs) = self.models_for_file(&uri);
-            let diags = diagnostics::compute(&source, &models, &enums, &oneofs, &dc);
-            self.client.publish_diagnostics(uri, diags, None).await;
-        }
-    }
-
+impl Inner {
     fn find_definition(
         &self,
         name: &str,
@@ -414,6 +794,46 @@ impl NmlLanguageServer {
 /// of the (canonicalized) workspace roots. Clients can send arbitrary
 /// `file://` URIs in watched-file notifications, so this is the boundary
 /// check that keeps the server from reading files outside the workspace.
+/// One freshness-poll snapshot (RFC 0030): `current` pointer content per
+/// package name, over `list_names()` ∪ every name in `prev` — carrying the
+/// previously-seen names forward is what lets a *removed* package (gone from
+/// `list_names()` entirely) still read as a present→absent transition.
+fn store_snapshot(
+    store: &nml_validate::store::Store,
+    prev: Option<&HashMap<String, Option<String>>>,
+) -> HashMap<String, Option<String>> {
+    let mut names: HashSet<String> = store.list_names().into_iter().collect();
+    if let Some(prev) = prev {
+        names.extend(prev.keys().cloned());
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let pointer = store.pointer_content(&name);
+            (name, pointer)
+        })
+        .collect()
+}
+
+/// True when any package's `current` pointer differs between two freshness
+/// snapshots (RFC 0030). A missing key reads as "absent" (`None`): a name in
+/// only one map with `Some` content is a transition (absent→present /
+/// present→absent), while a name both maps agree is absent — or an explicit
+/// `None` entry versus no entry at all — is not, so a package that merely
+/// stops appearing in `list_names()` after already reading `None` cannot
+/// re-trigger the fan-out forever.
+fn pointer_transitions(
+    prev: &HashMap<String, Option<String>>,
+    current: &HashMap<String, Option<String>>,
+) -> bool {
+    fn at<'m>(map: &'m HashMap<String, Option<String>>, name: &str) -> Option<&'m str> {
+        map.get(name).and_then(|p| p.as_deref())
+    }
+    prev.keys()
+        .chain(current.keys())
+        .any(|name| at(prev, name) != at(current, name))
+}
+
 fn watched_file_is_eligible(path: &Path, roots: &[PathBuf]) -> bool {
     let is_symlink = fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
@@ -861,6 +1281,50 @@ fn extract_word_at(line: &str, byte_col: usize) -> String {
     line[start..end].to_string()
 }
 
+/// The directive name under the cursor (`#name`), when the cursor sits on
+/// the name or on its `#`; `None` anywhere else — an ordinary word must not
+/// hover as a directive merely because the file has a vocabulary. Uses the
+/// directive-ident charset (alnum/`_`/`-`), narrower than [`is_word_char`]
+/// (whose `@`/`/`/`.` belong to reference tokens, which `#` never contains).
+fn directive_name_at(line: &str, byte_col: usize) -> Option<String> {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    let mut col = byte_col.min(line.len());
+    while col > 0 && !line.is_char_boundary(col) {
+        col -= 1;
+    }
+    let start = if line[col..].starts_with('#') {
+        // Cursor on the `#` itself: the name starts right after it.
+        col + 1
+    } else {
+        let start = line[..col]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !is_ident(*c))
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        if start == 0 || !line[..start].ends_with('#') {
+            return None;
+        }
+        start
+    };
+    let end = line[start..]
+        .char_indices()
+        .find(|(_, c)| !is_ident(*c))
+        .map(|(i, _)| start + i)
+        .unwrap_or(line.len());
+    (end > start).then(|| line[start..end].to_string())
+}
+
+/// Neutralize markdown code-fence openers in schema-author doc text before
+/// splicing it into a hover. ONLY triple-backtick runs are escaped: an
+/// unescaped ``` in the doc would open a fence that swallows the rest of the
+/// hover (including our own closing fence), which is structural breakage —
+/// whereas lighter emphasis characters (`*`, `_`, single backticks) at worst
+/// reflow cosmetically, not worth mangling every doc that mentions them.
+fn escape_markdown_fences(doc: &str) -> String {
+    doc.replace("```", "\\`\\`\\`")
+}
+
 // ── Document symbols ──────────────────────────────────────────
 
 /// Construct a `DocumentSymbol`, isolating the one `#[allow(deprecated)]`
@@ -1200,6 +1664,54 @@ fn find_model_ref_type_at(
     }
 }
 
+/// Enum variants valid in the value position at the cursor (RFC 0030): for a
+/// field typed as an enum ref, a list of enum refs, or a union whose members
+/// include enum refs, return the declared variants in schema-declaration
+/// order (canonical spelling — the whole point of surfacing them). This is
+/// the plain-enum completion the LSP never had: `ENUM_MEMBER` previously
+/// existed only for oneof discriminator arms and membership refs.
+fn find_enum_variants_at(
+    file: &File,
+    source: &str,
+    pos: Position,
+    index: &SchemaIndex,
+    line_index: &LineIndex,
+) -> Option<Vec<String>> {
+    let line = position::line_at(source, pos.line)?;
+    let end = position::utf16_to_byte(line, pos.character);
+    let eq_pos = line[..end].find('=')?;
+    let prop_name = line[..eq_pos].trim();
+    if prop_name.is_empty() {
+        return None;
+    }
+
+    let (model, _body) = find_model_body_at(file, pos, index, line_index)?;
+    let field = model.fields.iter().find(|f| f.name == prop_name)?;
+
+    fn variants_of(ty: &FieldType, index: &SchemaIndex, out: &mut Vec<String>) {
+        match ty {
+            FieldType::ModelRef(name) => {
+                if let Some(e) = index.enum_def(name) {
+                    out.extend(e.variants.iter().cloned());
+                }
+            }
+            FieldType::List(inner) | FieldType::Set(inner) => variants_of(inner, index, out),
+            FieldType::Union(members) => {
+                for m in members {
+                    variants_of(m, index, out);
+                }
+            }
+            // `(K -> V)` arm sets: the value position after `->` takes V —
+            // when V is (or contains) an enum, its variants complete there.
+            FieldType::Arms { target, .. } => variants_of(target, index, out),
+            _ => {}
+        }
+    }
+    let mut variants = Vec::new();
+    variants_of(&field.field_type, index, &mut variants);
+    (!variants.is_empty()).then_some(variants)
+}
+
 // ── Schema-driven field completion (RFC 0003) ─────────────────────────────────
 
 /// Resolve the model whose fields are valid at the cursor's body, **and that body** (so the
@@ -1341,7 +1853,10 @@ fn descend_to_cursor<'i, 'f>(
                     }
                     _ => None,
                 })?;
-                let ListItemKind::Named { body: item_body, .. } = &item.kind else {
+                let ListItemKind::Named {
+                    body: item_body, ..
+                } = &item.kind
+                else {
                     return None;
                 };
                 descend_to_cursor(item_model, item_body, pos, index, line_index)
@@ -1401,8 +1916,16 @@ fn present_field_names(body: &Body) -> HashSet<String> {
 /// `detail` for a field completion — the NML type as authored, with `?` for optional and
 /// `= <default>` when the schema declares one (so the author sees the effective value).
 fn field_detail(field: &FieldDef) -> String {
-    let mut detail = format!("{}{}", field.field_type, if field.optional { "?" } else { "" });
-    if let Some(rendered) = field.default_value.as_ref().and_then(|d| render_scalar(&d.value)) {
+    let mut detail = format!(
+        "{}{}",
+        field.field_type,
+        if field.optional { "?" } else { "" }
+    );
+    if let Some(rendered) = field
+        .default_value
+        .as_ref()
+        .and_then(|d| render_scalar(&d.value))
+    {
         detail.push_str(&format!(" = {rendered}"));
     }
     detail
@@ -1534,14 +2057,12 @@ fn find_declaration_hover(
                 // item hover is held rather than returned.
                 DeclarationKind::Array(arr) => {
                     if item_hover.is_none() {
-                        if let Some(item_body) =
-                            arr.body.items.iter().find_map(|item| match &item.kind {
-                                ListItemKind::Named { name, body } if name.name == word => {
-                                    Some(body)
-                                }
-                                _ => None,
-                            })
+                        if let Some(item_body) = arr.body.items.iter().find_map(|item| match &item
+                            .kind
                         {
+                            ListItemKind::Named { name, body } if name.name == word => Some(body),
+                            _ => None,
+                        }) {
                             item_hover = Some(render_declaration_hover(
                                 &arr.item_keyword.name,
                                 word,
@@ -1766,9 +2287,515 @@ fn compute_indent_after_line(lines: &[&str], line_idx: usize) -> usize {
 
 // ── LanguageServer implementation ─────────────────────────────
 
+/// The single-line replace/insert ranges for a value completion at `pos`:
+/// the existing value token (from the first non-space after `=` to the end
+/// of its contiguous run) is replaced; the insert range stops at the cursor
+/// (LSP 3.16 insert-vs-replace semantics). `None` when the line has no `=`
+/// before the cursor.
+fn value_edit_ranges(source: &str, pos: Position) -> Option<(Range, Range)> {
+    let line = position::line_at(source, pos.line)?;
+    let cursor = position::utf16_to_byte(line, pos.character);
+    let eq = line[..cursor].find('=')?;
+    let after_eq = eq + 1;
+    let token_start = after_eq
+        + line[after_eq..]
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(cursor.saturating_sub(after_eq));
+    let token_start = token_start.min(cursor);
+    // A quoted value extends to its closing quote (a `"a b"` literal is one
+    // token); anything else ends at the next whitespace.
+    let token_end = if line[token_start..].starts_with('"') {
+        line[token_start + 1..]
+            .find('"')
+            .map(|i| token_start + 1 + i + 1)
+            .unwrap_or(line.len())
+    } else {
+        token_start
+            + line[token_start..]
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(line.len() - token_start)
+    };
+    let token_end = token_end.max(cursor);
+    let col = |b: usize| position::byte_to_utf16(line, b);
+    let replace = Range::new(
+        Position::new(pos.line, col(token_start)),
+        Position::new(pos.line, col(token_end)),
+    );
+    let insert = Range::new(
+        Position::new(pos.line, col(token_start)),
+        Position::new(pos.line, col(cursor)),
+    );
+    Some((insert, replace))
+}
+
+/// A quoted-value completion item with a precise edit: `InsertReplaceEdit`
+/// when the client supports it (capability-gated), plain `TextEdit`
+/// otherwise; `filter_text` is the quoted form because clients filter
+/// against the range text, which starts at the opening quote.
+fn quoted_value_item(
+    variant: &str,
+    detail: &str,
+    sort: String,
+    edit_ranges: Option<(Range, Range)>,
+    insert_replace: bool,
+) -> CompletionItem {
+    let quoted = format!("\"{variant}\"");
+    let text_edit = edit_ranges.map(|(insert, replace)| {
+        if insert_replace {
+            CompletionTextEdit::InsertAndReplace(InsertReplaceEdit {
+                new_text: quoted.clone(),
+                insert,
+                replace,
+            })
+        } else {
+            CompletionTextEdit::Edit(TextEdit {
+                range: replace,
+                new_text: quoted.clone(),
+            })
+        }
+    });
+    CompletionItem {
+        label: quoted.clone(),
+        kind: Some(CompletionItemKind::ENUM_MEMBER),
+        detail: Some(detail.to_string()),
+        sort_text: Some(sort),
+        filter_text: Some(quoted),
+        text_edit,
+        ..Default::default()
+    }
+}
+
+/// A schema index for editor surfaces: borrowed from a bound package's
+/// validator, or owned (built from the scope registry).
+enum IndexHandle {
+    Bound(std::sync::Arc<nml_validate::schema::SchemaValidator>),
+    Registry(Box<SchemaIndex>),
+}
+
+impl IndexHandle {
+    fn index(&self) -> &SchemaIndex {
+        match self {
+            IndexHandle::Bound(v) => v.index(),
+            IndexHandle::Registry(i) => i,
+        }
+    }
+}
+
+/// What a pin/opt-out code action writes into `nml-project.nml`.
+enum ProjectEdit {
+    Pin(String),
+    OptOut,
+}
+
+impl NmlLanguageServer {
+    /// Build the workspace edit for a pin/opt-out action targeting the
+    /// nearest `nml-project.nml` (structural CST insert into the existing
+    /// `project` block — RFC 0030 P2) or creating one at the binding's root.
+    /// Injection-safe twice over: package names are charset-constrained at
+    /// package load, and the CST splice refuses any snippet that does not
+    /// parse as plain body entries.
+    fn project_edit_action(
+        &self,
+        file_path: &Path,
+        root: &Path,
+        title: String,
+        edit: ProjectEdit,
+    ) -> Option<CodeAction> {
+        // The action writes files: it must never target a path outside the
+        // workspace (a root marker in `$HOME` must not make the editor
+        // create `~/nml-project.nml`).
+        {
+            let roots = self
+                .workspace_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !roots
+                .iter()
+                .any(|r| root.starts_with(r) || r.starts_with(root))
+            {
+                return None;
+            }
+        }
+
+        // Nearest existing nml-project.nml between the file and its root.
+        let mut existing: Option<PathBuf> = None;
+        let mut dir = file_path.parent();
+        while let Some(d) = dir {
+            let candidate = d.join("nml-project.nml");
+            if candidate.is_file() {
+                existing = Some(candidate);
+                break;
+            }
+            if d == root {
+                break;
+            }
+            dir = d.parent();
+        }
+
+        let workspace_edit = match existing {
+            Some(project_path) => {
+                // Open-document text wins over disk — an unsaved buffer is
+                // the text the computed offsets must be valid against.
+                let text = Url::from_file_path(&project_path)
+                    .ok()
+                    .and_then(|u| {
+                        self.documents
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&u)
+                            .cloned()
+                    })
+                    .or_else(|| std::fs::read_to_string(&project_path).ok())?;
+                let new_text = project_file_insertion(&text, &edit)?;
+                // Whole-document replacement: the CST splice returns the
+                // complete new text, and a single full-range TextEdit is the
+                // simplest LSP shape that is guaranteed byte-exact — no
+                // offset→Position math for a structural edit to get subtly
+                // wrong, and the file is a small config so the payload cost
+                // is irrelevant.
+                let line_index = LineIndex::new(&text);
+                let uri = Url::from_file_path(&project_path).ok()?;
+                let mut changes = std::collections::HashMap::new();
+                changes.insert(
+                    uri,
+                    vec![TextEdit {
+                        range: line_index.range(nml_core::span::Span::new(0, text.len())),
+                        new_text,
+                    }],
+                );
+                WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }
+            }
+            None => {
+                let project_path = root.join("nml-project.nml");
+                let uri = Url::from_file_path(&project_path).ok()?;
+                let content = match &edit {
+                    ProjectEdit::Pin(name) => {
+                        format!("project Project:\n    schemaPackages:\n        - {name}\n")
+                    }
+                    ProjectEdit::OptOut => {
+                        "project Project:\n    autoAssociate = false\n".to_string()
+                    }
+                };
+                WorkspaceEdit {
+                    document_changes: Some(DocumentChanges::Operations(vec![
+                        DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                            uri: uri.clone(),
+                            options: None,
+                            annotation_id: None,
+                        })),
+                        DocumentChangeOperation::Edit(TextDocumentEdit {
+                            text_document: OptionalVersionedTextDocumentIdentifier {
+                                uri,
+                                version: None,
+                            },
+                            edits: vec![OneOf::Left(TextEdit {
+                                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                                new_text: content,
+                            })],
+                        }),
+                    ])),
+                    ..Default::default()
+                }
+            }
+        };
+
+        Some(CodeAction {
+            title,
+            kind: Some(CodeActionKind::QUICKFIX),
+            edit: Some(workspace_edit),
+            ..Default::default()
+        })
+    }
+
+    /// `nml/schemaInfo` (RFC 0030 introspection): which package validates a
+    /// file, from where, at which hash, bound how — plus every degraded-state
+    /// note. Registered as a custom JSON-RPC method; any LSP client can call
+    /// it, the VS Code extension renders it.
+    pub async fn schema_info(&self, params: serde_json::Value) -> Result<serde_json::Value> {
+        let uri = params
+            .get("uri")
+            .and_then(|u| u.as_str())
+            .and_then(|u| Url::parse(u).ok());
+        let Some(uri) = uri else {
+            return Ok(serde_json::json!({ "error": "missing or invalid 'uri'" }));
+        };
+        let Some(resolved) = self.resolve_document(&uri) else {
+            return Ok(serde_json::json!({ "bound": false, "notes": [] }));
+        };
+        // Structured notes — the never-migrate wire shape, fixed BEFORE the
+        // first consumer exists: enumerated severity (extensible, unlike a
+        // bool) and an LSP Range (the client's native vocabulary; raw byte
+        // offsets would push UTF-16 conversion onto every client).
+        let doc_text = {
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            docs.get(&uri).cloned()
+        };
+        let line_index = doc_text.as_deref().map(LineIndex::new);
+        let notes: Vec<serde_json::Value> = resolved
+            .notes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "message": n.message,
+                    "severity": if n.warning { "warning" } else { "info" },
+                    "range": n
+                        .span
+                        .zip(line_index.as_ref())
+                        .map(|(sp, li)| serde_json::to_value(li.range(sp)).ok()),
+                })
+            })
+            .collect();
+        Ok(match &resolved.resolution {
+            Resolution::Bound(b) => serde_json::json!({
+                "bound": true,
+                "package": b.package_name,
+                "version": b.package_version,
+                "contentHash": b.content_hash,
+                "binding": b.binding_name,
+                "source": b.source.label(),
+                "step": match b.step {
+                    packages::BindingStep::Pinned => "pinned",
+                    packages::BindingStep::AutoAssociated => "auto-associated",
+                },
+                "root": b.root.display().to_string(),
+                "shadowsStore": b.shadows_store,
+                "actions": if b.step == packages::BindingStep::AutoAssociated
+                    && b.source != packages::DefinitionSource::Builtin
+                {
+                    serde_json::json!(["pin", "disableAutoAssociation"])
+                } else {
+                    serde_json::json!([])
+                },
+                "notes": notes,
+            }),
+            Resolution::Unbound => serde_json::json!({ "bound": false, "notes": notes }),
+        })
+    }
+}
+
+/// Compute the full new text of an **existing** `nml-project.nml` for a
+/// pin/opt-out edit via the CST splice API (`nml_core::cst::edit`, RFC 0030
+/// P2) — a comment-preserving structural insert, not a line-offset text
+/// patch. `None` when the edit is redundant (already pinned / already opted
+/// out) or the file has no `project` block to target.
+fn project_file_insertion(text: &str, edit: &ProjectEdit) -> Option<String> {
+    use nml_core::cst::edit::{insert_entry_at_path, EntryPosition};
+    // Idempotency is decided structurally, through the SAME parser that reads
+    // pins at resolution time (`ProjectConfig::from_file`) — so the check can
+    // never disagree with how the config is actually interpreted, and a
+    // `- name` or `autoAssociate = false` appearing inside a comment or
+    // string can't false-suppress the action. This supersedes the earlier
+    // hand-rolled text scans (one scoped, one not — an inconsistency).
+    let config = {
+        let file = nml_core::cst::parse_best_effort(text);
+        nml_core::ProjectConfig::from_file(&file)
+    };
+    match edit {
+        ProjectEdit::Pin(name) => {
+            if config.schema_packages.iter().any(|p| p == name) {
+                return None;
+            }
+            // Append to the `schemaPackages:` block nested under the `project`
+            // block; failing that (no such nested block yet), create it (with
+            // its first item) directly under the `project <Name>:` header —
+            // the same shapes the plain-text writer produced, now
+            // indentation-adaptive and comment-safe. Path addressing means a
+            // `schemaPackages:` under some other top-level block can never
+            // receive the pin, and duplicates refuse rather than misdirect.
+            insert_entry_at_path(
+                text,
+                &["project", "schemaPackages"],
+                &format!("- {name}"),
+                EntryPosition::Last,
+            )
+            .or_else(|| {
+                insert_entry_at_path(
+                    text,
+                    &["project"],
+                    &format!("schemaPackages:\n    - {name}"),
+                    EntryPosition::AfterHeader,
+                )
+            })
+        }
+        ProjectEdit::OptOut => {
+            // `auto_associate` defaults true; a `false` already present means
+            // the opt-out is redundant.
+            if !config.auto_associate {
+                return None;
+            }
+            insert_entry_at_path(
+                text,
+                &["project"],
+                "autoAssociate = false",
+                EntryPosition::AfterHeader,
+            )
+        }
+    }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for NmlLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let insert_replace = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|t| t.completion.as_ref())
+            .and_then(|c| c.completion_item.as_ref())
+            .and_then(|ci| ci.insert_replace_support)
+            .unwrap_or(false);
+        self.insert_replace_support
+            .store(insert_replace, std::sync::atomic::Ordering::Relaxed);
+        // Push-based store-event notifier + freshness poll (RFC 0030): one
+        // background task with two arms. The notifier arm logs each event the
+        // instant the resolver sends it; the timer arm is the low-frequency
+        // store poll that heals *idle* editors after `nudge schema sync`
+        // (the per-pass re-resolution only heals on the next keystroke).
+        // take() makes double-spawn unconstructible. The task holds a
+        // `Weak<Inner>` — never an `Arc`, which would keep the resolver (and
+        // its channel sender) alive forever and make self-termination
+        // unreachable. Each select arm upgrades before touching state and
+        // breaks when the upgrade fails, so a dropped server ends the task on
+        // its next wakeup — no shutdown bookkeeping, by construction rather
+        // than by promise.
+        if let Some(mut rx) = self
+            .store_events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let client = self.client.clone();
+            let inner = Arc::downgrade(&self.inner);
+            // Freshness baseline, captured synchronously HERE rather than on
+            // the task's first tick: startup state is a *baseline*, never a
+            // "transition" (a warm store at initialize must not fan out
+            // spurious republishes) — and a sync landing in the scheduling
+            // gap between spawn and first poll must not be swallowed into
+            // that baseline. `None` only when running storeless.
+            let mut snapshot: Option<HashMap<String, Option<String>>> = self
+                .resolver
+                .store()
+                .map(|store| store_snapshot(store, None));
+            tokio::spawn(async move {
+                let mut poll = tokio::time::interval(STORE_POLL_INTERVAL);
+                // A stalled runtime must not burst-fire catch-up polls.
+                poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        event = rx.recv() => {
+                            // None = the resolver (the only sender) dropped:
+                            // the server is gone, so the poll must die with
+                            // it — same self-termination as the plain loop.
+                            let Some(event) = event else { break };
+                            // The Weak is the liveness authority: a server
+                            // mid-drop must not be logged for.
+                            if inner.upgrade().is_none() {
+                                break;
+                            }
+                            let level = if event.warning {
+                                MessageType::WARNING
+                            } else {
+                                MessageType::INFO
+                            };
+                            client.log_message(level, event.message).await;
+                        }
+                        _ = poll.tick() => {
+                            // Upgrade per tick: the server dropping between
+                            // wakeups ends the task here.
+                            let Some(inner) = inner.upgrade() else {
+                                break;
+                            };
+                            // Watch THE store the resolver binds against —
+                            // never `Store::user()` here, which would watch
+                            // the wrong directory under an injected store.
+                            let Some(store) = inner.resolver.store() else {
+                                continue;
+                            };
+                            let current = store_snapshot(store, snapshot.as_ref());
+                            let changed = snapshot
+                                .as_ref()
+                                .is_some_and(|prev| pointer_transitions(prev, &current));
+                            snapshot = Some(current);
+                            if changed {
+                                // Any pointer transition — including
+                                // absent→present, the brand-new-operator
+                                // path — re-resolves every open document, so
+                                // `nudge schema sync` in a terminal visibly
+                                // heals the editor within seconds while idle.
+                                for (uri, text, version) in inner.revalidation_batch(true) {
+                                    let diags = inner.validate_document(&uri, &text);
+                                    // Batch-time version: pairs the publish
+                                    // with the text it validated, so a client
+                                    // that edited meanwhile discards it.
+                                    client.publish_diagnostics(uri, diags, version).await;
+                                }
+                            }
+                        }
+                        // Broad-revalidation sweep: handlers whose edits
+                        // invalidate other documents notify instead of
+                        // fanning out inline (a 10k-document workspace would
+                        // otherwise serialize inside the request handler).
+                        // `Notify` coalesces bursts by design — N wakeups
+                        // pending at once collapse into ONE sweep, which is
+                        // correct because a sweep always reads the latest
+                        // text. The waiting future must hold an upgraded
+                        // `Arc` (`notified()` borrows the Notify inside
+                        // `Inner`), which can delay self-termination by at
+                        // most one poll tick: the tick arm completes the
+                        // select, the waiter (and its Arc) is dropped, and
+                        // the next iteration's upgrade fails.
+                        swept = async {
+                            match inner.upgrade() {
+                                Some(inner) => {
+                                    inner.sweep.notified().await;
+                                    true
+                                }
+                                None => false,
+                            }
+                        } => {
+                            if !swept {
+                                break;
+                            }
+                            // Upgrade-or-break, like the other arms.
+                            let Some(inner) = inner.upgrade() else {
+                                break;
+                            };
+                            for (uri, text, version) in inner.revalidation_batch(false) {
+                                let diags = inner.validate_document(&uri, &text);
+                                // Stale-publish guard: if the document
+                                // changed while this sweep validated it, a
+                                // newer on_change already validated and
+                                // published the newer text — publishing the
+                                // batch's older diagnostics now would
+                                // clobber it. Re-lock and compare BEFORE
+                                // publishing; skip on any mismatch. The
+                                // compare is cheap but racy (the doc can
+                                // change again between compare and publish):
+                                // passing the BATCH-time version alongside
+                                // lets the client discard that late frame
+                                // itself, closing the remaining TOCTOU.
+                                let current = inner
+                                    .documents
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .get(&uri)
+                                    .is_some_and(|now| *now == text);
+                                if current {
+                                    client.publish_diagnostics(uri, diags, version).await;
+                                }
+                                // Chunked responsiveness: yield between
+                                // documents so a long sweep never starves
+                                // the runtime.
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
         let roots: Vec<Url> = params
             .workspace_folders
             .as_ref()
@@ -1805,6 +2832,9 @@ impl LanguageServer for NmlLanguageServer {
                         ".".to_string(),
                         "$".to_string(),
                         "=".to_string(),
+                        // RFC 0030/0032: directive-vocabulary completion after
+                        // `#` on a field-def line in covered model files.
+                        "#".to_string(),
                     ]),
                     ..Default::default()
                 }),
@@ -1822,6 +2852,9 @@ impl LanguageServer for NmlLanguageServer {
                     first_trigger_character: "\n".to_string(),
                     more_trigger_character: None,
                 }),
+                // RFC 0030: machine-applicable quick-fixes (did-you-mean) +
+                // pin / auto-association code actions.
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -1853,18 +2886,49 @@ impl LanguageServer for NmlLanguageServer {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        self.open_docs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(params.text_document.uri.clone());
+        // Record the version BEFORE on_change so its publish carries it.
+        self.doc_versions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                params.text_document.uri.clone(),
+                params.text_document.version,
+            );
         self.on_change(params.text_document.uri, params.text_document.text)
             .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         if let Some(change) = params.content_changes.into_iter().last() {
+            // Record the version BEFORE on_change so its publish carries it.
+            self.doc_versions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    params.text_document.uri.clone(),
+                    params.text_document.version,
+                );
             self.on_change(params.text_document.uri, change.text).await;
         }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
+        self.open_docs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uri);
+        // Closed documents have no client version — a later reopen restarts
+        // the version sequence, so keeping the stale one would mislabel the
+        // sweep's publishes in between.
+        self.doc_versions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uri);
         let was_model = uri.as_str().ends_with(".model.nml");
         let indexed = self
             .indexed_uris
@@ -1880,12 +2944,36 @@ impl LanguageServer for NmlLanguageServer {
 
         if was_model {
             self.rebuild_schema_registry();
-            self.revalidate_all_documents().await;
+            // The registry changed under every other document — stale
+            // diagnostics are healed by the background sweep, not inline.
+            self.sweep.notify_one();
         }
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        // File create/delete changes what a package's binding globs can
+        // claim under a root — cached coverage verdicts are statements
+        // about existing files, so any watched change invalidates them
+        // (cheap to recompute; wrong-until-restart is not acceptable).
+        if !params.changes.is_empty() {
+            self.resolver.invalidate_claims();
+        }
         for change in params.changes {
+            // LSP spec: after didOpen the CLIENT buffer is the sole source of
+            // truth for a document's content — disk events are irrelevant
+            // while the file is open (didClose will reconcile). This guards
+            // EVERY arm: a CREATED/CHANGED must not clobber the open buffer's
+            // text with disk content any more than a DELETED may drop it —
+            // either way the served document would stop matching what the
+            // user sees in the editor.
+            let is_open = self
+                .open_docs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&change.uri);
+            if is_open {
+                continue;
+            }
             match change.typ {
                 FileChangeType::CREATED | FileChangeType::CHANGED => {
                     let Ok(path) = change.uri.to_file_path() else {
@@ -1906,6 +2994,12 @@ impl LanguageServer for NmlLanguageServer {
                     }
                 }
                 FileChangeType::DELETED => {
+                    // Open docs never reach here (guard above) — and that
+                    // covers this ENTIRE arm, registry handling included:
+                    // dropping the text while keeping serving the doc would
+                    // leave a half-alive document (definitions but no
+                    // content, or vice versa) — worse than either consistent
+                    // state.
                     self.documents
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1916,7 +3010,8 @@ impl LanguageServer for NmlLanguageServer {
                         .remove(&change.uri);
                     if change.uri.as_str().ends_with(".model.nml") {
                         self.rebuild_schema_registry();
-                        self.revalidate_all_documents().await;
+                        // Fan-out off the notification path — see `sweep`.
+                        self.sweep.notify_one();
                     }
                 }
                 _ => {}
@@ -1928,6 +3023,47 @@ impl LanguageServer for NmlLanguageServer {
         let mut items = Vec::new();
         let pos = params.text_document_position.position;
         let uri = params.text_document_position.text_document.uri;
+
+        // Directive completion (RFC 0030/0032): after `#` on a field-def line
+        // of a covered model file, offer the covering package's vocabulary.
+        // Checked before the value branch — a field line with a default
+        // (`port number = 80 #li`) has an `=` before the cursor, so the value
+        // detector would otherwise claim it.
+        if uri.as_str().ends_with(".model.nml") {
+            let in_directive_position = {
+                let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+                docs.get(&uri)
+                    .and_then(|source| {
+                        let line = position::line_at(source, pos.line)?;
+                        let end = position::utf16_to_byte(line, pos.character);
+                        // Strip the partly-typed name back to the `#`, then
+                        // require a field def before it: a directive TRAILS a
+                        // field definition, it never opens a line.
+                        let stem = line[..end].trim_end_matches(is_word_char);
+                        Some(stem.ends_with('#') && !stem[..stem.len() - 1].trim().is_empty())
+                    })
+                    .unwrap_or(false)
+            };
+            if in_directive_position {
+                // Opaque/undetermined files get an empty menu, not the
+                // generic keyword soup — nothing meaningful follows `#`
+                // without a KNOWN covering vocabulary.
+                if let packages::VocabularyOutcome::Covered(vocab) =
+                    self.vocabulary_for_document(&uri)
+                {
+                    for d in &vocab.directives {
+                        items.push(CompletionItem {
+                            label: d.name.clone(),
+                            kind: Some(CompletionItemKind::KEYWORD),
+                            detail: Some(d.arg.label().to_string()),
+                            documentation: Some(Documentation::String(d.doc.clone())),
+                            ..Default::default()
+                        });
+                    }
+                }
+                return Ok(Some(CompletionResponse::Array(items)));
+            }
+        }
 
         let is_value_position = {
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
@@ -1974,27 +3110,38 @@ impl LanguageServer for NmlLanguageServer {
                 return Ok(Some(CompletionResponse::Array(items)));
             }
 
-            // Schema-driven value completions (model refs + oneof discriminator arm
-            // keys) share one schema snapshot rather than re-cloning it per detector.
-            let (model_ref_type, discriminator_values): (Option<String>, Option<Vec<String>>) = {
+            // Schema-driven value completions (model refs, oneof discriminator
+            // arm keys, plain enum variants) share one schema snapshot rather
+            // than re-cloning it per detector. A package-bound document (RFC
+            // 0030) completes against its package's exclusive definitions —
+            // the same exclusivity rule diagnostics apply.
+            let (model_ref_type, discriminator_values, enum_variants): (
+                Option<String>,
+                Option<Vec<String>>,
+                Option<Vec<String>>,
+            ) = {
+                let handle = self.schema_index_for(&uri);
                 let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
                 match docs
                     .get(&uri)
                     .map(|source| (source, nml_core::cst::parse_best_effort(source)))
                 {
-                    // Parse once and build one schema index, shared by both detectors.
+                    // Parse once and build one schema index, shared by all detectors.
                     Some((source, file)) => {
-                        let (models, enums, oneofs) = self.models_for_file(&uri);
-                        let index = SchemaIndex::build(models, enums, oneofs);
+                        let index: &SchemaIndex = handle.index();
                         let line_index = LineIndex::new(source);
                         let model_ref =
-                            find_model_ref_type_at(&file, source, pos, &index, &line_index);
+                            find_model_ref_type_at(&file, source, pos, index, &line_index);
                         let discriminator =
-                            find_oneof_discriminator_at(&file, source, pos, &index, &line_index)
-                                .map(|o| o.variants.iter().map(|(value, _)| value.clone()).collect());
-                        (model_ref, discriminator)
+                            find_oneof_discriminator_at(&file, source, pos, index, &line_index)
+                                .map(|o| {
+                                    o.variants.iter().map(|(value, _)| value.clone()).collect()
+                                });
+                        let variants =
+                            find_enum_variants_at(&file, source, pos, index, &line_index);
+                        (model_ref, discriminator, variants)
                     }
-                    None => (None, None),
+                    None => (None, None, None),
                 }
             };
 
@@ -2012,16 +3159,41 @@ impl LanguageServer for NmlLanguageServer {
                 }
             }
 
+            // Precise value edits (RFC 0030): the client replaces the whole
+            // existing literal (quotes included) — no quote doubling in any
+            // client, insert-vs-replace honored where supported.
+            let edit_ranges = {
+                let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+                docs.get(&uri).and_then(|src| value_edit_ranges(src, pos))
+            };
+            let insert_replace = self
+                .insert_replace_support
+                .load(std::sync::atomic::Ordering::Relaxed);
+
             // Inside a `oneof` block, offer the arm keys as discriminator values.
             if let Some(values) = discriminator_values {
                 for value in values {
-                    items.push(CompletionItem {
-                        label: format!("\"{value}\""),
-                        kind: Some(CompletionItemKind::ENUM_MEMBER),
-                        detail: Some("discriminator value".to_string()),
-                        sort_text: Some(format!("0_{value}")),
-                        ..Default::default()
-                    });
+                    items.push(quoted_value_item(
+                        &value,
+                        "discriminator value",
+                        format!("0_{value}"),
+                        edit_ranges,
+                        insert_replace,
+                    ));
+                }
+            }
+
+            // Plain enum-typed field (RFC 0030): offer the declared variants,
+            // canonical spelling, schema-declaration order.
+            if let Some(variants) = enum_variants {
+                for (i, variant) in variants.iter().enumerate() {
+                    items.push(quoted_value_item(
+                        variant,
+                        "enum variant",
+                        format!("0_{i:03}"),
+                        edit_ranges,
+                        insert_replace,
+                    ));
                 }
             }
 
@@ -2038,11 +3210,11 @@ impl LanguageServer for NmlLanguageServer {
             // Property position (no `=` before the cursor): schema-driven FIELD completion
             // (RFC 0003) — the dual of the value-position completions above. Offer the
             // enclosing model's not-yet-present fields, type-aware insertion, required-first.
+            let handle = self.schema_index_for(&uri); // before the docs lock — resolution reads it
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(source) = docs.get(&uri) {
                 let file = nml_core::cst::parse_best_effort(source);
-                let (models, enums, oneofs) = self.models_for_file(&uri);
-                let index = SchemaIndex::build(models, enums, oneofs);
+                let index: &SchemaIndex = handle.index();
                 let line_index = LineIndex::new(source);
                 // Arm-target position (RFC 0007): after the `->` on an arm
                 // line, offer declarations of the arm set's target type `V`
@@ -2055,9 +3227,22 @@ impl LanguageServer for NmlLanguageServer {
                     .unwrap_or(false);
                 if after_arrow {
                     if let Some(target_keywords) =
-                        find_arm_target_types_at(&file, pos, &index, &line_index)
+                        find_arm_target_types_at(&file, pos, index, &line_index)
                     {
                         for keyword in &target_keywords {
+                            // Enum-typed arm target (RFC 0030): offer the
+                            // declared variants as values.
+                            if let Some(e) = index.enum_def(keyword) {
+                                for (i, variant) in e.variants.iter().enumerate() {
+                                    items.push(CompletionItem {
+                                        label: format!("\"{variant}\""),
+                                        kind: Some(CompletionItemKind::ENUM_MEMBER),
+                                        detail: Some("enum variant".to_string()),
+                                        sort_text: Some(format!("0_{i:03}")),
+                                        ..Default::default()
+                                    });
+                                }
+                            }
                             for (name, kw, file_name) in
                                 collect_declarations_by_keyword(&docs, keyword)
                             {
@@ -2073,7 +3258,7 @@ impl LanguageServer for NmlLanguageServer {
                         return Ok(Some(CompletionResponse::Array(items)));
                     }
                 }
-                if let Some((model, body)) = find_model_body_at(&file, pos, &index, &line_index) {
+                if let Some((model, body)) = find_model_body_at(&file, pos, index, &line_index) {
                     let present = present_field_names(body);
                     for (idx, field) in model.fields.iter().enumerate() {
                         if present.contains(&field.name) {
@@ -2083,8 +3268,11 @@ impl LanguageServer for NmlLanguageServer {
                             label: field.name.clone(),
                             kind: Some(CompletionItemKind::FIELD),
                             detail: Some(field_detail(field)),
+                            // The schema author's leading comment block (RFC
+                            // 0004 §4.3) documents the field in the menu too.
+                            documentation: field.doc.clone().map(Documentation::String),
                             sort_text: Some(field_sort_key(field, idx)),
-                            insert_text: Some(field_insert_text(&index, field)),
+                            insert_text: Some(field_insert_text(index, field)),
                             ..Default::default()
                         });
                     }
@@ -2197,9 +3385,130 @@ impl LanguageServer for NmlLanguageServer {
         Ok(Some(CompletionResponse::Array(items)))
     }
 
+    /// Quick-fixes from structured suggestions (`Diagnostic.data`) plus the
+    /// pin / opt-out actions on auto-associated documents (RFC 0030).
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+
+        let source = {
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            docs.get(&uri).cloned()
+        };
+        let Some(source) = source else {
+            return Ok(None);
+        };
+        let line_index = LineIndex::new(&source);
+
+        // 1. Machine-applicable suggestions the validator derived — never
+        //    re-derived, never parsed out of message text.
+        for diag in &params.context.diagnostics {
+            let Some(suggestion) = diag
+                .data
+                .as_ref()
+                .and_then(|d| d.get("suggestion"))
+                .and_then(|s| {
+                    Some((
+                        s.get("replacement")?.as_str()?.to_string(),
+                        s.get("start")?.as_u64()? as usize,
+                        s.get("end")?.as_u64()? as usize,
+                    ))
+                })
+            else {
+                continue;
+            };
+            let (replacement, start, end) = suggestion;
+            let edit = TextEdit {
+                range: line_index.range(nml_core::span::Span::new(start, end)),
+                new_text: replacement.clone(),
+            };
+            let mut changes = std::collections::HashMap::new();
+            changes.insert(uri.clone(), vec![edit]);
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("Replace with \"{replacement}\""),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diag.clone()]),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }),
+                is_preferred: Some(true),
+                ..Default::default()
+            }));
+        }
+
+        // 2. Pin / opt-out on auto-associated documents. Structural CST
+        //    inserts (RFC 0030 P2) — injection-safe because package names are
+        //    charset-constrained identifiers (enforced at package load) AND
+        //    the splice API refuses snippets that don't parse as body entries.
+        if let Some(resolved) = self.resolve_document(&uri) {
+            if let Resolution::Bound(binding) = &resolved.resolution {
+                if binding.step == packages::BindingStep::AutoAssociated
+                    && binding.source != packages::DefinitionSource::Builtin
+                {
+                    if let Ok(path) = uri.to_file_path() {
+                        let name = &binding.package_name;
+                        if let Some(action) = self.project_edit_action(
+                            &path,
+                            &binding.root,
+                            format!("Pin schema package '{name}'"),
+                            ProjectEdit::Pin(name.clone()),
+                        ) {
+                            actions.push(CodeActionOrCommand::CodeAction(action));
+                        }
+                        if let Some(action) = self.project_edit_action(
+                            &path,
+                            &binding.root,
+                            format!(
+                                "Not a {name} project? Disable schema auto-association for this root"
+                            ),
+                            ProjectEdit::OptOut,
+                        ) {
+                            actions.push(CodeActionOrCommand::CodeAction(action));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((!actions.is_empty()).then_some(actions))
+    }
+
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
+
+        // Document-start hover (RFC 0030 introspection): the binding summary —
+        // which package validates this file, from where, at which hash.
+        // Position (0,0) only, so it can never shadow a real token's hover
+        // (a token's hover is requested at the token, not at the file edge).
+        if pos.line == 0 && pos.character == 0 {
+            if let Some(resolved) = self.resolve_document(&uri) {
+                if let Resolution::Bound(b) = &resolved.resolution {
+                    let summary = format!(
+                        "**Schema package:** `{}` {} · `{}` · {} · binding `{}`\n\nroot: `{}`{}",
+                        b.package_name,
+                        b.package_version,
+                        format_args!("blake3:{}", nml_validate::store::hash8(&b.content_hash)),
+                        b.source.label(),
+                        b.binding_name,
+                        b.root.display(),
+                        if b.step == packages::BindingStep::AutoAssociated {
+                            "\n\n_auto-associated — a `schemaPackages` pin makes this explicit_"
+                        } else {
+                            ""
+                        }
+                    );
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: summary,
+                        }),
+                        range: None,
+                    }));
+                }
+            }
+        }
 
         let source_clone = {
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
@@ -2224,6 +3533,38 @@ impl LanguageServer for NmlLanguageServer {
                 }),
                 range: None,
             }));
+        }
+
+        // Directive hover (RFC 0030/0032): `#name` in a covered model file
+        // renders the vocabulary entry. Unknown names get no hover — the
+        // vocabulary diagnostic already explains them.
+        if uri.as_str().ends_with(".model.nml") {
+            if let Some(name) = directive_name_at(line, byte_col) {
+                // Covered files only: without a known vocabulary there is no
+                // entry to render (undetermined coverage already surfaced
+                // through the info diagnostic).
+                if let packages::VocabularyOutcome::Covered(vocab) =
+                    self.vocabulary_for_document(&uri)
+                {
+                    if let Some(d) = vocab.directives.iter().find(|d| d.name == name) {
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                // Fence-escaped: vocabulary docs are
+                                // author-supplied text (see
+                                // `escape_markdown_fences`).
+                                value: format!(
+                                    "**#{}** ({}) — {}",
+                                    d.name,
+                                    d.arg.label(),
+                                    escape_markdown_fences(&d.doc)
+                                ),
+                            }),
+                            range: None,
+                        }));
+                    }
+                }
+            }
         }
 
         let word = extract_word_at(line, byte_col);
@@ -2260,8 +3601,8 @@ impl LanguageServer for NmlLanguageServer {
             let file = nml_core::cst::parse_best_effort(&source_clone);
             let line_index = LineIndex::new(&source_clone);
             if let Some(keyword) = find_enclosing_block_keyword(&file, pos, &line_index) {
-                let (models, _, _) = self.models_for_file(&uri);
-                if let Some(model) = models.iter().find(|m| m.name == keyword) {
+                let handle = self.schema_index_for(&uri);
+                if let Some(model) = handle.index().model(&keyword) {
                     if let Some(field) = model.fields.iter().find(|f| f.name == word) {
                         // In source syntax the `|` sigil belongs to the
                         // field name (`|allow []string`), not the type.
@@ -2271,10 +3612,20 @@ impl LanguageServer for NmlLanguageServer {
                             ""
                         };
                         let opt = if field.optional { "?" } else { "" };
-                        let text = format!(
+                        let mut text = format!(
                             "**{keyword}** field\n\n```nml\n  {sigil}{} {}{opt}\n```",
                             field.name, field.field_type
                         );
+                        // The schema author's leading comment block (RFC 0004
+                        // §4.3) is the field's documentation — rendered as a
+                        // markdown paragraph under the signature.
+                        if let Some(doc) = &field.doc {
+                            text.push_str("\n\n");
+                            // Fence-escaped: the doc is author-supplied text
+                            // spliced after our own fenced signature block
+                            // (see `escape_markdown_fences`).
+                            text.push_str(&escape_markdown_fences(doc));
+                        }
                         return Ok(Some(Hover {
                             contents: HoverContents::Markup(MarkupContent {
                                 kind: MarkupKind::Markdown,
@@ -2317,10 +3668,9 @@ impl LanguageServer for NmlLanguageServer {
         if !word.is_empty() {
             let model_ref_type = if !is_prop {
                 let file = nml_core::cst::parse_best_effort(&source_clone);
-                let (models, enums, oneofs) = self.models_for_file(&uri);
-                let index = SchemaIndex::build(models, enums, oneofs);
+                let handle = self.schema_index_for(&uri);
                 let line_index = LineIndex::new(&source_clone);
-                find_model_ref_type_at(&file, &source_clone, pos, &index, &line_index)
+                find_model_ref_type_at(&file, &source_clone, pos, handle.index(), &line_index)
             } else {
                 None
             };
@@ -2720,7 +4070,175 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    // ── pointer_transitions (RFC 0030 freshness poll) ─────────
+
+    /// Build a snapshot map from `(name, pointer)` pairs.
+    fn snap(entries: &[(&str, Option<&str>)]) -> HashMap<String, Option<String>> {
+        entries
+            .iter()
+            .map(|(n, p)| (n.to_string(), p.map(str::to_string)))
+            .collect()
+    }
+
+    #[test]
+    fn pointer_transition_absent_to_present() {
+        // The brand-new-operator path: empty store baseline, then a sync.
+        assert!(pointer_transitions(
+            &snap(&[]),
+            &snap(&[("demo", Some("slot\nblake3:aa\n"))]),
+        ));
+    }
+
+    #[test]
+    fn pointer_transition_present_to_absent() {
+        let installed = snap(&[("demo", Some("slot\nblake3:aa\n"))]);
+        // Uninstall seen as an explicit None entry (name persisted in the
+        // snapshot key set) and as the key vanishing outright: both count.
+        assert!(pointer_transitions(&installed, &snap(&[("demo", None)])));
+        assert!(pointer_transitions(&installed, &snap(&[])));
+    }
+
+    #[test]
+    fn pointer_transition_content_change() {
+        assert!(pointer_transitions(
+            &snap(&[("demo", Some("slot\nblake3:aa\n"))]),
+            &snap(&[("demo", Some("slot2\nblake3:bb\n"))]),
+        ));
+    }
+
+    #[test]
+    fn pointer_transition_no_op() {
+        let stable = snap(&[("demo", Some("slot\nblake3:aa\n")), ("gone", None)]);
+        assert!(!pointer_transitions(&stable, &stable.clone()));
+        // Absent-as-explicit-None vs absent-as-missing-key is NOT a
+        // transition — otherwise a once-seen, since-removed name would
+        // re-trigger the fan-out on every tick forever.
+        assert!(!pointer_transitions(&snap(&[("gone", None)]), &snap(&[]),));
+        assert!(!pointer_transitions(&snap(&[]), &snap(&[("gone", None)])));
+    }
+
+    // ── project_file_insertion (RFC 0030 P2 structural writes) ─
+
+    #[test]
+    fn pin_insert_preserves_comments() {
+        // The RFC 0030 P2 payoff: a hand-commented project file survives a
+        // pin byte-for-byte outside the inserted line.
+        let text = "\
+// team conventions: keep pins sorted
+project MyApp:
+    // we pin explicitly
+    schemaPackages:
+        - alpha
+        // beta is legacy
+        - beta
+    autoAssociate = false
+";
+        let out = project_file_insertion(text, &ProjectEdit::Pin("gamma".into()))
+            .expect("pin insert succeeds");
+        assert_eq!(
+            out,
+            "\
+// team conventions: keep pins sorted
+project MyApp:
+    // we pin explicitly
+    schemaPackages:
+        - alpha
+        // beta is legacy
+        - beta
+        - gamma
+    autoAssociate = false
+"
+        );
+    }
+
+    #[test]
+    fn pin_insert_creates_schema_packages_block() {
+        let text = "project MyApp:\n    autoAssociate = false\n";
+        let out = project_file_insertion(text, &ProjectEdit::Pin("demo".into()))
+            .expect("pin insert succeeds");
+        assert_eq!(
+            out,
+            "project MyApp:\n    schemaPackages:\n        - demo\n    autoAssociate = false\n"
+        );
+    }
+
+    #[test]
+    fn pin_insert_redundant_or_structureless_returns_none() {
+        // Already pinned → no action offered.
+        let pinned = "project P:\n    schemaPackages:\n        - demo\n";
+        assert_eq!(
+            project_file_insertion(pinned, &ProjectEdit::Pin("demo".into())),
+            None
+        );
+        // No `project` block to target → no action (matches the old
+        // line-anchor behavior, now enforced structurally).
+        assert_eq!(
+            project_file_insertion(
+                "service App:\n    x = 1\n",
+                &ProjectEdit::Pin("demo".into())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn opt_out_inserts_after_header_and_is_idempotent() {
+        let text = "project P:\n    // pins below\n    schemaPackages:\n        - demo\n";
+        let out = project_file_insertion(text, &ProjectEdit::OptOut).expect("opt-out succeeds");
+        assert_eq!(
+            out,
+            "project P:\n    autoAssociate = false\n    // pins below\n    schemaPackages:\n        - demo\n"
+        );
+        assert_eq!(project_file_insertion(&out, &ProjectEdit::OptOut), None);
+    }
+
+    /// Idempotency is structural (via `ProjectConfig`), so text that merely
+    /// *looks* like a pin or opt-out inside a comment can never
+    /// false-suppress the action — the failure mode of the retired text
+    /// scans.
+    #[test]
+    fn idempotency_ignores_lookalike_text_in_comments() {
+        // A comment naming the pin does not count as pinned.
+        let commented_pin = "project P:\n    // - demo is not really pinned\n    x = 1\n";
+        assert!(project_file_insertion(commented_pin, &ProjectEdit::Pin("demo".into())).is_some());
+        // A comment naming the opt-out does not count as opted out.
+        let commented_optout = "project P:\n    // autoAssociate = false (someday)\n    x = 1\n";
+        assert!(project_file_insertion(commented_optout, &ProjectEdit::OptOut).is_some());
+    }
+
     // ── extract_word_at ───────────────────────────────────────
+
+    #[test]
+    fn directive_name_at_on_name_and_on_hash() {
+        let line = "    name string+ #live";
+        // On the name (any byte of `live`), and on the `#` itself.
+        for col in 17..=21 {
+            assert_eq!(
+                directive_name_at(line, col).as_deref(),
+                Some("live"),
+                "col {col}"
+            );
+        }
+    }
+
+    #[test]
+    fn directive_name_at_rejects_plain_words() {
+        let line = "    name string+ #live";
+        // `name`, `string+` — word positions without a leading `#`.
+        assert_eq!(directive_name_at(line, 6), None);
+        assert_eq!(directive_name_at(line, 11), None);
+        // A `#` with no name after it.
+        assert_eq!(directive_name_at("    name string+ #", 18), None);
+    }
+
+    #[test]
+    fn directive_name_at_argful() {
+        let line = "    host string #key(host)";
+        assert_eq!(directive_name_at(line, 18).as_deref(), Some("key"));
+        // Inside the argument parens: preceded by `(`, not `#` — not a
+        // directive name, no directive hover.
+        assert_eq!(directive_name_at(line, 22), None);
+    }
 
     #[test]
     fn extract_word_in_middle() {
@@ -4074,7 +5592,10 @@ workflow VoiceAgent:
         );
 
         let text = find_tagged_ref_hover_in_docs(&docs, "role", "admin").expect("hover present");
-        assert!(text.contains("**role** `admin`"), "names the declaration: {text}");
+        assert!(
+            text.contains("**role** `admin`"),
+            "names the declaration: {text}"
+        );
         assert!(
             text.contains("Privileged operators.") && text.contains("Use sparingly."),
             "surfaces the leading comment block as docs: {text}"
@@ -4227,7 +5748,15 @@ workflow VoiceAgent:
     // ── Watched-file eligibility ──────────────────────────────
 
     fn temp_workspace(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("nml-lsp-{tag}-{}", std::process::id()));
+        // pid + process-wide counter: pid alone collides when a re-used pid
+        // (or a same-process re-entry) hits the same tag.
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("nml-lsp-{tag}-{}-{nonce}", std::process::id()));
+        // Defensive: a prior run's leftovers (same pid recycled after a crash
+        // skipped the test's cleanup) must not leak stale files into this run.
+        let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -4300,6 +5829,22 @@ workflow VoiceAgent:
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    // ── Hover markdown safety ─────────────────────────────────
+
+    #[test]
+    fn markdown_fences_are_escaped_but_emphasis_left_alone() {
+        // A doc containing a fence must not be able to swallow the hover.
+        assert_eq!(
+            escape_markdown_fences("use ```nml\nx = 1\n``` here"),
+            "use \\`\\`\\`nml\nx = 1\n\\`\\`\\` here"
+        );
+        // Lighter emphasis chars pass through untouched (cosmetic only).
+        assert_eq!(
+            escape_markdown_fences("a *bold* _claim_ with `code`"),
+            "a *bold* _claim_ with `code`"
+        );
     }
 
     // ── Hover credential redaction ────────────────────────────

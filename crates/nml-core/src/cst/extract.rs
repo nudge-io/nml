@@ -44,6 +44,8 @@ fn extract_model(block: &BlockDecl) -> ModelDef {
                     optional: fd.optional(),
                     shorthand: fd.shorthand(),
                     default_value: fd.default().and_then(|v| v.decode().ok()),
+                    directives: extract_directives(fd.directives()),
+                    doc: fd.doc_comment(),
                     span: node_span(fd.syntax()),
                 }),
                 // A typed modifier (`|name type?`) declares a field too. Modifiers
@@ -56,6 +58,8 @@ fn extract_model(block: &BlockDecl) -> ModelDef {
                             optional: m.optional(),
                             shorthand: false,
                             default_value: None,
+                            directives: extract_directives(m.directives()),
+                            doc: m.doc_comment(),
                             span: node_span(m.syntax()),
                         });
                     }
@@ -79,7 +83,9 @@ fn extract_enum(block: &BlockDecl) -> EnumDef {
     let mut variants = Vec::new();
     if let Some(body) = block.body() {
         for entry in body.entries() {
-            let Entry::ListItem(item) = entry else { continue };
+            let Entry::ListItem(item) = entry else {
+                continue;
+            };
             if let Some(value) = item.value() {
                 // Shorthand: `- "variant"`.
                 if let Ok(sv) = value.decode() {
@@ -120,6 +126,21 @@ fn extract_oneof(decl: &OneOfDecl) -> OneOfDef {
     }
 }
 
+/// Extract a field's trailing directives (RFC 0032): name + optionally decoded
+/// argument + whole-directive span. Un-decodable arguments extract as `None`
+/// (the shared lower pass reports the semantic error).
+fn extract_directives(
+    directives: impl Iterator<Item = crate::cst::ast::Directive>,
+) -> Vec<crate::types::Directive> {
+    directives
+        .map(|d| crate::types::Directive {
+            name: token_text(d.name()),
+            arg: d.value().and_then(|v| v.decode().ok()),
+            span: node_span(d.syntax()),
+        })
+        .collect()
+}
+
 fn resolve_field_type(te: &TypeExpr) -> FieldType {
     match te.kind() {
         TypeExprKind::Named => {
@@ -151,6 +172,20 @@ fn resolve_field_type(te: &TypeExpr) -> FieldType {
                 key: Box::new(next()),
                 target: Box::new(next()),
             }
+        }
+        TypeExprKind::Set => {
+            // `set<T>` (RFC 0032). Several children = a BARE union's variants
+            // (`set<a | b>` — the canonical spelling); one child = the element
+            // (which may itself be a parenthesized union — same element type,
+            // fmt strips the redundant parens).
+            let mut children: Vec<FieldType> =
+                te.children().map(|t| resolve_field_type(&t)).collect();
+            let element = match children.len() {
+                0 => unknown_type(),
+                1 => children.pop().expect("len checked"),
+                _ => FieldType::Union(children),
+            };
+            FieldType::Set(Box::new(element))
         }
     }
 }
@@ -246,6 +281,68 @@ oneof email by provider as providerKind = \"log\":
         assert_eq!(email.default_discriminator.as_deref(), Some("log"));
     }
 
+    /// Field doc-comments ride extraction (RFC 0004 §4.3 via the shared
+    /// `entry_doc_comment` walk — the SAME rule `ListItem::doc_comment`
+    /// applies, so field and item docs can never drift apart):
+    /// - a comment above the FIRST field attaches (the sibling-walk fallback:
+    ///   that comment precedes the body's `Indent`, so it lives in the `Body`);
+    /// - a multi-line contiguous block joins with `//` markers stripped;
+    /// - a previous field's TRAILING comment is its own, never the next
+    ///   field's doc;
+    /// - typed modifiers (`|allow …`) document like any field.
+    #[test]
+    fn extract_attaches_field_doc_comments() {
+        let src = "\
+model M:
+    // first doc
+    first string
+    // line one
+    // line two
+    second string
+    third string // trailing on third
+    fourth string
+    // allow doc
+    |allow []string?
+";
+        let schema = extract(&Root::cast(parse(src).syntax()).unwrap());
+        let m = &schema.models[0];
+        let doc = |n: &str| {
+            m.fields
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap()
+                .doc
+                .as_deref()
+        };
+        assert_eq!(doc("first"), Some("first doc"));
+        assert_eq!(doc("second"), Some("line one\nline two"));
+        assert_eq!(doc("third"), None, "no leading block above third");
+        assert_eq!(doc("fourth"), None, "third's trailing comment is not a doc");
+        assert_eq!(doc("allow"), Some("allow doc"));
+    }
+
+    /// Blank-line behavior pins ListItem parity: a blank line DETACHES the
+    /// comment block (rustdoc/Go/JSDoc convention — the shared walk counts
+    /// consecutive newlines and two or more end the block), and the rule holds
+    /// for BOTH entry kinds via the one `entry_doc_comment` implementation.
+    /// Deliberately flipped from the earlier attach-through-blank pin: the
+    /// RFC 0030 decision adopted the prior-art rule.
+    #[test]
+    fn extract_field_doc_detached_by_blank_line_like_list_items() {
+        // Field: the blank line between the comment and `b` detaches it.
+        let src = "model M:\n    a string\n    // spaced doc\n\n    b string\n";
+        let schema = extract(&Root::cast(parse(src).syntax()).unwrap());
+        let b = schema.models[0].fields.iter().find(|f| f.name == "b");
+        assert_eq!(b.unwrap().doc.as_deref(), None);
+
+        // Typed modifier (the other extracted doc-bearing entry kind): same
+        // walk, same detach.
+        let src = "model M:\n    a string\n    // spaced doc\n\n    |allow []string?\n";
+        let schema = extract(&Root::cast(parse(src).syntax()).unwrap());
+        let allow = schema.models[0].fields.iter().find(|f| f.name == "allow");
+        assert_eq!(allow.unwrap().doc.as_deref(), None);
+    }
+
     #[test]
     fn extract_handles_nested_array_types() {
         // The CST is context-free (`[`/`]` are atoms the parser composes), so it
@@ -274,6 +371,9 @@ oneof email by provider as providerKind = \"log\":
         let src = "model A is B:\n    x string\n\nmodel B is A:\n    y string\n";
         let schema = extract(&Root::cast(parse(src).syntax()).unwrap());
         let cycles = crate::schema::find_extends_cycles(&schema);
-        assert!(!cycles.is_empty(), "extends cycle should be detected on CST-extracted schema");
+        assert!(
+            !cycles.is_empty(),
+            "extends cycle should be detected on CST-extracted schema"
+        );
     }
 }

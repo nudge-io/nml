@@ -7,7 +7,7 @@ use nml_core::schema_index::{FieldTarget, SchemaIndex};
 use nml_core::span::Span;
 use nml_core::types::{PrimitiveType, Value};
 
-use crate::diagnostics::{Diagnostic, Severity};
+use crate::diagnostics::Diagnostic;
 
 const MAX_VALIDATION_DEPTH: u32 = 64;
 
@@ -26,6 +26,7 @@ const UNION_SHORTHAND_MSG: &str =
 /// By default, the validator is **domain-neutral**: no modifiers, membership
 /// keywords, or built-in references are assumed.  Embedders opt in to
 /// domain-specific checks via builder methods.
+#[derive(Debug)]
 pub struct SchemaValidator {
     index: SchemaIndex,
     valid_modifiers: Vec<String>,
@@ -169,8 +170,7 @@ impl SchemaValidator {
             // §5). `oneof`/other targets keep the prior path.
             let resolved = match self.index.resolve_ref(keyword) {
                 FieldTarget::Model(m) => {
-                    let result =
-                        nml_core::identity::materialize_named(&block.name, &block.body, m);
+                    let result = nml_core::identity::materialize_named(&block.name, &block.body, m);
                     self.validate_materialized(result, m, 0, Some(block.name.span), diags);
                     true
                 }
@@ -286,9 +286,7 @@ impl SchemaValidator {
                 ListItemKind::Named { body, .. } => {
                     self.validate_target_instance(elem, body, depth, header, diags);
                 }
-                ListItemKind::Shorthand { value, .. }
-                    if matches!(elem, FieldTarget::OneOf(_)) =>
-                {
+                ListItemKind::Shorthand { value, .. } if matches!(elem, FieldTarget::OneOf(_)) => {
                     diags.push(
                         Diagnostic::error(UNION_SHORTHAND_MSG.to_string()).with_span(value.span),
                     )
@@ -313,11 +311,7 @@ impl SchemaValidator {
         diags: &mut Vec<Diagnostic>,
     ) {
         for err in result.diagnostics {
-            diags.push(Diagnostic {
-                message: err.message().to_string(),
-                severity: Severity::Error,
-                span: Some(err.span()),
-            });
+            diags.push(Diagnostic::error(err.message()).with_span(err.span()));
         }
         if result.validatable {
             self.validate_instance_against_model(&result.body, model, depth, header, diags);
@@ -489,6 +483,31 @@ impl SchemaValidator {
                 }
                 true
             }
+            FieldTarget::SetOf(inner) => {
+                // Shape: exactly a list. Then RFC 0032 uniqueness — duplicate
+                // elements are load errors, reported at the SECOND occurrence.
+                // Identity is value-level for scalar items (semantic_eq, span-
+                // blind) and name-level for named/reference items.
+                let mut items: Vec<&nml_core::ast::ListItem> = Vec::new();
+                for entry in &body.entries {
+                    if let BodyEntryKind::ListItem(item) = &entry.kind {
+                        self.validate_inline_item(item, inner.as_ref(), depth, diags);
+                        items.push(item);
+                    }
+                }
+                for (i, item) in items.iter().enumerate() {
+                    if items[..i].iter().any(|prev| set_items_equal(prev, item)) {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "duplicate set element{} — set elements must be unique",
+                                set_item_label(item)
+                            ))
+                            .with_span(item.span),
+                        );
+                    }
+                }
+                true
+            }
             FieldTarget::Arms { key, target } => {
                 self.validate_instance_against_arms(body, key, target, diags);
                 true
@@ -621,7 +640,7 @@ impl SchemaValidator {
             FieldType::ModelRef(name) => {
                 self.find_model(name).is_none() && self.find_oneof(name).is_none()
             }
-            FieldType::List(_) | FieldType::Arms { .. } => false,
+            FieldType::List(_) | FieldType::Set(_) | FieldType::Arms { .. } => false,
         }
     }
 
@@ -696,7 +715,9 @@ impl SchemaValidator {
                                 // item's identity into the body before validating —
                                 // so a required `name` supplied by the item key
                                 // (`- classify:`) is seen, not reported missing.
-                                let empty = Body { entries: Vec::new() };
+                                let empty = Body {
+                                    entries: Vec::new(),
+                                };
                                 for entry in &nb.body.entries {
                                     let BodyEntryKind::ListItem(item) = &entry.kind else {
                                         continue;
@@ -708,6 +729,44 @@ impl SchemaValidator {
                                     };
                                     let elem = self.index.resolve_type_in_body(inner, probe);
                                     self.validate_inline_item(item, &elem, depth + 1, diags);
+                                }
+                            }
+                            FieldType::Set(inner) => {
+                                // Items validate exactly like a list's (same
+                                // per-item variant resolution + identity
+                                // materialization as the `List` arm above)…
+                                let empty = Body {
+                                    entries: Vec::new(),
+                                };
+                                let mut items: Vec<&ListItem> = Vec::new();
+                                for entry in &nb.body.entries {
+                                    let BodyEntryKind::ListItem(item) = &entry.kind else {
+                                        continue;
+                                    };
+                                    let probe = match &item.kind {
+                                        ListItemKind::Named { body, .. } => body,
+                                        ListItemKind::Shorthand { body: Some(b), .. } => b,
+                                        _ => &empty,
+                                    };
+                                    let elem = self.index.resolve_type_in_body(inner, probe);
+                                    self.validate_inline_item(item, &elem, depth + 1, diags);
+                                    items.push(item);
+                                }
+                                // …then RFC 0032 uniqueness: duplicates are
+                                // load errors at the second occurrence, with
+                                // span-blind value identity for scalar items
+                                // and name identity for named items.
+                                for (i, item) in items.iter().enumerate() {
+                                    if items[..i].iter().any(|p| set_items_equal(p, item)) {
+                                        diags.push(
+                                            Diagnostic::error(format!(
+                                                "duplicate set element{} — set elements must \
+                                                 be unique",
+                                                set_item_label(item)
+                                            ))
+                                            .with_span(item.span),
+                                        );
+                                    }
                                 }
                             }
                             FieldType::Arms { key, target } => {
@@ -941,15 +1000,22 @@ impl SchemaValidator {
                 );
             }
             ModifierValue::Block(items) => {
-                let FieldType::List(inner) = declared.as_ref() else {
-                    diags.push(
-                        Diagnostic::error(format!(
-                            "type mismatch for '{}': expected {}, got array",
-                            field.name, declared
-                        ))
-                        .with_span(m.name.span),
-                    );
-                    return;
+                // A block-form modifier list satisfies a List OR a Set
+                // declaration (RFC 0032 — e.g. `|block set<string>?` written
+                // as `|block:` + items); sets additionally enforce uniqueness.
+                let (inner, is_set) = match declared.as_ref() {
+                    FieldType::List(inner) => (inner, false),
+                    FieldType::Set(inner) => (inner, true),
+                    _ => {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "type mismatch for '{}': expected {}, got array",
+                                field.name, declared
+                            ))
+                            .with_span(m.name.span),
+                        );
+                        return;
+                    }
                 };
                 for item in items {
                     match &item.kind {
@@ -974,6 +1040,22 @@ impl SchemaValidator {
                             );
                         }
                         ListItemKind::Reference(_) | ListItemKind::Named { .. } => {}
+                    }
+                }
+                if is_set {
+                    // RFC 0032 uniqueness — same rule and reporting as every
+                    // other set surface: error at the second occurrence,
+                    // span-blind value identity.
+                    for (i, item) in items.iter().enumerate() {
+                        if items[..i].iter().any(|p| set_items_equal(p, item)) {
+                            diags.push(
+                                Diagnostic::error(format!(
+                                    "duplicate set element{} — set elements must be unique",
+                                    set_item_label(item)
+                                ))
+                                .with_span(item.span),
+                            );
+                        }
                     }
                 }
             }
@@ -1032,6 +1114,47 @@ impl SchemaValidator {
                             item.span,
                             diags,
                         );
+                    }
+                }
+                // References (e.g. to consts) and env vars may resolve to arrays.
+                Value::Reference(_) | Value::Secret(_) => {}
+                _ => {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "type mismatch {context} '{field_name}': expected {field_type}, got {}",
+                            value_type_name(value)
+                        ))
+                        .with_span(span),
+                    );
+                }
+            },
+            FieldType::Set(inner) => match value {
+                Value::Array(items) => {
+                    for item in items {
+                        self.validate_value_against_type(
+                            &item.value,
+                            inner,
+                            field_name,
+                            "in set",
+                            item.span,
+                            diags,
+                        );
+                    }
+                    // RFC 0032 uniqueness: duplicates are load errors at the
+                    // second occurrence's span; identity is semantic (span- and
+                    // union-arm-blind), so the same value admitted via
+                    // different union arms is still one element.
+                    for (i, item) in items.iter().enumerate() {
+                        if items[..i].iter().any(|p| p.value.semantic_eq(&item.value)) {
+                            diags.push(
+                                Diagnostic::error(format!(
+                                    "duplicate set element {context} '{field_name}'{} — set \
+                                     elements must be unique",
+                                    value_label(&item.value)
+                                ))
+                                .with_span(item.span),
+                            );
+                        }
                     }
                 }
                 // References (e.g. to consts) and env vars may resolve to arrays.
@@ -1111,6 +1234,14 @@ impl SchemaValidator {
                     .all(|item| self.value_matches_type(&item.value, inner)),
                 _ => false,
             },
+            // Matching is shape-only; uniqueness is enforced (with spans) in
+            // `validate_value_against_type`, not here.
+            FieldType::Set(inner) => match value {
+                Value::Array(items) => items
+                    .iter()
+                    .all(|item| self.value_matches_type(&item.value, inner)),
+                _ => false,
+            },
             FieldType::Union(variants) => variants
                 .iter()
                 .any(|variant| self.value_matches_type(value, variant)),
@@ -1179,17 +1310,30 @@ impl SchemaValidator {
                 if !enum_def.variants.iter().any(|v| v == s) {
                     // Acceptance stays exact; the suggestion is fuzzy (a wrong-
                     // cased or lightly-typo'd value gets a `did you mean` hint).
-                    let hint = match suggest_variant(s, &enum_def.variants) {
+                    let suggested = suggest_variant(s, &enum_def.variants);
+                    let hint = match &suggested {
                         Some(v) => format!(" (did you mean \"{v}\"?)"),
                         None => String::new(),
                     };
-                    diags.push(
-                        Diagnostic::error(format!(
-                            "invalid value \"{s}\" for '{field_name}': expected one of {}{hint}",
-                            variants()
-                        ))
-                        .with_span(span),
-                    );
+                    let mut diag = Diagnostic::error(format!(
+                        "invalid value \"{s}\" for '{field_name}': expected one of {}{hint}",
+                        variants()
+                    ))
+                    .with_span(span);
+                    if let Some(v) = suggested {
+                        // Machine-applicable fix (RFC 0030): replace the value
+                        // *content* with the canonical variant. A string
+                        // literal's span includes its quotes, so the content
+                        // span excludes them; a bare reference has none.
+                        let content_span = match value {
+                            Value::String(_) if span.end > span.start + 1 => {
+                                Span::new(span.start + 1, span.end - 1)
+                            }
+                            _ => span,
+                        };
+                        diag = diag.with_suggestion(v, content_span);
+                    }
+                    diags.push(diag);
                 }
             }
             // Resolved later; unverifiable at validation time.
@@ -1463,6 +1607,11 @@ fn field_type_shape_errors(
         FieldTypeExpr::Array(inner) => {
             field_type_shape_errors(inner, Some("an array element"), span, diags);
         }
+        FieldTypeExpr::Set(inner) => {
+            // Same positional rules as an array element (an arm set nested in a
+            // collection element is unreachable — RFC 0007's placement rule).
+            field_type_shape_errors(inner, Some("a set element"), span, diags);
+        }
         FieldTypeExpr::Union(variants) => {
             let arm_sets = variants
                 .iter()
@@ -1495,6 +1644,47 @@ fn field_type_shape_errors(
             field_type_shape_errors(key, Some("an arm-set key"), span, diags);
             field_type_shape_errors(target, Some("an arm-set target"), span, diags);
         }
+    }
+}
+
+/// Set-element identity for **body-form** items (RFC 0032): value-level for
+/// scalar/shorthand items (span-blind `semantic_eq`), name-level for named /
+/// reference items. Mixed kinds are never equal.
+fn set_items_equal(a: &nml_core::ast::ListItem, b: &nml_core::ast::ListItem) -> bool {
+    use nml_core::ast::ListItemKind as K;
+    match (&a.kind, &b.kind) {
+        (K::Named { name: an, .. }, K::Named { name: bn, .. }) => an.name == bn.name,
+        (K::Shorthand { value: av, .. }, K::Shorthand { value: bv, .. }) => {
+            av.value.semantic_eq(&bv.value)
+        }
+        (K::Reference(ai), K::Reference(bi)) => ai.name == bi.name,
+        (K::Role(ar), K::Role(br)) => ar == br,
+        _ => false,
+    }
+}
+
+/// A short identity label for a duplicate-set-element diagnostic (` 'x'`), or
+/// empty when the item has no concise rendering — the span already points at
+/// the duplicate.
+fn set_item_label(item: &nml_core::ast::ListItem) -> String {
+    use nml_core::ast::ListItemKind as K;
+    match &item.kind {
+        K::Named { name, .. } | K::Reference(name) => format!(" '{}'", name.name),
+        K::Shorthand { value, .. } => value_label(&value.value),
+        K::Role(r) => format!(" '{r}'"),
+    }
+}
+
+/// A short value rendering for duplicate diagnostics; empty for compound
+/// values (the span carries the location).
+fn value_label(value: &Value) -> String {
+    match value {
+        Value::String(s) | Value::Path(s) | Value::Duration(s) | Value::Role(s) => {
+            format!(" '{s}'")
+        }
+        Value::Number(n) => format!(" '{n}'"),
+        Value::Bool(b) => format!(" '{b}'"),
+        _ => String::new(),
     }
 }
 
@@ -1534,6 +1724,31 @@ fn suggest_variant<'a>(input: &str, variants: &'a [String]) -> Option<&'a str> {
         .map(|(_, v)| v)
 }
 
+/// Directive-name near-miss (RFC 0030's `#lvie → #live`), for the LSP's
+/// directive-vocabulary pass. Same metric as [`suggest_variant`] but tuned
+/// for short identifiers, where the dominant typo is a transposition — plain
+/// Levenshtein distance 2 — which the enum threshold (a third of the length)
+/// rejects for typical 3–8 char directive names. Distance ≤ 2, capped at
+/// half the longer name's length so very short names still demand near-exact.
+/// Diagnostics-only, like its sibling: a suggestion never widens what a
+/// vocabulary accepts.
+pub fn suggest_directive<'a>(input: &str, names: &'a [String]) -> Option<&'a str> {
+    if let Some(name) = names.iter().find(|n| n.eq_ignore_ascii_case(input)) {
+        return Some(name.as_str());
+    }
+    names
+        .iter()
+        .map(|n| (levenshtein(input, n), n.as_str()))
+        .filter(|(dist, n)| {
+            let cap = 2usize
+                .min(input.chars().count().max(n.chars().count()) / 2)
+                .max(1);
+            *dist <= cap
+        })
+        .min_by_key(|(dist, _)| *dist)
+        .map(|(_, n)| n)
+}
+
 /// Levenshtein edit distance (two-row DP). Used only to rank "did you mean"
 /// suggestions, never to accept a value.
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -1555,6 +1770,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::Severity;
 
     fn make_validator(schema_source: &str) -> SchemaValidator {
         let schema = nml_core::cst::extract_schema(schema_source).0;
@@ -1570,6 +1786,29 @@ mod tests {
     fn diags(schema: &str, source: &str) -> Vec<Diagnostic> {
         let file = nml_core::cst::parse_to_ast(source).unwrap();
         make_validator(schema).validate(&file)
+    }
+
+    // ── RFC 0030: structured suggestions ──
+
+    /// The enum did-you-mean carries a machine-applicable suggestion whose
+    /// span covers the string's *content* (inside the quotes): applying the
+    /// replacement to the source yields the canonical value in place.
+    #[test]
+    fn enum_did_you_mean_carries_applicable_suggestion() {
+        let source = "settings app:\n    mode = \"lax\"\n";
+        let d = diags(
+            "enum sameSite:\n    - \"Lax\"\n    - \"Strict\"\nmodel settings:\n    name string+\n    mode sameSite\n",
+            source,
+        );
+        let diag = d
+            .iter()
+            .find(|x| x.message.contains("did you mean \"Lax\""))
+            .expect("did-you-mean diagnostic");
+        let sug = diag.suggestion.as_ref().expect("structured suggestion");
+        assert_eq!(sug.replacement, "Lax");
+        let mut fixed = source.to_string();
+        fixed.replace_range(sug.span.start..sug.span.end, &sug.replacement);
+        assert!(fixed.contains("mode = \"Lax\""), "applied: {fixed}");
     }
 
     // ── RFC 0005: identity materialization ──
@@ -1638,9 +1877,13 @@ mod tests {
         let nml_core::ast::DeclarationKind::Block(block) = &file.declarations[0].kind else {
             panic!("expected block");
         };
-        let svc: Svc =
-            nml_core::from_body_defaulted(&index, "svc", &block.body, &nml_core::ValueResolver::env())
-                .expect("should deserialize");
+        let svc: Svc = nml_core::from_body_defaulted(
+            &index,
+            "svc",
+            &block.body,
+            &nml_core::ValueResolver::env(),
+        )
+        .expect("should deserialize");
         assert_eq!(svc.resources[0].path, "/api");
         assert_eq!(svc.resources[0].method, None);
         assert_eq!(svc.resources[1].path, "/health");
@@ -1664,7 +1907,10 @@ mod tests {
             "enum httpMethod:\n    - \"GET\"\n    - \"POST\"\nmodel resource:\n    path path+\n    method httpMethod = \"GET\"\n",
             "[]resource resources:\n    - \"/admin\":\n        method = \"BOGUS\"\n",
         );
-        assert!(!d.is_empty(), "invalid method in the body should be flagged");
+        assert!(
+            !d.is_empty(),
+            "invalid method in the body should be flagged"
+        );
     }
 
     #[test]
@@ -1675,7 +1921,11 @@ mod tests {
             "model role:\n    name string\n    label string\n",
             "[]role roles:\n    - \"/api\"\n",
         );
-        assert_eq!(d.len(), 1, "expected only the dropped-key diagnostic: {d:?}");
+        assert_eq!(
+            d.len(),
+            1,
+            "expected only the dropped-key diagnostic: {d:?}"
+        );
         assert!(d[0].message.contains("no shorthand field"), "{d:?}");
     }
 
@@ -1683,7 +1933,10 @@ mod tests {
     fn scalar_shorthand_on_union_list_is_flagged() {
         let schema = "model a:\n    x string?\nmodel b:\n    y string?\noneof u by kind:\n    \"a\" -> a\n    \"b\" -> b\n";
         let d = diags(schema, "[]u items:\n    - \"foo\"\n");
-        assert!(d.iter().any(|x| x.message.contains("union-typed lists")), "{d:?}");
+        assert!(
+            d.iter().any(|x| x.message.contains("union-typed lists")),
+            "{d:?}"
+        );
     }
 
     #[test]
@@ -1715,7 +1968,10 @@ mod tests {
             "model widget:\n    name string\n    size number?\n",
             "widget Gizmo:\n    name = \"gizmo\"\n    size = 2\n",
         );
-        assert!(d.is_empty(), "explicit name should win over block name: {d:?}");
+        assert!(
+            d.is_empty(),
+            "explicit name should win over block name: {d:?}"
+        );
     }
 
     #[test]
@@ -2926,7 +3182,9 @@ workflow W:
         let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
         assert!(
-            !diags.iter().any(|d| d.message.contains("missing required field 'name'")),
+            !diags
+                .iter()
+                .any(|d| d.message.contains("missing required field 'name'")),
             "nested list field must inject each item's name; diags: {diags:?}"
         );
         // A genuinely-missing *required non-identity* field is still caught,
@@ -2935,7 +3193,10 @@ workflow W:
         let bad_file = nml_core::cst::parse_to_ast(bad).unwrap();
         let bad_diags = validator.validate(&bad_file);
         assert!(
-            bad_diags.is_empty() || !bad_diags.iter().any(|d| d.message.contains("missing required field 'name'")),
+            bad_diags.is_empty()
+                || !bad_diags
+                    .iter()
+                    .any(|d| d.message.contains("missing required field 'name'")),
             "name is supplied by the key, never missing; diags: {bad_diags:?}"
         );
     }
@@ -3132,7 +3393,8 @@ workflow W:
         ] {
             let d = diags_for(schema);
             assert!(
-                d.iter().any(|d| d.message.contains("cannot be an array element")),
+                d.iter()
+                    .any(|d| d.message.contains("cannot be an array element")),
                 "{schema:?}: {d:?}"
             );
         }
@@ -3145,7 +3407,8 @@ workflow W:
         // A union with two arm-set variants — the second is unreachable.
         let d = diags_for("model m:\n    f ((role -> a) | (plan -> b))?\n");
         assert!(
-            d.iter().any(|d| d.message.contains("at most one arm-set variant")),
+            d.iter()
+                .any(|d| d.message.contains("at most one arm-set variant")),
             "{d:?}"
         );
         // Arms anywhere in a MODIFIER's declared type — modifier values are
@@ -3186,7 +3449,10 @@ workflow W:
     #[test]
     fn arm_set_union_accepts_scalar_and_arm_forms() {
         let schema = "model mount:\n    path string\n    denial (string | (role -> denial))?\n";
-        let scalar = diags(schema, "mount M:\n    path = \"/x\"\n    denial = \"ProUpsell\"\n");
+        let scalar = diags(
+            schema,
+            "mount M:\n    path = \"/x\"\n    denial = \"ProUpsell\"\n",
+        );
         assert!(scalar.is_empty(), "scalar form: {scalar:?}");
 
         let arms = diags(
@@ -3245,10 +3511,7 @@ workflow W:
     #[test]
     fn arm_set_key_must_conform_to_declared_key_type() {
         let schema = "model mount:\n    handlers (string -> handler)?\n";
-        let d = diags(
-            schema,
-            "mount M:\n    handlers:\n        @plan/Pro -> A\n",
-        );
+        let d = diags(schema, "mount M:\n    handlers:\n        @plan/Pro -> A\n");
         assert!(
             d.iter().any(|d| d.message.contains("does not conform")
                 && d.message.contains("key type 'string'")),
@@ -3267,7 +3530,10 @@ workflow W:
             "model route:\n    dispatch (role -> path)?\n",
             "route R:\n    dispatch:\n        @role/admin -> \"admin.workflow.nml\"\n        else -> Fallback\n",
         );
-        assert!(ok.is_empty(), "literal + reference on a path target: {ok:?}");
+        assert!(
+            ok.is_empty(),
+            "literal + reference on a path target: {ok:?}"
+        );
 
         // V = a oneof (denial) → a literal target is a category error; a
         // reference is the natural form.
@@ -3278,7 +3544,9 @@ workflow W:
             "mount M:\n    denial:\n        @role/admin -> \"oops\"\n",
         );
         assert!(
-            bad.iter().any(|d| d.message.contains("string-literal arm target requires a scalar")),
+            bad.iter().any(|d| d
+                .message
+                .contains("string-literal arm target requires a scalar")),
             "{bad:?}"
         );
         let good = diags(
@@ -3292,7 +3560,8 @@ workflow W:
     /// errors instead of silently doing nothing.
     #[test]
     fn arm_outside_an_arm_typed_field_errors() {
-        let schema = "model mount:\n    path string\n    pipeline pipe?\nmodel pipe:\n    input string?\n";
+        let schema =
+            "model mount:\n    path string\n    pipeline pipe?\nmodel pipe:\n    input string?\n";
         let d = diags(
             schema,
             "mount M:\n    path = \"/x\"\n    pipeline:\n        @plan/Pro -> A\n",
@@ -3309,10 +3578,7 @@ workflow W:
     #[test]
     fn arm_set_rejects_non_arm_entries() {
         let schema = "model mount:\n    denial (role -> denial)?\n";
-        let d = diags(
-            schema,
-            "mount M:\n    denial:\n        title = \"nope\"\n",
-        );
+        let d = diags(schema, "mount M:\n    denial:\n        title = \"nope\"\n");
         assert!(
             d.iter()
                 .any(|d| d.message.contains("expected a routing arm")),
@@ -3326,7 +3592,8 @@ workflow W:
         let schema = "model mount:\n    denial (role -> denial)?\n";
         let d = diags(schema, "mount M:\n    denial = 42\n");
         assert!(
-            d.iter().any(|d| d.message.contains("expected an arm block")),
+            d.iter()
+                .any(|d| d.message.contains("expected an arm block")),
             "{d:?}"
         );
     }
@@ -3654,7 +3921,10 @@ workflow W:
         let errs = oneof_errors(
             "email Cfg:\n    provider = \"postmark\"\n    fromAddress = \"a@b.co\"\n    serverToken = $ENV.TOK\n",
         );
-        assert!(errs.is_empty(), "valid postmark variant should pass: {errs:?}");
+        assert!(
+            errs.is_empty(),
+            "valid postmark variant should pass: {errs:?}"
+        );
     }
 
     #[test]
@@ -3662,7 +3932,8 @@ workflow W:
         // serverToken belongs to the postmark variant, not log.
         let errs = oneof_errors("email Cfg:\n    provider = \"log\"\n    serverToken = $ENV.TOK\n");
         assert!(
-            errs.iter().any(|m| m.contains("unknown property 'serverToken'")),
+            errs.iter()
+                .any(|m| m.contains("unknown property 'serverToken'")),
             "log variant must reject postmark-only field: {errs:?}"
         );
     }
@@ -3711,7 +3982,8 @@ workflow W:
             "server S:\n    email:\n        provider = \"log\"\n        serverToken = $ENV.TOK\n",
         );
         assert!(
-            bad.iter().any(|m| m.contains("unknown property 'serverToken'")),
+            bad.iter()
+                .any(|m| m.contains("unknown property 'serverToken'")),
             "nested oneof must enforce per-variant fields: {bad:?}"
         );
     }
@@ -3731,7 +4003,8 @@ workflow W:
             "[]email mailers:\n    - primary:\n        provider = \"log\"\n        serverToken = $ENV.TOK\n",
         );
         assert!(
-            bad.iter().any(|m| m.contains("unknown property 'serverToken'")),
+            bad.iter()
+                .any(|m| m.contains("unknown property 'serverToken'")),
             "top-level []oneof must enforce per-variant fields: {bad:?}"
         );
     }
@@ -3809,7 +4082,10 @@ workflow W:
             .into_iter()
             .filter(|d| matches!(d.severity, Severity::Error))
             .collect();
-        assert!(errors.is_empty(), "valid typed defaults should pass: {errors:?}");
+        assert!(
+            errors.is_empty(),
+            "valid typed defaults should pass: {errors:?}"
+        );
     }
 
     #[test]
@@ -3826,6 +4102,133 @@ workflow W:
             .iter()
             .filter(|d| d.message.contains("as the default for") && d.message.contains("count"))
             .count();
-        assert_eq!(count, 1, "inherited bad default must be reported exactly once");
+        assert_eq!(
+            count, 1,
+            "inherited bad default must be reported exactly once"
+        );
+    }
+
+    /// Schema DEFAULTS are set-checked too: a default carrying duplicate
+    /// elements is a schema-load error (a schema shipping a bad default would
+    /// otherwise poison every instance).
+    #[test]
+    fn set_default_with_duplicates_is_rejected_at_schema_load() {
+        let check = |src: &str| {
+            let file = nml_core::cst::parse_to_ast(src).unwrap();
+            make_validator(src).validate(&file)
+        };
+        let d = check("model m:\n    xs set<string> = [\"a\", \"a\"]\n");
+        assert!(
+            d.iter()
+                .any(|d| d.message.contains("duplicate set element")),
+            "duplicate default elements must be rejected: {:?}",
+            d.iter().map(|x| &x.message).collect::<Vec<_>>()
+        );
+        let ok = check("model m:\n    xs set<string> = [\"a\", \"b\"]\n");
+        assert!(
+            !ok.iter().any(|d| d.message.contains("duplicate")),
+            "unique defaults are legal: {ok:?}"
+        );
+    }
+
+    /// The P1-critical shape: a MODIFIER field declared as a set
+    /// (`|block set<string>?` — nudge's reloadable egress denylist) accepts
+    /// block-form items, enforces uniqueness on them, and keeps working
+    /// inline. Before this fix, the Block arm required `List` and would have
+    /// REJECTED the set-typed declaration outright.
+    #[test]
+    fn modifier_set_block_form_accepts_and_dedups() {
+        let schema = "model ceiling:\n    |block set<string>?\n";
+        let dup = diags(
+            schema,
+            "ceiling c:\n    |block:\n        - \"10.0.0.0/8\"\n        - \"10.9.0.0/16\"\n        - \"10.0.0.0/8\"\n",
+        );
+        assert!(
+            dup.iter()
+                .any(|d| d.message.contains("duplicate set element")),
+            "block-form modifier set must dedup: {:?}",
+            dup.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let ok = diags(
+            schema,
+            "ceiling c:\n    |block:\n        - \"10.0.0.0/8\"\n        - \"10.9.0.0/16\"\n",
+        );
+        assert!(
+            !ok.iter()
+                .any(|d| d.message.contains("duplicate") || d.message.contains("type mismatch")),
+            "unique block-form items against a set declaration are legal: {:?}",
+            ok.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        // Inline form flows through the Set arm of value validation.
+        let inline_dup = diags(schema, "ceiling c:\n    |block = [\"a\", \"a\"]\n");
+        assert!(
+            inline_dup
+                .iter()
+                .any(|d| d.message.contains("duplicate set element")),
+            "inline modifier set must dedup: {:?}",
+            inline_dup.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    // ── RFC 0032: `set<T>` uniqueness ──
+
+    const SET_SCHEMA: &str = "model server:\n    cidrs set<string>\n    order []string?\n";
+
+    /// Inline-array form: a duplicate element is a load error at the second
+    /// occurrence; unique elements pass; element typing still applies.
+    #[test]
+    fn set_inline_duplicates_are_rejected_and_unique_pass() {
+        let dup = diags(
+            SET_SCHEMA,
+            "server s:\n    cidrs = [\"10.0.5.0/24\", \"10.0.9.0/24\", \"10.0.5.0/24\"]\n",
+        );
+        assert!(
+            dup.iter()
+                .any(|d| d.message.contains("duplicate set element")
+                    && d.message.contains("10.0.5.0/24")),
+            "duplicate must be rejected with its value named: {:?}",
+            dup.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        let ok = diags(
+            SET_SCHEMA,
+            "server s:\n    cidrs = [\"10.0.5.0/24\", \"10.0.9.0/24\"]\n",
+        );
+        assert!(
+            !ok.iter().any(|d| d.message.contains("duplicate")),
+            "unique elements are legal: {:?}",
+            ok.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Body-form items: duplicates are caught across LINES (span-blind value
+    /// identity — the exact cosmetic-difference case `semantic_eq` exists for).
+    #[test]
+    fn set_body_form_duplicates_are_rejected_span_blind() {
+        let d = diags(
+            SET_SCHEMA,
+            "server s:\n    cidrs:\n        - \"10.0.5.0/24\"\n        - \"10.0.9.0/24\"\n        - \"10.0.5.0/24\"\n",
+        );
+        assert!(
+            d.iter()
+                .any(|d| d.message.contains("duplicate set element")),
+            "same value on a different line is still a duplicate: {:?}",
+            d.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Control: a plain `[]T` list keeps allowing duplicates — uniqueness is
+    /// the SET type's semantics, never a blanket list rule.
+    #[test]
+    fn plain_lists_still_allow_duplicates() {
+        let d = diags(
+            SET_SCHEMA,
+            "server s:\n    cidrs = [\"a\"]\n    order = [\"x\", \"x\", \"x\"]\n",
+        );
+        assert!(
+            !d.iter().any(|d| d.message.contains("duplicate")),
+            "list duplicates are legal: {:?}",
+            d.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 }

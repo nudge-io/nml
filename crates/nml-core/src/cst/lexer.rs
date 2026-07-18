@@ -186,9 +186,7 @@ impl<'a> Lexer<'a> {
             }
             b'=' => self.single(SyntaxKind::Eq),
             b':' => self.single(SyntaxKind::Colon),
-            b'-' if self.bytes.get(start + 1) == Some(&b'>') => {
-                self.fixed(SyntaxKind::Arrow, 2)
-            }
+            b'-' if self.bytes.get(start + 1) == Some(&b'>') => self.fixed(SyntaxKind::Arrow, 2),
             b'-' => self.single(SyntaxKind::Dash),
             b'|' => self.single(SyntaxKind::Pipe),
             b'.' => self.single(SyntaxKind::Dot),
@@ -198,6 +196,14 @@ impl<'a> Lexer<'a> {
             b')' => self.single(SyntaxKind::RParen),
             b',' => self.single(SyntaxKind::Comma),
             b'?' => self.single(SyntaxKind::Question),
+            // Type-constructor angles (RFC 0032, `set<cidr>`). Single-char by
+            // design: no `<<`/`>>` munching, so `set<set<cidr>>` closes cleanly
+            // (`->`/`=>` are matched earlier from their `-`/`=` first bytes).
+            b'<' => self.single(SyntaxKind::Lt),
+            b'>' => self.single(SyntaxKind::Gt),
+            // Field directives (RFC 0032). Single char; `#` has no other
+            // meaning anywhere in NML (comments are `//`).
+            b'#' => self.single(SyntaxKind::Hash),
             // The positional-field marker (RFC 0005 §16). A bare `+` outside a
             // `@role` (where it is a role-continue char, consumed by `scan_role`)
             // or a string literal is only ever this marker.
@@ -300,12 +306,7 @@ impl<'a> Lexer<'a> {
     fn scan_role(&mut self) {
         let start = self.pos;
         let mut end = start + 1; // skip '@'
-        while self
-            .bytes
-            .get(end)
-            .copied()
-            .is_some_and(is_role_continue)
-        {
+        while self.bytes.get(end).copied().is_some_and(is_role_continue) {
             end += 1;
         }
         if self.bytes.get(end - 1) == Some(&b':')
@@ -378,7 +379,11 @@ fn is_ident_continue(b: u8) -> bool {
 }
 
 fn is_role_continue(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'/' | b':' | b'-' | b'_' | b'.' | b'@' | b'{' | b'}' | b'+')
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'/' | b':' | b'-' | b'_' | b'.' | b'@' | b'{' | b'}' | b'+'
+        )
 }
 
 /// True if the line at byte `i` (after its leading whitespace) is blank or a
@@ -433,8 +438,8 @@ mod tests {
         assert_eq!(
             kinds(src),
             vec![
-                Ident, Eq, String, Number, Role, Secret, Arrow, FatArrow, Colon, Dash, Pipe,
-                Dot, LBracket, RBracket, LParen, RParen, Comma, Question, Plus,
+                Ident, Eq, String, Number, Role, Secret, Arrow, FatArrow, Colon, Dash, Pipe, Dot,
+                LBracket, RBracket, LParen, RParen, Comma, Question, Plus,
             ]
         );
         assert_lossless(src);
@@ -454,8 +459,23 @@ mod tests {
     fn context_free_negative_number_and_array_prefix() {
         // No stateful look-back/ahead: `-` is Dash, `[]` is two brackets; the
         // parser composes negatives and `[]type`.
-        assert_eq!(kinds("x = -5"), vec![SyntaxKind::Ident, SyntaxKind::Eq, SyntaxKind::Dash, SyntaxKind::Number]);
-        assert_eq!(kinds("[]route"), vec![SyntaxKind::LBracket, SyntaxKind::RBracket, SyntaxKind::Ident]);
+        assert_eq!(
+            kinds("x = -5"),
+            vec![
+                SyntaxKind::Ident,
+                SyntaxKind::Eq,
+                SyntaxKind::Dash,
+                SyntaxKind::Number
+            ]
+        );
+        assert_eq!(
+            kinds("[]route"),
+            vec![
+                SyntaxKind::LBracket,
+                SyntaxKind::RBracket,
+                SyntaxKind::Ident
+            ]
+        );
     }
 
     #[test]
@@ -470,10 +490,7 @@ mod tests {
         // RFC 0005 §16: `+` is the positional-field marker. This is the pinned
         // collision check that justified choosing `+` over `!`.
         // A bare `+` after a type is its own token (the marker):
-        assert_eq!(
-            kinds("string+"),
-            vec![SyntaxKind::Ident, SyntaxKind::Plus]
-        );
+        assert_eq!(kinds("string+"), vec![SyntaxKind::Ident, SyntaxKind::Plus]);
         assert_eq!(
             kinds("string?+"),
             vec![SyntaxKind::Ident, SyntaxKind::Question, SyntaxKind::Plus]
@@ -488,7 +505,10 @@ mod tests {
     #[test]
     fn role_trailing_colon_given_back() {
         // `@public:` at line end → Role + Colon (the `:` is structural).
-        assert_eq!(kinds("- @public:\n"), vec![SyntaxKind::Dash, SyntaxKind::Role, SyntaxKind::Colon]);
+        assert_eq!(
+            kinds("- @public:\n"),
+            vec![SyntaxKind::Dash, SyntaxKind::Role, SyntaxKind::Colon]
+        );
         let toks = lex("@public:\n");
         assert_eq!(toks.tokens[0].text, "@public");
     }
@@ -497,7 +517,11 @@ mod tests {
     fn secret_is_raw_text_no_validation() {
         // The lexer does not validate the namespace; it spans `$…` and defers.
         let toks = lex("k = $ENV.MY_VAR\n");
-        let secret = toks.tokens.iter().find(|t| t.kind == SyntaxKind::Secret).unwrap();
+        let secret = toks
+            .tokens
+            .iter()
+            .find(|t| t.kind == SyntaxKind::Secret)
+            .unwrap();
         assert_eq!(secret.text, "$ENV.MY_VAR");
         // Even an unknown namespace lexes losslessly (value layer flags it).
         assert_lossless("k = $NOPE.X\n");
@@ -507,11 +531,21 @@ mod tests {
     fn strings_keep_raw_text_including_escapes_and_newlines() {
         // No decoding: the String token covers the raw bytes verbatim.
         let toks = lex("s = \"a\\nb\"\n");
-        let s = toks.tokens.iter().find(|t| t.kind == SyntaxKind::String).unwrap();
+        let s = toks
+            .tokens
+            .iter()
+            .find(|t| t.kind == SyntaxKind::String)
+            .unwrap();
         assert_eq!(s.text, "\"a\\nb\"");
         let ml = "s = \"\"\"\n  raw\n\"\"\"\n";
         assert_lossless(ml);
-        assert_eq!(kinds(ml).iter().filter(|k| **k == SyntaxKind::String).count(), 1);
+        assert_eq!(
+            kinds(ml)
+                .iter()
+                .filter(|k| **k == SyntaxKind::String)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -519,7 +553,10 @@ mod tests {
         let src = "service App:\n\tport = 1\n";
         let lexed = lex(src);
         assert!(
-            lexed.errors.iter().any(|e| e.message().contains("tabs are not permitted")),
+            lexed
+                .errors
+                .iter()
+                .any(|e| e.message().contains("tabs are not permitted")),
             "expected a tab diagnostic"
         );
         assert_lossless(src); // resilient: diagnosed, not aborted
@@ -537,11 +574,19 @@ mod tests {
         // CRLF must not produce per-line errors (exceeds the legacy hard-error).
         let src = "service App:\r\n    port = 1\r\n\r\n    host = 2\r\n";
         let lexed = lex(src);
-        assert!(lexed.errors.is_empty(), "CRLF should lex clean: {:?}", lexed.errors);
+        assert!(
+            lexed.errors.is_empty(),
+            "CRLF should lex clean: {:?}",
+            lexed.errors
+        );
         assert_lossless(src);
         // The blank CRLF line must not spuriously dedent: the body stays open,
         // so there is exactly one Dedent (at EOF) for the one block.
-        let dedents = lexed.tokens.iter().filter(|t| t.kind == SyntaxKind::Dedent).count();
+        let dedents = lexed
+            .tokens
+            .iter()
+            .filter(|t| t.kind == SyntaxKind::Dedent)
+            .count();
         assert_eq!(dedents, 1, "blank CRLF line must not dedent");
     }
 
@@ -551,7 +596,10 @@ mod tests {
         // quote, so this triple string is unterminated (parity with legacy).
         let lexed = lex("s = \"\"\"abc\\\"\"\"");
         assert!(
-            lexed.errors.iter().any(|e| e.message().contains("unterminated")),
+            lexed
+                .errors
+                .iter()
+                .any(|e| e.message().contains("unterminated")),
             "escaped quote should not close the triple string: {:?}",
             lexed.errors
         );

@@ -332,6 +332,7 @@ impl<'a> Formatter<'a> {
                     self.out.push_str(" = ");
                     format_value(&mut self.out, &default.value, depth);
                 }
+                render_directives(&mut self.out, &f.directives, depth);
                 self.emit_trailing_comment(entry.span.end.saturating_sub(1));
                 self.out.push('\n');
             }
@@ -371,12 +372,14 @@ impl<'a> Formatter<'a> {
             ModifierValue::TypeAnnotation {
                 field_type,
                 optional,
+                directives,
             } => {
                 self.out.push(' ');
                 self.out.push_str(&field_type.to_string());
                 if *optional {
                     self.out.push('?');
                 }
+                render_directives(&mut self.out, directives, depth);
                 self.emit_trailing_comment(m.name.span.start);
                 self.out.push('\n');
             }
@@ -539,6 +542,22 @@ fn format_value(out: &mut String, value: &Value, depth: usize) {
     }
 }
 
+/// Render trailing field directives (RFC 0032) canonically: one space,
+/// `#name` / `#name(arg)`, source order (stable ⇒ idempotent). Rendering is
+/// LOAD-BEARING — fmt formats from the AST, so an unrendered construct would
+/// be silently deleted. Shared by plain fields and modifier declarations.
+fn render_directives(out: &mut String, directives: &[nml_core::types::Directive], depth: usize) {
+    for d in directives {
+        out.push_str(" #");
+        out.push_str(&d.name);
+        if let Some(ref arg) = d.arg {
+            out.push('(');
+            format_value(out, &arg.value, depth);
+            out.push(')');
+        }
+    }
+}
+
 fn format_string(out: &mut String, s: &str, depth: usize) {
     if s.contains('\n') {
         out.push_str("\"\"\"\n");
@@ -602,6 +621,54 @@ mod tests {
         assert_eq!(first, second, "formatting is not idempotent");
     }
 
+    /// RFC 0032: directives SURVIVE formatting (rendering them is load-bearing
+    /// — fmt formats from the AST, so an unrendered field would be silently
+    /// deleted), in canonical one-space form, args included; and formatting is
+    /// idempotent over them.
+    #[test]
+    fn test_directives_survive_formatting_canonically() {
+        let source = "model server:\n    ceiling capabilitySet   #live\n    hosts set<string> #live   #key(\"host\")\n";
+        let formatted = format_source(source).unwrap();
+        assert!(
+            formatted.contains("ceiling capabilitySet #live\n"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains("hosts set<string> #live #key(\"host\")\n"),
+            "{formatted}"
+        );
+        idempotent(source);
+    }
+
+    /// RFC 0032: `set<T>` canonicalization comes from the canonical renderer —
+    /// `set <T>` loses the space, and redundant union-grouping parens inside
+    /// the angles are stripped (`set<(a | b)>` → `set<a | b>`).
+    #[test]
+    fn test_set_type_canonicalizes() {
+        let formatted =
+            format_source("model m:\n    xs set <string>\n    ys set<(string | number)>\n")
+                .unwrap();
+        assert!(formatted.contains("xs set<string>\n"), "{formatted}");
+        assert!(
+            formatted.contains("ys set<string | number>\n"),
+            "{formatted}"
+        );
+        idempotent("model m:\n    xs set <string>\n    ys set<(string | number)>\n");
+    }
+
+    /// RFC 0032: MODIFIER-declaration directives survive formatting too (the
+    /// same deletion class the field fix closed) and stay idempotent.
+    #[test]
+    fn test_modifier_directives_survive_formatting() {
+        let source = "model sandboxCeiling:\n    |block []string?   #live\n";
+        let formatted = format_source(source).unwrap();
+        assert!(
+            formatted.contains("|block []string? #live\n"),
+            "{formatted}"
+        );
+        idempotent(source);
+    }
+
     #[test]
     fn test_format_scalar_item_with_body_roundtrips() {
         // `- "/admin":` + body survives formatting (scalar-key-with-body).
@@ -644,7 +711,8 @@ mod tests {
         // RFC 0007 §5: the arm-set TYPE renders canonically as `(K -> V)`,
         // composes with unions on either side, keeps the field-suffix `?`
         // outside the parens, round-trips, and is idempotent.
-        let source = "model mount:\n    denial (string | (role -> denial))?\n    route (role -> (a | b))\n";
+        let source =
+            "model mount:\n    denial (string | (role -> denial))?\n    route (role -> (a | b))\n";
         let formatted = format(&parse(source).unwrap());
         assert!(
             formatted.contains("denial (string | (role -> denial))?"),
@@ -727,13 +795,14 @@ mod tests {
         let formatted = format_source(source)
             .unwrap_or_else(|e| panic!("failed to format:\n{}\nerror: {}", source, e.message()));
         let (_, original_comments) = nml_core::cst::parse_with_comments(source).unwrap();
-        let (_, kept_comments) = nml_core::cst::parse_with_comments(&formatted).unwrap_or_else(|e| {
-            panic!(
-                "failed to reparse formatted output:\n{}\nerror: {}",
-                formatted,
-                e.message()
-            )
-        });
+        let (_, kept_comments) =
+            nml_core::cst::parse_with_comments(&formatted).unwrap_or_else(|e| {
+                panic!(
+                    "failed to reparse formatted output:\n{}\nerror: {}",
+                    formatted,
+                    e.message()
+                )
+            });
         let original: Vec<&str> = original_comments.iter().map(|c| c.text.trim()).collect();
         let kept: Vec<&str> = kept_comments.iter().map(|c| c.text.trim()).collect();
         assert_eq!(original, kept, "comments lost or reordered:\n{formatted}");

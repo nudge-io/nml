@@ -54,6 +54,16 @@ pub struct FieldDef {
     /// when the field has no `= value`. The span points at the default literal so
     /// type-check diagnostics can locate it precisely.
     pub default_value: Option<SpannedValue>,
+    /// Trailing `#name`/`#name(value)` directives (RFC 0032), source order.
+    /// Opaque metadata — consumers interpret (see [`crate::types::Directive`]).
+    pub directives: Vec<crate::types::Directive>,
+    /// The leading own-line comment block documenting the field (RFC 0004 §4.3
+    /// comment attachment), `//` markers stripped, lines joined. Presentation
+    /// metadata for tooling (hover, completion) ONLY: it must never influence
+    /// validation or RFC 0032 reload/diff semantics — `FieldDef` deliberately
+    /// derives no `PartialEq`, and semantic comparison happens on `Value`s
+    /// (`Value::semantic_eq`), never on `FieldDef`s wholesale.
+    pub doc: Option<String>,
     pub span: Span,
 }
 
@@ -77,6 +87,13 @@ pub enum FieldType {
         key: Box<FieldType>,
         target: Box<FieldType>,
     },
+    /// `set<T>` — an unordered, **unique**-element collection (RFC 0032).
+    /// Duplicate elements are a load-time validation error (value-level
+    /// identity: for a union element type, the admitting arm is irrelevant).
+    /// Unlike `List`, element order never carries meaning — diffs are
+    /// order-insensitive (`SetDelta`), and authored order is preserved in
+    /// source but semantically inert.
+    Set(Box<FieldType>),
 }
 
 /// Renders the type in NML source syntax: `[]string`, `(step | []step)`,
@@ -102,6 +119,24 @@ impl std::fmt::Display for FieldType {
                 f.write_str(")")
             }
             FieldType::Arms { key, target } => write!(f, "({key} -> {target})"),
+            FieldType::Set(inner) => {
+                // Canonical form: bare union inside the angles (`set<a | b>`)
+                // — the angles already bound it, so the union's grouping
+                // parens would be redundant (RFC 0032 Decision 4).
+                f.write_str("set<")?;
+                match inner.as_ref() {
+                    FieldType::Union(variants) => {
+                        for (i, v) in variants.iter().enumerate() {
+                            if i > 0 {
+                                f.write_str(" | ")?;
+                            }
+                            write!(f, "{v}")?;
+                        }
+                    }
+                    other => write!(f, "{other}")?,
+                }
+                f.write_str(">")
+            }
         }
     }
 }

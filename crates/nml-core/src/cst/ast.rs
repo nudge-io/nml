@@ -136,20 +136,97 @@ impl Decl {
 /// comment attachment), as documentation text with each `//` marker stripped.
 /// Attachment places a leading comment *inside* the node it documents, so the
 /// same walk serves declarations and array items alike.
+///
+/// Blank-line rule (prior art: rustdoc, Go doc comments, JSDoc — in all three
+/// a blank line between a comment block and the item detaches the block, and
+/// a blank line *inside* a `//` run splits it so only the nearest paragraph
+/// documents the item): a doc block is only the comment run **contiguous**
+/// with the entry. Pinned to lexer ground truth, a blank line is two-or-more
+/// consecutive `Newline` tokens since the last `Comment` — one `Newline` is
+/// just the comment's own line terminator. `Whitespace` tokens (including the
+/// `\r` of a CRLF terminator, which lexes as whitespace) are transparent to
+/// the count. On detach the paragraphs collected so far are discarded and
+/// collection restarts, so a later run that does touch the entry still
+/// attaches.
 fn leading_doc_comment(node: &SyntaxNode) -> Option<String> {
     let mut lines = Vec::new();
+    // Consecutive `Newline`s since the last comment; ≥ 2 means a blank line
+    // separates the collected block from whatever follows it.
+    let mut newlines = 0usize;
     for child in node.children_with_tokens() {
         match child.into_token() {
             Some(t) if t.kind() == SyntaxKind::Comment => {
                 let raw = t.text();
                 lines.push(raw.strip_prefix("//").unwrap_or(raw).trim().to_string());
+                newlines = 0;
             }
-            // Whitespace/newlines between leading comments are skipped; the
-            // first real token (or child node) ends the doc block.
+            Some(t) if t.kind() == SyntaxKind::Newline => {
+                newlines += 1;
+                if newlines >= 2 {
+                    // Blank line: everything collected so far belongs to a
+                    // detached paragraph (a section banner, say) — drop it and
+                    // keep walking toward the entry's first real token.
+                    lines.clear();
+                }
+            }
+            // Other trivia (whitespace) is transparent; the first real token
+            // (or child node) ends the doc block.
             Some(t) if t.kind().is_trivia() => {}
             _ => break,
         }
     }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// The leading own-line comment block documenting a body ENTRY (list item,
+/// field definition, typed modifier): [`leading_doc_comment`] plus a
+/// preceding-sibling fallback. One implementation shared by every entry kind
+/// so their attachment semantics can never drift apart.
+///
+/// Attachment nuance: a comment above the body's FIRST entry precedes the
+/// entry's opening `Indent`, so it attaches to the enclosing `Body`, not the
+/// entry — the fallback walks the immediately preceding siblings for that
+/// contiguous comment block (skipping whitespace and the zero-width `Indent`).
+///
+/// The blank-line rule of [`leading_doc_comment`] applies identically here —
+/// the counting works the same walking backwards: the first `Newline` met is
+/// the previous line's terminator; a second consecutive one (whitespace
+/// transparent) is a blank line, which terminates the block. Backwards,
+/// "terminate" means stop — the entry keeps only the nearest contiguous
+/// paragraph already collected, or nothing if the blank line sits between the
+/// entry and the first comment.
+fn entry_doc_comment(node: &SyntaxNode) -> Option<String> {
+    if let Some(doc) = leading_doc_comment(node) {
+        return Some(doc);
+    }
+    let mut lines = Vec::new();
+    let mut newlines = 0usize;
+    let mut cursor = node.prev_sibling_or_token();
+    while let Some(element) = cursor {
+        let next = element.prev_sibling_or_token();
+        match element.into_token() {
+            Some(t) if t.kind() == SyntaxKind::Comment => {
+                let raw = t.text();
+                lines.push(raw.strip_prefix("//").unwrap_or(raw).trim().to_string());
+                newlines = 0;
+            }
+            Some(t) if t.kind() == SyntaxKind::Newline => {
+                newlines += 1;
+                if newlines >= 2 {
+                    // Blank line above: whatever precedes it is a detached
+                    // paragraph, never this entry's doc.
+                    break;
+                }
+            }
+            Some(t) if t.kind().is_trivia() || t.kind() == SyntaxKind::Indent => {}
+            // Any other token or node ends the block (e.g. a previous
+            // entry — its trailing comments are its own, never this
+            // entry's docs).
+            _ => break,
+        }
+        cursor = next;
+    }
+    lines.reverse();
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
@@ -265,10 +342,7 @@ impl Arm {
     /// `String` (a path/url literal, RFC 0007 §6) *after* the arrow, so it is
     /// never confused with an `else` selector's `Ident`.
     pub fn target(&self) -> Option<SyntaxToken> {
-        let mut toks = self
-            .0
-            .children_with_tokens()
-            .filter_map(|e| e.into_token());
+        let mut toks = self.0.children_with_tokens().filter_map(|e| e.into_token());
         toks.by_ref()
             .find(|t| matches!(t.kind(), SyntaxKind::Arrow | SyntaxKind::FatArrow))?;
         toks.find(|t| matches!(t.kind(), SyntaxKind::Ident | SyntaxKind::String))
@@ -383,6 +457,17 @@ impl Modifier {
     pub fn name(&self) -> Option<SyntaxToken> {
         token(&self.0, SyntaxKind::Ident)
     }
+    /// The leading own-line comment block documenting this modifier (RFC 0004
+    /// §4.3) — a typed modifier (`|allow []string?`) declares a field, so it
+    /// documents exactly like one.
+    pub fn doc_comment(&self) -> Option<String> {
+        entry_doc_comment(&self.0)
+    }
+    /// Trailing `#name`/`#name(value)` directives on a modifier TYPE
+    /// declaration (RFC 0032), source order.
+    pub fn directives(&self) -> impl Iterator<Item = Directive> + '_ {
+        children(&self.0)
+    }
     /// The inline value form (`= value`).
     pub fn value(&self) -> Option<ValueNode> {
         child(&self.0)
@@ -427,35 +512,8 @@ impl ListItem {
     /// The leading own-line comment block documenting this item (RFC 0004
     /// §4.3) — a `- Name:` item documents exactly like a declaration, so an
     /// arm target's hover (RFC 0007 §4.1) surfaces the comment above the item.
-    ///
-    /// Attachment nuance: a comment above the body's FIRST item precedes the
-    /// item's opening `Indent`, so it attaches to the enclosing `Body`, not
-    /// the item — the fallback walks the immediately preceding siblings for
-    /// that contiguous comment block (skipping whitespace and the zero-width
-    /// `Indent`).
     pub fn doc_comment(&self) -> Option<String> {
-        if let Some(doc) = leading_doc_comment(&self.0) {
-            return Some(doc);
-        }
-        let mut lines = Vec::new();
-        let mut cursor = self.0.prev_sibling_or_token();
-        while let Some(element) = cursor {
-            let next = element.prev_sibling_or_token();
-            match element.into_token() {
-                Some(t) if t.kind() == SyntaxKind::Comment => {
-                    let raw = t.text();
-                    lines.push(raw.strip_prefix("//").unwrap_or(raw).trim().to_string());
-                }
-                Some(t) if t.kind().is_trivia() || t.kind() == SyntaxKind::Indent => {}
-                // Any other token or node ends the block (e.g. a previous
-                // item — its trailing comments are its own, never this
-                // item's docs).
-                _ => break,
-            }
-            cursor = next;
-        }
-        lines.reverse();
-        (!lines.is_empty()).then(|| lines.join("\n"))
+        entry_doc_comment(&self.0)
     }
     /// The nested body (named form `- Name: …`).
     pub fn body(&self) -> Option<Body> {
@@ -469,6 +527,13 @@ impl ListItem {
     pub fn role(&self) -> Option<SyntaxToken> {
         token(&self.0, SyntaxKind::Role)
     }
+    /// Whether the item carries a trailing colon (`- Name:`). Distinguishes an
+    /// inline instance with an empty body from a bare reference (`- Name`) —
+    /// the colon is the author saying "this has a body", even when the body
+    /// has no entries yet.
+    pub fn has_colon(&self) -> bool {
+        token(&self.0, SyntaxKind::Colon).is_some()
+    }
 }
 
 ast_node!(/// `name type[?] (= default)?`
@@ -477,6 +542,12 @@ ast_node!(/// `name type[?] (= default)?`
 impl FieldDef {
     pub fn name(&self) -> Option<SyntaxToken> {
         token(&self.0, SyntaxKind::Ident)
+    }
+    /// The leading own-line comment block documenting this field (RFC 0004
+    /// §4.3) — the same contiguous-block rule as [`ListItem::doc_comment`],
+    /// via the shared [`entry_doc_comment`] walk.
+    pub fn doc_comment(&self) -> Option<String> {
+        entry_doc_comment(&self.0)
     }
     pub fn type_expr(&self) -> Option<TypeExpr> {
         child(&self.0)
@@ -491,6 +562,25 @@ impl FieldDef {
         token(&self.0, SyntaxKind::Plus).is_some()
     }
     pub fn default(&self) -> Option<ValueNode> {
+        child(&self.0)
+    }
+    /// Trailing `#name`/`#name(value)` directives (RFC 0032), source order.
+    pub fn directives(&self) -> impl Iterator<Item = Directive> + '_ {
+        children(&self.0)
+    }
+}
+
+ast_node!(/// `#name` / `#name(value)` — a field directive (RFC 0032), opaque
+    /// to the language beyond its syntax.
+    Directive => Directive);
+
+impl Directive {
+    /// The directive name (the ident after `#`).
+    pub fn name(&self) -> Option<SyntaxToken> {
+        token(&self.0, SyntaxKind::Ident)
+    }
+    /// The parenthesized argument value, if any.
+    pub fn value(&self) -> Option<ValueNode> {
         child(&self.0)
     }
 }
@@ -509,11 +599,19 @@ pub enum TypeExprKind {
     /// `(K -> V)` — a typed arm set (RFC 0007). `children()` yields exactly
     /// key then target.
     Arms,
+    /// `set<T>` — a type constructor (RFC 0032). `children()` yields the
+    /// argument types: one child = the element type; several = the variants of
+    /// a bare union (`set<a | b>`). The constructor name is [`TypeExpr::name`].
+    Set,
 }
 
 impl TypeExpr {
     pub fn kind(&self) -> TypeExprKind {
-        if token(&self.0, SyntaxKind::LBracket).is_some() {
+        // Checked first: a constructor node carries an `Ident` too, so `Lt` is
+        // its discriminator (nothing else puts an angle inside a TypeExpr).
+        if token(&self.0, SyntaxKind::Lt).is_some() {
+            TypeExprKind::Set
+        } else if token(&self.0, SyntaxKind::LBracket).is_some() {
             TypeExprKind::Array
         } else if token(&self.0, SyntaxKind::LParen).is_some() {
             // The arrow is a *direct* token of this node (a nested arm set's
@@ -664,7 +762,13 @@ mod tests {
     fn accessors_handle_partial_trees_without_panic() {
         // Malformed/incomplete input: every accessor must return None/empty, not
         // panic — the whole point of Option-returning wrappers.
-        for src in ["service", "service App is\n", "model M:\n    f\n", "oneof x\n", "[]\n"] {
+        for src in [
+            "service",
+            "service App is\n",
+            "model M:\n    f\n",
+            "oneof x\n",
+            "[]\n",
+        ] {
             let r = root(src);
             for decl in r.decls() {
                 match decl {
@@ -680,7 +784,12 @@ mod tests {
                         }
                     }
                     Decl::OneOf(o) => {
-                        let _ = (o.name(), o.discriminator(), o.enum_type(), o.default_value());
+                        let _ = (
+                            o.name(),
+                            o.discriminator(),
+                            o.enum_type(),
+                            o.default_value(),
+                        );
                         let _ = o.arms().count();
                     }
                     Decl::Array(a) => {
@@ -708,12 +817,17 @@ mod tests {
         };
         assert_eq!(p.name().unwrap().text(), "port");
         let v = p.value().unwrap().decode().unwrap().value;
-        assert_eq!(v, crate::types::Value::Number(crate::types::Number::Int(8080)));
+        assert_eq!(
+            v,
+            crate::types::Value::Number(crate::types::Number::Int(8080))
+        );
     }
 
     #[test]
     fn field_def_and_type_expr_accessors() {
-        let r = root("model M:\n    name string\n    tier string?\n    tags []string\n    mode (a | b)\n");
+        let r = root(
+            "model M:\n    name string\n    tier string?\n    tags []string\n    mode (a | b)\n",
+        );
         let Decl::Block(b) = r.decls().next().unwrap() else {
             unreachable!()
         };
@@ -795,5 +909,113 @@ mod tests {
             panic!("expected list item")
         };
         assert!(shorthand.value().is_some());
+    }
+
+    // ── doc-comment blank-line detach (RFC 0030 decision) ─────────────────
+    //
+    // Prior art (rustdoc / Go / JSDoc): a blank line detaches a comment block
+    // from the item below it; a blank line inside a `//` run keeps only the
+    // nearest paragraph. These tests pin that rule for every doc-bearing
+    // entry kind, so the shared walks can never drift apart.
+
+    /// The doc of the field named `n` in the first model of `src`.
+    fn field_doc(src: &str, n: &str) -> Option<String> {
+        let r = root(src);
+        for decl in r.decls() {
+            let Decl::Block(b) = decl else { continue };
+            let Some(body) = b.body() else { continue };
+            for e in body.entries() {
+                if let Entry::FieldDef(f) = e {
+                    if f.name().is_some_and(|t| t.text() == n) {
+                        return f.doc_comment();
+                    }
+                }
+            }
+        }
+        panic!("field {n} not found")
+    }
+
+    #[test]
+    fn section_banner_then_blank_detaches_from_field() {
+        // A section banner separated from the field by a blank line is layout,
+        // not documentation.
+        let src = "model M:\n    a string\n\n    // ── networking ──\n\n    b string\n";
+        assert_eq!(field_doc(src, "b"), None);
+        // Blank line directly between a would-be doc and the field: detached.
+        let src = "model M:\n    a string\n    // spaced doc\n\n    b string\n";
+        assert_eq!(field_doc(src, "b"), None);
+    }
+
+    #[test]
+    fn contiguous_multi_line_doc_still_attaches() {
+        let src = "model M:\n    a string\n    // line one\n    // line two\n    b string\n";
+        assert_eq!(field_doc(src, "b").as_deref(), Some("line one\nline two"));
+    }
+
+    #[test]
+    fn blank_inside_run_keeps_nearest_paragraph_only() {
+        let src = "model M:\n    // far paragraph\n\n    // near paragraph\n    b string\n";
+        assert_eq!(field_doc(src, "b").as_deref(), Some("near paragraph"));
+    }
+
+    #[test]
+    fn crlf_blank_line_detaches_identically() {
+        // CRLF's `\r` lexes as Whitespace — transparent to the newline count,
+        // so CRLF files follow exactly the LF rules.
+        let attached = "model M:\r\n    // doc\r\n    b string\r\n";
+        assert_eq!(field_doc(attached, "b").as_deref(), Some("doc"));
+        let detached = "model M:\r\n    // doc\r\n\r\n    b string\r\n";
+        assert_eq!(field_doc(detached, "b"), None);
+        let nearest = "model M:\r\n    // far\r\n\r\n    // near\r\n    b string\r\n";
+        assert_eq!(field_doc(nearest, "b").as_deref(), Some("near"));
+    }
+
+    #[test]
+    fn blank_line_detach_applies_to_every_entry_kind() {
+        // List items.
+        let src = "[]mount mounts:\n    // detached\n\n    - Main:\n        path = \"/\"\n";
+        let Decl::Array(a) = root(src).decls().next().unwrap() else {
+            panic!("expected array decl")
+        };
+        let Entry::ListItem(item) = a.body().unwrap().entries().next().unwrap() else {
+            panic!("expected list item")
+        };
+        assert_eq!(item.doc_comment(), None);
+
+        // The contiguous counterpart still attaches.
+        let src = "[]mount mounts:\n    // attached\n    - Main:\n        path = \"/\"\n";
+        let Decl::Array(a) = root(src).decls().next().unwrap() else {
+            unreachable!()
+        };
+        let Entry::ListItem(item) = a.body().unwrap().entries().next().unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(item.doc_comment().as_deref(), Some("attached"));
+
+        // Typed modifiers.
+        let src = "model M:\n    // detached\n\n    |allow []string?\n";
+        let Decl::Block(b) = root(src).decls().next().unwrap() else {
+            unreachable!()
+        };
+        let Entry::Modifier(m) = b.body().unwrap().entries().next().unwrap() else {
+            panic!("expected modifier")
+        };
+        assert_eq!(m.doc_comment(), None);
+
+        // Top-level declarations (`Decl::doc_comment`, forward walk only).
+        let src = "service A:\n    p = 1\n\n// detached\n\nservice B:\n    q = 2\n";
+        let doc = root(src)
+            .decls()
+            .find(|d| d.name().and_then(|n| n.text()).as_deref() == Some("B"))
+            .unwrap()
+            .doc_comment();
+        assert_eq!(doc, None);
+        let src = "service A:\n    p = 1\n\n// far\n\n// near\nservice B:\n    q = 2\n";
+        let doc = root(src)
+            .decls()
+            .find(|d| d.name().and_then(|n| n.text()).as_deref() == Some("B"))
+            .unwrap()
+            .doc_comment();
+        assert_eq!(doc.as_deref(), Some("near"));
     }
 }

@@ -1,0 +1,65 @@
+// Meta-schema for `<name>.package.nml` schema-package manifests (RFC 0030).
+//
+// Ships as the builtin package embedded in the LSP — the delivery and the
+// association of this file are the package mechanism itself (its builtin
+// manifest binds `*.package.nml`). Structural rules live here; semantic
+// cross-references (a `[]validator.schemas` entry naming a declared
+// `[]schema`, the package-name charset, the formatVersion gate) are enforced
+// by the package loader, which has the whole manifest in hand.
+
+model package:
+    // Identity, supplied by the block name (`package nudge:`). The loader
+    // additionally constrains the charset (lowercase ident) because the name
+    // becomes a store path component and a written pin entry.
+    name string+
+    // Human label (the publisher's CARGO_PKG_VERSION). Never an identity —
+    // the content hash is; see RFC 0030 "The content hash lives outside the
+    // manifest".
+    version string
+    // Package-format compatibility gate, checked by consumers BEFORE
+    // meta-validation so a newer publisher degrades an older editor
+    // gracefully instead of producing a wall of meta-schema errors.
+    formatVersion number
+    // Root-marker filenames anchoring binding globs to a project root.
+    rootMarkers []string?
+    // Modifier keywords legal in this package's configs (e.g. nudge's
+    // allow/deny/grant/trust/block).
+    modifiers []string?
+    membership membershipSemantics?
+
+// Mirrors nml-validate's MembershipSemantics — pure data.
+model membershipSemantics:
+    memberKeywords []string?
+    builtinRefs []string?
+    userRefPrefix string?
+
+// The sources declaration: logical schema name → source file. Three rules
+// hang off it (RFC 0030): `[]validator.schemas` resolves against its names,
+// the content hash covers its files in list order, and the directive
+// vocabulary applies to its files.
+model schema:
+    name string+
+    file string
+
+// A validator binding: which config files it claims (root-relative globs,
+// first match in list order wins) and the composed, optionally-strict schema
+// set that validates them.
+model validator:
+    name string+
+    files []string
+    schemas []schema
+    strict bool?
+
+enum directiveArg:
+    - "none"
+    - "ident"
+    - "string"
+    - "number"
+
+// Consumer-registered directive vocabulary (RFC 0032): completion,
+// validation, and hover for `#name` field directives in this package's
+// schema sources.
+model directive:
+    name string+
+    arg directiveArg
+    doc string
