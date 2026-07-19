@@ -348,7 +348,7 @@ impl Inner {
     /// global clobber is gone: per-document resolution reads the tree.
     fn diagnostic_config_for(&self, uri: &Url) -> diagnostics::DiagnosticConfig {
         let nearest = uri.to_file_path().ok().and_then(|p| {
-            let p = p.canonicalize().unwrap_or(p);
+            let p = dunce::canonicalize(&p).unwrap_or(p);
             let roots = self
                 .workspace_roots
                 .lock()
@@ -450,7 +450,7 @@ impl Inner {
         // path (macOS /tmp → /private/tmp, symlinked checkouts) would fail
         // every starts_with, silently unrooting resolution — and letting the
         // ancestor walk escape the workspace.
-        let path = path.canonicalize().unwrap_or(path);
+        let path = dunce::canonicalize(&path).unwrap_or(path);
         let roots = self
             .workspace_roots
             .lock()
@@ -464,7 +464,7 @@ impl Inner {
                     let p = u.to_file_path().ok()?;
                     // Canonicalized like the resolved document path — a
                     // symlinked workspace must not break is_self/root checks.
-                    Some((p.canonicalize().unwrap_or(p), text.clone()))
+                    Some((dunce::canonicalize(&p).unwrap_or(p), text.clone()))
                 })
                 .collect()
         };
@@ -769,7 +769,7 @@ fn watched_file_is_eligible(path: &Path, roots: &[PathBuf]) -> bool {
     if is_symlink {
         return false;
     }
-    match path.canonicalize() {
+    match dunce::canonicalize(path) {
         Ok(canonical) => roots.iter().any(|root| canonical.starts_with(root)),
         Err(_) => false,
     }
@@ -2577,7 +2577,7 @@ impl LanguageServer for NmlLanguageServer {
             .unwrap_or_else(|e| e.into_inner()) = roots
             .iter()
             .filter_map(|r| r.to_file_path().ok())
-            .filter_map(|p| p.canonicalize().ok())
+            .filter_map(|p| dunce::canonicalize(&p).ok())
             .collect();
         if !roots.is_empty() {
             self.index_workspace(&roots);
@@ -5511,7 +5511,7 @@ workflow VoiceAgent:
         let root = temp_workspace("inside");
         let file = root.join("a.nml");
         fs::write(&file, "x").unwrap();
-        let canon_root = root.canonicalize().unwrap();
+        let canon_root = dunce::canonicalize(&root).unwrap();
 
         assert!(watched_file_is_eligible(&file, &[canon_root]));
 
@@ -5524,7 +5524,7 @@ workflow VoiceAgent:
         let elsewhere = temp_workspace("outside-other");
         let file = elsewhere.join("a.nml");
         fs::write(&file, "x").unwrap();
-        let canon_root = root.canonicalize().unwrap();
+        let canon_root = dunce::canonicalize(&root).unwrap();
 
         assert!(!watched_file_is_eligible(&file, &[canon_root]));
 
@@ -5546,7 +5546,7 @@ workflow VoiceAgent:
     #[test]
     fn watched_file_missing_is_rejected() {
         let root = temp_workspace("missing");
-        let canon_root = root.canonicalize().unwrap();
+        let canon_root = dunce::canonicalize(&root).unwrap();
 
         assert!(!watched_file_is_eligible(
             &root.join("nope.nml"),
@@ -5565,7 +5565,7 @@ workflow VoiceAgent:
         fs::write(&target, "x").unwrap();
         let link = root.join("link.nml");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let canon_root = root.canonicalize().unwrap();
+        let canon_root = dunce::canonicalize(&root).unwrap();
 
         assert!(
             !watched_file_is_eligible(&link, &[canon_root]),

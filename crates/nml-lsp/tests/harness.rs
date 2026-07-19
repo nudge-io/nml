@@ -239,7 +239,7 @@ fn temp_dir(tag: &str) -> PathBuf {
     ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create scratch dir");
-    dir.canonicalize().expect("canonicalize scratch dir")
+    dunce::canonicalize(&dir).expect("canonicalize scratch dir")
 }
 
 /// A workspace whose `nml-project.nml` pins the demo package. The store
