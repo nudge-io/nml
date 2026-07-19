@@ -726,7 +726,7 @@ impl Inner {
     fn collect_declaration_names(&self) -> Vec<(String, String)> {
         let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         let mut names = Vec::new();
-        for (_, source) in docs.iter() {
+        for source in docs.values() {
             let file = nml_core::cst::parse_best_effort(source);
             for decl in &file.declarations {
                 match &decl.kind {
