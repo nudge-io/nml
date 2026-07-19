@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Building the WASM server here also guards that the wasm32 cfg-gated code
       # (the synchronous pump) compiles.
@@ -27,7 +27,7 @@ jobs:
       - name: Build the WASM neutral server
         run: cargo build -p nml-lsp --target wasm32-wasip1 --release
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 20
           cache: npm
@@ -53,7 +53,7 @@ jobs:
         run: npx --yes @vscode/vsce package --allow-missing-repository
 
       - name: Upload the VSIX artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nml-lang-vsix
           path: editors/vscode/*.vsix
