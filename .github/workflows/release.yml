@@ -1,0 +1,80 @@
+name: Release extension
+
+# Tag an extension release, e.g.:
+#   git tag vscode-v0.3.0 && git push origin vscode-v0.3.0
+# The tag version must match editors/vscode/package.json's "version".
+on:
+  push:
+    tags: ["vscode-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  # Fail fast on a version typo before spending a full build + E2E run.
+  verify:
+    name: Verify tag matches version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Tag == package.json version
+        run: |
+          pkg="$(jq -r .version editors/vscode/package.json)"
+          tag="${GITHUB_REF_NAME#vscode-v}"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} ($tag) != package.json version ($pkg)"
+            exit 1
+          fi
+
+  # Self-sufficient gates: the release re-runs the SAME reusable pipelines CI
+  # does, so it never trusts an unverified commit. `publish` needs both, so any
+  # fmt/clippy/test failure OR a failing E2E blocks the release before anything
+  # is published.
+  rust:
+    name: Rust gate
+    needs: verify
+    uses: ./.github/workflows/rust-ci.yml
+
+  build:
+    name: Build & E2E gate
+    needs: verify
+    uses: ./.github/workflows/extension-build.yml
+
+  publish:
+    name: GitHub Release · publish
+    needs: [rust, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # create the GitHub Release + upload the VSIX
+    # Marketplace/Open VSX tokens are OPTIONAL: without them the job still cuts a
+    # GitHub Release with the VSIX attached; each publish step runs only when its
+    # token secret is set.
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
+    steps:
+      - name: Download the built + tested VSIX
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nml-lang-vsix
+          path: vsix
+
+      - name: Create the GitHub Release and attach the VSIX
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" vsix/*.vsix --generate-notes
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: env.VSCE_PAT != '' || env.OVSX_PAT != ''
+        with:
+          node-version: 20
+
+      - name: Publish to the VS Code Marketplace
+        if: env.VSCE_PAT != ''
+        run: npx --yes @vscode/vsce publish --packagePath vsix/*.vsix -p "$VSCE_PAT"
+
+      - name: Publish to Open VSX
+        if: env.OVSX_PAT != ''
+        run: npx --yes ovsx publish vsix/*.vsix -p "$OVSX_PAT"

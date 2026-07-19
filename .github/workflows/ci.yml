@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One in-flight run per ref; a new push cancels the stale one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Both pipelines live in reusable workflows so CI and release run byte-identical
+# checks. Rust = fmt + clippy + cross-platform tests; extension = build + WASM +
+# typecheck + headless E2E + package.
+jobs:
+  rust:
+    name: Rust
+    uses: ./.github/workflows/rust-ci.yml
+
+  extension:
+    name: VS Code extension
+    uses: ./.github/workflows/extension-build.yml

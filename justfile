@@ -45,9 +45,9 @@ test:
 test-lsp:
     cargo test -p nml-lsp
 
-# Run clippy on the workspace
+# Run clippy on the workspace (matches CI: --all-targets covers tests/examples)
 lint:
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Format all Rust code
 fmt:
