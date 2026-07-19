@@ -26,7 +26,23 @@ nml-validate = { workspace = true }
 nml-fmt = { workspace = true }
 serde_json = { workspace = true }
 tower-lsp = { workspace = true }
+
+# tokio's feature surface is target-split (RFC 0035 WASM delivery). Native gets
+# the workspace's full tokio. `wasm32` (the in-editor neutral server, run under
+# VS Code's `wasm-wasi-core`) gets ONLY the wasm-supported subset — `net`/`fs`/
+# multi-thread pull in `mio`, which does not build on wasm. The runtime shell
+# uses exactly this subset; the stdio transport is target-split in `serve`.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "macros",
+    "io-util",
+    "sync",
+    "time",
+] }
 
 [dev-dependencies]
 nml-validate = { workspace = true, features = ["test-support"] }

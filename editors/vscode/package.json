@@ -12,13 +12,60 @@
   "engines": {
     "vscode": "^1.75.0"
   },
-  "activationEvents": [
-    "onLanguage:nml"
-  ],
+  "activationEvents": [],
   "categories": [
     "Programming Languages"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In an untrusted workspace the neutral nml-lsp still validates committed and cached schema (NML is data, not code). A project's own tool language server (`<tool> lsp`) is only launched once you trust the workspace."
+    }
+  },
   "contributes": {
+    "commands": [
+      {
+        "command": "nml.restartServer",
+        "title": "Restart Language Server",
+        "category": "NML"
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "nml.gettingStarted",
+        "title": "Get schema-aware NML editing",
+        "description": "Validate NML config against its schema, with completions and hovers.",
+        "steps": [
+          {
+            "id": "server",
+            "title": "Install the language server",
+            "description": "The neutral server is `nml-lsp`. Install it on your PATH (e.g. `cargo install nml-lsp`, or copy it to `~/.cargo/bin/nml-lsp`), or point `nml.server.path` at it.\n[Open NML settings](command:workbench.action.openSettings?%22nml.server%22)",
+            "media": {
+              "markdown": "walkthroughs/server.md"
+            },
+            "completionEvents": [
+              "onSettingChanged:nml.server.path"
+            ]
+          },
+          {
+            "id": "provider",
+            "title": "Use your tool's schema (optional)",
+            "description": "If your project is built with a schema-provider tool (e.g. nudge), declare it in `nml-project.nml`:\n\n```\nproject MyApp:\n    provider:\n        tool = \"nudge\"\n```\n\nIn a trusted workspace the editor then validates against the exact tool binary — zero sync. Otherwise the neutral server serves the tool's published package.",
+            "media": {
+              "markdown": "walkthroughs/provider.md"
+            }
+          },
+          {
+            "id": "open",
+            "title": "Open an NML file",
+            "description": "Open any `.nml` file. The status bar (bottom-right) names the active schema and its delivery channel. Errors, completions, and hovers come from that schema.\n[Open a folder](command:workbench.action.files.openFolder)",
+            "media": {
+              "markdown": "walkthroughs/open.md"
+            }
+          }
+        ]
+      }
+    ],
     "languages": [
       {
         "id": "nml",
@@ -45,8 +92,8 @@
         "nml.server.path": {
           "type": "string",
           "default": "",
-          "scope": "machine-overridable",
-          "description": "Absolute path to the nml-lsp binary. Defaults to ~/.cargo/bin/nml-lsp."
+          "scope": "machine",
+          "description": "Absolute path to the neutral nml-lsp binary. Defaults to ~/.cargo/bin/nml-lsp. Machine-scoped on purpose: a workspace cannot set it, so a repository can never redirect the language server at an untrusted binary."
         }
       }
     },
