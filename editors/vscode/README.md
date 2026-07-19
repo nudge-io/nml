@@ -8,7 +8,7 @@ schema.
 
 The extension ships a **neutral language server compiled to WebAssembly** and
 runs it sandboxed via the WASI host — no separate binary to install, works
-offline, on every platform. It validates:
+offline, on every desktop platform VS Code runs on. It validates:
 
 - **committed schema** — drop a `<name>.package.nml` (+ its `*.model.nml`
   sources) in your repo and it is discovered automatically, and
