@@ -23,7 +23,7 @@ use tower_lsp::{ClientSocket, LspService};
 
 use nml_lsp::server::NmlLanguageServer;
 use nml_validate::store::Store;
-use nml_validate::test_support::{publish_demo, DEMO_MANIFEST_WITH_DIRECTIVES};
+use nml_validate::test_support::{demo_package, publish_demo, DEMO_MANIFEST_WITH_DIRECTIVES};
 
 /// How long a test is willing to wait for an asynchronous server→client
 /// frame (the store-event notifier task runs on its own tokio task, so its
@@ -42,14 +42,30 @@ struct Harness {
 }
 
 impl Harness {
-    /// Build the service exactly as `main.rs` does — same custom-method
-    /// registration, so `nml/schemaInfo` is exercised through the real
-    /// JSON-RPC route — but with the resolver's store injected.
+    /// Build the service through the same `nml_lsp::build_service` owner the
+    /// binary uses — so `nml/schemaInfo` (and every future custom method) is
+    /// exercised through the real JSON-RPC route — but with the resolver's
+    /// store injected.
     fn new(store: Store) -> Self {
         let (service, socket) =
-            LspService::build(|client| NmlLanguageServer::with_store(client, Some(store)))
-                .custom_method("nml/schemaInfo", NmlLanguageServer::schema_info)
-                .finish();
+            nml_lsp::build_service(|client| NmlLanguageServer::with_store(client, Some(store)));
+        Self {
+            service,
+            socket,
+            inbox: VecDeque::new(),
+            next_id: 0,
+        }
+    }
+
+    /// Build a *provider* service (RFC 0035 in-binary channel) — the `nudge
+    /// lsp` wiring: the tool's package injected in-process, plus a store (here
+    /// a tempdir, so coverage must come from the injected package, not the
+    /// cache). Exercises `NmlLanguageServer::with_provider` through the same
+    /// service builder the tool binary uses.
+    fn new_provider(package: nml_validate::package::SchemaPackage, store: Store) -> Self {
+        let (service, socket) = nml_lsp::build_service(move |client| {
+            NmlLanguageServer::with_provider(client, package, Some(store))
+        });
         Self {
             service,
             socket,
@@ -335,6 +351,38 @@ async fn schema_info_reports_pinned_store_binding() {
     // not auto-association (which would also match here via rootMarkers).
     assert_eq!(info["step"], json!("pinned"), "wrong step: {info}");
     assert_eq!(info["notes"], json!([]), "expected a note-free binding");
+}
+
+/// TEST B2 — the in-binary channel end-to-end (RFC 0035): a *provider* server
+/// (embedded package injected in-binary, EMPTY store) validates an opened file
+/// through the real didOpen → validate → publish route, and the diagnostic's
+/// identity suffix names the `in-binary` source. This is the `nudge lsp`
+/// scenario minus the tool binary — the committed regression test behind the
+/// hand-driven stdio smoke.
+#[tokio::test]
+async fn injected_provider_validates_open_file_with_empty_store() {
+    let base = temp_dir("provider-in-binary");
+    let store_base = base.join("store"); // created, never published to
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let ws = base.join("ws");
+    fs::create_dir_all(&ws).expect("create workspace");
+    // `demo.nml` is a demo-package binding glob AND its root marker, so the
+    // file binds under its own directory with no nml-project.nml.
+    let demo_nml = ws.join("demo.nml");
+    let text = "core Main:\n    name = \"x\"\n    bogus = 1\n";
+    fs::write(&demo_nml, text).expect("write demo.nml");
+
+    let mut harness = Harness::new_provider(demo_package(), Store::at(&store_base));
+    harness.initialize(&ws).await;
+    let params = harness.open(&demo_nml, text).await;
+    let diags = params["diagnostics"].as_array().expect("diagnostics array");
+    assert!(
+        diags.iter().any(|d| {
+            let m = d["message"].as_str().unwrap_or("");
+            m.contains("bogus") && m.contains("in-binary")
+        }),
+        "expected an in-binary-sourced strict-unknown-key diagnostic; got {diags:?}"
+    );
 }
 
 /// A workspace holding the directive-vocabulary demo package as a WORKSPACE

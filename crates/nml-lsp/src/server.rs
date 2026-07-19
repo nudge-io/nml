@@ -13,7 +13,7 @@ use nml_core::types::Value;
 use nml_core::{FieldTarget, SchemaIndex};
 use nml_validate::schema::MembershipSemantics;
 
-use crate::diagnostics::{self, LanguageExtension, SchemaMode};
+use crate::diagnostics::{self, SchemaMode};
 use crate::packages::{self, Resolution, WorkspaceView};
 use crate::position::{self, LineIndex};
 
@@ -55,7 +55,6 @@ pub struct Inner {
     /// Canonicalized workspace roots captured at initialize; watched-file
     /// events outside these roots are ignored.
     workspace_roots: Mutex<Vec<PathBuf>>,
-    language_extension: Option<Arc<dyn LanguageExtension>>,
     membership: MembershipSemantics,
     /// Schema-package resolution (RFC 0030): pins > auto-association >
     /// unbound fallback, definitions from workspace manifests > store >
@@ -96,50 +95,82 @@ impl std::ops::Deref for NmlLanguageServer {
     }
 }
 
+/// Inputs to [`NmlLanguageServer::build`], defaulted so each named constructor
+/// sets only the fields it means to — no wall of positional `None`s at the call
+/// sites. `store: None` means "run storeless"; a constructor wanting the
+/// per-user store passes `Store::user()` explicitly.
+#[derive(Default)]
+struct BuildConfig {
+    store: Option<nml_validate::store::Store>,
+    membership: MembershipSemantics,
+    injected: Option<nml_validate::package::SchemaPackage>,
+}
+
 impl NmlLanguageServer {
     pub fn new(client: Client) -> Self {
         // Production wiring: the per-user schema-package store (may be absent
         // on exotic platforms; treated as an empty store, never an error).
         Self::build(
             client,
-            nml_validate::store::Store::user(),
-            None,
-            MembershipSemantics::default(),
+            BuildConfig {
+                store: nml_validate::store::Store::user(),
+                ..Default::default()
+            },
         )
     }
 
-    /// Embedder/test seam, parallel to [`Self::with_extension`]: identical to
-    /// [`Self::new`] except the schema-package store is supplied by the
-    /// caller instead of resolved from the user environment
-    /// (`NML_SCHEMA_STORE_DIR` / platform data dir). The in-process test
-    /// harness injects a tempdir store here; an embedder may inject its own
-    /// store, or `None` to run storeless.
-    pub fn with_store(client: Client, store: Option<nml_validate::store::Store>) -> Self {
-        Self::build(client, store, None, MembershipSemantics::default())
-    }
-
-    /// Create a server with an embedder-supplied language extension.
-    pub fn with_extension(
+    /// Provider seam (RFC 0035 in-binary channel): the server a schema-provider
+    /// tool starts from its own subcommand (`nudge lsp`). The tool's embedded
+    /// package is served in-process at top-of-cache precedence — the editor
+    /// validates against the exact running binary's schema, zero-sync — while
+    /// the given `store` and committed workspace manifests are still read.
+    ///
+    /// This server is a *pure superset* of the neutral one: the injected package
+    /// governs exactly the files its bindings claim — via its own validator,
+    /// which already carries the package's strictness, modifiers, and membership
+    /// — and every other file (unbound, or bound to a different package) behaves
+    /// identically to [`Self::new`]. A package's profile is scoped to the files
+    /// it claims, never leaked onto files it does not; so the unbound path keeps
+    /// neutral defaults. Production passes `Store::user()` (see [`crate::serve`]);
+    /// the harness injects a tempdir store.
+    pub fn with_provider(
         client: Client,
-        extension: Arc<dyn LanguageExtension>,
-        membership: MembershipSemantics,
+        package: nml_validate::package::SchemaPackage,
+        store: Option<nml_validate::store::Store>,
     ) -> Self {
         Self::build(
             client,
-            nml_validate::store::Store::user(),
-            Some(extension),
-            membership,
+            BuildConfig {
+                store,
+                injected: Some(package),
+                ..Default::default()
+            },
         )
     }
 
-    /// Shared constructor body: the public constructors differ only in where
-    /// the store/extension/membership come from.
-    fn build(
-        client: Client,
-        store: Option<nml_validate::store::Store>,
-        language_extension: Option<Arc<dyn LanguageExtension>>,
-        membership: MembershipSemantics,
-    ) -> Self {
+    /// Embedder/test seam: identical to [`Self::new`] except the
+    /// schema-package store is supplied by the caller instead of resolved from
+    /// the user environment (`NML_SCHEMA_STORE_DIR` / platform data dir). The
+    /// in-process test harness injects a tempdir store here; an embedder may
+    /// inject its own store, or `None` to run storeless.
+    pub fn with_store(client: Client, store: Option<nml_validate::store::Store>) -> Self {
+        Self::build(
+            client,
+            BuildConfig {
+                store,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Shared constructor body. The public constructors differ only in the
+    /// [`BuildConfig`] fields they set.
+    fn build(client: Client, cfg: BuildConfig) -> Self {
+        let BuildConfig {
+            store,
+            membership,
+            injected,
+        } = cfg;
         let (store_events_tx, store_events_rx) = tokio::sync::mpsc::channel(64);
         Self {
             client,
@@ -153,9 +184,12 @@ impl NmlLanguageServer {
                 scoped_oneofs: Mutex::new(HashMap::new()),
                 project_config: Mutex::new(nml_core::ProjectConfig::default()),
                 workspace_roots: Mutex::new(Vec::new()),
-                language_extension,
                 membership,
-                resolver: packages::PackageResolver::new(store, store_events_tx),
+                resolver: packages::PackageResolver::with_injected(
+                    store,
+                    store_events_tx,
+                    injected,
+                ),
                 insert_replace_support: std::sync::atomic::AtomicBool::new(false),
                 sweep: tokio::sync::Notify::new(),
             }),
@@ -383,7 +417,6 @@ impl Inner {
             template_namespaces: pc.template_namespaces.clone(),
             modifiers: pc.modifiers.clone(),
             membership,
-            language_extension: self.language_extension.clone(),
         }
     }
 
@@ -410,7 +443,6 @@ impl Inner {
             template_namespaces: pc.template_namespaces.clone(),
             modifiers: pc.modifiers.clone(),
             membership,
-            language_extension: self.language_extension.clone(),
         }
     }
 
@@ -2200,39 +2232,6 @@ fn is_template_namespace_position(before_cursor: &str) -> bool {
     }
 }
 
-/// Detect a `{{namespace.path}}` template expression around the given
-/// *byte* column and return its hover documentation.
-fn detect_template_hover(
-    line: &str,
-    byte_col: usize,
-    ext: Option<&dyn LanguageExtension>,
-) -> Option<String> {
-    let bytes = line.as_bytes();
-    let mut start = None;
-    let mut i = byte_col.min(line.len());
-    while i >= 2 {
-        if bytes.get(i - 1) == Some(&b'{') && bytes.get(i - 2) == Some(&b'{') {
-            start = Some(i);
-            break;
-        }
-        if bytes.get(i - 1) == Some(&b'}') && i >= 2 && bytes.get(i - 2) == Some(&b'}') {
-            break;
-        }
-        i -= 1;
-    }
-    let start = start?;
-    let end = line[start..].find("}}")?;
-    let expr = line[start..start + end].trim();
-    let parts: Vec<&str> = expr.splitn(2, '.').collect();
-    let (namespace, path_str) = if parts.len() == 2 {
-        (parts[0], parts[1])
-    } else {
-        (parts[0], "")
-    };
-
-    ext?.template_hover(namespace, path_str)
-}
-
 // ── On-type indent computation ───────────────────────────────
 
 fn is_inside_triple_quote(lines: &[&str], line_idx: usize) -> bool {
@@ -3340,17 +3339,6 @@ impl LanguageServer for NmlLanguageServer {
             });
         }
 
-        if let Some(ext) = &self.language_extension {
-            for (label, desc) in ext.builtin_reference_completions() {
-                items.push(CompletionItem {
-                    label,
-                    kind: Some(CompletionItemKind::CONSTANT),
-                    detail: Some(desc),
-                    ..Default::default()
-                });
-            }
-        }
-
         {
             let member_kws = &self.membership.member_keywords;
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
@@ -3523,18 +3511,6 @@ impl LanguageServer for NmlLanguageServer {
         };
         let byte_col = position::utf16_to_byte(line, pos.character);
 
-        if let Some(template_hover) =
-            detect_template_hover(line, byte_col, self.language_extension.as_deref())
-        {
-            return Ok(Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: template_hover,
-                }),
-                range: None,
-            }));
-        }
-
         // Directive hover (RFC 0030/0032): `#name` in a covered model file
         // renders the vocabulary entry. Unknown names get no hover — the
         // vocabulary diagnostic already explains them.
@@ -3570,16 +3546,7 @@ impl LanguageServer for NmlLanguageServer {
         let word = extract_word_at(line, byte_col);
 
         if word.starts_with('@') {
-            let hover_text = if let Some(ext) = &self.language_extension {
-                ext.builtin_reference_completions()
-                    .iter()
-                    .find(|(label, _)| label == &word)
-                    .map(|(label, desc)| format!("**{label}** -- {desc}"))
-            } else {
-                None
-            }
-            .or_else(|| {
-                let stripped = word.strip_prefix('@')?;
+            let hover_text = word.strip_prefix('@').and_then(|stripped| {
                 let (keyword, name) = stripped.split_once('/')?;
                 self.find_tagged_ref_hover(keyword, name)
             });

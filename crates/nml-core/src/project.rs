@@ -10,9 +10,27 @@
 use crate::ast::*;
 use crate::types::Value;
 
+/// A project's declared schema-provider tool (RFC 0035 in-binary channel).
+/// A block, not a scalar, so the coherence pin (`version`) and the escape
+/// hatches (`package`, `command`) can be added later without a breaking change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderDecl {
+    /// The provider tool binary name. An editor prefers launching `<tool> lsp`
+    /// (trust-gated); and the tool name doubles as an implicit same-named
+    /// schema-package pin (see [`ProjectConfig::pinned_packages`]) so the
+    /// neutral server validates against the tool's published package even when
+    /// the tool's own LSP is not launched. The value is validated against the
+    /// package-name charset at every use site (it is both a package name and a
+    /// spawn target), never trusted raw.
+    pub tool: String,
+}
+
 /// Project-level configuration for NML tooling.
 #[derive(Debug, Clone)]
 pub struct ProjectConfig {
+    /// The schema-provider tool for this project (RFC 0035), if declared.
+    /// `None` = generic / no provider tool (the neutral experience).
+    pub provider: Option<ProviderDecl>,
     /// Schema-package pins (RFC 0030): package *names* this root binds. A pin
     /// is authoritative over auto-association; the definition it resolves to
     /// is always the freshest available (workspace manifest, else the store's
@@ -44,6 +62,7 @@ pub struct ProjectConfig {
 impl Default for ProjectConfig {
     fn default() -> Self {
         Self {
+            provider: None,
             schema_packages: Vec::new(),
             // Auto-association is the zero-config path; opting out is the
             // explicit act.
@@ -64,6 +83,8 @@ impl ProjectConfig {
     /// Expects a top-level block like:
     /// ```nml
     /// project MyProject:
+    ///     provider:
+    ///         tool = "nudge"
     ///     autoAssociate = false
     ///     schemaPackages:
     ///         - nudge
@@ -86,6 +107,25 @@ impl ProjectConfig {
         }
 
         config
+    }
+
+    /// The package pins this root binds, in precedence order (RFC 0035): the
+    /// explicit `schemaPackages` list first, then — appended if not already
+    /// listed — the `provider` tool's implied same-named package. This is the
+    /// tool→package fallback that lets the neutral server validate a
+    /// provider-declared project against the tool's published package without
+    /// launching the tool's own LSP. First-match-wins downstream means an
+    /// explicit pin still takes precedence over the implied one. Callers must
+    /// still validate each name against the package-name charset before using
+    /// it as a path component or spawn target.
+    pub fn pinned_packages(&self) -> Vec<String> {
+        let mut pins = self.schema_packages.clone();
+        if let Some(provider) = &self.provider {
+            if !pins.contains(&provider.tool) {
+                pins.push(provider.tool.clone());
+            }
+        }
+        pins
     }
 
     fn parse_body(body: &Body, config: &mut ProjectConfig) {
@@ -120,6 +160,23 @@ impl ProjectConfig {
                             }
                         }
                         _ => {}
+                    }
+                }
+                BodyEntryKind::NestedBlock(nested) if nested.name.name == "provider" => {
+                    // `provider: tool = "<name>"`. Stored raw; the charset
+                    // guard is applied at every use site (pin resolution, spawn
+                    // target) — nml-core cannot reach the shared
+                    // `valid_package_name` predicate, and both consumers gate it
+                    // already.
+                    let tool = nested.body.entries.iter().find_map(|e| match &e.kind {
+                        BodyEntryKind::Property(p) if p.name.name == "tool" => match &p.value.value {
+                            Value::String(s) => Some(s.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+                    if let Some(tool) = tool {
+                        config.provider = Some(ProviderDecl { tool });
                     }
                 }
                 BodyEntryKind::NestedBlock(nested) if nested.name.name == "schemaPackages" => {
@@ -191,6 +248,50 @@ project MyProject:
         assert_eq!(config.member_keywords, vec!["role", "plan"]);
         assert_eq!(config.builtin_refs, vec!["@public", "@authenticated"]);
         assert_eq!(config.user_ref_prefix, Some("@user/".to_string()));
+    }
+
+    #[test]
+    fn parse_provider_block_and_pinned_packages_fallback() {
+        let source = concat!(
+            "project MyApp:\n",
+            "    provider:\n",
+            "        tool = \"nudge\"\n",
+        );
+        let file = parse_to_ast(source).unwrap();
+        let config = ProjectConfig::from_file(&file);
+        assert_eq!(
+            config.provider,
+            Some(ProviderDecl {
+                tool: "nudge".to_string()
+            })
+        );
+        // The provider tool implies its same-named package pin.
+        assert_eq!(config.pinned_packages(), vec!["nudge"]);
+    }
+
+    #[test]
+    fn provider_tool_does_not_duplicate_an_explicit_pin() {
+        let source = concat!(
+            "project MyApp:\n",
+            "    provider:\n",
+            "        tool = \"nudge\"\n",
+            "    schemaPackages:\n",
+            "        - nudge\n",
+            "        - other\n",
+        );
+        let file = parse_to_ast(source).unwrap();
+        let config = ProjectConfig::from_file(&file);
+        // Explicit pins first, provider tool not re-appended when already listed.
+        assert_eq!(config.pinned_packages(), vec!["nudge", "other"]);
+    }
+
+    #[test]
+    fn no_provider_means_pins_are_just_schema_packages() {
+        let source = "project P:\n    schemaPackages:\n        - acme\n";
+        let file = parse_to_ast(source).unwrap();
+        let config = ProjectConfig::from_file(&file);
+        assert!(config.provider.is_none());
+        assert_eq!(config.pinned_packages(), vec!["acme"]);
     }
 
     #[test]

@@ -17,12 +17,23 @@ use nml_validate::package::{builtin_meta_package, DirectiveDecl, PackageError, S
 use nml_validate::schema::SchemaValidator;
 use nml_validate::store::{Store, StoreError};
 
-/// Where a bound package's definition came from.
+/// Where a bound package's definition came from. Ordered by determinism, which
+/// is exactly the resolution precedence (RFC 0035 "delivery channels"): a
+/// committed workspace manifest (in-repo) beats a provider tool's embedded
+/// package (in-binary), which beats the machine-local cache (store), which
+/// beats the builtin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefinitionSource {
-    /// A `<name>.package.nml` in the workspace (the authoring path).
+    /// A `<name>.package.nml` in the workspace (the authoring path; RFC 0035
+    /// in-repo channel — the most deterministic source, shared via git).
     WorkspaceManifest(PathBuf),
-    /// The per-user store's `current` slot.
+    /// Injected in-process by an embedder that IS a schema provider — a tool
+    /// (e.g. `nudge lsp`) serving the neutral server with its own embedded
+    /// package (RFC 0035 in-binary channel). Beats the store so the editor
+    /// validates against the exact binary in front of the user, zero-sync;
+    /// yields to a committed workspace manifest, which the team chose to pin.
+    InBinary,
+    /// The per-user store's `current` slot (RFC 0035 in-cache channel).
     Store,
     /// Embedded in the LSP itself (today: the `package.model.nml` meta
     /// package).
@@ -33,6 +44,7 @@ impl DefinitionSource {
     pub fn label(&self) -> &'static str {
         match self {
             Self::WorkspaceManifest(_) => "workspace manifest",
+            Self::InBinary => "in-binary",
             Self::Store => "store current",
             Self::Builtin => "builtin",
         }
@@ -228,6 +240,12 @@ const VALIDATOR_CACHE_CAP: usize = 64;
 
 pub struct PackageResolver {
     store: Option<Store>,
+    /// An embedder-supplied package served in-process (RFC 0035 in-binary
+    /// channel): precomputed once with its content hash so resolution never
+    /// re-hashes it. `None` for the neutral server; `Some` for a provider tool
+    /// like `nudge lsp`. Sits above the store in precedence, below a committed
+    /// workspace manifest.
+    injected: Option<Definition>,
     builtin: Arc<SchemaPackage>,
     builtin_hash: String,
     store_cache: Mutex<HashMap<String, StoreCacheEntry>>,
@@ -247,10 +265,32 @@ pub struct PackageResolver {
 
 impl PackageResolver {
     pub fn new(store: Option<Store>, events: tokio::sync::mpsc::Sender<StoreEvent>) -> Self {
+        Self::with_injected(store, events, None)
+    }
+
+    /// Construct a resolver that also serves an embedder-supplied package
+    /// in-process (RFC 0035 in-binary channel; the seam `nudge lsp` uses). The
+    /// package's content hash is computed once here — resolution treats it like
+    /// any other [`Definition`], so binding, vocabulary, caching, and the
+    /// freshness poll all work unchanged.
+    pub fn with_injected(
+        store: Option<Store>,
+        events: tokio::sync::mpsc::Sender<StoreEvent>,
+        injected: Option<SchemaPackage>,
+    ) -> Self {
         let builtin = Arc::new(builtin_meta_package());
         let builtin_hash = builtin.content_hash();
+        let injected = injected.map(|package| {
+            let hash = package.content_hash();
+            Definition {
+                package: Arc::new(package),
+                hash,
+                source: DefinitionSource::InBinary,
+            }
+        });
         Self {
             store,
+            injected,
             builtin,
             builtin_hash,
             store_cache: Mutex::new(HashMap::new()),
@@ -315,7 +355,12 @@ impl PackageResolver {
         // wholesale; lists never merge across nesting levels (RFC 0030).
         let project = nearest_project_config(path, ws);
         let (pins, auto_associate) = match &project {
-            Some((_, config)) => (config.schema_packages.clone(), config.auto_associate),
+            // `pinned_packages()` folds in the `provider` tool as an implicit
+            // same-named pin (RFC 0035 tool→package fallback), so the neutral
+            // server validates a provider-declared project against the tool's
+            // published package without launching the tool's LSP. Each pin is
+            // charset-gated in the loop below.
+            Some((_, config)) => (config.pinned_packages(), config.auto_associate),
             None => (Vec::new(), true),
         };
 
@@ -329,7 +374,7 @@ impl PackageResolver {
             if !nml_validate::package::valid_package_name(pin) {
                 notes.push(DegradedNote {
                     message: format!(
-                        "pinned schema package name {pin:?} is not a valid package name ([a-z][a-z0-9-]*) — pin ignored"
+                        "schema package name {pin:?} is not a valid package name ([a-z][a-z0-9-]*) — ignored (from schemaPackages or provider.tool)"
                     ),
                     warning: true,
                     span: None,
@@ -572,6 +617,15 @@ impl PackageResolver {
                 notes.extend(local);
             }
         }
+        // In-binary channel (RFC 0035): above the store, below a committed
+        // workspace manifest of the same name — the team's committed copy wins,
+        // but the embedded package always beats its own possibly-stale cache.
+        if let Some(def) = &self.injected {
+            if !seen.contains(&def.package.manifest.name) {
+                seen.push(def.package.manifest.name.clone());
+                out.push(def.clone());
+            }
+        }
         if let Some(store) = &self.store {
             for name in store.list_names() {
                 if seen.contains(&name) {
@@ -617,6 +671,14 @@ impl PackageResolver {
                     });
                 }
                 return None;
+            }
+        }
+        // In-binary channel (RFC 0035): a pin resolves to the embedded package
+        // before the store, so `nudge lsp` validates against the running
+        // binary's schema even when the store holds an older synced copy.
+        if let Some(def) = &self.injected {
+            if def.package.manifest.name == name {
+                return Some(def.clone());
             }
         }
         match self.load_store_package(name) {
@@ -1064,9 +1126,11 @@ fn find_root(
         DefinitionSource::WorkspaceManifest(manifest_path) => {
             manifest_path.parent().map(Path::to_path_buf)
         }
-        // Store/builtin packages with no marker root: the workspace root
-        // containing the file anchors the globs.
-        _ => ws
+        // In-binary/store/builtin packages with no marker root: the workspace
+        // root containing the file anchors the globs. Enumerated (not a
+        // catch-all) so a new source with different anchoring can't fall
+        // through silently.
+        DefinitionSource::InBinary | DefinitionSource::Store | DefinitionSource::Builtin => ws
             .roots
             .iter()
             .find(|r| path.starts_with(r))
@@ -1181,6 +1245,134 @@ mod tests {
                 .resolution,
             Resolution::Unbound
         ));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A `demo` package with a distinguishing version, so precedence tests can
+    /// tell an injected/store/workspace copy of the same name apart by
+    /// `package_version` as well as by `source`.
+    fn demo_package_versioned(version: &str) -> SchemaPackage {
+        let manifest = MANIFEST.replace("version = \"0.1.0\"", &format!("version = \"{version}\""));
+        SchemaPackage::from_parts(&manifest, |_| Ok(CORE.to_string())).expect("demo package loads")
+    }
+
+    /// RFC 0035 in-binary channel: an injected package binds a file with NO
+    /// store and NO workspace manifest — the `nudge lsp` zero-install path.
+    #[test]
+    fn injected_package_binds_with_no_store_no_manifest() {
+        let ws = temp_ws("inj-alone");
+        let project = ws.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("demo.nml"), "").unwrap();
+
+        let resolver = PackageResolver::with_injected(
+            None,
+            test_events().0,
+            Some(demo_package_versioned("9.9.9")),
+        );
+        let roots = vec![ws.clone()];
+        let view = WorkspaceView {
+            roots: &roots,
+            manifests: &[],
+            doc_text: &no_docs,
+        };
+        match resolver
+            .resolve(&project.join("demo.nml"), &view)
+            .resolution
+        {
+            Resolution::Bound(b) => {
+                assert_eq!(b.package_name, "demo");
+                assert_eq!(b.source, DefinitionSource::InBinary);
+                assert_eq!(b.package_version, "9.9.9");
+                assert_eq!(b.root, project);
+            }
+            Resolution::Unbound => panic!("injected package should bind demo.nml"),
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Determinism ladder (RFC 0035): the in-binary package beats its own
+    /// possibly-stale cache. Store holds `demo` 0.1.0; the injected `demo`
+    /// 9.9.9 wins — zero-sync coherence.
+    #[test]
+    fn injected_beats_store_for_same_name() {
+        let ws = temp_ws("inj-store");
+        let store_base = ws.join("store");
+        std::fs::create_dir_all(&store_base).unwrap();
+        publish_demo(&Store::at(&store_base)); // demo 0.1.0
+        let project = ws.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("demo.nml"), "").unwrap();
+
+        let resolver = PackageResolver::with_injected(
+            Some(Store::at(&store_base)),
+            test_events().0,
+            Some(demo_package_versioned("9.9.9")),
+        );
+        let roots = vec![ws.clone()];
+        let view = WorkspaceView {
+            roots: &roots,
+            manifests: &[],
+            doc_text: &no_docs,
+        };
+        match resolver
+            .resolve(&project.join("demo.nml"), &view)
+            .resolution
+        {
+            Resolution::Bound(b) => {
+                assert_eq!(
+                    b.source,
+                    DefinitionSource::InBinary,
+                    "in-binary beats cache"
+                );
+                assert_eq!(b.package_version, "9.9.9");
+            }
+            Resolution::Unbound => panic!("should bind"),
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// Determinism ladder (RFC 0035): a committed workspace manifest — the
+    /// team's chosen source of truth — beats the in-binary package.
+    #[test]
+    fn workspace_manifest_beats_injected_for_same_name() {
+        let ws = temp_ws("inj-ws");
+        let project = ws.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("demo.nml"), "").unwrap();
+        let manifest_path = project.join("demo.package.nml");
+        // Committed manifest for `demo` at version 2.0.0; its declared source
+        // `core.model.nml` is read from disk (doc_text is empty here).
+        let manifest_text = MANIFEST.replace("version = \"0.1.0\"", "version = \"2.0.0\"");
+        std::fs::write(&manifest_path, &manifest_text).unwrap();
+        std::fs::write(project.join("core.model.nml"), CORE).unwrap();
+
+        let resolver = PackageResolver::with_injected(
+            None,
+            test_events().0,
+            Some(demo_package_versioned("9.9.9")),
+        );
+        let roots = vec![ws.clone()];
+        let manifests = vec![(manifest_path.clone(), manifest_text.clone())];
+        let view = WorkspaceView {
+            roots: &roots,
+            manifests: &manifests,
+            doc_text: &no_docs,
+        };
+        match resolver
+            .resolve(&project.join("demo.nml"), &view)
+            .resolution
+        {
+            Resolution::Bound(b) => {
+                assert!(
+                    matches!(b.source, DefinitionSource::WorkspaceManifest(_)),
+                    "committed manifest beats in-binary, got {:?}",
+                    b.source
+                );
+                assert_eq!(b.package_version, "2.0.0");
+            }
+            Resolution::Unbound => panic!("should bind"),
+        }
         let _ = std::fs::remove_dir_all(&ws);
     }
 

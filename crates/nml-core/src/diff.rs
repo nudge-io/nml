@@ -368,6 +368,13 @@ pub fn wrap_file_as_body(file: &File) -> Body {
                 crate::resolve::apply_shared_properties(&b.body),
             ),
             DeclarationKind::Array(a) => {
+                // The synth root models an array as `List(item)`, so its
+                // diffable content is its ELEMENTS (shared properties merged in).
+                // Array-LEVEL modifiers/properties (`[]x |allow …` / `[]x k = v`)
+                // are the array's own meta, not element data — a consumer that
+                // needs to diff those models the array as a model-with-a-list
+                // field instead. (nudge's reload substrate never carries them:
+                // every reloadable top-level array is element-only.)
                 let items = crate::resolve::apply_array_shared_properties(&a.body);
                 let entries = items
                     .into_iter()
