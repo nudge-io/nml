@@ -720,15 +720,6 @@ impl PackageResolver {
         None
     }
 
-    /// The store this resolver binds against — for the freshness poll
-    /// (RFC 0030), which must watch the SAME store resolution reads. The
-    /// harness injects a tempdir store through `with_store`; a poll built on
-    /// `Store::user()` would watch the wrong directory there and in any
-    /// embedder with a custom store.
-    pub(crate) fn store(&self) -> Option<&Store> {
-        self.store.as_ref()
-    }
-
     fn store_has(&self, name: &str) -> bool {
         self.store
             .as_ref()
@@ -884,7 +875,7 @@ impl PackageResolver {
                 match manifest_stem(manifest_path) {
                     Some(stem) if stem != package.manifest.name => Err(format!(
                         "workspace package manifest '{}' declares package '{}' but its filename says '{stem}' — rename one; using basic validation until then",
-                        manifest_path.display(),
+                        display_path(manifest_path, ws.roots),
                         package.manifest.name
                     )),
                     _ => {
@@ -898,11 +889,11 @@ impl PackageResolver {
                 supported,
             }) => Err(format!(
                 "package manifest '{}' needs formatVersion {required}; this nml-lsp supports {supported} — update nml-lsp; using basic validation until then",
-                manifest_path.display()
+                display_path(manifest_path, ws.roots)
             )),
             Err(e) => Err(format!(
                 "workspace package manifest '{}' failed to load: {e} — falling back to basic validation",
-                manifest_path.display()
+                display_path(manifest_path, ws.roots)
             )),
         };
 
@@ -1088,6 +1079,22 @@ fn manifest_stem(path: &Path) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// A path for user-facing messages (diagnostics, hover, `nml/schemaInfo`):
+/// workspace-root-relative, with a forward-slash separator, falling back to the
+/// file name when the path sits outside every root. Never an absolute path —
+/// which keeps messages terse on every backend and, on the wasm neutral server,
+/// never leaks the `/workspace` WASI mount prefix (paths there are the mounted
+/// guest paths, not host paths).
+pub(crate) fn display_path(path: &Path, roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .find_map(|root| path.strip_prefix(root).ok())
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .filter(|rel| !rel.is_empty())
+        .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
 /// The nearest-ancestor `nml-project.nml` from `path`'s directory upward,
 /// bounded by the workspace roots. Nearest file wins wholesale.
 pub fn nearest_project_config(
@@ -1183,6 +1190,32 @@ mod tests {
 
     fn no_docs(_: &Path) -> Option<String> {
         None
+    }
+
+    #[test]
+    fn display_path_is_relative_never_absolute() {
+        let roots = vec![PathBuf::from("/ws"), PathBuf::from("/other")];
+        // Under a root → root-relative, forward slashes.
+        assert_eq!(
+            display_path(Path::new("/ws/pkg/demo.package.nml"), &roots),
+            "pkg/demo.package.nml"
+        );
+        // The wasm mount case: `/workspace/...` maps root-relative, so the
+        // `/workspace` prefix never leaks into a message.
+        assert_eq!(
+            display_path(
+                Path::new("/workspace/demo.package.nml"),
+                &[PathBuf::from("/workspace")]
+            ),
+            "demo.package.nml"
+        );
+        // Exactly a root → the root's own name, never "" or an absolute path.
+        assert_eq!(display_path(Path::new("/ws"), &roots), "ws");
+        // Outside every root → file name only, never the absolute path.
+        assert_eq!(
+            display_path(Path::new("/elsewhere/x.package.nml"), &roots),
+            "x.package.nml"
+        );
     }
 
     /// Unwrap a `Covered` outcome; panics (with the reason) otherwise.

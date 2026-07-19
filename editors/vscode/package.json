@@ -10,8 +10,11 @@
     "url": "https://github.com/nudge-io/nml.git"
   },
   "engines": {
-    "vscode": "^1.75.0"
+    "vscode": "^1.78.0"
   },
+  "extensionDependencies": [
+    "ms-vscode.wasm-wasi-core"
+  ],
   "activationEvents": [],
   "categories": [
     "Programming Languages"
@@ -106,17 +109,29 @@
       }
     }
   },
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "scripts": {
+    "bundle:wasm": "mkdir -p server && cp ../../target/wasm32-wasip1/release/nml-lsp.wasm server/nml-lsp.wasm",
+    "bundle:js": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify --sourcemap",
+    "typecheck": "tsc --noEmit -p ./",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run bundle:wasm && npm run bundle:js && npm run compile",
+    "test": "vscode-test",
+    "vscode:prepublish": "npm run bundle:wasm && npm run bundle:js"
   },
   "dependencies": {
+    "@vscode/wasm-wasi": "^1.0.1",
+    "vscode-jsonrpc": "^8.2.0",
     "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
+    "@types/mocha": "^10.0.7",
     "@types/node": "^25.3.2",
-    "@types/vscode": "^1.75.0",
+    "@types/vscode": "^1.78.0",
+    "@vscode/test-cli": "^0.0.10",
+    "@vscode/test-electron": "^2.4.1",
+    "esbuild": "^0.28.1",
     "typescript": "^5.0.0"
   }
 }

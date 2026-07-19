@@ -20,34 +20,19 @@ use crate::position::{self, LineIndex};
 const MAX_DIR_DEPTH: usize = 20;
 const MAX_FILE_COUNT: usize = 10_000;
 
-/// How often the background freshness poll re-reads store pointer contents
-/// (RFC 0030 "Freshness"): low-frequency on purpose — the per-validation-pass
-/// re-resolution already heals on the next keystroke; the poll only has to
-/// heal the *idle* editor within seconds of `nudge schema sync`.
-const STORE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// The server's shared state, held behind `Arc` so the background
-/// freshness-poll task (spawned at `initialize`) reads the exact same
-/// documents/resolver the request handlers mutate. `NmlLanguageServer`
-/// `Deref`s to this: every pre-existing `self.field` and `self.method()`
-/// call site compiles unchanged, and the split is enforced by the compiler —
-/// anything needing the `Client` cannot live here, so state-only methods are
-/// exactly the ones the poll task may call.
+/// The server's shared state, held behind `Arc`. `NmlLanguageServer` `Deref`s
+/// to this, so every `self.field`/`self.method()` on state-only methods reads
+/// through here; the split is enforced by the compiler — anything needing the
+/// `Client` (diagnostics delivery, logging) lives on `NmlLanguageServer`, not
+/// here. Under the pull model there is no background task, so `Inner` is
+/// touched only by request handlers, all on the one server task.
 pub struct Inner {
     documents: Mutex<HashMap<Url, String>>,
     indexed_uris: Mutex<HashSet<Url>>,
     /// Documents currently open in the editor (didOpen without a matching
-    /// didClose). The freshness poll's fan-out revalidates only these —
-    /// indexed-but-closed files have no visible squiggles to heal.
+    /// didClose). Guards watched-file disk events from clobbering an open
+    /// buffer — while a file is open the client buffer is its source of truth.
     open_docs: Mutex<HashSet<Url>>,
-    /// Last client-reported version per OPEN document (didOpen/didChange;
-    /// removed on didClose — closed docs have no client version). Every
-    /// `publish_diagnostics` passes the version captured for the text it
-    /// validated, so the client can discard a stale set on its own: the
-    /// sweep's text compare-guard avoids wasted validates, but between that
-    /// compare and the publish the document can change again (TOCTOU) — the
-    /// version closes that window client-side per the LSP contract.
-    doc_versions: Mutex<HashMap<Url, i32>>,
     scoped_models: Mutex<HashMap<String, Vec<ModelDef>>>,
     scoped_enums: Mutex<HashMap<String, Vec<EnumDef>>>,
     scoped_oneofs: Mutex<HashMap<String, Vec<OneOfDef>>>,
@@ -64,28 +49,20 @@ pub struct Inner {
     /// Client capability: `completionItem.insertReplaceSupport` (LSP 3.16) —
     /// gates `InsertReplaceEdit` vs plain `TextEdit` value completions.
     insert_replace_support: std::sync::atomic::AtomicBool,
-    /// Wakes the background broad-revalidation sweep (third arm of the
-    /// notifier/poll task). Handlers whose edits invalidate OTHER documents
-    /// (manifest/model edits, project-config changes, deletions) notify
-    /// instead of fanning out inline — a workspace can hold up to 10k
-    /// documents, and serial revalidation inside a request handler blocks
-    /// the editor. `Notify` coalesces bursts by design: N notifications
-    /// while a sweep is pending collapse into one stored permit ⇒ one sweep
-    /// covers them all.
-    sweep: tokio::sync::Notify,
 }
 
 pub struct NmlLanguageServer {
     client: Client,
     inner: Arc<Inner>,
-    /// Parked until `initialize` spawns the notifier/freshness task (the
-    /// only guaranteed-async, guaranteed-once seam). Never spawning (an
-    /// embedder that skips initialize) is benign: the bounded channel fills
-    /// and drops. The task holds only a `Weak<Inner>`, so it cannot keep the
-    /// server alive: when the server drops, the sender (in the resolver)
-    /// drops and every `upgrade()` fails — either path breaks the task's
-    /// loop. No abort handle, nothing to remember at shutdown.
-    store_events: Mutex<Option<tokio::sync::mpsc::Receiver<packages::StoreEvent>>>,
+    /// Store-health transitions the resolver emits during resolution (which
+    /// has no `Client` of its own). Drained in the document-pull handler —
+    /// the one place that both runs on every validation and holds the
+    /// `Client` — and surfaced as `window/logMessage`. Pull-driven, not a
+    /// background task: the wasm neutral server runs a synchronous pump that
+    /// cannot host one, and the store cache is stat-guarded so correctness
+    /// never depended on a poll. Bounded + best-effort: on overflow the
+    /// newest events drop (the first transition is the informative one).
+    store_events: Mutex<tokio::sync::mpsc::Receiver<packages::StoreEvent>>,
 }
 
 impl std::ops::Deref for NmlLanguageServer {
@@ -178,7 +155,6 @@ impl NmlLanguageServer {
                 documents: Mutex::new(HashMap::new()),
                 indexed_uris: Mutex::new(HashSet::new()),
                 open_docs: Mutex::new(HashSet::new()),
-                doc_versions: Mutex::new(HashMap::new()),
                 scoped_models: Mutex::new(HashMap::new()),
                 scoped_enums: Mutex::new(HashMap::new()),
                 scoped_oneofs: Mutex::new(HashMap::new()),
@@ -191,9 +167,8 @@ impl NmlLanguageServer {
                     injected,
                 ),
                 insert_replace_support: std::sync::atomic::AtomicBool::new(false),
-                sweep: tokio::sync::Notify::new(),
             }),
-            store_events: Mutex::new(Some(store_events_rx)),
+            store_events: Mutex::new(store_events_rx),
         }
     }
 }
@@ -629,54 +604,39 @@ impl Inner {
         }
         diags
     }
-
-    /// The `(uri, text, version)` batch a revalidation fan-out walks: every
-    /// tracked document, or (`open_only`) just the ones currently open in the
-    /// editor. One owner for the filter so the freshness poll's fan-out and
-    /// the background sweep cannot drift apart. Model files are
-    /// included on both paths: `validate_document` runs the schema-source
-    /// pass for covered model files, and their directive diagnostics depend
-    /// on manifest/`[]directive` edits and store state.
-    ///
-    /// The version is captured HERE, at batch time, alongside the text it
-    /// belongs to: a fan-out publishing later must pass the version of the
-    /// text it validated (not whatever is current by then), so a client
-    /// holding a newer buffer discards the stale diagnostic set.
-    fn revalidation_batch(&self, open_only: bool) -> Vec<(Url, String, Option<i32>)> {
-        let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-        let versions = self.doc_versions.lock().unwrap_or_else(|e| e.into_inner());
-        if open_only {
-            let open = self.open_docs.lock().unwrap_or_else(|e| e.into_inner());
-            open.iter()
-                .filter_map(|u| {
-                    docs.get(u)
-                        .map(|s| (u.clone(), s.clone(), versions.get(u).copied()))
-                })
-                .collect()
-        } else {
-            docs.iter()
-                .map(|(u, s)| (u.clone(), s.clone(), versions.get(u).copied()))
-                .collect()
-        }
-    }
 }
 
 impl NmlLanguageServer {
-    async fn on_change(&self, uri: Url, text: String) {
+    /// Surface store-health transitions (Ready↔Failed, shadow warnings) the
+    /// resolver queued during resolution, as `window/logMessage`. Called from
+    /// the document-pull handler — the frequent path that holds the `Client` —
+    /// so it replaces the deleted background notifier. Drain fully under the
+    /// lock into a `Vec`, then log outside it (never hold a lock across await).
+    async fn drain_store_events(&self) {
+        let events: Vec<packages::StoreEvent> = {
+            let mut rx = self.store_events.lock().unwrap_or_else(|e| e.into_inner());
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        };
+        for ev in events {
+            let level = if ev.warning {
+                MessageType::WARNING
+            } else {
+                MessageType::INFO
+            };
+            self.client.log_message(level, ev.message).await;
+        }
+    }
+
+    /// Update server state for a changed document. Diagnostics are NOT pushed:
+    /// under the pull model (RFC 0035) the client re-pulls this document (a
+    /// `didChange` triggers a document pull) and re-pulls dependents when they
+    /// gain focus. A model or project-config edit only updates the shared
+    /// registry/config here; every affected file heals on its next pull.
+    fn on_change(&self, uri: Url, text: String) {
         self.documents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(uri.clone(), text.clone());
-        // The version for THIS text: didOpen/didChange recorded it before
-        // calling here, so "current" is exactly the validated text's version.
-        // Non-open documents (watched-file adoption) have none — publish
-        // versionless, as before.
-        let version = self
-            .doc_versions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&uri)
-            .copied();
 
         if uri.as_str().ends_with("nml-project.nml") {
             let file = nml_core::cst::parse_best_effort(&text);
@@ -685,34 +645,10 @@ impl NmlLanguageServer {
                 .project_config
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = config;
-            // The edited document itself gets immediate diagnostics; the
-            // workspace-wide fan-out the config change implies runs on the
-            // background sweep, off this request's critical path.
-            let diags = self.validate_document(&uri, &text);
-            self.client.publish_diagnostics(uri, diags, version).await;
-            self.sweep.notify_one();
             return;
         }
-
-        let is_model_file = uri.as_str().ends_with(".model.nml");
-        if is_model_file {
+        if uri.as_str().ends_with(".model.nml") {
             self.rebuild_schema_registry();
-        }
-        // A manifest edit changes a workspace package's definition; a model
-        // edit may change a workspace package's sources. Both invalidate
-        // other documents' bound validation, so both fan out.
-        let affects_packages = is_model_file || uri.as_str().ends_with(".package.nml");
-
-        let diags = self.validate_document(&uri, &text);
-        self.client
-            .publish_diagnostics(uri.clone(), diags, version)
-            .await;
-
-        if affects_packages {
-            // Other documents' diagnostics are stale now, but revalidating
-            // them here would serialize the whole workspace inside this
-            // handler — the background sweep does it instead.
-            self.sweep.notify_one();
         }
     }
 }
@@ -826,46 +762,6 @@ impl Inner {
 /// of the (canonicalized) workspace roots. Clients can send arbitrary
 /// `file://` URIs in watched-file notifications, so this is the boundary
 /// check that keeps the server from reading files outside the workspace.
-/// One freshness-poll snapshot (RFC 0030): `current` pointer content per
-/// package name, over `list_names()` ∪ every name in `prev` — carrying the
-/// previously-seen names forward is what lets a *removed* package (gone from
-/// `list_names()` entirely) still read as a present→absent transition.
-fn store_snapshot(
-    store: &nml_validate::store::Store,
-    prev: Option<&HashMap<String, Option<String>>>,
-) -> HashMap<String, Option<String>> {
-    let mut names: HashSet<String> = store.list_names().into_iter().collect();
-    if let Some(prev) = prev {
-        names.extend(prev.keys().cloned());
-    }
-    names
-        .into_iter()
-        .map(|name| {
-            let pointer = store.pointer_content(&name);
-            (name, pointer)
-        })
-        .collect()
-}
-
-/// True when any package's `current` pointer differs between two freshness
-/// snapshots (RFC 0030). A missing key reads as "absent" (`None`): a name in
-/// only one map with `Some` content is a transition (absent→present /
-/// present→absent), while a name both maps agree is absent — or an explicit
-/// `None` entry versus no entry at all — is not, so a package that merely
-/// stops appearing in `list_names()` after already reading `None` cannot
-/// re-trigger the fan-out forever.
-fn pointer_transitions(
-    prev: &HashMap<String, Option<String>>,
-    current: &HashMap<String, Option<String>>,
-) -> bool {
-    fn at<'m>(map: &'m HashMap<String, Option<String>>, name: &str) -> Option<&'m str> {
-        map.get(name).and_then(|p| p.as_deref())
-    }
-    prev.keys()
-        .chain(current.keys())
-        .any(|name| at(prev, name) != at(current, name))
-}
-
 fn watched_file_is_eligible(path: &Path, roots: &[PathBuf]) -> bool {
     let is_symlink = fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
@@ -1093,6 +989,20 @@ fn find_definition_in_docs(
 
 fn span_to_range(span: nml_core::span::Span, line_index: &LineIndex) -> Range {
     line_index.range(span)
+}
+
+/// A stable result-id for a pull-diagnostics report: a hash of the diagnostics
+/// themselves, so it changes iff the output does. A re-pull that recomputes the
+/// same set (the common focus-change case) matches the client's
+/// `previous_result_id` and returns `Unchanged` — no re-render churn.
+/// `DefaultHasher` is fixed-seed, hence deterministic across pulls/runs.
+fn diagnostics_result_id(items: &[Diagnostic]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(items)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn find_schema_block_definition(file: &File, name: &str, line_index: &LineIndex) -> Option<Range> {
@@ -2547,6 +2457,11 @@ impl NmlLanguageServer {
                 })
             })
             .collect();
+        let roots = self
+            .workspace_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         Ok(match &resolved.resolution {
             Resolution::Bound(b) => serde_json::json!({
                 "bound": true,
@@ -2559,7 +2474,9 @@ impl NmlLanguageServer {
                     packages::BindingStep::Pinned => "pinned",
                     packages::BindingStep::AutoAssociated => "auto-associated",
                 },
-                "root": b.root.display().to_string(),
+                // Workspace-relative — never an absolute host path, and never the
+                // `/workspace` WASI mount prefix on the wasm neutral server.
+                "root": packages::display_path(&b.root, &roots),
                 "shadowsStore": b.shadows_store,
                 "actions": if b.step == packages::BindingStep::AutoAssociated
                     && b.source != packages::DefinitionSource::Builtin
@@ -2648,153 +2565,6 @@ impl LanguageServer for NmlLanguageServer {
             .unwrap_or(false);
         self.insert_replace_support
             .store(insert_replace, std::sync::atomic::Ordering::Relaxed);
-        // Push-based store-event notifier + freshness poll (RFC 0030): one
-        // background task with two arms. The notifier arm logs each event the
-        // instant the resolver sends it; the timer arm is the low-frequency
-        // store poll that heals *idle* editors after `nudge schema sync`
-        // (the per-pass re-resolution only heals on the next keystroke).
-        // take() makes double-spawn unconstructible. The task holds a
-        // `Weak<Inner>` — never an `Arc`, which would keep the resolver (and
-        // its channel sender) alive forever and make self-termination
-        // unreachable. Each select arm upgrades before touching state and
-        // breaks when the upgrade fails, so a dropped server ends the task on
-        // its next wakeup — no shutdown bookkeeping, by construction rather
-        // than by promise.
-        if let Some(mut rx) = self
-            .store_events
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            let client = self.client.clone();
-            let inner = Arc::downgrade(&self.inner);
-            // Freshness baseline, captured synchronously HERE rather than on
-            // the task's first tick: startup state is a *baseline*, never a
-            // "transition" (a warm store at initialize must not fan out
-            // spurious republishes) — and a sync landing in the scheduling
-            // gap between spawn and first poll must not be swallowed into
-            // that baseline. `None` only when running storeless.
-            let mut snapshot: Option<HashMap<String, Option<String>>> = self
-                .resolver
-                .store()
-                .map(|store| store_snapshot(store, None));
-            tokio::spawn(async move {
-                let mut poll = tokio::time::interval(STORE_POLL_INTERVAL);
-                // A stalled runtime must not burst-fire catch-up polls.
-                poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tokio::select! {
-                        event = rx.recv() => {
-                            // None = the resolver (the only sender) dropped:
-                            // the server is gone, so the poll must die with
-                            // it — same self-termination as the plain loop.
-                            let Some(event) = event else { break };
-                            // The Weak is the liveness authority: a server
-                            // mid-drop must not be logged for.
-                            if inner.upgrade().is_none() {
-                                break;
-                            }
-                            let level = if event.warning {
-                                MessageType::WARNING
-                            } else {
-                                MessageType::INFO
-                            };
-                            client.log_message(level, event.message).await;
-                        }
-                        _ = poll.tick() => {
-                            // Upgrade per tick: the server dropping between
-                            // wakeups ends the task here.
-                            let Some(inner) = inner.upgrade() else {
-                                break;
-                            };
-                            // Watch THE store the resolver binds against —
-                            // never `Store::user()` here, which would watch
-                            // the wrong directory under an injected store.
-                            let Some(store) = inner.resolver.store() else {
-                                continue;
-                            };
-                            let current = store_snapshot(store, snapshot.as_ref());
-                            let changed = snapshot
-                                .as_ref()
-                                .is_some_and(|prev| pointer_transitions(prev, &current));
-                            snapshot = Some(current);
-                            if changed {
-                                // Any pointer transition — including
-                                // absent→present, the brand-new-operator
-                                // path — re-resolves every open document, so
-                                // `nudge schema sync` in a terminal visibly
-                                // heals the editor within seconds while idle.
-                                for (uri, text, version) in inner.revalidation_batch(true) {
-                                    let diags = inner.validate_document(&uri, &text);
-                                    // Batch-time version: pairs the publish
-                                    // with the text it validated, so a client
-                                    // that edited meanwhile discards it.
-                                    client.publish_diagnostics(uri, diags, version).await;
-                                }
-                            }
-                        }
-                        // Broad-revalidation sweep: handlers whose edits
-                        // invalidate other documents notify instead of
-                        // fanning out inline (a 10k-document workspace would
-                        // otherwise serialize inside the request handler).
-                        // `Notify` coalesces bursts by design — N wakeups
-                        // pending at once collapse into ONE sweep, which is
-                        // correct because a sweep always reads the latest
-                        // text. The waiting future must hold an upgraded
-                        // `Arc` (`notified()` borrows the Notify inside
-                        // `Inner`), which can delay self-termination by at
-                        // most one poll tick: the tick arm completes the
-                        // select, the waiter (and its Arc) is dropped, and
-                        // the next iteration's upgrade fails.
-                        swept = async {
-                            match inner.upgrade() {
-                                Some(inner) => {
-                                    inner.sweep.notified().await;
-                                    true
-                                }
-                                None => false,
-                            }
-                        } => {
-                            if !swept {
-                                break;
-                            }
-                            // Upgrade-or-break, like the other arms.
-                            let Some(inner) = inner.upgrade() else {
-                                break;
-                            };
-                            for (uri, text, version) in inner.revalidation_batch(false) {
-                                let diags = inner.validate_document(&uri, &text);
-                                // Stale-publish guard: if the document
-                                // changed while this sweep validated it, a
-                                // newer on_change already validated and
-                                // published the newer text — publishing the
-                                // batch's older diagnostics now would
-                                // clobber it. Re-lock and compare BEFORE
-                                // publishing; skip on any mismatch. The
-                                // compare is cheap but racy (the doc can
-                                // change again between compare and publish):
-                                // passing the BATCH-time version alongside
-                                // lets the client discard that late frame
-                                // itself, closing the remaining TOCTOU.
-                                let current = inner
-                                    .documents
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .get(&uri)
-                                    .is_some_and(|now| *now == text);
-                                if current {
-                                    client.publish_diagnostics(uri, diags, version).await;
-                                }
-                                // Chunked responsiveness: yield between
-                                // documents so a long sweep never starves
-                                // the runtime.
-                                tokio::task::yield_now().await;
-                            }
-                        }
-                    }
-                }
-            });
-        }
         let roots: Vec<Url> = params
             .workspace_folders
             .as_ref()
@@ -2854,6 +2624,26 @@ impl LanguageServer for NmlLanguageServer {
                 // RFC 0030: machine-applicable quick-fixes (did-you-mean) +
                 // pin / auto-association code actions.
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                // RFC 0035: PULL diagnostics (LSP 3.17). The client requests a
+                // document's diagnostics (`textDocument/diagnostic`) on open,
+                // edit, and focus — no server push, so the model works
+                // identically on the native server and the wasm neutral server
+                // (whose synchronous pump cannot host a background push task).
+                // `inter_file_dependencies` is true — an nml file's diagnostics
+                // depend on its schema package and sibling model files — so the
+                // client re-pulls a dependent when it regains focus after an
+                // upstream edit. Workspace-wide pull is deliberately OFF:
+                // exhaustive whole-tree validation is the tool CLI's job (e.g.
+                // `nudge` schema checks), not a long-poll the serial wasm pump
+                // cannot serve.
+                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                    DiagnosticOptions {
+                        identifier: Some("nml".to_string()),
+                        inter_file_dependencies: true,
+                        workspace_diagnostics: false,
+                        work_done_progress_options: Default::default(),
+                    },
+                )),
                 ..Default::default()
             },
             ..Default::default()
@@ -2891,47 +2681,72 @@ impl LanguageServer for NmlLanguageServer {
         Ok(())
     }
 
+    /// Pull diagnostics (RFC 0035, LSP 3.17): compute this document's full
+    /// diagnostic set on demand. `result_id` is a hash of the diagnostics, so
+    /// a re-pull whose output is unchanged (the common focus-change case)
+    /// returns a cheap `Unchanged` report and the client keeps its rendering.
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> Result<DocumentDiagnosticReportResult> {
+        let uri = params.text_document.uri;
+        let text = self
+            .documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&uri)
+            .cloned();
+        // An unknown document (never opened, not indexed) has nothing to
+        // report — an empty full report, never an error.
+        let items = match text.as_deref() {
+            Some(text) => self.validate_document(&uri, text),
+            None => Vec::new(),
+        };
+        // Surface any store-health transitions the resolution above queued
+        // (this handler now owns that delivery — see `drain_store_events`).
+        self.drain_store_events().await;
+
+        let result_id = diagnostics_result_id(&items);
+        if params.previous_result_id.as_deref() == Some(result_id.as_str()) {
+            return Ok(DocumentDiagnosticReportResult::Report(
+                DocumentDiagnosticReport::Unchanged(RelatedUnchangedDocumentDiagnosticReport {
+                    related_documents: None,
+                    unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport {
+                        result_id,
+                    },
+                }),
+            ));
+        }
+        Ok(DocumentDiagnosticReportResult::Report(
+            DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+                related_documents: None,
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    result_id: Some(result_id),
+                    items,
+                },
+            }),
+        ))
+    }
+
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         self.open_docs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(params.text_document.uri.clone());
-        // Record the version BEFORE on_change so its publish carries it.
-        self.doc_versions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                params.text_document.uri.clone(),
-                params.text_document.version,
-            );
-        self.on_change(params.text_document.uri, params.text_document.text)
-            .await;
+        // State only; the client pulls this document's diagnostics (didOpen
+        // triggers a pull under the diagnostic-provider capability).
+        self.on_change(params.text_document.uri, params.text_document.text);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         if let Some(change) = params.content_changes.into_iter().last() {
-            // Record the version BEFORE on_change so its publish carries it.
-            self.doc_versions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    params.text_document.uri.clone(),
-                    params.text_document.version,
-                );
-            self.on_change(params.text_document.uri, change.text).await;
+            self.on_change(params.text_document.uri, change.text);
         }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.open_docs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&uri);
-        // Closed documents have no client version — a later reopen restarts
-        // the version sequence, so keeping the stale one would mislabel the
-        // sweep's publishes in between.
-        self.doc_versions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&uri);
@@ -2949,10 +2764,9 @@ impl LanguageServer for NmlLanguageServer {
         }
 
         if was_model {
+            // The registry changed under other documents; they heal on their
+            // next pull (focus/edit) — no inline fan-out.
             self.rebuild_schema_registry();
-            // The registry changed under every other document — stale
-            // diagnostics are healed by the background sweep, not inline.
-            self.sweep.notify_one();
         }
     }
 
@@ -2996,7 +2810,7 @@ impl LanguageServer for NmlLanguageServer {
                         continue;
                     }
                     if let Ok(content) = fs::read_to_string(&path) {
-                        self.on_change(change.uri, content).await;
+                        self.on_change(change.uri, content);
                     }
                 }
                 FileChangeType::DELETED => {
@@ -3015,9 +2829,8 @@ impl LanguageServer for NmlLanguageServer {
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&change.uri);
                     if change.uri.as_str().ends_with(".model.nml") {
+                        // Other documents heal on their next pull.
                         self.rebuild_schema_registry();
-                        // Fan-out off the notification path — see `sweep`.
-                        self.sweep.notify_one();
                     }
                 }
                 _ => {}
@@ -3480,6 +3293,11 @@ impl LanguageServer for NmlLanguageServer {
         if pos.line == 0 && pos.character == 0 {
             if let Some(resolved) = self.resolve_document(&uri) {
                 if let Resolution::Bound(b) = &resolved.resolution {
+                    let roots = self
+                        .workspace_roots
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     let summary = format!(
                         "**Schema package:** `{}` {} · `{}` · {} · binding `{}`\n\nroot: `{}`{}",
                         b.package_name,
@@ -3487,7 +3305,7 @@ impl LanguageServer for NmlLanguageServer {
                         format_args!("blake3:{}", nml_validate::store::hash8(&b.content_hash)),
                         b.source.label(),
                         b.binding_name,
-                        b.root.display(),
+                        packages::display_path(&b.root, &roots),
                         if b.step == packages::BindingStep::AutoAssociated {
                             "\n\n_auto-associated — a `schemaPackages` pin makes this explicit_"
                         } else {
@@ -4043,53 +3861,6 @@ fn rename_word_byte_range(line: &str, byte_col: usize) -> (usize, usize) {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-
-    // ── pointer_transitions (RFC 0030 freshness poll) ─────────
-
-    /// Build a snapshot map from `(name, pointer)` pairs.
-    fn snap(entries: &[(&str, Option<&str>)]) -> HashMap<String, Option<String>> {
-        entries
-            .iter()
-            .map(|(n, p)| (n.to_string(), p.map(str::to_string)))
-            .collect()
-    }
-
-    #[test]
-    fn pointer_transition_absent_to_present() {
-        // The brand-new-operator path: empty store baseline, then a sync.
-        assert!(pointer_transitions(
-            &snap(&[]),
-            &snap(&[("demo", Some("slot\nblake3:aa\n"))]),
-        ));
-    }
-
-    #[test]
-    fn pointer_transition_present_to_absent() {
-        let installed = snap(&[("demo", Some("slot\nblake3:aa\n"))]);
-        // Uninstall seen as an explicit None entry (name persisted in the
-        // snapshot key set) and as the key vanishing outright: both count.
-        assert!(pointer_transitions(&installed, &snap(&[("demo", None)])));
-        assert!(pointer_transitions(&installed, &snap(&[])));
-    }
-
-    #[test]
-    fn pointer_transition_content_change() {
-        assert!(pointer_transitions(
-            &snap(&[("demo", Some("slot\nblake3:aa\n"))]),
-            &snap(&[("demo", Some("slot2\nblake3:bb\n"))]),
-        ));
-    }
-
-    #[test]
-    fn pointer_transition_no_op() {
-        let stable = snap(&[("demo", Some("slot\nblake3:aa\n")), ("gone", None)]);
-        assert!(!pointer_transitions(&stable, &stable.clone()));
-        // Absent-as-explicit-None vs absent-as-missing-key is NOT a
-        // transition — otherwise a once-seen, since-removed name would
-        // re-trigger the fan-out on every tick forever.
-        assert!(!pointer_transitions(&snap(&[("gone", None)]), &snap(&[]),));
-        assert!(!pointer_transitions(&snap(&[]), &snap(&[("gone", None)])));
-    }
 
     // ── project_file_insertion (RFC 0030 P2 structural writes) ─
 

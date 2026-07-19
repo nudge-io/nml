@@ -1,0 +1,17 @@
+# The published VSIX ships ONLY the esbuild bundle + the WASM server + static
+# contributions. Everything below is build-time, test, or source — the bundle
+# (dist/extension.js) already contains all runtime dependencies, so node_modules
+# is never shipped.
+.vscode/**
+.vscode-test/**
+.vscode-test.mjs
+.gitignore
+.eslintrc*
+src/**
+out/**
+node_modules/**
+tsconfig.json
+esbuild.*
+**/*.map
+**/tsconfig.json
+INSTALL.md
