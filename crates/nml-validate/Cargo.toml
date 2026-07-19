@@ -18,7 +18,7 @@ nml-core = { workspace = true }
 # checks compare blake3 hashes of the framed manifest+sources byte stream.
 blake3 = "1"
 # Locates the per-user schema-package store (XDG / Application Support).
-dirs = "5"
+dirs = "6"
 
 [features]
 # Shared test fixtures (demo package manifest/sources, publish helpers) for
