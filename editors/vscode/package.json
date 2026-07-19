@@ -122,17 +122,17 @@
   },
   "dependencies": {
     "@vscode/wasm-wasi": "^1.0.1",
-    "vscode-jsonrpc": "^8.2.0",
-    "vscode-languageclient": "^9.0.1"
+    "vscode-jsonrpc": "^9.0.1",
+    "vscode-languageclient": "^10.1.0"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.7",
-    "@types/node": "^25.3.2",
-    "@types/vscode": "^1.78.0",
-    "@vscode/test-cli": "^0.0.10",
-    "@vscode/test-electron": "^2.4.1",
+    "@types/node": "^26.1.1",
+    "@types/vscode": "^1.125.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
     "esbuild": "^0.28.1",
-    "typescript": "^5.0.0"
+    "typescript": "^7.0.2"
   },
   "overrides": {
     "serialize-javascript": "^7.0.7"
