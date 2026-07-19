@@ -64,18 +64,173 @@ pub enum ChangeKind {
     },
 }
 
-/// One semantic change, with everything a consumer needs to classify
-/// (`directives`), redact (`is_secret`), and report (`path`, `origin`).
+/// A schema-field hop along a [`FieldPath`]: its name plus the schema facts a
+/// consumer folds to classify the change — **without re-walking the schema**.
+/// `directives` are opaque to nml-core (RFC 0032: consumers assign the meaning);
+/// `is_secret` is a first-class nml fact (a `secret`-typed field, which is
+/// always terminal). `modifier` records that the field is an access-control
+/// modifier (`|name`) so a report can render the sigil the operator wrote.
+#[derive(Debug, Clone)]
+pub struct FieldStep {
+    pub name: String,
+    pub modifier: bool,
+    pub directives: Vec<Directive>,
+    pub is_secret: bool,
+}
+
+impl FieldStep {
+    /// A field step with no directives and no sigil (the common test/consumer
+    /// constructor; the differ builds steps from real [`FieldDef`]s).
+    pub fn new(name: impl Into<String>, directives: Vec<Directive>, is_secret: bool) -> Self {
+        Self {
+            name: name.into(),
+            modifier: false,
+            directives,
+            is_secret,
+        }
+    }
+
+    fn from_field(field: &FieldDef) -> Self {
+        Self {
+            name: field.name.clone(),
+            modifier: matches!(field.field_type, FieldType::Modifier(_)),
+            directives: field.directives.clone(),
+            is_secret: is_secret(&field.field_type),
+        }
+    }
+}
+
+/// A collection element's identity along a [`FieldPath`] — pure navigation
+/// (never classified). Split by the exact ambiguity boundary: an identifier key
+/// renders **dotted** (grammatically dot-free), a scalar key renders
+/// **bracketed and quoted** so an identity containing dots (e.g. an `[]install`
+/// package `[vendor]-x.v1`) stays one unambiguous segment.
+#[derive(Debug, Clone)]
+pub enum ElemKey {
+    /// `- Google:` / `- SomeRef` / `- @role/x` — an identifier/reference/role.
+    Name(String),
+    /// `- "[vendor]-x.v1"` — a scalar shorthand key.
+    Key(Value),
+}
+
+/// One hop of a [`FieldPath`].
+#[derive(Debug, Clone)]
+pub enum PathSeg {
+    Field(FieldStep),
+    Element(ElemKey),
+}
+
+/// A change's path as **structure, not a string**: an ordered list of
+/// field/element hops, each field hop carrying its own reload-relevant schema
+/// facts. This is the single source of truth a consumer both classifies (fold
+/// over [`FieldPath::field_steps`]) and renders ([`std::fmt::Display`]) — no
+/// re-walk of the schema, no re-parse of a dotted string, no dot-in-identity
+/// ambiguity. The root is always a field hop.
+#[derive(Debug, Clone, Default)]
+pub struct FieldPath {
+    segs: Vec<PathSeg>,
+}
+
+impl FieldPath {
+    /// Construct from raw segments (consumers building a path directly, e.g.
+    /// tests). The differ builds paths by immutable extension during the walk.
+    pub fn from_segments(segs: Vec<PathSeg>) -> Self {
+        Self { segs }
+    }
+
+    /// This path plus one trailing hop — the immutable-extend the differ uses
+    /// as it descends (mirrors the previous `format!("{path}.{name}")`, with no
+    /// mutable stack to keep balanced).
+    fn appended(&self, seg: PathSeg) -> Self {
+        let mut segs = self.segs.clone();
+        segs.push(seg);
+        Self { segs }
+    }
+
+    pub fn segments(&self) -> &[PathSeg] {
+        &self.segs
+    }
+
+    /// The field hops in order (element hops skipped) — what a consumer folds
+    /// to classify. The nearest-directive rule reads these leaf-to-root; a
+    /// `secret` field is always the terminal hop, so the terminal step's
+    /// `is_secret` is the only one that can be `true`.
+    pub fn field_steps(&self) -> impl Iterator<Item = &FieldStep> {
+        self.segs.iter().filter_map(|s| match s {
+            PathSeg::Field(f) => Some(f),
+            PathSeg::Element(_) => None,
+        })
+    }
+
+    /// Whether this change's value is a `secret` (drives redaction): the
+    /// terminal field hop's flag (secrets are terminal).
+    pub fn is_secret(&self) -> bool {
+        self.field_steps().last().is_some_and(|f| f.is_secret)
+    }
+}
+
+impl std::fmt::Display for FieldPath {
+    /// `server.sandboxCeiling.|block`, `plugins["[acme]-x.v1"].egressRate.rate`,
+    /// `providers.Google.clientSecret` — field hops dotted (modifiers keep their
+    /// `|` sigil), scalar element keys bracketed and quoted, identifier element
+    /// keys dotted. Unambiguous by construction.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, seg) in self.segs.iter().enumerate() {
+            match seg {
+                PathSeg::Field(fs) => {
+                    if i != 0 {
+                        f.write_str(".")?;
+                    }
+                    if fs.modifier {
+                        f.write_str("|")?;
+                    }
+                    f.write_str(&fs.name)?;
+                }
+                PathSeg::Element(ElemKey::Name(n)) => {
+                    // Identifier keys are dot-free by grammar → dotted, reading
+                    // like a field (`providers.Google`).
+                    if i != 0 {
+                        f.write_str(".")?;
+                    }
+                    f.write_str(n)?;
+                }
+                PathSeg::Element(ElemKey::Key(v)) => {
+                    write!(f, "[{}]", render_key(v))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Render a scalar element key for a bracketed path segment: strings and other
+/// text-ish scalars quoted, numbers/bools bare.
+fn render_key(v: &Value) -> String {
+    match v {
+        Value::String(s) | Value::Path(s) | Value::Role(s) | Value::Duration(s) => {
+            format!("{s:?}")
+        }
+        Value::Number(n) => format!("{n}"),
+        Value::Bool(b) => format!("{b}"),
+        other => format!("{other:?}"),
+    }
+}
+
+/// One semantic change: WHERE ([`FieldPath`] — carrying the schema facts to
+/// classify and redact), WHAT ([`ChangeKind`]), and the source origin.
 #[derive(Debug, Clone)]
 pub struct FieldChange {
-    /// Dotted, bare-name path relative to the root model (modifier fields
-    /// drop the `|` sigil — matching the P1 enumeration vocabulary).
-    pub path: String,
+    pub path: FieldPath,
     pub kind: ChangeKind,
-    pub is_secret: bool,
-    pub directives: Vec<Directive>,
     /// The NEW side's origin (the OLD side's for `Removed`).
     pub origin: Origin,
+}
+
+impl FieldChange {
+    /// Whether this change's value is a `secret` (drives consumer redaction).
+    pub fn is_secret(&self) -> bool {
+        self.path.is_secret()
+    }
 }
 
 /// Bounds recursion (mirrors the validator/defaulter guards — this walks
@@ -97,7 +252,7 @@ pub fn diff_config(
     let Some(model) = index.model(root_model) else {
         return out;
     };
-    diff_model(index, model, old, new, "", 0, &mut out);
+    diff_model(index, model, old, new, &FieldPath::default(), 0, &mut out);
     out
 }
 
@@ -237,7 +392,7 @@ fn diff_model(
     model: &crate::model::ModelDef,
     old: &[(PathBuf, &Body)],
     new: &[(PathBuf, &Body)],
-    prefix: &str,
+    prefix: &FieldPath,
     depth: u32,
     out: &mut Vec<FieldChange>,
 ) {
@@ -245,23 +400,19 @@ fn diff_model(
         return;
     }
     for field in &model.fields {
-        let path = if prefix.is_empty() {
-            field.name.clone()
-        } else {
-            format!("{prefix}.{}", field.name)
-        };
+        let path = prefix.appended(PathSeg::Field(FieldStep::from_field(field)));
         diff_field(index, field, old, new, &path, depth, out);
     }
 }
 
 /// One field: resolve effective old/new (last-file-wins, else schema default)
-/// and dispatch on shape.
+/// and dispatch on shape. `path` already ends in this field's hop.
 fn diff_field(
     index: &SchemaIndex,
     field: &FieldDef,
     old: &[(PathBuf, &Body)],
     new: &[(PathBuf, &Body)],
-    path: &str,
+    path: &FieldPath,
     depth: u32,
     out: &mut Vec<FieldChange>,
 ) {
@@ -363,27 +514,21 @@ fn effective<'a>(
     }
 }
 
-/// Compare two value-shaped effectives at a leaf.
+/// Compare two value-shaped effectives at a leaf. `path` already ends in the
+/// field's hop, so `push` reads its classify/redact facts straight off it.
 fn diff_values_at(
     field: &FieldDef,
     old: &Effective,
     new: &Effective,
-    path: &str,
+    path: &FieldPath,
     out: &mut Vec<FieldChange>,
 ) {
     let (old_v, _old_origin) = value_of(old);
     let (new_v, new_origin) = value_of(new);
     match (old_v, new_v) {
         (None, None) => {}
-        (None, Some(n)) => push(
-            field,
-            path,
-            ChangeKind::Added { new: n.clone() },
-            new_origin,
-            out,
-        ),
+        (None, Some(n)) => push(path, ChangeKind::Added { new: n.clone() }, new_origin, out),
         (Some(o), None) => push(
-            field,
             path,
             ChangeKind::Removed { old: o.clone() },
             origin_of(old),
@@ -408,18 +553,11 @@ fn diff_values_at(
                         if added.is_empty() && removed.is_empty() {
                             return;
                         }
-                        push(
-                            field,
-                            path,
-                            ChangeKind::SetDelta { added, removed },
-                            new_origin,
-                            out,
-                        );
+                        push(path, ChangeKind::SetDelta { added, removed }, new_origin, out);
                         return;
                     }
                 }
                 push(
-                    field,
                     path,
                     ChangeKind::Modified {
                         old: o.clone(),
@@ -458,7 +596,7 @@ fn diff_bodies(
     field: &FieldDef,
     old: &Effective,
     new: &Effective,
-    path: &str,
+    path: &FieldPath,
     depth: u32,
     out: &mut Vec<FieldChange>,
 ) {
@@ -473,7 +611,6 @@ fn diff_bodies(
             (Some((o, _)), Some((n, origin))) => {
                 if o != n {
                     push(
-                        field,
                         path,
                         ChangeKind::Modified {
                             old: Value::String(o),
@@ -485,7 +622,6 @@ fn diff_bodies(
                 }
             }
             (None, Some((n, origin))) => push(
-                field,
                 path,
                 ChangeKind::Added {
                     new: Value::String(n),
@@ -494,7 +630,6 @@ fn diff_bodies(
                 out,
             ),
             (Some((o, origin)), None) => push(
-                field,
                 path,
                 ChangeKind::Removed {
                     old: Value::String(o),
@@ -678,26 +813,19 @@ fn diff_collections(
     field: &FieldDef,
     old: &[Elem<'_>],
     new: &[Elem<'_>],
-    path: &str,
+    path: &FieldPath,
     depth: u32,
     out: &mut Vec<FieldChange>,
 ) {
     if is_set(&field.field_type) {
         for n in new {
             if !old.iter().any(|o| o.id.eq(&n.id)) {
-                push(
-                    field,
-                    path,
-                    ChangeKind::Added { new: n.id.render() },
-                    elem_origin(n),
-                    out,
-                );
+                push(path, ChangeKind::Added { new: n.id.render() }, elem_origin(n), out);
             }
         }
         for o in old {
             if !new.iter().any(|n| n.id.eq(&o.id)) {
                 push(
-                    field,
                     path,
                     ChangeKind::Removed { old: o.id.render() },
                     elem_origin(o),
@@ -716,14 +844,13 @@ fn diff_collections(
     // removes an element's sub-block reports precise leaf add/removes.
     for n in new {
         let Some(o) = old.iter().find(|o| o.id.eq(&n.id)) else {
-            // A brand-new NAMED element reports as an Added at its leaf path
+            // A brand-new NAMED element reports as an Added at its element path
             // (unchanged behavior); new scalar elements — bodied or not — fall
             // to the ordered LCS path below as a whole-element Added, so they
             // are not double-reported here.
             if matches!(n.id, ElemId::Name(_)) && !is_set(&field.field_type) {
                 push(
-                    field,
-                    &format!("{path}.{}", elem_path_seg(&n.id)),
+                    &path.appended(PathSeg::Element(elem_key(&n.id))),
                     ChangeKind::Added { new: n.id.render() },
                     elem_origin(n),
                     out,
@@ -736,7 +863,7 @@ fn diff_collections(
         if n.body.is_none() && o.body.is_none() {
             continue;
         }
-        let elem_path = format!("{path}.{}", elem_path_seg(&n.id));
+        let elem_path = path.appended(PathSeg::Element(elem_key(&n.id)));
         let o_files: Vec<(PathBuf, &Body)> = o
             .body
             .map(|b| vec![(o.file.map(Path::to_path_buf).unwrap_or_default(), b)])
@@ -757,13 +884,7 @@ fn diff_collections(
         let matched = lcs_pairs(old, new);
         for (i, n) in new.iter().enumerate() {
             if matches!(n.id, ElemId::Val(_)) && !matched.iter().any(|&(_, b)| b == i) {
-                push(
-                    field,
-                    path,
-                    ChangeKind::Added { new: n.id.render() },
-                    elem_origin(n),
-                    out,
-                );
+                push(path, ChangeKind::Added { new: n.id.render() }, elem_origin(n), out);
             }
         }
         for (i, o) in old.iter().enumerate() {
@@ -773,7 +894,6 @@ fn diff_collections(
                 matches!(o.id, ElemId::Val(_)) && !matched.iter().any(|&(a, _)| a == i);
             if removed_named || removed_val {
                 push(
-                    field,
                     path,
                     ChangeKind::Removed { old: o.id.render() },
                     elem_origin(o),
@@ -864,17 +984,13 @@ fn elem_origin(e: &Elem<'_>) -> Origin {
     }
 }
 
-/// The dotted-path segment for an element's identity: a name verbatim, a
-/// string-ish scalar by its content (e.g. an `[]install` package key), any
-/// other scalar by its debug form. Used to build precise leaf paths when
-/// recursing into a body-carrying element.
-fn elem_path_seg(id: &ElemId) -> String {
+/// An element's identity as a path segment: identifier keys stay `Name`
+/// (rendered dotted), scalar shorthand keys become `Key` (rendered bracketed +
+/// quoted, so an `[]install` package like `[vendor]-x.v1` stays unambiguous).
+fn elem_key(id: &ElemId) -> ElemKey {
     match id {
-        ElemId::Name(n) => (*n).to_string(),
-        ElemId::Val(v) => match v {
-            Value::String(s) | Value::Path(s) | Value::Role(s) | Value::Duration(s) => s.clone(),
-            other => format!("{other:?}"),
-        },
+        ElemId::Name(n) => ElemKey::Name((*n).to_string()),
+        ElemId::Val(v) => ElemKey::Key((*v).clone()),
     }
 }
 
@@ -903,18 +1019,13 @@ fn is_secret(ft: &FieldType) -> bool {
     }
 }
 
-fn push(
-    field: &FieldDef,
-    path: &str,
-    kind: ChangeKind,
-    origin: Origin,
-    out: &mut Vec<FieldChange>,
-) {
+/// Record a change at `path`. All classify/redact facts (directives, secret-
+/// ness) ride on the path's field hops, so `push` needs only WHERE, WHAT, and
+/// the origin — no re-derivation from the schema.
+fn push(path: &FieldPath, kind: ChangeKind, origin: Origin, out: &mut Vec<FieldChange>) {
     out.push(FieldChange {
-        path: path.to_string(),
+        path: path.clone(),
         kind,
-        is_secret: is_secret(&field.field_type),
-        directives: field.directives.clone(),
         origin,
     });
 }
@@ -934,6 +1045,21 @@ mod tests {
 
     fn parse_doc(src: &str) -> crate::ast::File {
         crate::cst::parse_to_ast(src).unwrap()
+    }
+
+    /// The changed field's own directives (the terminal field hop) — what a
+    /// consumer folds; replaces the old flat `FieldChange.directives`.
+    fn leaf_directives(c: &FieldChange) -> &[Directive] {
+        c.path
+            .field_steps()
+            .last()
+            .map(|f| f.directives.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// The rendered path, for terse assertions.
+    fn p(c: &FieldChange) -> String {
+        c.path.to_string()
     }
 
     fn server_body(file: &crate::ast::File) -> &Body {
@@ -976,7 +1102,7 @@ mod tests {
             &[(PathBuf::from("f.nml"), server_body(&new))],
         );
         assert_eq!(d.len(), 1, "{d:?}");
-        assert_eq!(d[0].path, "denial.page");
+        assert_eq!(p(&d[0]), "denial.page");
         assert!(matches!(&d[0].kind, ChangeKind::Modified { .. }));
         // The scalar variant still works through the value path.
         let old = parse_doc("server s:\n    denial = \"x\"\n");
@@ -988,7 +1114,7 @@ mod tests {
             &[(PathBuf::from("f.nml"), server_body(&new))],
         );
         assert_eq!(d.len(), 1);
-        assert_eq!(d[0].path, "denial");
+        assert_eq!(p(&d[0]), "denial");
     }
 
     /// r10 fix 2 — ARM blocks diff: a retargeted arm is a Modified (rendered
@@ -1013,7 +1139,7 @@ mod tests {
         let retarget = "server s:\n    route:\n        @role/a -> Z\n        else -> Y\n";
         let d = diff2(base, retarget);
         assert_eq!(d.len(), 1, "{d:?}");
-        assert_eq!(d[0].path, "route");
+        assert_eq!(p(&d[0]), "route");
         assert!(
             matches!(&d[0].kind, ChangeKind::Modified { new, .. }
                 if matches!(new, Value::String(s) if s.contains("-> Z"))),
@@ -1048,7 +1174,7 @@ mod tests {
             &[(PathBuf::from("server.nml"), server_body(&new))],
         );
         assert_eq!(d.len(), 1, "reorder invisible, one addition: {d:?}");
-        assert_eq!(d[0].path, "sandboxCeiling.block");
+        assert_eq!(p(&d[0]), "sandboxCeiling.|block");
         assert!(
             matches!(&d[0].kind, ChangeKind::Added { new }
                 if new.semantic_eq(&Value::String("192.168.0.0/16".into()))),
@@ -1056,7 +1182,7 @@ mod tests {
         );
         // The #live directive on the modifier field rides the change.
         assert!(
-            d[0].directives.iter().any(|dir| dir.name == "live"),
+            leaf_directives(&d[0]).iter().any(|dir| dir.name == "live"),
             "{d:?}"
         );
         assert!(
@@ -1076,7 +1202,7 @@ mod tests {
             "server s:\n    port = 9090\n",
         );
         assert_eq!(d.len(), 1, "{d:?}");
-        assert_eq!(d[0].path, "port");
+        assert_eq!(p(&d[0]), "port");
         assert!(matches!(&d[0].kind, ChangeKind::Modified { .. }));
         assert!(matches!(&d[0].origin, Origin::File { file, .. } if file.ends_with("new.nml")));
 
@@ -1145,7 +1271,7 @@ mod tests {
             k => panic!("expected SetDelta, got {k:?}"),
         }
         // The #live directive rides along for the consumer to classify.
-        assert!(d[0].directives.iter().any(|dir| dir.name == "live"));
+        assert!(leaf_directives(&d[0]).iter().any(|dir| dir.name == "live"));
 
         let d = diff_single(
             "server s:\n    cidrs = [\"a\", \"b\"]\n",
@@ -1179,15 +1305,15 @@ mod tests {
         );
         let url = d
             .iter()
-            .find(|c| c.path == "providers.Google.url")
+            .find(|c| p(c) == "providers.Google.url")
             .expect("leaf path");
         assert!(matches!(&url.kind, ChangeKind::Modified { .. }));
-        assert!(!url.is_secret);
+        assert!(!url.is_secret());
         let sec = d
             .iter()
-            .find(|c| c.path == "providers.Google.clientSecret")
+            .find(|c| p(c) == "providers.Google.clientSecret")
             .expect("secret leaf");
-        assert!(sec.is_secret, "secret flag must ride for redaction");
+        assert!(sec.is_secret(), "secret flag must ride for redaction");
         // A renamed entry is remove+add (name IS identity).
         let d = diff_single(
             "server s:\n    providers:\n        - Google:\n            url = \"a\"\n",
@@ -1203,6 +1329,46 @@ mod tests {
                 .any(|c| matches!(&c.kind, ChangeKind::Removed { .. })),
             "{d:?}"
         );
+    }
+
+    /// The structured path renders unambiguously and skips element hops when
+    /// folded for classification (Design B): modifier fields keep their `|`
+    /// sigil, scalar element keys are bracketed+quoted (dots inside stay one
+    /// segment), identifier element keys read dotted, and `field_steps()`
+    /// yields only the field hops in order.
+    #[test]
+    fn structured_path_render_and_field_steps() {
+        let path = FieldPath::from_segments(vec![
+            PathSeg::Field(FieldStep::new("server", vec![], false)),
+            PathSeg::Field(FieldStep {
+                name: "block".into(),
+                modifier: true,
+                directives: vec![],
+                is_secret: false,
+            }),
+        ]);
+        assert_eq!(path.to_string(), "server.|block");
+
+        let keyed = FieldPath::from_segments(vec![
+            PathSeg::Field(FieldStep::new("plugins", vec![], false)),
+            PathSeg::Element(ElemKey::Key(Value::String("[acme]-x.v1".into()))),
+            PathSeg::Field(FieldStep::new("egressRate", vec![], false)),
+            PathSeg::Field(FieldStep::new("rate", vec![], false)),
+        ]);
+        assert_eq!(keyed.to_string(), "plugins[\"[acme]-x.v1\"].egressRate.rate");
+        // Element hops are skipped when folding for classification.
+        assert_eq!(
+            keyed.field_steps().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["plugins", "egressRate", "rate"]
+        );
+
+        let named = FieldPath::from_segments(vec![
+            PathSeg::Field(FieldStep::new("providers", vec![], false)),
+            PathSeg::Element(ElemKey::Name("Google".into())),
+            PathSeg::Field(FieldStep::new("clientSecret", vec![], true)),
+        ]);
+        assert_eq!(named.to_string(), "providers.Google.clientSecret");
+        assert!(named.is_secret(), "terminal secret hop drives redaction");
     }
 
     // -- Multi-root (RFC 0032): whole-config diff via the synthesized root. ----
@@ -1243,7 +1409,7 @@ mod tests {
         );
 
         // server.port changed (declaration-prefixed).
-        let port = d.iter().find(|c| c.path == "server.port").expect("port");
+        let port = d.iter().find(|c| p(c) == "server.port").expect("port");
         assert!(matches!(&port.kind, ChangeKind::Modified { .. }));
 
         // install egressRate.rate reported at a precise leaf through the
@@ -1253,17 +1419,17 @@ mod tests {
         // walk, `classify_path`, exercised on the nudge side.)
         let rate = d
             .iter()
-            .find(|c| c.path == "plugins.[acme]-x.v1.egressRate.rate")
+            .find(|c| p(c) == "plugins[\"[acme]-x.v1\"].egressRate.rate")
             .unwrap_or_else(|| panic!("install leaf path missing: {d:?}"));
         assert!(matches!(&rate.kind, ChangeKind::Modified { .. }));
 
         // role edit reports (restart-class — no directive rides).
         let role = d
             .iter()
-            .find(|c| c.path == "roles.admin.description")
+            .find(|c| p(c) == "roles.admin.description")
             .unwrap_or_else(|| panic!("role leaf path missing: {d:?}"));
         assert!(matches!(&role.kind, ChangeKind::Modified { .. }));
-        assert!(role.directives.is_empty());
+        assert!(leaf_directives(role).is_empty());
 
         // Exactly those three semantic changes — nothing spurious (burst
         // unchanged, package identity stable).
@@ -1295,7 +1461,7 @@ mod tests {
         );
         assert!(
             d.iter()
-                .any(|c| c.path == "plugins.[acme]-x.v1.egressRate.rate"
+                .any(|c| p(c) == "plugins[\"[acme]-x.v1\"].egressRate.rate"
                     && matches!(&c.kind, ChangeKind::Added { .. })),
             "bare→bodied install add reports leaf Added: {d:?}"
         );
@@ -1322,7 +1488,7 @@ mod tests {
             &[(PathBuf::from("nudge.nml"), &nb)],
         );
         assert_eq!(d.len(), 1, "{d:?}");
-        assert_eq!(d[0].path, "plugins");
+        assert_eq!(p(&d[0]), "plugins");
         assert!(
             matches!(&d[0].kind, ChangeKind::Added { new } if new.semantic_eq(&Value::String("[acme]-y.v1".into()))),
             "{d:?}"
