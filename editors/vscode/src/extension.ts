@@ -2,6 +2,7 @@ import {
   commands,
   ExtensionContext,
   languages,
+  OutputChannel,
   StatusBarAlignment,
   StatusBarItem,
   ThemeColor,
@@ -16,6 +17,13 @@ import {
 } from "vscode-languageclient/node";
 import { constants as fsConstants, promises as fsp } from "fs";
 import * as path from "path";
+import { WasmProcess } from "@vscode/wasm-wasi/v1";
+import {
+  createWasmServer,
+  NeutralServer,
+  resolveNeutralServer,
+  wasmUriConverters,
+} from "./serverAcquisition";
 
 // ─────────────────────────────────────────────────────────────────────────
 // RFC 0035 — default-safe discovery + Workspace-Trust gate + status surface.
@@ -30,20 +38,36 @@ import * as path from "path";
 // ─────────────────────────────────────────────────────────────────────────
 
 let client: LanguageClient | undefined;
+/** The bundled WASM neutral server's process, when that backend is running.
+ *  A function `ServerOptions` does not own the process, so the client won't reap
+ *  it — we terminate it ourselves on stop/restart to avoid leaking one. */
+let wasmProcess: WasmProcess | undefined;
 let status: StatusBarItem | undefined;
 /** Human label of the server actually launched, for the status surface. */
 let serverLabel = "";
+/** One output channel for the extension's lifetime. Created lazily and owned by
+ *  `context.subscriptions`; a `LanguageClient` given a channel it did not create
+ *  never disposes it, so creating one per start would leak a duplicate "NML
+ *  Language Server" channel on every restart/trust-grant. */
+let outputChannel: OutputChannel | undefined;
 
-const DEFAULT_SERVER_PATH =
-  (process.env.HOME || process.env.USERPROFILE || "") + "/.cargo/bin/nml-lsp";
+function ensureOutputChannel(context: ExtensionContext): OutputChannel {
+  if (!outputChannel) {
+    outputChannel = window.createOutputChannel("NML Language Server");
+    context.subscriptions.push(outputChannel);
+  }
+  return outputChannel;
+}
 
 /** Same charset as a package name — the tool is both a package name and a spawn
  *  target, so this guards path-traversal / spawn abuse (RFC 0035 Security). */
 const TOOL_NAME = /^[a-z][a-z0-9-]*$/;
 
-type Resolution =
-  | { kind: "provider"; tool: string; command: string; args: string[]; label: string }
-  | { kind: "neutral"; command: string; args: string[]; label: string };
+/** A resolved server to launch: a declared provider's `<tool> lsp` and the
+ *  native neutral server are both processes; the bundled WASM neutral server is
+ *  the third shape. Provider vs neutral is the discovery ladder; the neutral
+ *  *delivery* (wasm/native) is [`resolveNeutralServer`]. */
+type Resolution = NeutralServer;
 
 /** Lightweight bootstrap read of `provider: tool = "<name>"` from an
  *  `nml-project.nml`. The server does the authoritative parse; this only has to
@@ -138,35 +162,23 @@ async function realPath(p: string): Promise<string> {
   }
 }
 
-function neutralPath(): string {
-  // `nml.server.path` is `machine`-scoped (see package.json): a workspace
-  // cannot set it, so a repo can never redirect the language server at a
-  // workspace-resident binary. Only the user's own machine/user settings apply.
-  const configured = workspace.getConfiguration("nml").get<string>("server.path", "");
-  return configured || DEFAULT_SERVER_PATH;
-}
-
-function neutral(): Resolution {
-  return { kind: "neutral", command: neutralPath(), args: [], label: "neutral nml-lsp" };
-}
-
 /** The discovery ladder (RFC 0035). Prefers a declared provider tool's own LSP
- *  when it is safe to launch, else the neutral server. May prompt once per
- *  workspace for approval. */
+ *  when it is safe to launch, else the neutral server ([`resolveNeutralServer`]:
+ *  bundled WASM, or native). May prompt once per workspace for approval. */
 async function resolveServer(context: ExtensionContext): Promise<Resolution> {
   const tool = await declaredProviderTool();
-  if (!tool) return neutral();
+  if (!tool) return resolveNeutralServer(context);
 
   // Trust gate: never launch a project-resolved binary in an untrusted
   // workspace. The neutral server still validates committed/cached schema.
-  if (!workspace.isTrusted) return neutral();
+  if (!workspace.isTrusted) return resolveNeutralServer(context);
 
   const command = await resolveOnPath(tool);
   if (!command || (await insideWorkspace(command))) {
     // Declared but not a user-global install (or workspace-resident): fall back
     // rather than hunt for it in the workspace. Neutral still serves the
     // tool's published package by name (the tool→package fallback).
-    return neutral();
+    return resolveNeutralServer(context);
   }
 
   // Per-workspace approval, remembered. Approving is trusting `<tool> lsp` to
@@ -180,13 +192,12 @@ async function resolveServer(context: ExtensionContext): Promise<Resolution> {
       "Use it",
       "Use neutral server"
     );
-    if (choice !== "Use it") return neutral();
+    if (choice !== "Use it") return resolveNeutralServer(context);
     await context.workspaceState.update(key, command);
   }
 
   return {
-    kind: "provider",
-    tool,
+    kind: "process",
     command,
     args: ["lsp"],
     label: `${tool} (in-binary)`,
@@ -263,36 +274,60 @@ async function startClient(context: ExtensionContext): Promise<void> {
   const resolution = await resolveServer(context);
   serverLabel = resolution.label;
 
-  const serverOptions: ServerOptions = {
-    command: resolution.command,
-    args: resolution.args,
-  };
-  const outputChannel = window.createOutputChannel("NML Language Server");
-  outputChannel.appendLine(
-    `Starting NML LSP (${resolution.label}): ${resolution.command} ${resolution.args.join(" ")}`
-  );
+  const channel = ensureOutputChannel(context);
+  const serverOptions: ServerOptions =
+    resolution.kind === "wasm"
+      ? async () => {
+          const server = await createWasmServer(resolution.module, channel);
+          wasmProcess = server.process; // tracked so we can terminate it on stop
+          return server.transports;
+        }
+      : { command: resolution.command, args: resolution.args };
+  channel.appendLine(`Starting NML LSP (${resolution.label})`);
+
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "nml" }],
-    outputChannel,
+    outputChannel: channel,
+    // The WASM neutral server runs a synchronous pump and cannot issue the
+    // server→client request that registers file watchers (RFC 0035), so the
+    // client watches on its behalf; the native server self-registers, so adding
+    // it there too would double the events. It also lives in a WASI filesystem
+    // namespace, so URIs are rewritten to the mounted paths it can actually read.
+    ...(resolution.kind === "wasm"
+      ? {
+          synchronize: { fileEvents: workspace.createFileSystemWatcher("**/*.nml") },
+          uriConverters: wasmUriConverters(),
+        }
+      : {}),
   };
   client = new LanguageClient("nml-lsp", "NML Language Server", serverOptions, clientOptions);
   try {
     await client.start();
   } catch (err) {
-    outputChannel.appendLine(`NML: failed to start language server: ${err}`);
+    channel.appendLine(`NML: failed to start language server: ${err}`);
     window.showErrorMessage(
-      `NML: failed to start the language server (${resolution.command}). ` +
-        `Install nml-lsp or set nml.server.path.`
+      `NML: failed to start the NML language server (${resolution.label}). ` +
+        `Set nml.server.path to an nml-lsp binary, or install one.`
     );
     client = undefined;
   }
   await refreshStatus();
 }
 
+/** Terminate the WASM backend, if one is running. A no-op for the process
+ *  backend (the client reaps its own child). Must run AFTER the client releases
+ *  the transports so we don't race an in-flight write. */
+async function terminateWasm(): Promise<void> {
+  const proc = wasmProcess;
+  wasmProcess = undefined;
+  if (proc) await proc.terminate().catch(() => undefined);
+}
+
 async function restartClient(context: ExtensionContext): Promise<void> {
   const old = client;
   client = undefined;
   if (old) await old.stop().catch(() => undefined);
+  await terminateWasm();
   await startClient(context);
 }
 
@@ -328,5 +363,8 @@ export async function activate(context: ExtensionContext): Promise<void> {
 
 export function deactivate(): Thenable<void> | undefined {
   if (statusTimer) clearTimeout(statusTimer);
-  return client?.stop();
+  const stop = client?.stop();
+  if (!stop && !wasmProcess) return undefined;
+  // Terminate the WASM backend only after the client releases the transports.
+  return Promise.resolve(stop).then(() => terminateWasm());
 }

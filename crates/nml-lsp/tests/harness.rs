@@ -3,18 +3,19 @@
 //! No stdio, no editor: `LspService` implements `tower::Service`, so the
 //! tests drive it with raw JSON-RPC `Request` values
 //! (`service.ready().await.call(req)`) and read server→client traffic
-//! (publishDiagnostics, window/logMessage, client/registerCapability) off the
-//! `ClientSocket`, which is a `Stream` of `Request` frames — exactly
-//! tower-lsp's own testing style, but against the real `NmlLanguageServer`
-//! with a real (tempdir) schema-package store injected through
-//! `NmlLanguageServer::with_store`.
+//! (window/logMessage, client/registerCapability) off the `ClientSocket`,
+//! which is a `Stream` of `Request` frames — exactly tower-lsp's own testing
+//! style, but against the real `NmlLanguageServer` with a real (tempdir)
+//! schema-package store injected through `NmlLanguageServer::with_store`.
+//! Diagnostics are PULLED (`textDocument/diagnostic`), not read off the
+//! socket — see [`Harness::diagnostics`].
 
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use futures::{FutureExt, SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tower::{Service, ServiceExt};
 use tower_lsp::jsonrpc::{Request, Response};
@@ -25,9 +26,10 @@ use nml_lsp::server::NmlLanguageServer;
 use nml_validate::store::Store;
 use nml_validate::test_support::{demo_package, publish_demo, DEMO_MANIFEST_WITH_DIRECTIVES};
 
-/// How long a test is willing to wait for an asynchronous server→client
-/// frame (the store-event notifier task runs on its own tokio task, so its
-/// log messages are not ordered against handler completion).
+/// Generous slack for a server→client notification. Store-health
+/// `window/logMessage`s are emitted during the diagnostic-pull handler
+/// (`drain_store_events`), so after a pull they are already queued; this
+/// bound only guards against a hang, never a busy-wait.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The in-process server plus both directions of its wire.
@@ -148,17 +150,14 @@ impl Harness {
         self.notify("initialized", json!({})).await;
     }
 
-    /// `textDocument/didOpen`, returning the document's freshly published
-    /// diagnostics.
+    /// `textDocument/didOpen` followed by a diagnostics PULL — RFC 0035: the
+    /// server no longer pushes `publishDiagnostics`; the client requests a
+    /// document's diagnostics. Returns the report normalized to
+    /// `{"uri", "diagnostics": [...]}`, so assertions read a full report's
+    /// `items` exactly as they read the old publish params' `diagnostics`.
     ///
-    /// Determinism smoke-assert: the publishDiagnostics for this exact URI
-    /// must already be available on the socket the moment the didOpen call
-    /// completes — no sleeps, no retries. This pins the
-    /// handlers-await-their-publishes property: `on_change` awaits
-    /// `publish_diagnostics`, which buffers the frame into the loopback
-    /// channel *before* the handler returns. If someone ever detaches the
-    /// publish onto a spawned task, this assertion (a non-blocking drain)
-    /// starts failing rather than the suite going flaky.
+    /// This is strictly MORE deterministic than the old push assert: a request
+    /// yields its response synchronously, with no notification to race.
     async fn open(&mut self, path: &Path, text: &str) -> Value {
         let uri = file_uri(path);
         self.notify(
@@ -173,31 +172,29 @@ impl Harness {
             }),
         )
         .await;
-        self.take_ready_notification("textDocument/publishDiagnostics", |params| {
-            params["uri"] == json!(uri)
-        })
-        .await
-        .unwrap_or_else(|| {
-            panic!("publishDiagnostics for {uri} not on the socket after didOpen returned")
-        })
+        self.diagnostics(&uri).await
     }
 
-    /// Non-blocking take: drain whatever frames are *already* buffered on
-    /// the socket (`now_or_never` — a poll, never a wait), then pull the
-    /// first queued notification matching `method` + predicate.
-    async fn take_ready_notification(
-        &mut self,
-        method: &str,
-        matches: impl Fn(&Value) -> bool,
-    ) -> Option<Value> {
-        while let Some(frame) = self.socket.next().now_or_never() {
-            self.route(frame.expect("client socket closed")).await;
-        }
-        let position = self.inbox.iter().position(|frame| {
-            frame.method() == method && matches(frame.params().unwrap_or(&Value::Null))
-        })?;
-        let frame = self.inbox.remove(position).expect("position just found");
-        Some(frame.params().cloned().unwrap_or(Value::Null))
+    /// Pull a document's diagnostics (`textDocument/diagnostic`), normalized to
+    /// `{"uri", "diagnostics": [...]}`. Tests never send a `previousResultId`,
+    /// so the server always returns a full report (never `Unchanged`). This is
+    /// also how a test asserts cross-file / out-of-band healing under the pull
+    /// model: re-pull an already-open document after the upstream change.
+    async fn diagnostics(&mut self, uri: &str) -> Value {
+        let report = self
+            .request(
+                "textDocument/diagnostic",
+                json!({ "textDocument": { "uri": uri } }),
+            )
+            .await;
+        assert_eq!(
+            report["kind"], "full",
+            "test pulls always expect a full report: {report}"
+        );
+        json!({
+            "uri": uri,
+            "diagnostics": report.get("items").cloned().unwrap_or_else(|| json!([])),
+        })
     }
 
     /// Next server→client notification with the given method (already-queued
@@ -474,21 +471,16 @@ async fn directive_completion_offers_vocabulary() {
     );
 }
 
-/// How long a test is willing to wait for the freshness poll's fan-out: the
-/// poll ticks every ~3s (a server-private constant), so this is one interval
-/// plus generous slack — never a busy-wait, the frame arrives off the socket.
-const POLL_HEAL_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// TEST F — freshness poll, the final RFC 0030 item: a pinned file opened
+/// TEST F — out-of-band store heal, PULL model (RFC 0035): a pinned file opened
 /// against an EMPTY store resolves unbound; publishing the package into the
-/// store OUT-OF-BAND (plain fs writes through a second `Store` handle —
-/// exactly what `nudge schema sync` does from another process) must heal the
-/// idle editor with no further client requests: the ~3s background poll sees
-/// the absent→present pointer transition, re-resolves every open document,
-/// and republishes diagnostics.
+/// store OUT-OF-BAND (plain fs writes through a second `Store` handle — exactly
+/// what `nudge schema sync` does from another process) must heal the editor on
+/// its NEXT pull. There is no background poll: the store cache is stat-guarded,
+/// so the very next `textDocument/diagnostic` re-resolves against the freshly
+/// published package. This is the "heals on next interaction" contract.
 #[tokio::test]
-async fn out_of_band_store_publish_heals_open_documents() {
-    let base = temp_dir("freshness-poll");
+async fn out_of_band_store_publish_heals_on_repull() {
+    let base = temp_dir("out-of-band-heal");
     let store_base = base.join("store");
     // The store *directory* exists but holds no packages — the cold-store,
     // brand-new-operator baseline.
@@ -518,21 +510,10 @@ async fn out_of_band_store_publish_heals_open_documents() {
         .await;
     assert_eq!(info["bound"], json!(false), "must open unbound: {info}");
 
-    // The out-of-band sync. From here the test sends nothing else — the next
-    // publishDiagnostics for this uri can only come from the poll task.
+    // The out-of-band sync, then a re-pull — what the editor issues on the
+    // next interaction (edit/focus) with the file.
     publish_demo(&Store::at(&store_base));
-
-    let uri = file_uri(&file);
-    let healed = loop {
-        // The poll fans out to every open document (nml-project.nml is
-        // indexed too), so scan for this uri's frame specifically.
-        let params = harness
-            .next_from_client("textDocument/publishDiagnostics", POLL_HEAL_TIMEOUT)
-            .await;
-        if params["uri"] == json!(uri) {
-            break params;
-        }
-    };
+    let healed = harness.diagnostics(&file_uri(&file)).await;
     let healed_notes: Vec<&str> = healed["diagnostics"]
         .as_array()
         .expect("diagnostics array")
@@ -541,7 +522,7 @@ async fn out_of_band_store_publish_heals_open_documents() {
         .collect();
     assert!(
         !healed_notes.iter().any(|m| m.contains("not installed")),
-        "healed publish must drop the missing-pin note: {healed_notes:?}"
+        "re-pull after the sync must drop the missing-pin note: {healed_notes:?}"
     );
 
     let info = harness
@@ -550,20 +531,20 @@ async fn out_of_band_store_publish_heals_open_documents() {
     assert_eq!(
         info["bound"],
         json!(true),
-        "poll did not heal binding: {info}"
+        "re-pull did not heal binding: {info}"
     );
     assert_eq!(info["package"], json!("demo"), "{info}");
     assert_eq!(info["source"], json!("store current"), "{info}");
 }
 
-/// TEST E — the broad revalidation fan-out runs on the background sweep, off
-/// the request path: a model edit (didChange) returns after publishing only
-/// the edited document, and OTHER open documents' diagnostics heal via a
-/// later, sweep-published frame — the test sends nothing after the edit, so
-/// the healing publish can only come from the sweep task.
+/// TEST E — cross-file heal, PULL model (RFC 0035): editing a schema (`model`)
+/// file makes a dependent instance file's diagnostics stale. There is no
+/// background sweep — the dependent heals when it is next PULLED (what VS Code
+/// issues when the file regains focus). This is the exact cross-file promise
+/// the pull migration rests on: fix the schema, re-pull the instance, clean.
 #[tokio::test]
-async fn model_edit_heals_other_documents_via_background_sweep() {
-    let base = temp_dir("sweep-heal");
+async fn model_edit_heals_other_documents_on_repull() {
+    let base = temp_dir("cross-file-heal");
     let store_base = base.join("store");
     fs::create_dir_all(&store_base).expect("create store dir");
     let ws = base.join("ws");
@@ -587,8 +568,8 @@ async fn model_edit_heals_other_documents_via_background_sweep() {
         "string-for-number must diagnose before the fix: {published}"
     );
 
-    // Fix the schema instead of the instance: `port` becomes a string, so
-    // the app's diagnostic is now stale — only a workspace fan-out heals it.
+    // Fix the schema instead of the instance: `port` becomes a string, so the
+    // app's `port = "x"` is now valid — but its published set is stale.
     harness
         .notify(
             "textDocument/didChange",
@@ -599,20 +580,13 @@ async fn model_edit_heals_other_documents_via_background_sweep() {
         )
         .await;
 
-    // From here the test sends nothing — the app's next publish can only
-    // come from the background sweep.
-    let uri = file_uri(&app);
-    let healed = loop {
-        let params = harness
-            .next_from_client("textDocument/publishDiagnostics", FRAME_TIMEOUT)
-            .await;
-        if params["uri"] == json!(uri)
-            && params["diagnostics"].as_array().is_some_and(Vec::is_empty)
-        {
-            break params;
-        }
-    };
-    assert_eq!(healed["uri"], json!(uri));
+    // Re-pull the app — the client's focus-change pull. It re-resolves against
+    // the edited model and comes back clean.
+    let healed = harness.diagnostics(&file_uri(&app)).await;
+    assert!(
+        healed["diagnostics"].as_array().is_some_and(Vec::is_empty),
+        "re-pull after the schema fix must clear the app's diagnostic: {healed}"
+    );
 }
 
 /// TEST G — a watched DELETED event for an OPEN document must not touch it:
@@ -675,8 +649,8 @@ async fn watched_delete_of_open_document_is_ignored() {
 /// document must not adopt the disk content either. Same LSP-spec rule (the
 /// client buffer is the sole source of truth after didOpen): the disk gets a
 /// DIFFERENT model definition, and both observable surfaces must still
-/// reflect the BUFFER text afterwards — hover resolves the buffer's field
-/// signature, and no diagnostics were republished from the disk text.
+/// reflect the BUFFER text afterwards — a re-pull of the dependent validates
+/// against the buffer's schema, and hover resolves the buffer's field.
 #[tokio::test]
 async fn watched_change_of_open_document_is_ignored() {
     let base = temp_dir("watched-change-open");
@@ -707,17 +681,16 @@ async fn watched_change_of_open_document_is_ignored() {
         )
         .await;
 
-    // Buffer-is-truth, surface 1: no publish for the model — adopting the
-    // disk text would have republished inline (on_change awaits its publish,
-    // so a wrongly-adopted change is already on the socket here).
-    assert_eq!(
-        harness
-            .take_ready_notification("textDocument/publishDiagnostics", |params| {
-                params["uri"] == json!(file_uri(&model))
-            })
-            .await,
-        None,
-        "watched CHANGED of an open doc must not republish from disk"
+    // Buffer-is-truth, surface 1 (pull model): re-pull the APP. `port = 80`
+    // is valid against the BUFFER's `port number` (empty diagnostics); had the
+    // server adopted the DISK's `port string`, 80 would flag a type error. An
+    // empty set therefore proves the disk CHANGED was ignored.
+    let app_diags = harness.diagnostics(&file_uri(&app)).await;
+    assert!(
+        app_diags["diagnostics"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "watched CHANGED of an open model must not adopt disk text: {app_diags}"
     );
 
     // Buffer-is-truth, surface 2: hover still resolves the BUFFER's schema

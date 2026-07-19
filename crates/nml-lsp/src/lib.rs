@@ -32,6 +32,12 @@ mod wasm_pump {
 
     use crate::server::NmlLanguageServer;
 
+    /// A bogus/corrupt `Content-Length` must never OOM the memory-limited
+    /// module: cap the body allocation well above any real LSP message (nml
+    /// config/schema files are KB–low-MB). Over the cap ⇒ treat the stream as
+    /// corrupt and terminate, rather than allocate gigabytes.
+    const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
     /// Read one `Content-Length`-framed JSON-RPC message. Blocking (the host
     /// services the wait); `None` on EOF or a malformed frame.
     fn read_frame(reader: &mut impl BufRead) -> Option<Request> {
@@ -48,6 +54,9 @@ mod wasm_pump {
             if let Some(v) = line.strip_prefix("Content-Length:") {
                 content_length = v.trim().parse().ok()?;
             }
+        }
+        if content_length == 0 || content_length > MAX_FRAME_BYTES {
+            return None;
         }
         let mut body = vec![0u8; content_length];
         reader.read_exact(&mut body).ok()?;
