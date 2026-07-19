@@ -26,6 +26,12 @@ nml-validate = { workspace = true }
 nml-fmt = { workspace = true }
 serde_json = { workspace = true }
 tower-lsp = { workspace = true }
+# Canonicalize WITHOUT the Windows `\\?\` verbatim prefix: `std::fs::canonicalize`
+# yields verbatim paths on Windows, which `Url::from_file_path` mishandles — and
+# the server round-trips canonicalized paths through URIs (doc lookup, roots).
+# `dunce` is byte-for-byte `std` on non-Windows, so it changes nothing on
+# Unix/WASM and fixes URI matching on Windows.
+dunce = "1"
 
 # tokio's feature surface is target-split (RFC 0035 WASM delivery). Native gets
 # the workspace's full tokio. `wasm32` (the in-editor neutral server, run under
