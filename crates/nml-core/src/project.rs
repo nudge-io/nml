@@ -169,7 +169,8 @@ impl ProjectConfig {
                     // `valid_package_name` predicate, and both consumers gate it
                     // already.
                     let tool = nested.body.entries.iter().find_map(|e| match &e.kind {
-                        BodyEntryKind::Property(p) if p.name.name == "tool" => match &p.value.value {
+                        BodyEntryKind::Property(p) if p.name.name == "tool" => match &p.value.value
+                        {
                             Value::String(s) => Some(s.clone()),
                             _ => None,
                         },

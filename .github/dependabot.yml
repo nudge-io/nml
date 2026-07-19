@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned GitHub Actions current (Dependabot bumps the commit SHA
+  # and its `# vX` comment together), so pinning stays secure without going stale.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # VS Code extension dependencies.
+  - package-ecosystem: npm
+    directory: /editors/vscode
+    schedule:
+      interval: weekly
+    groups:
+      npm:
+        patterns: ["*"]
+
+  # Rust workspace.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
