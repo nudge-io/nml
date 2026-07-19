@@ -12,6 +12,7 @@ out/**
 node_modules/**
 tsconfig.json
 esbuild.*
-**/*.map
 **/tsconfig.json
 INSTALL.md
+# dist/extension.js.map IS shipped (open-source; maps production stack traces
+# back to source and avoids a dangling sourceMappingURL reference in the bundle).
