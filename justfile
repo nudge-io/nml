@@ -8,6 +8,13 @@ build-lsp:
 build-lsp-debug:
     unset CARGO_TARGET_DIR && cargo build -p nml-lsp
 
+# Build the LSP as a WASM module — the neutral server the VS Code extension
+# bundles (`vscode:prepublish` copies it into the VSIX). Without this the VSIX
+# would ship a stale wasm, or `bundle:wasm` would fail on a fresh checkout.
+build-lsp-wasm:
+    rustup target add wasm32-wasip1
+    unset CARGO_TARGET_DIR && cargo build -p nml-lsp --target wasm32-wasip1 --release
+
 # Copy the built LSP binary to ~/.cargo/bin
 install-bin: build-lsp
     cp target/release/nml-lsp ~/.cargo/bin/nml-lsp
@@ -16,13 +23,15 @@ install-bin: build-lsp
 compile-ext:
     cd editors/vscode && npm install && npm run compile
 
-# Package the extension as a VSIX
-package-ext: compile-ext
-    cd editors/vscode && npx vsce package --allow-missing-repository
+# Package the extension as a VSIX (fresh WASM built first; old VSIXes cleared so
+# exactly one remains for install-ext to pick up regardless of version).
+package-ext: compile-ext build-lsp-wasm
+    cd editors/vscode && rm -f *.vsix && npx vsce package --allow-missing-repository
 
-# Install the VSIX into Cursor
+# Install the VSIX into Cursor (globs the single freshly-built VSIX, so a
+# version bump never breaks this).
 install-ext: package-ext
-    cursor --install-extension editors/vscode/nml-lang-0.3.0.vsix
+    cursor --install-extension editors/vscode/*.vsix
 
 # Full rebuild and reinstall: LSP binary + extension + install into Cursor
 install: install-bin install-ext
