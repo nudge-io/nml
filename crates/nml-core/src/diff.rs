@@ -147,10 +147,6 @@ impl FieldPath {
         Self { segs }
     }
 
-    pub fn segments(&self) -> &[PathSeg] {
-        &self.segs
-    }
-
     /// The field hops in order (element hops skipped) — what a consumer folds
     /// to classify. The nearest-directive rule reads these leaf-to-root; a
     /// `secret` field is always the terminal hop, so the terminal step's
@@ -212,6 +208,11 @@ fn render_key(v: &Value) -> String {
         }
         Value::Number(n) => format!("{n}"),
         Value::Bool(b) => format!("{b}"),
+        // A secret can never be an element identity in any real schema, but the
+        // diff layer is secret-safe BY CONSTRUCTION: never render one, even the
+        // `$ENV` variable name, so a future `set<secret>`/`[]secret` cannot turn
+        // a path into a leak.
+        Value::Secret(_) => "‹secret›".to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -553,7 +554,12 @@ fn diff_values_at(
                         if added.is_empty() && removed.is_empty() {
                             return;
                         }
-                        push(path, ChangeKind::SetDelta { added, removed }, new_origin, out);
+                        push(
+                            path,
+                            ChangeKind::SetDelta { added, removed },
+                            new_origin,
+                            out,
+                        );
                         return;
                     }
                 }
@@ -820,7 +826,12 @@ fn diff_collections(
     if is_set(&field.field_type) {
         for n in new {
             if !old.iter().any(|o| o.id.eq(&n.id)) {
-                push(path, ChangeKind::Added { new: n.id.render() }, elem_origin(n), out);
+                push(
+                    path,
+                    ChangeKind::Added { new: n.id.render() },
+                    elem_origin(n),
+                    out,
+                );
             }
         }
         for o in old {
@@ -884,7 +895,12 @@ fn diff_collections(
         let matched = lcs_pairs(old, new);
         for (i, n) in new.iter().enumerate() {
             if matches!(n.id, ElemId::Val(_)) && !matched.iter().any(|&(_, b)| b == i) {
-                push(path, ChangeKind::Added { new: n.id.render() }, elem_origin(n), out);
+                push(
+                    path,
+                    ChangeKind::Added { new: n.id.render() },
+                    elem_origin(n),
+                    out,
+                );
             }
         }
         for (i, o) in old.iter().enumerate() {
@@ -1355,10 +1371,16 @@ mod tests {
             PathSeg::Field(FieldStep::new("egressRate", vec![], false)),
             PathSeg::Field(FieldStep::new("rate", vec![], false)),
         ]);
-        assert_eq!(keyed.to_string(), "plugins[\"[acme]-x.v1\"].egressRate.rate");
+        assert_eq!(
+            keyed.to_string(),
+            "plugins[\"[acme]-x.v1\"].egressRate.rate"
+        );
         // Element hops are skipped when folding for classification.
         assert_eq!(
-            keyed.field_steps().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            keyed
+                .field_steps()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["plugins", "egressRate", "rate"]
         );
 
@@ -1369,6 +1391,20 @@ mod tests {
         ]);
         assert_eq!(named.to_string(), "providers.Google.clientSecret");
         assert!(named.is_secret(), "terminal secret hop drives redaction");
+
+        // Defense-in-depth: a secret can never be an element key in any real
+        // schema, but the render is secret-safe by construction — never the
+        // value, never even the $ENV variable name.
+        let secret_key = FieldPath::from_segments(vec![
+            PathSeg::Field(FieldStep::new("keys", vec![], false)),
+            PathSeg::Element(ElemKey::Key(Value::Secret("API_TOKEN".into()))),
+        ]);
+        let rendered = secret_key.to_string();
+        assert_eq!(rendered, "keys[‹secret›]");
+        assert!(
+            !rendered.contains("API_TOKEN"),
+            "secret var name must not render"
+        );
     }
 
     // -- Multi-root (RFC 0032): whole-config diff via the synthesized root. ----
@@ -1414,9 +1450,9 @@ mod tests {
 
         // install egressRate.rate reported at a precise leaf through the
         // scalar-shorthand element body. (The #live directive sits on the
-        // `egressRate` container field, so LEAF changes carry no directive of
-        // their own — the consumer classifies leaves by the nearest-directive
-        // walk, `classify_path`, exercised on the nudge side.)
+        // `egressRate` container field's hop, so the consumer classifies by
+        // folding the nearest directive over the path's field steps — exercised
+        // on the nudge side.)
         let rate = d
             .iter()
             .find(|c| p(c) == "plugins[\"[acme]-x.v1\"].egressRate.rate")
