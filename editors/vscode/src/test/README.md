@@ -1,11 +1,15 @@
 # nml extension — end-to-end tests
 
-Runs the extension in a real (headless) VS Code via
-[`@vscode/test-cli`](https://code.visualstudio.com/api/working-with-extensions/testing-extension),
-against the fixture workspace in `fixtures/ws`. These are the empirical check
-for the RFC 0035 **pull-diagnostics** model — most importantly the **cross-file
-focus-heal**: edit a schema, re-focus a dependent instance, and its diagnostics
-re-pull and clear with no server-side background sweep.
+Runs the **bundled** extension (`dist/extension.js`) in a real (headless) VS
+Code via
+[`@vscode/test-cli`](https://code.visualstudio.com/api/working-with-extensions/testing-extension).
+`.vscode-test.mjs` defines two launches (each its own VS Code / workspace):
+
+- **single-root** (`fixtures/ws`) — pull diagnostics + the **cross-file
+  focus-heal** (edit a schema, a dependent instance re-pulls and clears, with no
+  server-side background sweep).
+- **multi-root** (`fixtures/multi.code-workspace`) — the per-folder
+  `/workspaces/<name>` WASI mount + cross-folder schema resolution.
 
 ## Prerequisites
 
@@ -30,3 +34,26 @@ gate, so it is not wired into the default config. To exercise it, build the
 native `nml-lsp`, point `nml.server.path` (a `machine`-scoped user setting) at
 it via a prepared `--user-data-dir`, and re-run — the same assertions hold, the
 only difference is transport.
+
+## Debugging the extension (F5)
+
+The repo gitignores `.vscode/`, so editor launch config is each contributor's
+own. To debug interactively: build the bundle (`npm run bundle:js`, and once,
+the WASM server per the Prerequisites above — without it the neutral server
+falls back to native `~/.cargo/bin/nml-lsp`), then add a personal
+`editors/vscode/.vscode/launch.json`:
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run NML Extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"]
+    }
+  ]
+}
+```
