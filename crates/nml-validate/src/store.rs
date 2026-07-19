@@ -579,9 +579,11 @@ package demo:
         for i in 0..6 {
             let slot = dir.join(format!("0.0.{i}+aaaaaaa{i}"));
             std::fs::create_dir_all(&slot).unwrap();
+            // Backdate the slot DIRECTORY's mtime (GC ages by it). `filetime`
+            // retimes a directory cross-platform; a raw `File::open(dir)` fails
+            // on Windows ("Access is denied" — no FILE_FLAG_BACKUP_SEMANTICS).
             let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
-            let f = std::fs::File::open(&slot).unwrap();
-            f.set_modified(old).unwrap();
+            filetime::set_file_mtime(&slot, filetime::FileTime::from_system_time(old)).unwrap();
         }
         std::fs::create_dir_all(dir.join("0.0.9+fresh000")).unwrap();
         // Re-publishing (unchanged) skips GC; force one via a content change.

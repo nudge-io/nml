@@ -28,3 +28,7 @@ test-support = []
 [dev-dependencies]
 # Only the validator/`de` agreement test deserializes through `nml-core::de`.
 serde = { workspace = true }
+# Cross-platform mtime setting for the GC aging tests: `std` cannot open a
+# directory handle to retime it on Windows (needs FILE_FLAG_BACKUP_SEMANTICS);
+# `filetime::set_file_mtime` does this correctly on every platform.
+filetime = "0.2"
