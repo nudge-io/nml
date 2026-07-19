@@ -2861,20 +2861,27 @@ impl LanguageServer for NmlLanguageServer {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        let registration = Registration {
-            id: "nml-file-watcher".to_string(),
-            method: "workspace/didChangeWatchedFiles".to_string(),
-            register_options: Some(
-                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
-                    watchers: vec![FileSystemWatcher {
-                        glob_pattern: GlobPattern::String("**/*.nml".to_string()),
-                        kind: None,
-                    }],
-                })
-                .unwrap_or_default(),
-            ),
-        };
-        let _ = self.client.register_capability(vec![registration]).await;
+        // Dynamic capability registration is a server→client *request*. The wasm
+        // neutral server (RFC 0035) is driven by a synchronous pump that cannot
+        // await one, so file-watch registration is native-only; under
+        // `wasm-wasi-core` the editor host drives file events without it.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let registration = Registration {
+                id: "nml-file-watcher".to_string(),
+                method: "workspace/didChangeWatchedFiles".to_string(),
+                register_options: Some(
+                    serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                        watchers: vec![FileSystemWatcher {
+                            glob_pattern: GlobPattern::String("**/*.nml".to_string()),
+                            kind: None,
+                        }],
+                    })
+                    .unwrap_or_default(),
+                ),
+            };
+            let _ = self.client.register_capability(vec![registration]).await;
+        }
         self.client
             .log_message(MessageType::INFO, "NML language server initialized")
             .await;

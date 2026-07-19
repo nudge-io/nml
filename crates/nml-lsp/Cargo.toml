@@ -39,10 +39,16 @@ tokio = { workspace = true }
 tokio = { version = "1", default-features = false, features = [
     "rt",
     "macros",
-    "io-util",
     "sync",
     "time",
 ] }
+# The wasm synchronous pump (`lib::wasm_pump`) drives the `LspService` directly:
+# `tower` for the Service/ready/call surface, `futures` for stream draining, and
+# `serde` for framing the JSON-RPC wire. (Native drives via tower-lsp's own
+# `Server::serve`, so these are wasm-only.)
+tower = { version = "0.4", default-features = false, features = ["util"] }
+futures = { version = "0.3", default-features = false }
+serde = "1"
 
 [dev-dependencies]
 nml-validate = { workspace = true, features = ["test-support"] }
