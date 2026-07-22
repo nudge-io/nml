@@ -1126,8 +1126,14 @@ fn body_eq_bounded(a: &Body, b: &Body, depth: u32) -> bool {
                 ListItemKind::Named { name: bn, body: bb },
             ) => an.name == bn.name && body_eq_bounded(ab, bb, depth + 1),
             (
-                ListItemKind::Shorthand { value: av, body: ab },
-                ListItemKind::Shorthand { value: bv, body: bb },
+                ListItemKind::Shorthand {
+                    value: av,
+                    body: ab,
+                },
+                ListItemKind::Shorthand {
+                    value: bv,
+                    body: bb,
+                },
             ) => {
                 av.value.semantic_eq(&bv.value)
                     && match (ab, bb) {
@@ -1142,8 +1148,7 @@ fn body_eq_bounded(a: &Body, b: &Body, depth: u32) -> bool {
         }
     }
     a.entries.len() == b.entries.len()
-        && a
-            .entries
+        && a.entries
             .iter()
             .zip(&b.entries)
             .all(|(x, y)| entry_eq(x, y, depth))
@@ -1401,7 +1406,9 @@ mod tests {
                 "server s:\n    sandboxCeiling:\n        |block:\n            - egress:\n{cidrs}"
             )
         };
-        let old = parse_doc(&src("                - \"203.0.113.0/24\"\n                - \"10.0.0.0/8\"\n"));
+        let old = parse_doc(&src(
+            "                - \"203.0.113.0/24\"\n                - \"10.0.0.0/8\"\n",
+        ));
         let new = parse_doc(&src("                - \"10.0.0.0/8\"\n                - \"203.0.113.0/24\"\n                - \"198.51.100.0/24\"\n"));
         let d = diff_config(
             &idx,
@@ -1432,7 +1439,9 @@ mod tests {
         );
 
         // Cosmetic-only (reorder inside the namespace) ⇒ silence.
-        let cosmetic = parse_doc(&src("                - \"10.0.0.0/8\"\n                - \"203.0.113.0/24\"\n"));
+        let cosmetic = parse_doc(&src(
+            "                - \"10.0.0.0/8\"\n                - \"203.0.113.0/24\"\n",
+        ));
         let none = diff_config(
             &idx,
             "server",
@@ -1476,11 +1485,17 @@ mod tests {
         let b = deep_body(MAX_DEPTH + 8);
         // Identical over-deep bodies: UNEQUAL past the cap (fail-visible), and
         // critically this returns instead of overflowing the stack.
-        assert!(!body_structural_eq(&a, &b), "over-deep must compare unequal");
+        assert!(
+            !body_structural_eq(&a, &b),
+            "over-deep must compare unequal"
+        );
         // Within the cap, identical bodies still compare equal.
         let c = deep_body(8);
         let d = deep_body(8);
-        assert!(body_structural_eq(&c, &d), "shallow identical bodies are equal");
+        assert!(
+            body_structural_eq(&c, &d),
+            "shallow identical bodies are equal"
+        );
     }
 
     /// The walk's resource boundary honors the invariant: a change buried
@@ -1491,7 +1506,8 @@ mod tests {
     fn changes_below_the_walk_depth_cap_surface_visibly() {
         use crate::ast::{BodyEntry, Identifier, NestedBlock, Property};
         use crate::types::SpannedValue;
-        let schema = "model node:\n    child node?\n    v number?\n\nmodel server:\n    root node?\n";
+        let schema =
+            "model node:\n    child node?\n    v number?\n\nmodel server:\n    root node?\n";
         let (sch, errs) = crate::cst::extract_schema(schema);
         assert!(errs.is_empty(), "{errs:?}");
         let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
@@ -1570,7 +1586,11 @@ mod tests {
         let (sch, errs) = crate::cst::extract_schema(SCHEMA);
         assert!(errs.is_empty());
         // Simulate drift: drop the `limits` model the `server.limits` field references.
-        let models: Vec<_> = sch.models.into_iter().filter(|m| m.name != "limits").collect();
+        let models: Vec<_> = sch
+            .models
+            .into_iter()
+            .filter(|m| m.name != "limits")
+            .collect();
         let idx = SchemaIndex::build(models, sch.enums, sch.oneofs);
         let old = parse_doc("server s:\n    limits:\n        cap = 5\n");
         let new = parse_doc("server s:\n    limits:\n        cap = 9\n");

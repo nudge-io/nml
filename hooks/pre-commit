@@ -1,0 +1,32 @@
+#!/bin/sh
+# Versioned pre-commit hook (enable once per clone):
+#     git config core.hooksPath hooks
+#
+# Mirrors nudge's hook for the mistake classes that have actually redded CI
+# from this workspace, cheapest first:
+#
+#   1. Formatting drift — CI's first job is `cargo fmt --all --check`.
+#      (This exact class shipped once: python-patched edits in nml-core
+#      diff.rs that were check/clippy/test-green but fmt-dirty.)
+#   2. A workspace that does not compile — a sync point that fails
+#      `cargo check` poisons bisects; skip in an emergency with
+#      NML_PRECOMMIT_SKIP_CHECK=1 (never --no-verify, so 1 always runs).
+
+set -e
+
+# ── 1. formatting ───────────────────────────────────────────────────────────
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+    echo "pre-commit: cargo fmt --all --check failed — run 'cargo fmt --all' and re-stage." >&2
+    cargo fmt --all -- --check 2>&1 | grep '^Diff in' | head -10 >&2
+    exit 1
+fi
+
+# ── 2. the workspace compiles ───────────────────────────────────────────────
+if [ "${NML_PRECOMMIT_SKIP_CHECK:-0}" != "1" ]; then
+    if ! cargo check --workspace --quiet >/dev/null 2>&1; then
+        echo "pre-commit: cargo check failed — a sync point must build." >&2
+        echo "  (emergency escape: NML_PRECOMMIT_SKIP_CHECK=1 git commit …)" >&2
+        cargo check --workspace --quiet 2>&1 | grep '^error' | head -5 >&2
+        exit 1
+    fi
+fi
