@@ -19,6 +19,16 @@
 //!   keyed, references, or roles, never anonymous — so paired elements
 //!   recurse and report precise leaf paths. (This is why the RFC's `#key`
 //!   escape hatch never shipped: the language's own grammar subsumes it.)
+//!
+//! **Invariant — visible, never silent:** content the schema model cannot
+//! represent (model↔grammar drift: a shape the grammar accepts but the model
+//! does not describe) must degrade to a *visible* [`ChangeKind::OpaqueChanged`]
+//! at the nearest describable field path — never to silence. Silence is
+//! indistinguishable from equality, and for a security-classification consumer
+//! that turns drift into invisibly-skipped changes (the `|block` incident this
+//! invariant was written from). `OpaqueChanged` is payload-free by design: the
+//! schema cannot know which parts of an undescribable shape are secrets, so
+//! the only safe rendering is no rendering.
 
 use std::path::{Path, PathBuf};
 
@@ -62,6 +72,12 @@ pub enum ChangeKind {
         added: Vec<Value>,
         removed: Vec<Value>,
     },
+    /// The sides differ inside a shape the schema model cannot describe
+    /// (model↔grammar drift) — a coarse but **visible** change at the nearest
+    /// describable path (see the module-level invariant). Deliberately
+    /// payload-free: the schema cannot know which parts of an undescribable
+    /// shape are secrets, so no content is carried.
+    OpaqueChanged,
 }
 
 /// A schema-field hop along a [`FieldPath`]: its name plus the schema facts a
@@ -405,6 +421,10 @@ fn diff_model(
     out: &mut Vec<FieldChange>,
 ) {
     if depth >= MAX_DEPTH {
+        // The resource boundary honors the module invariant: content the walk
+        // cannot descend into is structurally compared and surfaces as a
+        // visible OpaqueChanged when it differs — never silently truncated.
+        opaque_if_different(old, new, prefix, out);
         return;
     }
     for field in &model.fields {
@@ -676,7 +696,65 @@ fn diff_bodies(
     };
     if let Some(model) = resolve_instance_model(index, &field.field_type, n, o) {
         diff_model(index, model, o, n, path, depth + 1, out)
+    } else {
+        // Bodies that neither arms, elements, nor a resolvable model consumed:
+        // a shape the schema cannot describe (model↔grammar drift — a renamed/
+        // missing model, an unknown oneof variant, a body under a scalar-typed
+        // field). Visible, never silent (module invariant).
+        opaque_if_different(o, n, path, out);
     }
+}
+
+/// Ordered structural equality over collection elements at the walk's resource
+/// boundary: identities and (depth-bounded) bodies. Conservative like the body
+/// comparison — order differences read as changed.
+fn elems_structural_eq(old: &[Elem<'_>], new: &[Elem<'_>]) -> bool {
+    old.len() == new.len()
+        && old.iter().zip(new).all(|(o, n)| {
+            o.id.eq(&n.id)
+                && match (o.body, n.body) {
+                    (Some(a), Some(b)) => body_structural_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                }
+        })
+}
+
+/// Emit a payload-free [`ChangeKind::OpaqueChanged`] iff the two sides'
+/// undescribable bodies differ structurally (span-ignoring — a cosmetic-only
+/// edit stays quiet, preserving the no-op property). Payload-free because the
+/// schema cannot know which parts of an undescribable shape are secrets.
+///
+/// The comparison is the per-file body SEQUENCE (an undescribable shape has no
+/// merge semantics to apply), so re-splitting identical content across files
+/// conservatively reads as changed — visible, never silent, per the invariant.
+fn opaque_if_different(
+    old: &[(PathBuf, &Body)],
+    new: &[(PathBuf, &Body)],
+    path: &FieldPath,
+    out: &mut Vec<FieldChange>,
+) {
+    let eq = old.len() == new.len()
+        && old
+            .iter()
+            .zip(new)
+            .all(|((_, a), (_, b))| body_structural_eq(a, b));
+    if eq {
+        return;
+    }
+    let origin = new
+        .first()
+        .or_else(|| old.first())
+        .map(|(f, b)| Origin::File {
+            file: f.clone(),
+            span: b
+                .entries
+                .first()
+                .map(|e| e.span)
+                .unwrap_or(Span { start: 0, end: 0 }),
+        })
+        .unwrap_or(Origin::Default);
+    push(path, ChangeKind::OpaqueChanged, origin, out);
 }
 
 /// Resolve the model a nested instance validates against — following model
@@ -830,6 +908,19 @@ fn diff_collections(
     depth: u32,
     out: &mut Vec<FieldChange>,
 ) {
+    if depth >= MAX_DEPTH {
+        // Same invariant at the collections boundary: compare what we cannot
+        // walk; differ ⇒ visible OpaqueChanged, identical ⇒ silence.
+        if !elems_structural_eq(old, new) {
+            let origin = new
+                .first()
+                .or_else(|| old.first())
+                .map(elem_origin)
+                .unwrap_or(Origin::Default);
+            push(path, ChangeKind::OpaqueChanged, origin, out);
+        }
+        return;
+    }
     if is_set(&field.field_type) {
         for n in new {
             if !old.iter().any(|o| o.id.eq(&n.id)) {
@@ -894,6 +985,24 @@ fn diff_collections(
             resolve_instance_model(index, elem_type(&field.field_type), &n_files, &o_files)
         {
             diff_model(index, model, &o_files, &n_files, &elem_path, depth + 1, out);
+        } else {
+            // Scalar-typed elements whose bodies carry config content — e.g.
+            // `|block set<string>` with namespaced `- egress:` entries (the RFC
+            // 0032 |block blind spot): there is no model to recurse into, but
+            // the content is still list items. Complete the recursion: diff the
+            // bodies' own items with the PARENT collection's semantics at the
+            // element path — full per-element fidelity with real origins.
+            let o_items = Effective::Bodies(o_files.clone());
+            let n_items = Effective::Bodies(n_files.clone());
+            let o_items = collect_elems(&o_items);
+            let n_items = collect_elems(&n_items);
+            if !o_items.is_empty() || !n_items.is_empty() {
+                diff_collections(index, field, &o_items, &n_items, &elem_path, depth + 1, out);
+            } else {
+                // No items AND no model: content the schema cannot describe —
+                // visible, never silent (module invariant).
+                opaque_if_different(&o_files, &n_files, &elem_path, out);
+            }
         }
     }
     if !is_set(&field.field_type) {
@@ -929,12 +1038,122 @@ fn diff_collections(
 
 /// Longest-common-subsequence pairing over element identity (Myers-class,
 /// O(n·m) DP — trivial at config scale).
+/// Canonical single-arm rendering ("sel -> target") — shared by the wholesale
+/// arms diff and the structural body equality, so the two can never disagree
+/// about what an arm "is".
+fn render_arm(a: &crate::ast::Arm) -> String {
+    use crate::ast::{ArmSelector, ArmTarget};
+    let sel = match &a.selector {
+        ArmSelector::Role(r) => r.as_str(),
+        ArmSelector::Else => "else",
+    };
+    let tgt = match &a.target {
+        ArmTarget::Reference(id) => id.name.clone(),
+        ArmTarget::Literal { value, .. } => format!("{value:?}"),
+    };
+    format!("{sel} -> {tgt}")
+}
+
+/// Span-ignoring structural equality over config-instance bodies — the
+/// comparison behind [`ChangeKind::OpaqueChanged`] (see the module invariant).
+/// Order-sensitive by design: in a shape the schema cannot describe, the differ
+/// cannot know whether order carries meaning, so a reorder is conservatively a
+/// visible change. Comments never reach the AST, so trivia cannot false-positive;
+/// `Value` comparison is `semantic_eq` (spans ignored, secrets by name).
+/// Authoring-only constructs (`FieldDefinition`, modifier `TypeAnnotation`)
+/// carry no config values, so they compare equal by construction — a schema-side
+/// edit is not a config change.
+fn body_structural_eq(a: &Body, b: &Body) -> bool {
+    // Depth-bounded like every diff walk (`MAX_DEPTH`). The parser also caps
+    // nesting (RFC 0004 §9), so parsed input cannot get here over-deep — this
+    // bound is defense-in-depth for programmatically-built ASTs and against
+    // drift between the two caps. Exceeding it compares UNEQUAL — fail-visible
+    // (an OpaqueChanged), never silently equal (the invariant), never a
+    // stack overflow.
+    body_eq_bounded(a, b, 0)
+}
+
+fn body_eq_bounded(a: &Body, b: &Body, depth: u32) -> bool {
+    if depth >= MAX_DEPTH {
+        return false;
+    }
+    fn entry_eq(a: &BodyEntry, b: &BodyEntry, depth: u32) -> bool {
+        use crate::ast::SharedPropertyKind;
+        match (&a.kind, &b.kind) {
+            (BodyEntryKind::Property(x), BodyEntryKind::Property(y)) => {
+                x.name.name == y.name.name && x.value.value.semantic_eq(&y.value.value)
+            }
+            (BodyEntryKind::NestedBlock(x), BodyEntryKind::NestedBlock(y)) => {
+                x.name.name == y.name.name && body_eq_bounded(&x.body, &y.body, depth + 1)
+            }
+            (BodyEntryKind::Modifier(x), BodyEntryKind::Modifier(y)) => {
+                x.name.name == y.name.name && modifier_value_eq(&x.value, &y.value, depth)
+            }
+            (BodyEntryKind::SharedProperty(x), BodyEntryKind::SharedProperty(y)) => {
+                x.name.name == y.name.name
+                    && match (&x.kind, &y.kind) {
+                        (SharedPropertyKind::Block(bx), SharedPropertyKind::Block(by)) => {
+                            body_eq_bounded(bx, by, depth + 1)
+                        }
+                        (SharedPropertyKind::Scalar(vx), SharedPropertyKind::Scalar(vy)) => {
+                            vx.value.semantic_eq(&vy.value)
+                        }
+                        _ => false,
+                    }
+            }
+            (BodyEntryKind::ListItem(x), BodyEntryKind::ListItem(y)) => list_item_eq(x, y, depth),
+            (BodyEntryKind::Arm(x), BodyEntryKind::Arm(y)) => render_arm(x) == render_arm(y),
+            // Authoring constructs carry no config values.
+            (BodyEntryKind::FieldDefinition(_), BodyEntryKind::FieldDefinition(_)) => true,
+            _ => false,
+        }
+    }
+    fn modifier_value_eq(a: &ModifierValue, b: &ModifierValue, depth: u32) -> bool {
+        match (a, b) {
+            (ModifierValue::Inline(x), ModifierValue::Inline(y)) => x.value.semantic_eq(&y.value),
+            (ModifierValue::Block(x), ModifierValue::Block(y)) => {
+                x.len() == y.len() && x.iter().zip(y).all(|(i, j)| list_item_eq(i, j, depth))
+            }
+            // Authoring construct: carries no config values.
+            (ModifierValue::TypeAnnotation { .. }, ModifierValue::TypeAnnotation { .. }) => true,
+            _ => false,
+        }
+    }
+    fn list_item_eq(a: &ListItem, b: &ListItem, depth: u32) -> bool {
+        match (&a.kind, &b.kind) {
+            (
+                ListItemKind::Named { name: an, body: ab },
+                ListItemKind::Named { name: bn, body: bb },
+            ) => an.name == bn.name && body_eq_bounded(ab, bb, depth + 1),
+            (
+                ListItemKind::Shorthand { value: av, body: ab },
+                ListItemKind::Shorthand { value: bv, body: bb },
+            ) => {
+                av.value.semantic_eq(&bv.value)
+                    && match (ab, bb) {
+                        (Some(x), Some(y)) => body_eq_bounded(x, y, depth + 1),
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }
+            (ListItemKind::Reference(x), ListItemKind::Reference(y)) => x.name == y.name,
+            (ListItemKind::Role(x), ListItemKind::Role(y)) => x == y,
+            _ => false,
+        }
+    }
+    a.entries.len() == b.entries.len()
+        && a
+            .entries
+            .iter()
+            .zip(&b.entries)
+            .all(|(x, y)| entry_eq(x, y, depth))
+}
+
 /// The effective arm list of a routing block, rendered canonically
 /// ("sel -> target; ..."), with the winning file's origin. Last file carrying
 /// arms wins wholesale (arms are ordered first-match — order IS meaning, so a
 /// reorder is honestly a change).
 fn collect_arms(e: &Effective) -> Option<(String, Origin)> {
-    use crate::ast::{ArmSelector, ArmTarget};
     let bodies: &[(PathBuf, &Body)] = match e {
         Effective::Bodies(b) => b,
         _ => return None,
@@ -949,15 +1168,7 @@ fn collect_arms(e: &Effective) -> Option<(String, Origin)> {
     for entry in &body.entries {
         if let BodyEntryKind::Arm(a) = &entry.kind {
             first_span.get_or_insert(a.selector_span);
-            let sel = match &a.selector {
-                ArmSelector::Role(r) => r.as_str(),
-                ArmSelector::Else => "else",
-            };
-            let tgt = match &a.target {
-                ArmTarget::Reference(id) => id.name.clone(),
-                ArmTarget::Literal { value, .. } => format!("{value:?}"),
-            };
-            rendered.push(format!("{sel} -> {tgt}"));
+            rendered.push(render_arm(a));
         }
     }
     Some((
@@ -1174,6 +1385,250 @@ mod tests {
     }
 
     /// The flagship consumer path (nudge RFC 0031): `server → sandboxCeiling
+    /// THE |block blind-spot fix (RFC 0032): the VALIDATED namespaced form
+    /// (`|block: - egress:` + nested CIDR list) — elements pair by namespace
+    /// name and their scalar bodies diff with the parent set's semantics at the
+    /// element path. Full per-element fidelity, real origins, #live reachable;
+    /// a reorder-only edit inside the namespace stays invisible.
+    #[test]
+    fn namespaced_set_elements_diff_with_full_fidelity() {
+        let schema = "model ceiling:\n    |block set<string>? #live\n\nmodel server:\n    sandboxCeiling ceiling?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let src = |cidrs: &str| {
+            format!(
+                "server s:\n    sandboxCeiling:\n        |block:\n            - egress:\n{cidrs}"
+            )
+        };
+        let old = parse_doc(&src("                - \"203.0.113.0/24\"\n                - \"10.0.0.0/8\"\n"));
+        let new = parse_doc(&src("                - \"10.0.0.0/8\"\n                - \"203.0.113.0/24\"\n                - \"198.51.100.0/24\"\n"));
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("server.nml"), server_body(&old))],
+            &[(PathBuf::from("server.nml"), server_body(&new))],
+        );
+        assert_eq!(d.len(), 1, "reorder invisible, one addition: {d:?}");
+        // Identifier element keys render DOTTED (the ElemKey convention;
+        // bracketed-quoted is reserved for scalar keys that may contain dots).
+        assert_eq!(p(&d[0]), "sandboxCeiling.|block.egress");
+        assert!(
+            matches!(&d[0].kind, ChangeKind::Added { new }
+                if new.semantic_eq(&Value::String("198.51.100.0/24".into()))),
+            "{d:?}"
+        );
+        // #live on the |block hop still folds for classification.
+        assert!(
+            d[0].path
+                .field_steps()
+                .any(|f| f.directives.iter().any(|dir| dir.name == "live")),
+            "{d:?}"
+        );
+        assert!(
+            matches!(&d[0].origin, Origin::File { .. }),
+            "real file origin: {:?}",
+            d[0].origin
+        );
+
+        // Cosmetic-only (reorder inside the namespace) ⇒ silence.
+        let cosmetic = parse_doc(&src("                - \"10.0.0.0/8\"\n                - \"203.0.113.0/24\"\n"));
+        let none = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("server.nml"), server_body(&old))],
+            &[(PathBuf::from("server.nml"), server_body(&cosmetic))],
+        );
+        assert!(none.is_empty(), "{none:?}");
+    }
+
+    /// The structural equality's depth bound (defense-in-depth): the PARSER
+    /// already caps nesting (RFC 0004 §9 — over-deep blocks are skipped, in
+    /// strict AND best-effort modes), so parsed input can never reach this
+    /// bound; it guards programmatically-built ASTs and any future drift
+    /// between the parser's cap and the differ's. Past `MAX_DEPTH` the
+    /// comparison is UNEQUAL — fail-VISIBLE (an `OpaqueChanged` on identical
+    /// content), never a stack overflow, never silence.
+    #[test]
+    fn over_deep_bodies_fail_visible_not_stack_overflow() {
+        use crate::ast::{BodyEntry, Identifier, NestedBlock};
+        fn deep_body(levels: u32) -> Body {
+            let mut body = Body {
+                entries: Vec::new(),
+            };
+            for i in 0..levels {
+                body = Body {
+                    entries: vec![BodyEntry {
+                        span: Span { start: 0, end: 0 },
+                        kind: BodyEntryKind::NestedBlock(NestedBlock {
+                            name: Identifier {
+                                name: format!("n{i}"),
+                                span: Span { start: 0, end: 0 },
+                            },
+                            body,
+                        }),
+                    }],
+                };
+            }
+            body
+        }
+        let a = deep_body(MAX_DEPTH + 8);
+        let b = deep_body(MAX_DEPTH + 8);
+        // Identical over-deep bodies: UNEQUAL past the cap (fail-visible), and
+        // critically this returns instead of overflowing the stack.
+        assert!(!body_structural_eq(&a, &b), "over-deep must compare unequal");
+        // Within the cap, identical bodies still compare equal.
+        let c = deep_body(8);
+        let d = deep_body(8);
+        assert!(body_structural_eq(&c, &d), "shallow identical bodies are equal");
+    }
+
+    /// The walk's resource boundary honors the invariant: a change buried
+    /// DEEPER than the walk cap surfaces as a visible `OpaqueChanged` (the walk
+    /// compares what it cannot descend into), while identical over-deep content
+    /// stays silent — never silent truncation of a real change.
+    #[test]
+    fn changes_below_the_walk_depth_cap_surface_visibly() {
+        use crate::ast::{BodyEntry, Identifier, NestedBlock, Property};
+        use crate::types::SpannedValue;
+        let schema = "model node:\n    child node?\n    v number?\n\nmodel server:\n    root node?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        // Hand-build a chain deeper than the walk cap with `v = <leaf>` at the bottom.
+        fn chain(levels: u32, leaf: i64) -> Body {
+            let nospan = Span { start: 0, end: 0 };
+            let mut body = Body {
+                entries: vec![BodyEntry {
+                    span: nospan,
+                    kind: BodyEntryKind::Property(Property {
+                        name: Identifier {
+                            name: "v".into(),
+                            span: nospan,
+                        },
+                        value: SpannedValue {
+                            value: Value::Number(leaf.into()),
+                            span: nospan,
+                        },
+                    }),
+                }],
+            };
+            for _ in 0..levels {
+                body = Body {
+                    entries: vec![BodyEntry {
+                        span: nospan,
+                        kind: BodyEntryKind::NestedBlock(NestedBlock {
+                            name: Identifier {
+                                name: "child".into(),
+                                span: nospan,
+                            },
+                            body,
+                        }),
+                    }],
+                };
+            }
+            Body {
+                entries: vec![BodyEntry {
+                    span: nospan,
+                    kind: BodyEntryKind::NestedBlock(NestedBlock {
+                        name: Identifier {
+                            name: "root".into(),
+                            span: nospan,
+                        },
+                        body,
+                    }),
+                }],
+            }
+        }
+        let old = chain(MAX_DEPTH + 8, 1);
+        let new = chain(MAX_DEPTH + 8, 2);
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("server.nml"), &old)],
+            &[(PathBuf::from("server.nml"), &new)],
+        );
+        assert_eq!(d.len(), 1, "a change below the cap must be VISIBLE: {d:?}");
+        assert!(matches!(d[0].kind, ChangeKind::OpaqueChanged), "{d:?}");
+
+        // Identical over-deep content ⇒ silence (no false positives at the cap).
+        let same = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("server.nml"), &old)],
+            &[(PathBuf::from("server.nml"), &old)],
+        );
+        assert!(same.is_empty(), "{same:?}");
+    }
+
+    /// Model↔grammar drift, shape 1 — a `ModelRef` to a model MISSING from the
+    /// index (renamed/deleted model): the instance's bodies cannot be walked,
+    /// so the change degrades to a VISIBLE payload-free `OpaqueChanged` at the
+    /// field path (module invariant), and an identical no-op stays silent.
+    #[test]
+    fn unknown_model_ref_drift_degrades_visible_never_silent() {
+        let (sch, errs) = crate::cst::extract_schema(SCHEMA);
+        assert!(errs.is_empty());
+        // Simulate drift: drop the `limits` model the `server.limits` field references.
+        let models: Vec<_> = sch.models.into_iter().filter(|m| m.name != "limits").collect();
+        let idx = SchemaIndex::build(models, sch.enums, sch.oneofs);
+        let old = parse_doc("server s:\n    limits:\n        cap = 5\n");
+        let new = parse_doc("server s:\n    limits:\n        cap = 9\n");
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("server.nml"), server_body(&old))],
+            &[(PathBuf::from("server.nml"), server_body(&new))],
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(p(&d[0]), "limits");
+        assert!(matches!(d[0].kind, ChangeKind::OpaqueChanged), "{d:?}");
+
+        // Identical content under the unknown model ⇒ silence (no-op preserved).
+        let same = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("server.nml"), server_body(&old))],
+            &[(PathBuf::from("server.nml"), server_body(&old))],
+        );
+        assert!(same.is_empty(), "{same:?}");
+    }
+
+    /// Model↔grammar drift, shape 2 — an UNKNOWN oneof discriminator variant:
+    /// the variant's body cannot be resolved, so the change is a visible
+    /// `OpaqueChanged`, and — the security property — the payload carries NO
+    /// value from the body (the schema cannot know what is secret in an
+    /// undescribable shape).
+    #[test]
+    fn unknown_oneof_variant_degrades_visible_and_leaks_nothing() {
+        let schema = "oneof email by kind:\n    \"log\" -> emailLog\n\nmodel emailLog:\n    path string?\n\nmodel server:\n    email email?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let old = parse_doc(
+            "server s:\n    email:\n        kind = \"smtp\"\n        password = \"hunter2\"\n",
+        );
+        let new = parse_doc(
+            "server s:\n    email:\n        kind = \"smtp\"\n        password = \"hunter3\"\n",
+        );
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("server.nml"), server_body(&old))],
+            &[(PathBuf::from("server.nml"), server_body(&new))],
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(p(&d[0]), "email");
+        assert!(matches!(d[0].kind, ChangeKind::OpaqueChanged), "{d:?}");
+        // Payload-free: the change's debug rendering must not contain the
+        // secret-looking values from either side's body.
+        let rendered = format!("{:?}", d[0]);
+        assert!(
+            !rendered.contains("hunter2") && !rendered.contains("hunter3"),
+            "OPAQUE CHANGE LEAKED BODY CONTENT: {rendered}"
+        );
+    }
+
     /// (#live container) → |block set<string>` written BLOCK-FORM — element
     /// deltas with the container's classification reachable, secret-free, and
     /// a pure reorder invisible. Exercises NestedBlock→Bodies overlay,

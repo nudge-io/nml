@@ -1,0 +1,46 @@
+# cargo-deny — supply-chain & license gate for the NML language crates.
+#
+#     cargo deny check licenses advisories sources
+#
+# NML is open source (MIT OR Apache-2.0). This gate keeps that offering clean:
+#   • licenses   — deps must be permissively licensed; any strong copyleft
+#                  (GPL/AGPL/LGPL/SSPL) that would encumber NML's MIT/Apache
+#                  distribution fails the gate.
+#   • advisories — fails on any dependency with a known RustSec vulnerability.
+#   • sources    — dependencies may come ONLY from crates.io.
+#
+# https://embarkstudios.github.io/cargo-deny/
+
+[licenses]
+# Permissive licenses only — compatible with redistributing NML under
+# MIT OR Apache-2.0. Strong copyleft (GPL/AGPL/LGPL/SSPL) is deliberately absent
+# and therefore denied. Dual-licensed crates pass by electing a permissive side.
+# NML's own crates are `MIT OR Apache-2.0`, covered by the entries below.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "CC0-1.0",
+    "MPL-2.0",                 # weak, file-level copyleft — compatible unmodified
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+
+[advisories]
+# The RustSec advisory database is fetched at check time; a known vulnerability
+# in any dependency is a hard failure. Record reviewed, accepted risks here:
+#   ignore = [{ id = "RUSTSEC-2024-0001", reason = "not reachable from our build" }]
+ignore = []
+# Only flag unmaintained crates we own/depend on directly — deep transitive
+# unmaintained crates are rarely actionable. Vulnerabilities always fail.
+unmaintained = "workspace"
+
+[sources]
+# Dependencies may come ONLY from crates.io. No git or alternative-registry deps
+# exist today; one silently sourced from an untrusted git repo would fail here.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

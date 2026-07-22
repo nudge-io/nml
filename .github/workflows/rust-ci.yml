@@ -24,6 +24,19 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # Supply-chain & license gate (see deny.toml): permissive-only dep licenses +
+  # RustSec security advisories + a crates.io-only source policy. Reads the
+  # dependency graph — no build needed.
+  supply-chain:
+    name: licenses · advisories · sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2 (cargo-deny 0.20.2)
+        with:
+          command: check licenses advisories sources
+
   test:
     name: test (${{ matrix.os }})
     strategy:
