@@ -1,0 +1,5 @@
+model notifiable:
+    other string?
+
+notifiable N:
+    other = "x"

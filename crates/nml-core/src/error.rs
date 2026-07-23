@@ -75,10 +75,6 @@ pub enum NmlError {
     #[error("{}", kind.message())]
     Lex { kind: ParseErrorKind, span: Span },
 
-    /// A semantic validation error (e.g., duplicate declarations).
-    #[error("{message}")]
-    Validation { message: String, span: Span },
-
     /// An invalid money literal (e.g., bad currency code).
     #[error("invalid money value: {message}")]
     InvalidMoney {
@@ -98,7 +94,6 @@ impl NmlError {
         match self {
             NmlError::Parse { span, .. }
             | NmlError::Lex { span, .. }
-            | NmlError::Validation { span, .. }
             | NmlError::InvalidMoney { span, .. } => *span,
         }
     }
@@ -108,9 +103,7 @@ impl NmlError {
     pub fn message(&self) -> String {
         match self {
             NmlError::Parse { kind, .. } | NmlError::Lex { kind, .. } => kind.message(),
-            NmlError::Validation { message, .. } | NmlError::InvalidMoney { message, .. } => {
-                message.clone()
-            }
+            NmlError::InvalidMoney { message, .. } => message.clone(),
         }
     }
 
@@ -144,7 +137,6 @@ impl NmlError {
                     None => diag,
                 }
             }
-            _ => diag,
         }
     }
 

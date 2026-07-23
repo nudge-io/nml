@@ -127,6 +127,22 @@ Role references can contain path variables that are matched at runtime:
 
 This matches any role where `{org}` and `{dept}` are filled in with actual values.
 
+## Role Conjunctions
+
+A single `&` between role references forms a **conjunction** — one selector
+value carrying every atom (RFC 0014):
+
+```
+|allow = [@role/admin & @role/editor, @plan/Pro]
+```
+
+A selector list is a disjunction (any entry may grant); `&` composes
+*within* an entry. The language carries the expression opaquely and
+canonicalizes its text to the `" & "`-joined form; consumers assign the
+AND semantics (for nudge: the identity must match every atom). Arm
+selectors (`@selector -> target`) name exactly one selector — conjunctions
+are not accepted there.
+
 ## Modeling Access Control
 
 The `accessControlled` trait captures the `|allow` / `|deny` pattern for reuse
@@ -134,8 +150,8 @@ across models:
 
 ```
 trait accessControlled:
-    |allow []@roleRef
-    |deny []@roleRef
+    |allow []role?
+    |deny []role?
 
 model service is accessControlled:
     localMount path

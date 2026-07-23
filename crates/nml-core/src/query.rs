@@ -93,6 +93,20 @@ impl<'a> Document<'a> {
         ValueQuery::NotFound
     }
 
+    /// Look up a top-level array declaration (`[]keyword Name:`) by its
+    /// name, returning its body — items, shared properties, properties,
+    /// modifiers. Reference assignments (`endpoints = Name`) point at these;
+    /// `defaults::from_document_defaulted` materializes them (RFC 0013).
+    pub fn array_body(&self, name: &str) -> Option<&'a ArrayBody> {
+        self.file
+            .declarations
+            .iter()
+            .find_map(|decl| match &decl.kind {
+                DeclarationKind::Array(a) if a.name.name == name => Some(&a.body),
+                _ => None,
+            })
+    }
+
     /// Get all declaration names and keywords in the file.
     pub fn declarations(&self) -> Vec<(&'a str, &'a str)> {
         let mut result = Vec::new();

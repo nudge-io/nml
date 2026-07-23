@@ -15,7 +15,6 @@ model modelName:
     fieldName fieldType
     fieldName fieldType = defaultValue
     fieldName fieldType?
-    fieldName fieldType <constraint, ...>
 ```
 
 ### Field Presence Rules
@@ -29,30 +28,6 @@ model webProfile:
     siteName string                // required
     debug logLevel?                // optional
     sessionDuration duration = "24h"  // has default
-```
-
-### Constraints
-
-Constraints are specified in angle brackets after the type:
-
-| Constraint | Applies to | Description |
-|------------|-----------|-------------|
-| `<unique>` | any | Value must be unique across all instances |
-| `<secret>` | string | Masked in logs, supports `$ENV.X` resolution |
-| `<token>` | string | Used as a lookup identifier |
-| `<distinct>` | lists | All items must be unique |
-| `<integer>` | number | Must be a whole number |
-| `<min = N>` | number | Minimum value (inclusive) |
-| `<max = N>` | number | Maximum value (inclusive) |
-| `<minLength = N>` | string | Minimum string length |
-| `<maxLength = N>` | string | Maximum string length |
-| `<pattern = "re">` | string | Must match the regex pattern |
-| `<currency = "X">` | money | Restrict accepted ISO 4217 codes |
-
-Multiple constraints are comma-separated:
-
-```
-port number <integer, min = 1, max = 65535>
 ```
 
 ### Inline Nested Objects
@@ -74,7 +49,10 @@ For reuse, extract it into its own model.
 
 ### Shared Properties (`.` prefix)
 
-The `.` prefix defines a property inherited by all children of a list:
+The `.` prefix defines a property inherited by the list items of the body
+it appears in — each body is its own scope, at any nesting depth (see
+[syntax.md](syntax.md) §Shared Properties for the scope and precedence
+rules):
 
 ```
 model endpoint:
@@ -218,7 +196,7 @@ from standard NML:
 
 ```
 // Model definition
-model service (accessControlled):
+model service is accessControlled:
     localMount path
     resources []resource
     endpoints []endpoint

@@ -55,6 +55,10 @@ pub enum StoreError {
     Write { detail: String },
 }
 
+/// `StoreError` participates in standard error handling; variants carry
+/// rendered detail strings, so there is no `source()` chain.
+impl std::error::Error for StoreError {}
+
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

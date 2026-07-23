@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```toml
 [dependencies]
-nml-core = { git = "https://github.com/nicknudge/nml" }   # crates.io release: soon
+nml-core = { git = "https://github.com/nudge-io/nml" }   # crates.io release: soon
 serde = { version = "1", features = ["derive"] }
 ```
 
@@ -99,6 +99,11 @@ serde = { version = "1", features = ["derive"] }
   the secret value never lives in the committed file
 - **Access control built in** — `|allow` / `|deny` modifiers with roles and
   parameterized role references
+- **Self-validating files** — schema and config compose into one
+  namespace, so a single file with `model` + instances fully validates
+  (`nml check app.nml`, no flags); under a shipped schema package the
+  vocabulary is closed instead, so tenant files can't redefine or extend
+  your schemas
 - **Serde-native embedding** — parse → resolve → apply schema defaults →
   deserialize into your structs; or use the fluent query API without serde
 - **Semantic config diff** — schema-aware change detection with structured
@@ -116,7 +121,7 @@ serde = { version = "1", features = ["derive"] }
 
 ```bash
 # installs the `nml` binary (until the crates.io release, use:
-#   cargo install --git https://github.com/nicknudge/nml nml-cli)
+#   cargo install --git https://github.com/nudge-io/nml nml-cli)
 cargo install nml-cli
 
 nml parse <file>                  # dump the AST as JSON (reports ALL errors)

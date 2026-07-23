@@ -398,6 +398,432 @@ notifiable Alerts:
 **Fix:** instantiate a model that mixes the trait in with `is`, or
 promote the trait to a `model` if it really is a standalone block type.
 
+## NML2025
+
+**A mixin listed twice.** The same model/trait appears more than once in
+one `is` clause. The merge is idempotent — nothing breaks — but the
+duplicate is noise, usually copy-paste residue or a rename that collapsed
+two parents into one. (Transitive "diamonds" — `x is a, b` where `b`
+itself mixes in `a` — are fine and never flagged; that composition is the
+point of mixins.)
+
+```nml check expect-output='[NML2025]'
+trait monitored:
+    timeout duration = "5s"
+
+model endpoint is monitored, monitored:
+    url string+
+```
+
+**Fix:** delete the duplicate entry.
+
+## NML2026
+
+**In-file definitions under a closed binding.** This file is validated by
+a schema **package binding** — a tool's published, composed schema set —
+and that set is the entire vocabulary, so `model`/`trait`/`enum`/`oneof`
+definitions authored in the file have no effect: they type nothing, and a
+keyword they would introduce still fails strict validation as unknown. A
+warning in lenient validation; an **error** under strict. (Outside package
+bindings — plain `nml check` — in-file definitions are first-class and
+type the file's own instances.)
+
+```nml fragment
+// In a file bound by a tool's schema package:
+model smuggled:      // NML2026 — has no effect here
+    x string?
+
+smuggled Foo:        // still an unknown keyword under strict
+    x = "boo"
+```
+
+**Fix:** remove the definitions, or move them into the tool's schema
+package where they become real vocabulary.
+
+## NML2027
+
+**Duplicate enum variant.** The same variant appears more than once (both
+authored forms — `- "a"` and `- a` — name one variant). Harmless at
+runtime, definitely unintended.
+
+```nml check expect-output='[NML2027]'
+enum level:
+    - "info"
+    - info
+```
+
+**Fix:** delete the duplicate.
+
+## NML2028
+
+**Empty enum.** The enum declares no variants, so no value can ever
+satisfy a field it types — and a `oneof … as` clause can never cover it.
+A warning (an enum is transiently empty while you type it); make it a
+hard gate with `--strict` in CI.
+
+```nml check expect-output='[NML2028]'
+enum pending:
+```
+
+**Fix:** add variants, or remove the enum until it has some.
+
+## NML2029
+
+**Invalid duration.** A `duration`-typed value must match the spec grammar
+— an unsigned integer immediately followed by one unit: `h`, `m`, `s`, or
+`ms` (`"72h"`, `"30m"`, `"5s"`, `"500ms"`). No sign, no decimals, no
+compound forms.
+
+```nml check expect-error='[NML2029]'
+model job:
+    timeout duration
+
+job Nightly:
+    timeout = "30x"
+```
+
+**Fix:** use a valid unit (`"30s"`).
+
+## NML2030
+
+**Duplicate set element.** `set<T>` elements are unique by definition;
+identity is value-level (the same value admitted via different union arms
+is still one element). The second occurrence is flagged.
+
+```nml check expect-error='[NML2030]'
+model deploy:
+    regions set<string>
+
+deploy Prod:
+    regions = ["us-east", "us-east"]
+```
+
+**Fix:** remove the duplicate element.
+
+## NML2031
+
+**Non-arm entry in an arms body.** A `(K -> V)`-typed field's body holds
+only routing arms (`@selector -> target`, `else -> target`); a plain
+property has no meaning there.
+
+```nml check expect-error='[NML2031]'
+model service:
+    landing (role -> string)?
+
+service Api:
+    landing:
+        theme = "dark"
+```
+
+**Fix:** write arms (`@role/admin -> "ops"`), or move the property out of
+the arms body.
+
+## NML2032
+
+**No union variant matches.** The value matches none of the union type's
+variants.
+
+```nml check expect-error='[NML2032]'
+model service:
+    contact (string | []string)?
+
+service Api:
+    contact = 7
+```
+
+**Fix:** supply one of the listed shapes.
+
+## NML2033
+
+**Type composition with no instance form.** RFC 0007 §4.3: an arm set
+(`(K -> V)`) describes a field's *body*, so it cannot appear where a body
+can never hold arms — as an array/set element, an arm-set key or target,
+or a modifier's declared type. A union may carry at most one arm-set
+variant (body shape selects the variant; a second arm-set variant would be
+unreachable).
+
+```nml check expect-error='[NML2033]'
+model service:
+    |landing (role -> string)?
+```
+
+**Fix:** restructure the type — e.g. declare the routing as a plain field
+(`landing (role -> string)?`), which modifiers can then reference.
+
+## NML2034
+
+**Misplaced field definition.** `name type` field definitions belong in
+`model`/`trait` declarations; in other blocks they have no meaning.
+
+```nml check expect-error='[NML2034]'
+model widget:
+    name string?
+
+service Api:
+    port number
+```
+
+**Fix:** move the definition into a model, or write an instance property
+(`port = 8080`).
+
+## NML2035
+
+**Routing arms in a schema declaration.** A declaration carries the
+`(K -> V)` *type*; the arms themselves belong in instance blocks.
+
+```nml check expect-error='[NML2035]'
+model service:
+    @role/admin -> "ops"
+```
+
+**Fix:** declare `landing (role -> string)?` here and write the arms in
+the instance.
+
+## NML2036
+
+**Duplicate arm.** An arm set repeats a selector — a second `else`, or the
+same arm key twice. Arms match first-to-last, so the duplicate could never
+apply.
+
+```nml check expect-error='[NML2036]'
+model service:
+    landing (role -> string)?
+
+service Api:
+    landing:
+        else -> "status"
+        else -> "ops"
+```
+
+**Fix:** remove the duplicate arm.
+
+## NML2037
+
+**Unreachable arm.** An arm after `else` can never match — `else` is the
+catch-all, so it must be the final arm.
+
+```nml check expect-error='[NML2037]'
+model service:
+    landing (role -> string)?
+
+service Api:
+    landing:
+        else -> "status"
+        @role/admin -> "ops"
+```
+
+**Fix:** move `else` to the end.
+
+## NML2038
+
+**Arm key mismatch.** The arm's selector does not conform to the arm set's
+declared key type.
+
+```nml check expect-error='[NML2038]'
+model service:
+    landing (string -> string)?
+
+service Api:
+    landing:
+        @role/admin -> "ops"
+```
+
+**Fix:** use a selector of the declared key type (e.g. `@role/…` for a
+`role`-keyed arm set, a string key for a `string`-keyed one).
+
+## NML2039
+
+**Arm target mismatch.** A string-literal target (`-> "value"`) requires a
+scalar-capable target type; a model-typed arm set needs a declared name.
+
+```nml check expect-error='[NML2039]'
+model page:
+    path string?
+
+model service:
+    landing (role -> page)?
+
+service Api:
+    landing:
+        else -> "status"
+```
+
+**Fix:** point the arm at a declared instance (`-> StatusPage`).
+
+## NML2040
+
+**Arms where fields are expected.** A routing arm inside a model-typed
+body — arms belong under a field typed `(K -> V)`.
+
+```nml check expect-error='[NML2040]'
+model service:
+    host string?
+
+service Api:
+    else -> "status"
+```
+
+**Fix:** declare an arm-typed field and put the arms in its block.
+
+## NML2041
+
+**Missing discriminator.** The `oneof` instance omits its discriminator
+and the union declares no default arm.
+
+```nml check expect-error='[NML2041]'
+model a:
+    x string?
+model b:
+    y string?
+
+oneof entry by kind:
+    "a" -> a
+    "b" -> b
+
+entry E:
+    x = "1"
+```
+
+**Fix:** set the discriminator, or give the union a default arm
+(`by kind = "a"`).
+
+## NML2042
+
+**Invalid discriminator.** The discriminator's value must be a string
+naming an arm.
+
+```nml check expect-error='[NML2042]'
+model a:
+    x string?
+
+oneof entry by kind:
+    "a" -> a
+
+entry E:
+    kind = 5
+```
+
+**Fix:** use one of the declared arm strings.
+
+## NML2043
+
+**Shorthand on a union-typed list.** A bare scalar item can't select a
+union variant — the variant is undecidable from one token.
+
+```nml check expect-error='[NML2043]'
+model run:
+    cmd string?
+model wait:
+    seconds number?
+
+oneof step by kind:
+    "run" -> run
+    "wait" -> wait
+
+model pipeline:
+    steps []step?
+
+pipeline P:
+    steps:
+        - "make test"
+```
+
+**Fix:** write the item in block form and select the variant explicitly.
+
+## NML2044
+
+**Validation truncated.** Nesting exceeded the maximum validation depth;
+deeper entries were not checked (advisory). Almost always a sign of
+generated or accidental extreme nesting.
+
+**Fix:** flatten the structure, or split the document.
+
+## NML2045
+
+**Role written as a string.** `role`-typed fields hold *references*
+(`@name`), not strings. Machine-fixable — the suggestion removes the
+quotes and adds the `@` when missing.
+
+```nml check expect-output='[NML2045]'
+model resource:
+    owner role?
+
+resource Home:
+    owner = "admin"
+```
+
+**Fix:** apply the suggestion (`@admin`).
+
+## NML2046
+
+**User reference in an access rule.** `@user/…` references identify
+members; access-control rules (`|allow`/`|deny`) take roles. Surfaced
+where a package configures membership semantics (RFC 0030).
+
+**Fix:** put the user in the role's members list and allow the role.
+
+## NML2047
+
+**Built-in access level in a members list.** `@public`-style levels are
+access semantics, not members. Surfaced under package membership
+semantics.
+
+**Fix:** remove it; use it in `|allow` instead.
+
+## NML2048
+
+**Membership cycle.** Role/plan membership references form a cycle
+(advisory). Surfaced under package membership semantics.
+
+**Fix:** break the cycle at its least meaningful edge.
+
+## NML2049
+
+**Dropped item key.** A bare scalar list item supplies one value, but the
+element model declares no positional (`+`) field to receive it — the key
+has nowhere to go.
+
+```nml check expect-error='[NML2049]'
+model step:
+    run string?
+
+model job:
+    steps []step
+
+job Nightly:
+    steps:
+        - "make test"
+```
+
+**Fix:** mark one field positional (`run string?+`), or write the item in
+block form.
+
+## NML2050
+
+**Arm-shorthand mismatch.** A bare scalar item fills an arm-set (`(K -> V)`)
+shorthand field through the canonical `else ->` embedding — so the value
+must be a name or a string (an arm target's two forms). This value is
+neither, and no arm can be synthesized from it.
+
+```nml check expect-error='[NML2050]'
+model page:
+    landing (role -> string)+
+
+[]page pages:
+    - 42
+```
+
+**Fix:** supply a name or a string (it becomes the `else ->` arm's
+target), or write the item in block form with explicit arms.
+
+## NML4000
+
+**Fully shadowed validator.** A package validator binding's globs can
+never match first — earlier bindings claim every file it would. Dead
+configuration in the manifest (RFC 0030 meta-validation).
+
+**Fix:** reorder the bindings, or remove the dead one.
+
 ## NML2013
 
 **Inheritance cycle.** `is` chains must be acyclic.

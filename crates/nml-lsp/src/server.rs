@@ -369,10 +369,12 @@ impl Inner {
             };
             packages::nearest_project_config(&p, &view).map(|(_, config)| config)
         });
-        match nearest {
+        let mut config = match nearest {
             Some(pc) => self.config_from_project(&pc),
             None => self.diagnostic_config(),
-        }
+        };
+        config.uri_is_registry_source = uri.as_str().ends_with(".model.nml");
+        config
     }
 
     fn config_from_project(&self, pc: &nml_core::ProjectConfig) -> diagnostics::DiagnosticConfig {
@@ -392,6 +394,7 @@ impl Inner {
             template_namespaces: pc.template_namespaces.clone(),
             modifiers: pc.modifiers.clone(),
             membership,
+            uri_is_registry_source: false,
         }
     }
 
@@ -418,6 +421,7 @@ impl Inner {
             template_namespaces: pc.template_namespaces.clone(),
             modifiers: pc.modifiers.clone(),
             membership,
+            uri_is_registry_source: false,
         }
     }
 
@@ -1576,8 +1580,9 @@ fn summarize_body(body: &Body) -> String {
 /// At a value position (`<prop> = <here>`), the model-ref name the field's type expects, so
 /// declarations of that model can be offered. Built on the shared cursor-context walk
 /// ([`find_model_body_at`]) — which resolves the enclosing model at **any** nesting depth — so
-/// this works inside nested bodies too (the former top-level-only `find_enclosing_block_keyword`
-/// + flat `models.find` path is removed). Takes the parsed `&File` (parse-once).
+/// this works inside nested bodies too (completion no longer routes through the top-level-only
+/// `find_enclosing_block_keyword` + flat `models.find` lookup; that helper still serves the
+/// hover/definition paths). Takes the parsed `&File` (parse-once).
 fn find_model_ref_type_at(
     file: &File,
     source: &str,
@@ -2884,6 +2889,11 @@ impl LanguageServer for NmlLanguageServer {
             }
         }
 
+        // One schema-context acquisition per request — the value, field, and
+        // keyword sections below all read it (Registry mode builds an index;
+        // building it once per keystroke is the budget, not once per section).
+        let handle = self.schema_index_for(&uri);
+
         let is_value_position = {
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             docs.get(&uri)
@@ -2939,7 +2949,6 @@ impl LanguageServer for NmlLanguageServer {
                 Option<Vec<String>>,
                 Option<Vec<String>>,
             ) = {
-                let handle = self.schema_index_for(&uri);
                 let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
                 match docs
                     .get(&uri)
@@ -3029,7 +3038,6 @@ impl LanguageServer for NmlLanguageServer {
             // Property position (no `=` before the cursor): schema-driven FIELD completion
             // (RFC 0003) — the dual of the value-position completions above. Offer the
             // enclosing model's not-yet-present fields, type-aware insertion, required-first.
-            let handle = self.schema_index_for(&uri); // before the docs lock — resolution reads it
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(source) = docs.get(&uri) {
                 let file = nml_core::cst::parse_best_effort(source);
@@ -3112,6 +3120,47 @@ impl LanguageServer for NmlLanguageServer {
         {
             let mut seen: HashSet<String> =
                 language_keywords.iter().map(|s| s.to_string()).collect();
+
+            // Schema-driven block-keyword completions — the keyword twin of
+            // RFC 0003's field completion: the document's resolved schema
+            // context supplies the vocabulary. A package-bound document
+            // completes against its package's exclusive definitions (the
+            // same closed-vocabulary rule diagnostics enforce, RFC 0012);
+            // an open document adds its own definitions. Concrete models
+            // and oneofs only — a trait is never a keyword (RFC 0011).
+            {
+                let index = handle.index();
+                let mut names: Vec<String> = index
+                    .models()
+                    .iter()
+                    .filter(|m| !m.is_trait())
+                    .map(|m| m.name.clone())
+                    .chain(index.oneofs().iter().map(|o| o.name.clone()))
+                    .collect();
+                if matches!(handle, IndexHandle::Registry(_)) {
+                    let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(source) = docs.get(&uri) {
+                        let (own, _) = nml_core::cst::extract_schema(source);
+                        names.extend(
+                            own.models
+                                .iter()
+                                .filter(|m| !m.is_trait())
+                                .map(|m| m.name.clone()),
+                        );
+                        names.extend(own.oneofs.iter().map(|o| o.name.clone()));
+                    }
+                }
+                for name in names {
+                    if seen.insert(name.clone()) {
+                        items.push(CompletionItem {
+                            label: name,
+                            kind: Some(CompletionItemKind::KEYWORD),
+                            detail: Some("schema".to_string()),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
 
             let pc = self
                 .project_config

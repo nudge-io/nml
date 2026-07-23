@@ -1,0 +1,2 @@
+model job:
+    timeout duration = "5x"

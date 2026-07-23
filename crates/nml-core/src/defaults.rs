@@ -69,6 +69,145 @@ where
     from_block(&resolved)
 }
 
+/// Materialization bound for declaration-reference inlining: far beyond any
+/// real composition depth, so a pathological reference chain degrades to
+/// "reference left in place" (reported by symbols/validation), never a hang.
+const MAX_REFERENCE_DEPTH: u32 = 16;
+
+/// [`from_body_defaulted`] at **document** scope (RFC 0013): properties whose
+/// value is a reference to a top-level array declaration
+/// (`endpoints = monitoredEndpoints`) are materialized — shared properties,
+/// properties, and items inlined as if written in place — before the body
+/// pipeline runs. The modular layout Chapter 4 teaches and the serde structs
+/// Chapter 7 builds stop being a trade-off: references are late-bound in the
+/// file and transparent to the consumer.
+///
+/// Only array-declaration references are materialized here; `const`
+/// references resolve via [`crate::resolve::ValueResolver::with_symbols`],
+/// and anything else is left in place for symbols validation to report.
+pub fn from_document_defaulted<T>(
+    index: &SchemaIndex,
+    doc: &crate::query::Document<'_>,
+    keyword: &str,
+    name: &str,
+    resolver: &ValueResolver,
+) -> Result<T, de::Error>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let body = match doc.block(keyword, name).body() {
+        Some(b) => b,
+        None => {
+            return Err(serde::de::Error::custom(format!(
+                "block `{keyword} {name}` not found in document"
+            )))
+        }
+    };
+    let inlined = inline_array_references(doc, body, 0);
+    from_body_defaulted(index, keyword, &inlined, resolver)
+}
+
+/// Rewrite `x = SomeArrayName` properties into the inline nested-list form
+/// when `SomeArrayName` is a top-level array declaration, recursively (a
+/// materialized array's own properties may reference further arrays).
+fn inline_array_references(doc: &crate::query::Document<'_>, body: &Body, depth: u32) -> Body {
+    if depth >= MAX_REFERENCE_DEPTH {
+        return body.clone();
+    }
+    let entries = body
+        .entries
+        .iter()
+        .map(|entry| match &entry.kind {
+            BodyEntryKind::Property(p) => {
+                if let Value::Reference(target) = &p.value.value {
+                    if let Some(array_body) = doc.array_body(target) {
+                        return BodyEntry {
+                            span: entry.span,
+                            kind: BodyEntryKind::NestedBlock(NestedBlock {
+                                name: p.name.clone(),
+                                body: array_declaration_as_body(doc, array_body, depth + 1),
+                            }),
+                        };
+                    }
+                }
+                entry.clone()
+            }
+            BodyEntryKind::NestedBlock(nb) => BodyEntry {
+                span: entry.span,
+                kind: BodyEntryKind::NestedBlock(NestedBlock {
+                    name: nb.name.clone(),
+                    body: inline_array_references(doc, &nb.body, depth + 1),
+                }),
+            },
+            BodyEntryKind::ListItem(item) => BodyEntry {
+                span: entry.span,
+                kind: BodyEntryKind::ListItem(inline_in_item(doc, item, depth + 1)),
+            },
+            _ => entry.clone(),
+        })
+        .collect();
+    Body { entries }
+}
+
+fn inline_in_item(doc: &crate::query::Document<'_>, item: &ListItem, depth: u32) -> ListItem {
+    match &item.kind {
+        ListItemKind::Named { name, body } => ListItem {
+            span: item.span,
+            kind: ListItemKind::Named {
+                name: name.clone(),
+                body: inline_array_references(doc, body, depth),
+            },
+        },
+        ListItemKind::Shorthand {
+            value,
+            body: Some(body),
+        } => ListItem {
+            span: item.span,
+            kind: ListItemKind::Shorthand {
+                value: value.clone(),
+                body: Some(inline_array_references(doc, body, depth)),
+            },
+        },
+        _ => item.clone(),
+    }
+}
+
+/// An array declaration's content as an inline nested-list body: shared
+/// properties, properties, modifiers, and items, in that order — exactly
+/// what the author would have written in place.
+fn array_declaration_as_body(
+    doc: &crate::query::Document<'_>,
+    array_body: &ArrayBody,
+    depth: u32,
+) -> Body {
+    let mut entries = Vec::new();
+    for sp in &array_body.shared_properties {
+        entries.push(BodyEntry {
+            span: sp.name.span,
+            kind: BodyEntryKind::SharedProperty(sp.clone()),
+        });
+    }
+    for m in &array_body.modifiers {
+        entries.push(BodyEntry {
+            span: m.name.span,
+            kind: BodyEntryKind::Modifier(m.clone()),
+        });
+    }
+    for p in &array_body.properties {
+        entries.push(BodyEntry {
+            span: p.name.span,
+            kind: BodyEntryKind::Property(p.clone()),
+        });
+    }
+    for item in &array_body.items {
+        entries.push(BodyEntry {
+            span: item.span,
+            kind: BodyEntryKind::ListItem(inline_in_item(doc, item, depth)),
+        });
+    }
+    Body { entries }
+}
+
 /// [`from_body_defaulted`] keyed by a block's keyword (its root model/oneof), so
 /// keyword and body cannot be mismatched.
 pub fn from_block_defaulted<T>(
@@ -225,7 +364,7 @@ impl<'a> Defaulter<'a> {
     /// the union variant per item via the shared `resolve_type_in_body`. Items are
     /// never synthesized — an absent list stays empty.
     fn list_body(&self, inner: &FieldType, body: &Body, depth: u32) -> Body {
-        map_named_items(body, |item_body| {
+        map_item_bodies(body, |item_body| {
             let target = self.index.resolve_type_in_body(inner, item_body);
             self.default_against(target, item_body, depth)
         })
@@ -240,7 +379,7 @@ impl<'a> Defaulter<'a> {
             FieldTarget::Model(m) => self.model_body(m, body, depth),
             FieldTarget::OneOf(o) => self.oneof_body(o, body, depth),
             FieldTarget::ListOf(inner) | FieldTarget::SetOf(inner) => {
-                map_named_items(body, |item_body| match inner.as_ref() {
+                map_item_bodies(body, |item_body| match inner.as_ref() {
                     FieldTarget::Model(m) => self.model_body(m, item_body, depth + 1),
                     FieldTarget::OneOf(o) => self.oneof_body(o, item_body, depth + 1),
                     _ => item_body.clone(),
@@ -343,10 +482,13 @@ fn compute_defaultable(index: &SchemaIndex) -> std::collections::HashSet<&str> {
     set
 }
 
-/// Rebuild a body, replacing each named list item's body with `f(item_body)` and
-/// leaving every other entry untouched. Centralizes the list-item rewrite shared by
-/// the list-field and union-list-variant defaulting paths.
-fn map_named_items(body: &Body, f: impl Fn(&Body) -> Body) -> Body {
+/// Rebuild a body, replacing each list item's body with `f(item_body)` and
+/// leaving every other entry untouched. Covers named items AND materialized
+/// positional items (`Shorthand` with a body — produced by
+/// `identity::apply_positional`, RFC 0005 §10), so positional items receive
+/// schema defaults exactly like named ones. Centralizes the list-item
+/// rewrite shared by the list-field and union-list-variant defaulting paths.
+fn map_item_bodies(body: &Body, f: impl Fn(&Body) -> Body) -> Body {
     let entries = body
         .entries
         .iter()
@@ -360,6 +502,19 @@ fn map_named_items(body: &Body, f: impl Fn(&Body) -> Body) -> Body {
                         kind: ListItemKind::Named {
                             name: name.clone(),
                             body: f(item_body),
+                        },
+                        span: item.span,
+                    }),
+                    span: entry.span,
+                },
+                ListItemKind::Shorthand {
+                    value,
+                    body: Some(item_body),
+                } => BodyEntry {
+                    kind: BodyEntryKind::ListItem(ListItem {
+                        kind: ListItemKind::Shorthand {
+                            value: value.clone(),
+                            body: Some(f(item_body)),
                         },
                         span: item.span,
                     }),
@@ -920,5 +1075,210 @@ mod tests {
             resolver.resolve_body(&shared).is_ok(),
             "resolve-last: overridden shared secret is never resolved"
         );
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    //! Shared-property scoping (spec/syntax.md §Shared Properties) and
+    //! positional defaulting through the full `from_body_defaulted`
+    //! pipeline — the two data-loss shapes the tutorial uncovered: a nested
+    //! list's `.shared` value silently losing to the schema default, and a
+    //! materialized positional item receiving no defaults at all.
+
+    use serde::Deserialize;
+
+    use crate::query::Document;
+    use crate::resolve::ValueResolver;
+    use crate::schema_index::SchemaIndex;
+    use crate::{cst, from_body_defaulted};
+
+    #[derive(Debug, Deserialize)]
+    struct Service {
+        endpoints: Vec<Endpoint>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Endpoint {
+        #[serde(default)]
+        name: String,
+        url: String,
+        timeout: String,
+        interval: String,
+    }
+
+    const SCHEMA: &str =
+        "trait monitored:\n    timeout duration = \"5s\"\n    interval duration = \"60s\"\n\n\
+                          model endpoint is monitored:\n    url string+\n\n\
+                          model service:\n    endpoints []endpoint\n";
+
+    fn deserialize(source: &str) -> Service {
+        let (schema, errors) = cst::extract_schema(SCHEMA);
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut schema = schema;
+        crate::schema::resolve_model_inheritance(&mut schema);
+        let index = SchemaIndex::build(schema.models, schema.enums, schema.oneofs);
+        let file = cst::parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "Api").body().unwrap();
+        from_body_defaulted(&index, "service", body, &ValueResolver::new(|_| None)).unwrap()
+    }
+
+    #[test]
+    fn nested_list_shared_property_beats_schema_default() {
+        let service = deserialize(
+            "service Api:\n    endpoints:\n        .timeout = \"10s\"\n\n        - Web:\n            url = \"https://a\"\n\n        - Fast:\n            url = \"https://b\"\n            timeout = \"2s\"\n",
+        );
+        let by_name = |n: &str| service.endpoints.iter().find(|e| e.name == n).unwrap();
+        // The authored shared value wins over the trait default — at depth.
+        assert_eq!(by_name("Web").timeout, "10s");
+        // An item's own value still beats the shared one.
+        assert_eq!(by_name("Fast").timeout, "2s");
+        // Defaults fill only what nothing authored.
+        assert_eq!(by_name("Web").interval, "60s");
+    }
+
+    #[test]
+    fn positional_item_receives_shared_properties_and_defaults() {
+        let service = deserialize(
+            "service Api:\n    endpoints:\n        .timeout = \"10s\"\n\n        - \"https://bare\"\n",
+        );
+        let bare = &service.endpoints[0];
+        // The bare item's key filled the positional field…
+        assert_eq!(bare.url, "https://bare");
+        // …and its materialized body participates in shared merge + defaults.
+        assert_eq!(bare.timeout, "10s");
+        assert_eq!(bare.interval, "60s");
+        // No label ⇒ no injected name (bare items are anonymous by design).
+        assert_eq!(bare.name, "");
+    }
+
+    #[test]
+    fn two_scopes_do_not_leak_into_each_other() {
+        // A sibling nested block's shared property must not bleed into the
+        // endpoint list (each body is its own scope).
+        let service = deserialize(
+            "service Api:\n    endpoints:\n        - Web:\n            url = \"https://a\"\n",
+        );
+        assert_eq!(service.endpoints[0].timeout, "5s", "trait default applies");
+    }
+}
+
+#[cfg(test)]
+mod document_scope_tests {
+    //! RFC 0013: `from_document_defaulted` materializes array-declaration
+    //! references — the Chapter 6 layout (`endpoints = monitoredEndpoints`)
+    //! deserializes without inlining anything by hand.
+
+    use serde::Deserialize;
+
+    use crate::query::Document;
+    use crate::resolve::ValueResolver;
+    use crate::schema_index::SchemaIndex;
+    use crate::{cst, from_document_defaulted};
+
+    #[derive(Debug, Deserialize)]
+    struct Service {
+        endpoints: Vec<Endpoint>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Endpoint {
+        #[serde(default)]
+        name: String,
+        url: String,
+        timeout: String,
+    }
+
+    const SCHEMA: &str = "trait monitored:\n    timeout duration = \"5s\"\n\n\
+                          model endpoint is monitored:\n    url string+\n\n\
+                          model service:\n    endpoints []endpoint\n";
+
+    #[test]
+    fn array_reference_materializes_with_shared_properties_and_defaults() {
+        let (mut schema, errors) = cst::extract_schema(SCHEMA);
+        assert!(errors.is_empty(), "{errors:?}");
+        crate::schema::resolve_model_inheritance(&mut schema);
+        let index = SchemaIndex::build(schema.models, schema.enums, schema.oneofs);
+
+        let source = "[]endpoint monitoredEndpoints:\n    .timeout = \"10s\"\n\n    - Api:\n        url = \"https://a\"\n\n    - \"https://bare\"\n\nservice Api:\n    endpoints = monitoredEndpoints\n";
+        let file = cst::parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let service: Service = from_document_defaulted(
+            &index,
+            &doc,
+            "service",
+            "Api",
+            &ValueResolver::new(|_| None),
+        )
+        .unwrap();
+
+        assert_eq!(service.endpoints.len(), 2);
+        // The named item: shared property beat the trait default.
+        assert_eq!(service.endpoints[0].name, "Api");
+        assert_eq!(service.endpoints[0].timeout, "10s");
+        // The bare positional item, through the same reference.
+        assert_eq!(service.endpoints[1].url, "https://bare");
+        assert_eq!(service.endpoints[1].timeout, "10s");
+    }
+
+    #[test]
+    fn missing_block_is_a_named_error_and_unknown_refs_pass_through() {
+        let (schema, _) = cst::extract_schema(SCHEMA);
+        let index = SchemaIndex::build(schema.models, schema.enums, schema.oneofs);
+        let file = cst::parse_to_ast("service Api:\n    endpoints = nowhere\n").unwrap();
+        let doc = Document::new(&file);
+        let err = from_document_defaulted::<Service>(
+            &index,
+            &doc,
+            "service",
+            "Missing",
+            &ValueResolver::new(|_| None),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("service Missing"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod reference_cycle_tests {
+    //! RFC 0013: a mutual array-reference chain hits the depth bound and
+    //! degrades to references-left-in-place — never a hang or overflow.
+
+    use serde::Deserialize;
+
+    use crate::query::Document;
+    use crate::resolve::ValueResolver;
+    use crate::schema_index::SchemaIndex;
+    use crate::{cst, from_document_defaulted};
+
+    #[test]
+    fn mutual_array_references_terminate() {
+        #[derive(Debug, Deserialize)]
+        struct Service {
+            endpoints: Vec<Item>,
+        }
+        #[derive(Debug, Deserialize)]
+        struct Item {}
+
+        let schema = cst::extract_schema(
+            "model endpoint:\n    x string?\n\nmodel service:\n    endpoints []endpoint\n",
+        )
+        .0;
+        let index = SchemaIndex::build(schema.models, schema.enums, schema.oneofs);
+        let source = "[]endpoint a:\n    x = b\n\n[]endpoint b:\n    x = a\n\nservice Api:\n    endpoints = a\n";
+        let file = cst::parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        // Terminates; the cyclic property chain bottoms out at the depth
+        // bound with a reference left in place (no items either way).
+        let service: Service = from_document_defaulted(
+            &index,
+            &doc,
+            "service",
+            "Api",
+            &ValueResolver::new(|_| None),
+        )
+        .unwrap();
+        assert!(service.endpoints.is_empty());
     }
 }

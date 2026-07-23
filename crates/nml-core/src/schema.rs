@@ -20,6 +20,17 @@ impl ExtractedSchema {
     }
 }
 
+/// Attach a definition's declaring source (when the loader stamped one, see
+/// [`ModelDef::source`]) so a definition-anchored finding renders
+/// `file:line:col` against the right file. Findings stay unattributed only
+/// when no single definition owns them.
+fn at_def(diag: Diagnostic, source: &Option<String>) -> Diagnostic {
+    match source {
+        Some(s) => diag.with_source(s),
+        None => diag,
+    }
+}
+
 /// Validate `oneof` declarations against the rest of the schema:
 /// - every arm model must be a declared `model`,
 /// - discriminator values must be unique within a union,
@@ -40,9 +51,12 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
         // One code per fix-pattern (RFC 0008): the code names what to do,
         // the message names the specifics.
         let err = |code: Code, message: String| {
-            Diagnostic::error(message)
-                .with_code(code)
-                .with_span(oneof.span)
+            at_def(
+                Diagnostic::error(message)
+                    .with_code(code)
+                    .with_span(oneof.span),
+                &oneof.source,
+            )
         };
 
         if model_names.contains(oneof.name.as_str()) || enum_names.contains(oneof.name.as_str()) {
@@ -146,6 +160,43 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
     errors
 }
 
+/// Validate enum definitions: duplicate variants (both authored forms name
+/// one variant — `- "a"` and `- a` are the same) and empty enums (no value
+/// can satisfy a field the enum types). Both are warnings: harmless at
+/// runtime, definitely unintended — and an enum is transiently empty while
+/// being typed in an editor.
+pub fn find_enum_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
+    let mut errors = Vec::new();
+    for enum_def in &schema.enums {
+        if enum_def.variants.is_empty() {
+            errors.push(at_def(
+                Diagnostic::warning(format!(
+                    "enum '{}' declares no variants — no value can satisfy it",
+                    enum_def.name
+                ))
+                .with_code(codes::EMPTY_ENUM)
+                .with_span(enum_def.span),
+                &enum_def.source,
+            ));
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        for variant in &enum_def.variants {
+            if !seen.insert(variant.as_str()) {
+                errors.push(at_def(
+                    Diagnostic::warning(format!(
+                        "enum '{}' declares variant \"{}\" more than once",
+                        enum_def.name, variant
+                    ))
+                    .with_code(codes::DUPLICATE_ENUM_VARIANT)
+                    .with_span(enum_def.span),
+                    &enum_def.source,
+                ));
+            }
+        }
+    }
+    errors
+}
+
 /// Validate composition (`is`) and trait usage across the schema (RFC 0011):
 /// - every `is` target must resolve to a declared model or trait (with a
 ///   machine-applicable did-you-mean over both when it doesn't),
@@ -168,6 +219,26 @@ pub fn find_composition_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
     let mut errors = Vec::new();
 
     for model in &schema.models {
+        // Direct duplicates in one `is` clause are noise (the merge is
+        // idempotent) — warn on the second occurrence, at its token.
+        // Transitive diamonds (`x is a, b` where `b is a`) are the point of
+        // mixins and stay silent.
+        let mut listed: HashSet<&str> = HashSet::new();
+        for parent in &model.extends {
+            if !listed.insert(parent.name.as_str()) {
+                errors.push(at_def(
+                    Diagnostic::warning(format!(
+                        "'{}' is listed more than once in {} '{}''s `is` clause",
+                        parent.name,
+                        model.kind.label(),
+                        model.name,
+                    ))
+                    .with_code(codes::DUPLICATE_MIXIN)
+                    .with_span(parent.span),
+                    &model.source,
+                ));
+            }
+        }
         for parent in &model.extends {
             if defs.contains_key(parent.name.as_str()) {
                 continue;
@@ -179,7 +250,7 @@ pub fn find_composition_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
             } else {
                 None
             };
-            errors.push(match wrong_kind {
+            let diag = match wrong_kind {
                 Some(kind_name) => Diagnostic::error(format!(
                     "`is` target '{}' in {} '{}' is {} — only models and traits compose",
                     parent.name,
@@ -203,14 +274,15 @@ pub fn find_composition_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
                     }
                     diag
                 }
-            });
+            };
+            errors.push(at_def(diag, &model.source));
         }
 
         for field in &model.fields {
             let mut referenced = Vec::new();
             collect_trait_refs(&field.field_type, &defs, &mut referenced);
             for trait_name in referenced {
-                errors.push(
+                errors.push(at_def(
                     Diagnostic::error(format!(
                         "field '{}' of {} '{}' is typed by trait '{}' — a trait is not a \
                          value type; mix it into a model with `is` instead",
@@ -221,7 +293,8 @@ pub fn find_composition_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
                     ))
                     .with_code(codes::TRAIT_AS_FIELD_TYPE)
                     .with_span(field.span),
-                );
+                    &model.source,
+                ));
             }
         }
     }
@@ -297,14 +370,15 @@ pub fn find_shorthand_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
                     .map(|n| format!("'{n}'"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                errors.push(
+                errors.push(at_def(
                     Diagnostic::error(format!(
                         "model '{}' declares more than one {axis} shorthand field ({joined}); {what}",
                         model.name
                     ))
                     .with_code(codes::MULTIPLE_POSITIONAL_FIELDS)
                     .with_span(model.span),
-                );
+                    &model.source,
+                ));
             }
         }
     }
@@ -478,17 +552,15 @@ fn push_cycle_errors(
         .collect::<Vec<_>>()
         .join(" -> ");
     for &member in cycle {
-        let span = schema
-            .models
-            .iter()
-            .find(|m| m.name == member)
+        let member_def = schema.models.iter().find(|m| m.name == member);
+        let span = member_def
             .map(|m| m.span)
             .unwrap_or_else(|| crate::span::Span::empty(0));
         let mut diag = Diagnostic::error(format!("{kind}: {desc}"))
             .with_code(code)
             .with_span(span);
         diag.severity = severity.clone();
-        errors.push(diag);
+        errors.push(at_def(diag, member_def.map_or(&None, |m| &m.source)));
     }
 }
 
@@ -655,6 +727,7 @@ mod tests {
         let models: Vec<ModelDef> = (0..DEPTH)
             .map(|i| ModelDef {
                 kind: ModelKind::Model,
+                source: None,
                 name: format!("m{i}"),
                 extends: if i + 1 < DEPTH {
                     vec![MixinRef::synthetic(format!("m{}", i + 1))]
@@ -683,6 +756,7 @@ mod tests {
         let models: Vec<ModelDef> = (0..DEPTH)
             .map(|i| ModelDef {
                 kind: ModelKind::Model,
+                source: None,
                 name: format!("m{i}"),
                 extends: if i + 1 < DEPTH {
                     vec![MixinRef::synthetic(format!("m{}", i + 1))]
@@ -707,6 +781,7 @@ mod tests {
         // diagnostic per member (each pointing at that model).
         let model = |name: &str, parent: &str| ModelDef {
             kind: ModelKind::Model,
+            source: None,
             name: name.to_string(),
             extends: vec![MixinRef::synthetic(parent)],
             fields: vec![],
@@ -731,6 +806,7 @@ mod tests {
         // each model at minimum retaining its own field.
         let model = |name: &str, parent: &str, f: &str| ModelDef {
             kind: ModelKind::Model,
+            source: None,
             name: name.to_string(),
             extends: vec![MixinRef::synthetic(parent)],
             fields: vec![FieldDef {
@@ -774,6 +850,7 @@ mod tests {
         };
         let model = |name: &str, extends: &[&str], f: &str| ModelDef {
             kind: ModelKind::Model,
+            source: None,
             name: name.to_string(),
             extends: extends.iter().map(|s| MixinRef::synthetic(*s)).collect(),
             fields: vec![field(f)],

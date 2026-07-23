@@ -873,3 +873,41 @@ async fn directive_hover_renders_vocabulary_entry() {
         "{result}"
     );
 }
+
+/// Schema-driven block-keyword completion (RFC 0012 editor package): an open
+/// document completes block keywords from its resolved schema context — the
+/// scope registry's concrete models — labeled with "schema" provenance.
+#[tokio::test]
+async fn keyword_completion_offers_schema_models() {
+    let base = temp_dir("schema-keyword-completion");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let ws = base.join("ws");
+    fs::create_dir_all(&ws).expect("create ws");
+    let model = ws.join("cache.model.nml");
+    let model_text = "model cache:\n    maxEntries number\n";
+    fs::write(&model, model_text).expect("write model");
+    let app = ws.join("app.nml");
+    let app_text = "\n";
+    fs::write(&app, app_text).expect("write app");
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness.open(&model, model_text).await;
+    harness.open(&app, app_text).await;
+    let result = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                "position": { "line": 0, "character": 0 },
+            }),
+        )
+        .await;
+    let items = result.as_array().expect("completion item array");
+    let cache = items
+        .iter()
+        .find(|i| i["label"] == json!("cache"))
+        .unwrap_or_else(|| panic!("schema keyword offered: {result}"));
+    assert_eq!(cache["detail"], json!("schema"), "{cache}");
+}

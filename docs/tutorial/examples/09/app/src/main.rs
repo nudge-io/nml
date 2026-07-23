@@ -10,7 +10,7 @@ use nml_validate::store::{hash8, PublishOutcome, Store};
 fn main() -> Result<(), Box<dyn Error>> {
     // Load the package: the .package.nml manifest plus every schema source
     // it names, from the chapter directory.
-    let package = SchemaPackage::from_dir(Path::new(".")).map_err(|e| e.to_string())?;
+    let package = SchemaPackage::from_dir(Path::new("."))?;
     let manifest = &package.manifest;
     println!(
         "package {} v{} — {} schema(s), {} validator binding(s)",
@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Publish to a store. Real tools use Store::user() — the per-user store
     // editors read; this demo uses a scratch directory.
     let store = Store::at(std::env::temp_dir().join("skylight-store-demo"));
-    let outcome = store.publish(&package).map_err(|e| e.to_string())?;
+    let outcome = store.publish(&package)?;
     match outcome {
         PublishOutcome::Published { slot } => println!("published to slot {slot}"),
         PublishOutcome::Unchanged => println!("published already — store is current"),

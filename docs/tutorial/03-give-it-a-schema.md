@@ -104,7 +104,10 @@ Read the field types you haven't met as declarations yet:
 
 `--schema` points at a **directory**; every `.model.nml` file in it is
 loaded. Keep the schema next to the config (or in a `schemas/` directory —
-your call):
+your call). Schema and config can even share **one file** — declarations
+and instances compose into a single namespace, so `nml check app.nml`
+alone validates a self-contained file; the directory layout is a choice
+about organization, never about how much checking you get:
 
 ```bash
 nml check --schema . app.nml

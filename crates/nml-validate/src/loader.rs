@@ -12,8 +12,8 @@ use std::collections::HashSet;
 // Import the passes by name (not the module) so the bare `schema` identifier stays
 // free for the local `ExtractedSchema` value and our own `crate::schema` module.
 use nml_core::schema::{
-    find_composition_errors, find_extends_cycles, find_model_cycles, find_oneof_errors,
-    find_shorthand_errors, resolve_model_inheritance, ExtractedSchema,
+    find_composition_errors, find_enum_errors, find_extends_cycles, find_model_cycles,
+    find_oneof_errors, find_shorthand_errors, resolve_model_inheritance, ExtractedSchema,
 };
 
 use nml_core::diagnostic::Diagnostic;
@@ -37,10 +37,12 @@ use nml_core::diagnostic::Diagnostic;
 /// Sources are `(name, text)` pairs; the name identifies the source document
 /// in diagnostics (RFC 0030: multi-source loads — package schemas — need file
 /// attribution, since spans from different sources are numerically
-/// ambiguous). Per-source findings (parse errors, reserved/duplicate
-/// definition names) carry their source; cross-source structural passes
-/// (inheritance cycles, shorthand, oneof integrity, reference cycles) are
-/// findings no single file owns and stay unattributed.
+/// ambiguous). Every definition is stamped with its declaring source before
+/// the merge, so per-source findings (parse errors, reserved/duplicate
+/// names) AND definition-anchored structural findings (composition, oneof
+/// integrity, shorthand arity, cycle members) all carry the file that owns
+/// their anchor. Only a finding with no single defining anchor would stay
+/// unattributed.
 pub fn load_schema(sources: &[(&str, &str)]) -> (ExtractedSchema, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
 
@@ -52,8 +54,21 @@ pub fn load_schema(sources: &[(&str, &str)]) -> (ExtractedSchema, Vec<Diagnostic
     let mut seen_enums = HashSet::new();
     let mut seen_oneofs = HashSet::new();
     for (name, text) in sources {
-        let (extracted, errors) = nml_core::cst::extract_schema(text);
+        let (mut extracted, errors) = nml_core::cst::extract_schema(text);
         diagnostics.extend(errors.into_iter().map(|d| d.with_source(*name)));
+        // Stamp each definition with its declaring source before the merge:
+        // definition-anchored findings (composition, oneof integrity, arity,
+        // cycles) copy it so they render `file:line:col` against the right
+        // file instead of a directory-prefixed byte span.
+        for m in &mut extracted.models {
+            m.source = Some((*name).to_string());
+        }
+        for o in &mut extracted.oneofs {
+            o.source = Some((*name).to_string());
+        }
+        for e in &mut extracted.enums {
+            e.source = Some((*name).to_string());
+        }
         for m in &extracted.models {
             // Traits share the model namespace (RFC 0011): a trait and a
             // model with one name would be unresolvable at `is` sites.
@@ -108,6 +123,9 @@ pub fn load_schema(sources: &[(&str, &str)]) -> (ExtractedSchema, Vec<Diagnostic
     // `oneof` integrity (arm models exist, unique values, name collisions) is
     // an error: a malformed union cannot be validated against.
     diagnostics.extend(find_oneof_errors(&schema));
+
+    // Enum tidiness (duplicate variants, empty enums) — warnings.
+    diagnostics.extend(find_enum_errors(&schema));
 
     // Severity travels with the diagnostic (warning at the source).
     diagnostics.extend(find_model_cycles(&schema));
@@ -395,10 +413,40 @@ mod trait_tests {
                 "missing {expected} in {codes:?}"
             );
         }
-        // Cross-source structural passes stay unattributed by design (see
-        // the module doc): a finding over the *merged* schema is owned by no
-        // single file. The span still points into the defining source.
-        assert!(diags.iter().all(|d| d.span.is_some()), "{diags:?}");
+        // Definition-anchored findings carry their declaring source (stamped
+        // at load), so the CLI renders them `file:line:col` — and every one
+        // still points at a real span in that file.
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.span.is_some() && d.source.as_deref() == Some("bad.model.nml")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn positional_arity_counts_trait_contributed_fields() {
+        // NML2011 runs post-inheritance: a trait's `+` field and the
+        // composing model's own `+` field collide on the merged set.
+        let src = "trait keyed:\n    id string+\n\n\
+                   model item is keyed:\n    slug string+\n";
+        let (_, diags) = load_schema(&[("t.model.nml", src)]);
+        assert!(
+            code_strings(&diags).contains(&"NML2011".to_string()),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn directives_travel_with_the_trait_merge() {
+        let src = "trait tuned:\n    rate number = 5 #live\n\n\
+                   model server is tuned:\n    host string?\n";
+        let (schema, diags) = load_schema(&[("t.model.nml", src)]);
+        assert!(diags.is_empty(), "{diags:?}");
+        let server = schema.models.iter().find(|m| m.name == "server").unwrap();
+        let rate = server.fields.iter().find(|f| f.name == "rate").unwrap();
+        assert_eq!(rate.directives.len(), 1, "inherited field keeps #live");
+        assert_eq!(rate.directives[0].name, "live");
     }
 
     #[test]
@@ -408,6 +456,40 @@ mod trait_tests {
         assert!(
             code_strings(&diags).contains(&"NML2009".to_string()),
             "trait/model share one namespace: {diags:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod enum_tests {
+    //! Enum tidiness (NML2027/NML2028): duplicate variants normalize across
+    //! both authored forms; empty enums warn.
+
+    use super::*;
+    use nml_core::diagnostic::Severity;
+
+    #[test]
+    fn duplicate_variant_across_both_authored_forms_warns() {
+        let (_, diags) =
+            load_schema(&[("e.model.nml", "enum level:\n    - \"info\"\n    - info\n")]);
+        let hits: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2027"))
+            .collect();
+        assert_eq!(hits.len(), 1, "{diags:?}");
+        assert_eq!(hits[0].severity, Severity::Warning);
+        assert_eq!(hits[0].source.as_deref(), Some("e.model.nml"));
+    }
+
+    #[test]
+    fn empty_enum_warns() {
+        let (_, diags) = load_schema(&[("e.model.nml", "enum pending:\n")]);
+        assert!(
+            diags.iter().any(
+                |d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2028")
+                    && d.severity == Severity::Warning
+            ),
+            "{diags:?}"
         );
     }
 }

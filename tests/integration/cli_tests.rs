@@ -330,3 +330,154 @@ fn test_check_rejects_trait_instantiation() {
     assert!(combined.contains("NML2024"), "{combined}");
     assert!(combined.contains("cannot be instantiated"), "{combined}");
 }
+
+#[test]
+fn test_check_matches_validate_on_definition_files() {
+    // `check` is a superset of `validate`: a definition file's composition
+    // errors surface without --schema, once.
+    let output = nml_bin()
+        .args(["check", "tests/fixtures/invalid/unknown-mixin.model.nml"])
+        .output()
+        .expect("failed to run nml");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        combined.matches("NML2020").count(),
+        2, // the finding + the `nml explain NML2020` hint line
+        "exactly one finding and its explain hint; got:\n{combined}"
+    );
+}
+
+#[test]
+fn test_check_self_contained_trait_file_is_clean_against_foreign_schema() {
+    // A file declaring both a trait and its composer must not be flagged
+    // against an unrelated --schema directory (false NML2020 regression pin).
+    let output = nml_bin()
+        .args([
+            "check",
+            "--schema",
+            "docs/errors/schemas",
+            "tests/fixtures/invalid/trait-instantiation/s.model.nml",
+        ])
+        .output()
+        .expect("failed to run nml");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "self-contained definitions resolve; got:\n{combined}"
+    );
+}
+
+#[test]
+fn test_self_contained_file_validates_with_no_flags() {
+    // RFC 0012: `model cache` above `cache Foo:` types Foo — one file, no
+    // --schema. Missing required field caught; fixed file passes.
+    let dir = "tests/fixtures/schema-check";
+    let output = nml_bin()
+        .args(["check", &format!("{dir}/self-contained-bad.nml")])
+        .output()
+        .expect("failed to run nml");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("NML2007"), "{combined}");
+
+    let output = nml_bin()
+        .args(["check", &format!("{dir}/self-contained-good.nml")])
+        .output()
+        .expect("failed to run nml");
+    assert!(output.status.success(), "fixed self-contained file passes");
+}
+
+#[test]
+fn test_file_vs_schema_dir_collision_is_nml2009() {
+    // RFC 0012: one namespace — a checked file redefining a directory
+    // schema's name is a duplicate-definition error, never a silent shadow.
+    let output = nml_bin()
+        .args([
+            "check",
+            "--schema",
+            "docs/errors/schemas",
+            "tests/fixtures/schema-check/collides-with-dir.nml",
+        ])
+        .output()
+        .expect("failed to run nml");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("NML2009"), "{combined}");
+}
+
+#[test]
+fn test_validate_and_check_agree_on_definition_files() {
+    // A bad schema default (duration "5x") must fail BOTH verbs with the
+    // same code — the definitions verbs can never disagree.
+    let fixture = "tests/fixtures/invalid/bad-duration-default.model.nml";
+    for verb in ["validate", "check"] {
+        let output = nml_bin()
+            .args([verb, fixture])
+            .output()
+            .expect("failed to run nml");
+        assert!(!output.status.success(), "{verb} must fail");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(combined.contains("NML2029"), "{verb}: {combined}");
+    }
+}
+
+#[test]
+fn test_verbs_agree_on_type_shape_rules_too() {
+    // RFC 0007 §4.3 shape rules run through the SAME body pass in both
+    // verbs — the structural guarantee that the R1/R2 parity class is
+    // closed for good.
+    let rel = "tests/fixtures/invalid/arm-shape.model.nml";
+    for verb in ["validate", "check"] {
+        let output = nml_bin().args([verb, rel]).output().expect("run nml");
+        assert!(!output.status.success(), "{verb} must fail");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(combined.contains("NML2033"), "{verb}: {combined}");
+    }
+}
+
+#[test]
+fn test_strict_with_nothing_to_enforce_is_a_usage_error() {
+    // RFC 0012 follow-up: `--strict` with an empty schema universe fails
+    // the invocation loudly instead of silently degrading to parse-only —
+    // the "CI points at the wrong path and stays green" trap.
+    let output = nml_bin()
+        .args([
+            "check",
+            "--strict",
+            "tests/fixtures/valid/minimal-service.nml",
+        ])
+        .output()
+        .expect("failed to run nml");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("nothing to enforce"), "{combined}");
+}

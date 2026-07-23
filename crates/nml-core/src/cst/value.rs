@@ -67,7 +67,7 @@ fn decode_scalar(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
         SyntaxKind::Number => number_or_money(&toks[..], span, false)?,
         SyntaxKind::Dash => number_or_money(&toks[..], span, true)?,
         SyntaxKind::Role => {
-            // RFC 0011: a role-conjunction expression (`Role (& Role)*`)
+            // RFC 0014: a role-conjunction expression (`Role (& Role)*`)
             // lowers to ONE `Value::Role` carrying the canonical
             // `" & "`-joined text — single-spaced regardless of source
             // spacing. This exact form is the cross-repo contract consumers

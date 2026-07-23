@@ -75,6 +75,7 @@ fn extract_model(block: &BlockDecl, kind: ModelKind) -> ModelDef {
     ModelDef {
         name: name_text(block),
         kind,
+        source: None,
         extends: block
             .extends()
             .map(|e| {
@@ -114,6 +115,7 @@ fn extract_enum(block: &BlockDecl) -> EnumDef {
     EnumDef {
         name: name_text(block),
         variants,
+        source: None,
         span: node_span(block.syntax()),
     }
 }
@@ -121,6 +123,7 @@ fn extract_enum(block: &BlockDecl) -> EnumDef {
 fn extract_oneof(decl: &OneOfDecl) -> OneOfDef {
     OneOfDef {
         name: decl.name().and_then(|n| n.text()).unwrap_or_default(),
+        source: None,
         discriminator: token_text(decl.discriminator()),
         discriminator_type: decl.enum_type().map(|t| t.text().to_string()),
         default_discriminator: decl

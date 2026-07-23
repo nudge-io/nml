@@ -1499,7 +1499,7 @@ workflow W:
         from_block(body)
     }
 
-    // ── RFC 0011: role-conjunction expressions (`&`) ──────────────────────
+    // ── RFC 0014: role-conjunction expressions (`&`) ──────────────────────
 
     #[derive(Deserialize, Debug)]
     struct AclConfig {
@@ -1513,7 +1513,7 @@ workflow W:
         from_block(body)
     }
 
-    /// THE cross-repo contract (RFC 0011): a role-conjunction expression
+    /// THE cross-repo contract (RFC 0014): a role-conjunction expression
     /// lowers to ONE string in canonical `" & "`-joined form — single-spaced
     /// regardless of source spacing — because that exact text is what
     /// consumers (nudge's selector parser, its `Display`, its effective-

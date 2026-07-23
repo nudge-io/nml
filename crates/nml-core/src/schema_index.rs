@@ -128,15 +128,36 @@ impl SchemaIndex {
             .entries
             .iter()
             .any(|e| matches!(e.kind, BodyEntryKind::Arm(_)));
-        // Body shape selects the variant: arm entries → the arm-set variant
-        // (RFC 0007); list items → the list variant; otherwise the scalar /
-        // model-ref variant. First matching variant wins (source order).
+        // A KEYED body (properties / nested blocks / modifiers) is a block
+        // instance — a scalar variant cannot represent it, so it must select a
+        // model/oneof-ref variant.
+        let has_keyed = body.entries.iter().any(|e| {
+            matches!(
+                e.kind,
+                BodyEntryKind::Property(_)
+                    | BodyEntryKind::NestedBlock(_)
+                    | BodyEntryKind::Modifier(_)
+            )
+        });
+        // Body shape selects the variant (first matching wins, source order):
+        // arms → the arm-set variant (RFC 0007); list items → the list variant;
+        // a keyed block → the first model/oneof-ref variant (never a scalar —
+        // a scalar can't hold keyed entries); otherwise (bare / empty) the
+        // first scalar / model-ref variant.
         variants
             .iter()
             .find(|variant| match variant {
                 FieldType::Arms { .. } => has_arms,
                 FieldType::List(_) => !has_arms && has_list_items,
-                _ => !has_arms && !has_list_items,
+                FieldType::ModelRef(name) if has_keyed => {
+                    !has_arms
+                        && !has_list_items
+                        && matches!(
+                            self.resolve_ref(name),
+                            FieldTarget::Model(_) | FieldTarget::OneOf(_)
+                        )
+                }
+                _ => !has_arms && !has_list_items && !has_keyed,
             })
             .map(|variant| self.resolve_type(variant))
             .unwrap_or(FieldTarget::Leaf)
@@ -189,6 +210,7 @@ mod tests {
     fn model(name: &str, fields: Vec<FieldDef>) -> ModelDef {
         ModelDef {
             kind: ModelKind::Model,
+            source: None,
             name: name.to_string(),
             extends: Vec::new(),
             fields,
@@ -282,6 +304,7 @@ mod tests {
             vec![model("varA", vec![])],
             vec![],
             vec![OneOfDef {
+                source: None,
                 name: "u".into(),
                 discriminator: "kind".into(),
                 discriminator_type: None,
@@ -318,6 +341,21 @@ mod tests {
             idx.resolve_type_in_body(&union, &list),
             FieldTarget::ListOf(inner) if matches!(*inner, FieldTarget::Model(_))
         ));
+
+        // Rule-completion: a KEYED block body under `(string | model)` selects
+        // the MODEL variant, never the scalar (a scalar can't hold properties).
+        let sm = FieldType::Union(vec![
+            FieldType::Primitive(PrimitiveType::String),
+            FieldType::ModelRef("step".into()),
+        ]);
+        let keyed = body_of("x X:\n    k = \"v\"\n");
+        assert!(
+            matches!(
+                idx.resolve_type_in_body(&sm, &keyed),
+                FieldTarget::Model(m) if m.name == "step"
+            ),
+            "a keyed body must resolve to the model variant, not the leading scalar"
+        );
     }
 
     fn body_of(src: &str) -> Body {

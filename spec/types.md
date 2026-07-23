@@ -85,7 +85,9 @@ debug = false
 
 ### `duration`
 
-Quoted time duration strings with a numeric value and unit suffix:
+Quoted time duration strings — an unsigned integer immediately followed
+by one unit suffix (see [syntax.md](syntax.md) §Duration Literals for the
+exact grammar; enforced as `NML2029`):
 
 ```
 sessionDuration = "72h"
@@ -167,13 +169,14 @@ An ordered collection of values of type `T`:
 // In a model definition
 domains []string
 listeners []listener
-members []@roleRef
+members []role
 ```
 
-Use the `<distinct>` constraint to require all items be unique:
+For collections whose elements must be unique, use a set type instead —
+duplicates are rejected at validation (`NML2030`):
 
 ```
-domains []string <distinct>
+regions set<string>
 ```
 
 ### `T?` -- Optional
@@ -205,19 +208,13 @@ User-defined references follow the pattern `@namespace/path`:
 - `@user/gmatty@gmail.com`
 - `@nudge:research/admin`
 
-### `&T` -- Reference Only
+Role references compose with the conjunction operator `&`
+(see [syntax.md](syntax.md) §Role Conjunctions): `@role/admin & @role/editor`
+is one value carrying both atoms — consumers assign the AND semantics.
 
-Restricts a field to accept only a reference to an instance defined elsewhere.
-The field cannot be defined inline.
+### References vs. Inline Definitions
 
-```
-// In a model definition
-redirectTo &listener?      // must point to an existing listener
-```
-
-By default (without `&`), all fields accept both inline definitions and references.
-The parser distinguishes them syntactically:
+Fields accept both inline definitions and references to declarations
+defined elsewhere in the file. The parser distinguishes them syntactically:
 - `field = SomeName` -- reference
 - `field:` with indented content -- inline
-
-Use `&` only when inline definition does not make semantic sense.

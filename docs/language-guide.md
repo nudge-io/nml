@@ -240,10 +240,9 @@ references.
 | Syntax | Meaning |
 |--------|---------|
 | `@roleRef` | Role or identity reference |
-| `&T` | Reference-only (must point to an existing instance) |
 
-By default, fields accept both inline definitions and references. Use `&T` to
-restrict a field to reference-only when inline definition doesn't make sense.
+Fields accept both inline definitions and references to declarations
+defined elsewhere in the file.
 
 ## Modeling
 
@@ -281,31 +280,6 @@ model webProfile:
     description string?           // optional
     sessionDuration duration = "24h"  // has default
 ```
-
-### Constraints
-
-Constraints are specified in angle brackets after the type:
-
-```
-port number <integer, min = 1, max = 65535>
-email string <pattern = "^[^@]+@[^@]+$">
-domains []string <distinct>
-price money <currency = "USD">
-```
-
-| Constraint | Applies to | Purpose |
-|------------|-----------|---------|
-| `<unique>` | any | Value must be unique across all instances |
-| `<secret>` | string | Masked in logs, supports `$ENV.X` resolution |
-| `<token>` | string | Used as a lookup identifier |
-| `<distinct>` | lists | All items must be unique |
-| `<integer>` | number | Must be a whole number |
-| `<min = N>` | number | Minimum value (inclusive) |
-| `<max = N>` | number | Maximum value (inclusive) |
-| `<minLength = N>` | string | Minimum length |
-| `<maxLength = N>` | string | Maximum length |
-| `<pattern = "re">` | string | Must match regex |
-| `<currency = "X">` | money | Restrict accepted currency codes |
 
 ### Traits
 
@@ -513,6 +487,21 @@ precedence.
 @nudge:research/admin         // org:path format
 @nudge/{org}/admin/{dept}/update  // parameterized
 ```
+
+### Requiring Several Roles at Once (`&`)
+
+Join role references with `&` to require **all** of them in one selector:
+
+```
+service AdminReports:
+    |allow:
+        - @role/admin & @role/billing    // must hold BOTH
+        - @role/owner                    // or this one alone
+```
+
+Each list entry is an independent grant (any entry may match); `&`
+composes conditions *within* an entry. Spacing is canonicalized to
+`" & "` — `nml fmt` rewrites tight spacing for you.
 
 ### Inheritance
 

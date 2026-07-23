@@ -677,7 +677,7 @@ impl<'a> Parser<'a> {
         self.at(SyntaxKind::Pipe) && !self.newline_before()
     }
 
-    /// RFC 0011: the `(& Role)*` tail of a role-conjunction expression.
+    /// RFC 0014: the `(& Role)*` tail of a role-conjunction expression.
     /// The atoms stay separate tokens inside one node (lossless CST); the
     /// value layer joins them into the canonical `" & "` form. `&` is valid
     /// ONLY between role tokens — dangling or doubled operators get targeted

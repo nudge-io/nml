@@ -307,27 +307,61 @@ pub fn apply_shared_properties(body: &Body) -> Body {
         })
         .collect();
 
-    if shared.is_empty() {
-        return body.clone();
-    }
-
+    // Every body is a scope: this body's `.name` entries merge into ITS list
+    // items, and every deeper body — nested blocks, item bodies — applies its
+    // own shared properties the same way (spec/syntax.md §Shared Properties).
+    // No early return on empty `shared`: deeper scopes may carry their own.
     let entries = body
         .entries
         .iter()
         .filter_map(|entry| match &entry.kind {
+            // Consumed at this scope — items below carry the merged values.
             BodyEntryKind::SharedProperty(_) => None,
             BodyEntryKind::ListItem(item) => {
                 let merged = merge_shared_into_item(item, &shared);
                 Some(BodyEntry {
-                    kind: BodyEntryKind::ListItem(merged),
+                    kind: BodyEntryKind::ListItem(apply_shared_in_item(merged)),
                     span: entry.span,
                 })
             }
+            BodyEntryKind::NestedBlock(nb) => Some(BodyEntry {
+                kind: BodyEntryKind::NestedBlock(NestedBlock {
+                    name: nb.name.clone(),
+                    body: apply_shared_properties(&nb.body),
+                }),
+                span: entry.span,
+            }),
             _ => Some(entry.clone()),
         })
         .collect();
 
     Body { entries }
+}
+
+/// Recurse into a (just-merged) item's own body so ITS scopes apply their
+/// own shared properties. Bodyless scalars and references have no scopes.
+fn apply_shared_in_item(item: ListItem) -> ListItem {
+    let span = item.span;
+    match item.kind {
+        ListItemKind::Named { name, body } => ListItem {
+            kind: ListItemKind::Named {
+                name,
+                body: apply_shared_properties(&body),
+            },
+            span,
+        },
+        ListItemKind::Shorthand {
+            value,
+            body: Some(body),
+        } => ListItem {
+            kind: ListItemKind::Shorthand {
+                value,
+                body: Some(apply_shared_properties(&body)),
+            },
+            span,
+        },
+        other => ListItem { kind: other, span },
+    }
 }
 
 /// Merge shared property defaults from an `ArrayBody` into its list items.
@@ -336,14 +370,20 @@ pub fn apply_shared_properties(body: &Body) -> Body {
 /// dedicated `shared_properties` field.
 pub fn apply_array_shared_properties(array_body: &ArrayBody) -> Vec<ListItem> {
     if array_body.shared_properties.is_empty() {
-        return array_body.items.clone();
+        // Still recurse: item bodies are scopes with their own shared
+        // properties even when the array itself declares none.
+        return array_body
+            .items
+            .iter()
+            .map(|item| apply_shared_in_item(item.clone()))
+            .collect();
     }
 
     let shared_refs: Vec<&SharedProperty> = array_body.shared_properties.iter().collect();
     array_body
         .items
         .iter()
-        .map(|item| merge_shared_into_item(item, &shared_refs))
+        .map(|item| apply_shared_in_item(merge_shared_into_item(item, &shared_refs)))
         .collect()
 }
 

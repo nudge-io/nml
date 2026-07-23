@@ -212,6 +212,35 @@ let value = doc.block("service", "MyApp").property("tags").value().unwrap();
 let tags: Vec<String> = from_value(value)?;
 ```
 
+### Document Scope: `from_document_defaulted`
+
+The modular layout — a top-level array declaration referenced by name —
+deserializes directly at document scope (RFC 0013): the reference is
+materialized (shared properties and items inlined) before the body
+pipeline runs:
+
+```rust
+use nml_core::{from_document_defaulted, Document};
+
+let doc = Document::new(&file);
+let config: ServiceConfig =
+    from_document_defaulted(&index, &doc, "service", "Api", &resolver)?;
+```
+
+```nml check
+[]endpoint monitoredEndpoints:
+    .timeout = "10s"
+
+    - Api:
+        url = "https://api.example.dev"
+
+service Api:
+    endpoints = monitoredEndpoints
+```
+
+`Document::array_body(name)` exposes the referenced declaration for manual
+handling when you need it.
+
 ### Combined Pipeline: `from_body_resolved`
 
 For the common case of resolve + deserialize, use the combined pipeline:

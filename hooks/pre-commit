@@ -14,6 +14,25 @@
 
 set -e
 
+# ── 0. RFC index integrity ──────────────────────────────────────────────────
+# docs/rfcs/ is gitignored, so CI can never see it — this hook is the ONLY
+# checkpoint that can. Two invariants (an 0011 number collision shipped once):
+# every RFC number is unique, and every RFC has a row in the README index
+# (which declares itself the authoritative status list).
+if [ -d docs/rfcs ]; then
+    dups=$(ls docs/rfcs | grep -E '^[0-9]{4}-' | cut -c1-4 | sort | uniq -d)
+    if [ -n "$dups" ]; then
+        echo "pre-commit: duplicate RFC number(s) in docs/rfcs/: $dups" >&2
+        exit 1
+    fi
+    for f in docs/rfcs/[0-9]*.md; do
+        if ! grep -qF "($(basename "$f"))" docs/rfcs/README.md; then
+            echo "pre-commit: docs/rfcs/README.md has no row for $(basename "$f")" >&2
+            exit 1
+        fi
+    done
+fi
+
 # ── 1. formatting ───────────────────────────────────────────────────────────
 if ! cargo fmt --all -- --check >/dev/null 2>&1; then
     echo "pre-commit: cargo fmt --all --check failed — run 'cargo fmt --all' and re-stage." >&2

@@ -8,17 +8,21 @@ run in CI):
 
 ```text
 Skylight https://status.skylight.dev on 0.0.0.0:8080 — log level info, retries 3, 4 endpoint(s)
-  - Api https://api.skylight.dev (timeout 5s, every 60s, regions: us-east+eu-west)
-  - Marketing https://www.skylight.dev (timeout 5s, every 60s, regions: all)
-  - AdminConsole https://admin.skylight.dev (timeout 5s, every 60s, regions: all)
-  - Docs https://docs.skylight.dev (timeout 5s, every 60s, regions: all)
+  - Api https://api.skylight.dev (timeout 10s, every 60s, regions: us-east+eu-west)
+  - Marketing https://www.skylight.dev (timeout 10s, every 60s, regions: all)
+  - AdminConsole https://admin.skylight.dev (timeout 10s, every 60s, regions: all)
+  - (unnamed) https://docs.skylight.dev (timeout 10s, every 60s, regions: all)
   database postgres://localhost/skylight (pool 10) — api key 20 chars, tags ["web", "api"], timeout 30s
 ```
 
-Look at what's in there that the config file never wrote: `log level info`,
-`timeout 5s`, `every 60s`, `pool 10` are schema defaults; `retries 3` came
-through a `const` reference; the api key resolved through its fallback
-chain. The pipeline hands your code finished values.
+Look at what's in there that no single line of config wrote: `log level
+info`, `every 60s`, and `pool 10` are schema defaults; `timeout 10s` is the
+list's shared `.timeout` beating the trait's `5s` default; the last endpoint
+is a bare positional item (`- "https://docs.skylight.dev"`) that still
+arrived fully materialized; `retries 3` came through a `const` reference;
+the api key resolved through its fallback chain. The full precedence ladder
+from Chapter 4 — schema default → shared property → the item's own value —
+lands in your structs already settled.
 
 The complete program lives in
 [`examples/07/app/`](examples/07/app/); the chapter walks through it. One
@@ -67,7 +71,9 @@ struct DatabaseConfig {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Endpoint {
-    /// Injected from the list item's label (`- Api:` → `"Api"`).
+    /// Injected from the list item's label (`- Api:` → `"Api"`). Bare
+    /// positional items (`- "https://…"`) carry no label, so default it.
+    #[serde(default)]
     name: String,
     url: String,
     timeout: String,
@@ -84,7 +90,8 @@ Three things to notice:
 - `#[serde(rename_all = "camelCase")]` maps NML's `camelCase` properties to
   Rust's `snake_case` fields.
 - Nested blocks become nested structs; list items become `Vec<T>`, and each
-  named item's label arrives as a `name` field.
+  named item's label arrives as a `name` field — bare positional items have
+  no label, so `name` defaults (they're anonymous by design).
 - Your structs only declare what you need — body entries you don't ask for
   (`notifiers`, `landing`, `|allow`…) are simply not deserialized.
 
@@ -172,34 +179,34 @@ Finally, defaults + deserialization in one call:
 ```
 
 `from_body_defaulted` runs the whole tail of the pipeline: positional-item
-materialization, shared-property merge for the body's items, schema
-defaults (including the trait-inherited ones — that's where `timeout 5s`
-and `every 60s` come from), reference resolution, then serde. Your structs
-receive finished values; no `unwrap_or` sprinkled through the codebase.
+materialization, shared-property merge (every body scope, at any depth),
+schema defaults (including the trait-inherited ones — that's where `every
+60s` comes from), reference resolution, then serde. Your structs receive
+finished values; no `unwrap_or` sprinkled through the codebase.
 
 The rest of the program is `println!`. Run it from the chapter directory
 (`cargo run`) and you get the output at the top of the page.
 
 ## What about references between declarations?
 
-Chapter 6's config said `notifiers = alertNotifiers` — and this program
-never notices, because it doesn't deserialize `notifiers`. That's the
-general rule: **references are late-bound, and the binding is yours**. The
-validator checks them; the serde pipeline materializes `const` references
-(through `with_symbols`) but leaves declaration references (like a
-top-level `[]notifier` array) to the host application — the query API
-(`doc.blocks(…)`, `doc.const_value(…)`) is how you look the targets up when
-you want them. For data your program consumes as a struct, prefer the
-inline form, as we did with `endpoints`.
+Chapter 6's config said `endpoints = monitoredEndpoints` — a reference to
+a top-level array declaration. This program deserializes the inline form,
+but you don't have to restructure a config to embed it: the pipeline also
+runs at **document scope**, where declaration references are materialized
+for you (shared properties and items inlined, exactly as if written in
+place):
 
-Two more current limitations worth knowing so they never surprise you:
+```rust
+let config: ServiceConfig =
+    from_document_defaulted(&index, &doc, "service", "Api", &resolver)?;
+```
 
-- Shared properties (`.timeout = "10s"`) merge into the items of the body
-  being deserialized — but not into deeper nested lists. Where you rely on
-  the serde path, set the value per item or let a schema default carry it.
-- Bare positional items (`- "https://…"`) validate fine but don't receive
-  schema defaults through the serde path today — in lists you deserialize,
-  use named items.
+`const` references resolve through `with_symbols` either way, and a
+reference the document doesn't define passes through for validation to
+report. The remaining late-bound cases are deliberate: reference *list
+items* (`- SomeRef`) and role/landing targets stay yours to interpret —
+the query API (`doc.blocks(…)`, `doc.array_body(…)`,
+`doc.const_value(…)`) is how you look them up.
 
 ## Exercises
 

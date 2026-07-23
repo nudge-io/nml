@@ -100,6 +100,24 @@ RUST_FENCE_RE = re.compile(r"^```rust\s+(\S.*)$")
 BANNED_TOKENS = ["<shorthand>", "=>"]
 BANNED_PROSE_TOKENS = ["<shorthand>"]
 
+# Removed syntax with a shape a bare substring can't pin — same scope as
+# BANNED_TOKENS (nml blocks and example files). Each pattern names a dead
+# form so the failure message teaches the living replacement's existence:
+#   - angle-bracket constraints  → typed fields / set<T> / schema validation
+#   - `model x (trait):`         → `model x is trait:`
+#   - `&Type` reference marker   → plain references (conjunction atoms
+#     start with `@`, so `&[A-Za-z]` can never hit a legal conjunction)
+#   - `[]@roleRef` element type  → `[]role`
+BANNED_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
+    (
+        "angle-bracket constraint",
+        re.compile(r"<(unique|token|distinct|integer|secret)>|<(min|max|minLength|maxLength|pattern|currency)\s*="),
+    ),
+    ("parenthesized composition", re.compile(r"^(?:model|trait)\s+\w+\s*\(", re.M)),
+    ("'&'-reference marker", re.compile(r"&[A-Za-z]")),
+    ("'[]@' element type", re.compile(r"\[\]@")),
+]
+
 # Historical records may (and should) describe removed syntax.
 BAN_EXEMPT_PATHS = ("docs/rfcs/", "docs/DOCUMENTATION-PLAN.md")
 
@@ -230,7 +248,9 @@ def run_check(block: Block) -> tuple[bool, str]:
 
 
 def banned_tokens_in(text: str) -> list[str]:
-    return [tok for tok in BANNED_TOKENS if tok in text]
+    hits = [tok for tok in BANNED_TOKENS if tok in text]
+    hits.extend(name for name, pat in BANNED_PATTERNS if pat.search(text))
+    return hits
 
 
 def run_cmd(

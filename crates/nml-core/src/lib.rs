@@ -89,7 +89,9 @@ pub mod types;
 /// The top-level parse facade: source → semantic [`ast::File`], reporting the
 /// first error. Ergonomic alias for [`cst::parse_to_ast`] (the layered name).
 pub use cst::parse_to_ast as parse;
-pub use defaults::{apply_defaults, from_block_defaulted, from_body_defaulted};
+pub use defaults::{
+    apply_defaults, from_block_defaulted, from_body_defaulted, from_document_defaulted,
+};
 pub use project::ProjectConfig;
 pub use query::Document;
 pub use resolve::ValueResolver;

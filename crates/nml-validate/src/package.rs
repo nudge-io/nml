@@ -136,6 +136,7 @@ impl PackageManifest {
                         "validator '{}' is fully shadowed by earlier validator '{}' (first match wins) — it can never bind a file",
                         later.name, earlier.name
                     ))
+            .with_code(nml_core::diagnostic::codes::SHADOWED_VALIDATOR)
                     .with_span(later.span),
                 );
             }
@@ -176,6 +177,11 @@ pub enum PackageError {
     /// definitions, cycles). Diagnostics carry per-source attribution.
     Sources { errors: Vec<Diagnostic> },
 }
+
+/// `PackageError` participates in standard error handling (`?` into
+/// `Box<dyn Error>`): every variant is self-contained (diagnostics and
+/// strings), so there is no `source()` chain.
+impl std::error::Error for PackageError {}
 
 impl fmt::Display for PackageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -315,7 +321,10 @@ impl SchemaPackage {
     /// with the package's profile applied (strictness, modifiers, membership).
     pub fn validator(&self, binding: &ValidatorBinding) -> Result<SchemaValidator, PackageError> {
         let schema = self.composed_schema(binding)?;
+        // Package bindings are a closed vocabulary (RFC 0012): the operator's
+        // composed schemas are the entire authority for bound files.
         let mut validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
+            .closed_vocabulary()
             .with_modifiers(self.manifest.modifiers.clone())
             .with_membership_semantics(self.manifest.membership.clone());
         if binding.strict {
@@ -436,7 +445,7 @@ pub fn parse_manifest(text: &str) -> Result<PackageManifest, PackageError> {
                 }
             }
             return Err(PackageError::Manifest {
-                errors: vec![Diagnostic::error(e.message().to_string()).with_span(e.span())],
+                errors: vec![e.to_diagnostic()],
             });
         }
     };
@@ -457,7 +466,9 @@ pub fn parse_manifest(text: &str) -> Result<PackageManifest, PackageError> {
         meta_diags.is_empty(),
         "embedded meta-schema must load clean: {meta_diags:?}"
     );
-    let validator = SchemaValidator::new(meta.models, meta.enums, meta.oneofs).strict();
+    let validator = SchemaValidator::new(meta.models, meta.enums, meta.oneofs)
+        .closed_vocabulary()
+        .strict();
     let errors: Vec<Diagnostic> = validator
         .validate(&file)
         .into_iter()

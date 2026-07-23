@@ -1,0 +1,6 @@
+model cache:
+    maxEntries number
+    enabled bool = true
+
+cache Hot:
+    maxEntries = 500

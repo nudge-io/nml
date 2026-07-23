@@ -55,6 +55,11 @@ pub struct ModelDef {
     pub kind: ModelKind,
     pub extends: Vec<MixinRef>,
     pub fields: Vec<FieldDef>,
+    /// The schema source (file name) that declared this definition, stamped
+    /// by the loader when composing a multi-source set. Definition-anchored
+    /// findings copy it so they render `file:line:col` instead of a raw
+    /// byte span; `None` for single-source extraction and synthesized roots.
+    pub source: Option<String>,
     pub span: Span,
 }
 
@@ -70,6 +75,8 @@ impl ModelDef {
 pub struct EnumDef {
     pub name: String,
     pub variants: Vec<String>,
+    /// Declaring schema source — see [`ModelDef::source`].
+    pub source: Option<String>,
     pub span: Span,
 }
 
@@ -91,6 +98,8 @@ pub struct OneOfDef {
     pub default_discriminator: Option<String>,
     /// `(discriminator_value, variant_model_name)` pairs, in source order.
     pub variants: Vec<(String, String)>,
+    /// Declaring schema source — see [`ModelDef::source`].
+    pub source: Option<String>,
     pub span: Span,
 }
 

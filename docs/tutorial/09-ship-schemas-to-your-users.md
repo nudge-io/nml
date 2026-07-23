@@ -66,7 +66,7 @@ Four sections, four jobs:
 Load the package and ask who it is:
 
 ```rust source=docs/tutorial/examples/09/app/src/main.rs
-    let package = SchemaPackage::from_dir(Path::new(".")).map_err(|e| e.to_string())?;
+    let package = SchemaPackage::from_dir(Path::new("."))?;
     let manifest = &package.manifest;
 ```
 
@@ -92,7 +92,7 @@ slot per `(version, hash)`, plus a `current` pointer flipped atomically:
     // Publish to a store. Real tools use Store::user() — the per-user store
     // editors read; this demo uses a scratch directory.
     let store = Store::at(std::env::temp_dir().join("skylight-store-demo"));
-    let outcome = store.publish(&package).map_err(|e| e.to_string())?;
+    let outcome = store.publish(&package)?;
     match outcome {
         PublishOutcome::Published { slot } => println!("published to slot {slot}"),
         PublishOutcome::Unchanged => println!("published already — store is current"),

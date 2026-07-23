@@ -163,6 +163,86 @@ pub mod codes {
         /// A block or array keyword names a trait — traits cannot be
         /// instantiated (RFC 0011).
         TRAIT_INSTANTIATED = 2024;
+        /// A model/trait `is` clause lists the same mixin twice — the merge
+        /// is idempotent, so the duplicate is noise (composition tidiness).
+        DUPLICATE_MIXIN = 2025;
+        /// In-file schema definitions under a closed package binding have no
+        /// effect (RFC 0012): the binding's schemas are the entire
+        /// vocabulary.
+        INEFFECTIVE_DEFINITIONS = 2026;
+        /// An enum declares the same variant twice (both authored forms —
+        /// `- "a"` and `- a` — name one variant).
+        DUPLICATE_ENUM_VARIANT = 2027;
+        /// An enum declares no variants — no instance value can satisfy a
+        /// field it types, and an `as`-typed `oneof` can never cover it.
+        EMPTY_ENUM = 2028;
+        /// A `duration`-typed value does not match the duration grammar
+        /// (spec: a numeric value with unit `h`/`m`/`s`/`ms`, e.g. "30s").
+        INVALID_DURATION = 2029;
+        /// A set contains the same element more than once (element identity
+        /// is value-level; sets are unique by definition).
+        DUPLICATE_SET_ELEMENT = 2030;
+        /// A non-arm entry appears in a `(K -> V)`-typed field's body,
+        /// which holds only routing arms.
+        ARMS_BODY_ENTRY = 2031;
+        /// A value matches none of a union type's variants.
+        UNION_TYPE_MISMATCH = 2032;
+        /// A type composition with no instance form (RFC 0007 §4.3): an arm
+        /// set in a position whose body can never hold arms, or a union
+        /// with more than one arm-set variant.
+        INVALID_TYPE_SHAPE = 2033;
+        /// A field definition outside a model/trait declaration.
+        MISPLACED_FIELD_DEFINITION = 2034;
+        /// Routing arm entries inside a schema declaration — arms belong in
+        /// instances; the declaration carries the `(K -> V)` type.
+        ARMS_IN_DEFINITION = 2035;
+        /// An arm set repeats a selector: a second `else`, or a duplicate
+        /// arm key — dispatch would be ambiguous (first match wins).
+        DUPLICATE_ARM = 2036;
+        /// An arm after `else` can never match — arms match first-to-last,
+        /// so `else` must be the final arm.
+        UNREACHABLE_ARM = 2037;
+        /// An arm's selector does not conform to the declared key type.
+        ARM_KEY_MISMATCH = 2038;
+        /// A string-literal arm target where the arm set's target type is
+        /// not scalar-capable — use a declared name instead.
+        ARM_TARGET_MISMATCH = 2039;
+        /// Routing arms in a model-typed body — arms belong under a field
+        /// typed `(K -> V)`.
+        ARMS_NOT_EXPECTED = 2040;
+        /// A `oneof` instance omits its discriminator and the union declares
+        /// no default arm.
+        MISSING_DISCRIMINATOR = 2041;
+        /// A `oneof` discriminator value that is not a string.
+        INVALID_DISCRIMINATOR = 2042;
+        /// A scalar shorthand item on a union-typed list — the variant is
+        /// undecidable from a bare scalar; write the block form.
+        UNION_SHORTHAND = 2043;
+        /// Validation stopped descending at the maximum nesting depth;
+        /// deeper entries were not checked (advisory).
+        VALIDATION_TRUNCATED = 2044;
+        /// A quoted string in a `role`-typed field — roles are references
+        /// (`@name`), not strings; machine-fixable.
+        ROLE_LITERAL = 2045;
+        /// A user reference (`@user/…`) in an access-control rule — user
+        /// refs belong in members lists.
+        USER_REF_IN_ACL = 2046;
+        /// A built-in access level (`@public`, …) in a members list.
+        BUILTIN_IN_MEMBERS = 2047;
+        /// Role/plan membership references form a cycle.
+        MEMBERSHIP_CYCLE = 2048;
+        /// A bare scalar item's key was dropped: the element model declares
+        /// no positional (`+`) field to receive it.
+        DROPPED_ITEM_KEY = 2049;
+
+        /// A scalar item cannot fill an arm-set shorthand field — an arm
+        /// target is a name or a string, so no arm can be synthesized from
+        /// this value (RFC 0005 §10).
+        ARM_SHORTHAND_MISMATCH = 2050;
+
+        /// A package validator binding is fully shadowed by earlier
+        /// bindings — its globs can never match first (RFC 0030).
+        SHADOWED_VALIDATOR = 4000;
         /// Model `extends` chains form a cycle.
         EXTENDS_CYCLE = 2013;
         /// Model references form a cycle (advisory: legal, but often a sign

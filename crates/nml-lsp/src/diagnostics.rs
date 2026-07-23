@@ -16,6 +16,10 @@ pub struct DiagnosticConfig {
     pub modifiers: Vec<String>,
     /// Membership semantics passed through to `SchemaValidator`.
     pub membership: MembershipSemantics,
+    /// Whether the document itself feeds the scope registry (`.model.nml`):
+    /// its definitions arrive through the registry, so the open-mode
+    /// doc-local merge (and its collision reporting) must not re-add them.
+    pub uri_is_registry_source: bool,
 }
 
 /// Where schema validation for a document comes from (RFC 0030).
@@ -75,11 +79,90 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
             enums,
             oneofs,
         } => {
+            // Open mode is one namespace (RFC 0012): the document's own
+            // definitions join its validation set, so a self-contained file
+            // (`model cache` above `cache Foo:`) is typed in the editor
+            // exactly as `nml check` types it. Workspace-registry
+            // definitions stay authoritative on a name collision (the same
+            // first-wins rule the loader applies; the CLI reports the
+            // collision as NML2009).
+            let mut models = models.to_vec();
+            let mut enums = enums.to_vec();
+            let mut oneofs = oneofs.to_vec();
+            // A `.model.nml` document IS a registry source — its definitions
+            // arrived through the registry already, so merging (or
+            // collision-checking) them against themselves would be noise.
+            let doc_is_registry_source = config.uri_is_registry_source;
+            if !doc_is_registry_source {
+                let (own, _) = nml_core::cst::extract_schema(source);
+                for m in own.models {
+                    if models.iter().any(|k| k.name == m.name) {
+                        // CLI parity (RFC 0012): the same collision `nml
+                        // check` reports — never a silent shadow.
+                        push_diagnostic(
+                            nml_core::diagnostic::Diagnostic::error(format!(
+                                "duplicate {} definition '{}' — the workspace schema \
+                                 registry already defines it",
+                                m.kind.label(),
+                                m.name
+                            ))
+                            .with_code(nml_core::diagnostic::codes::DUPLICATE_DEFINITION)
+                            .with_span(m.span),
+                            None,
+                            &line_index,
+                            &mut diagnostics,
+                        );
+                    } else {
+                        models.push(m);
+                    }
+                }
+                for e in own.enums {
+                    if enums.iter().any(|k| k.name == e.name) {
+                        push_diagnostic(
+                            nml_core::diagnostic::Diagnostic::error(format!(
+                                "duplicate enum definition '{}' — the workspace schema \
+                                 registry already defines it",
+                                e.name
+                            ))
+                            .with_code(nml_core::diagnostic::codes::DUPLICATE_DEFINITION)
+                            .with_span(e.span),
+                            None,
+                            &line_index,
+                            &mut diagnostics,
+                        );
+                    } else {
+                        enums.push(e);
+                    }
+                }
+                for o in own.oneofs {
+                    if oneofs.iter().any(|k| k.name == o.name) {
+                        push_diagnostic(
+                            nml_core::diagnostic::Diagnostic::error(format!(
+                                "duplicate oneof definition '{}' — the workspace schema \
+                                 registry already defines it",
+                                o.name
+                            ))
+                            .with_code(nml_core::diagnostic::codes::DUPLICATE_DEFINITION)
+                            .with_span(o.span),
+                            None,
+                            &line_index,
+                            &mut diagnostics,
+                        );
+                    } else {
+                        oneofs.push(o);
+                    }
+                }
+            }
             if !models.is_empty() || !enums.is_empty() || !oneofs.is_empty() {
-                let validator =
-                    SchemaValidator::new(models.to_vec(), enums.to_vec(), oneofs.to_vec())
-                        .with_modifiers(config.modifiers.clone())
-                        .with_membership_semantics(config.membership.clone());
+                let mut schema = nml_core::schema::ExtractedSchema {
+                    models,
+                    enums,
+                    oneofs,
+                };
+                nml_core::schema::resolve_model_inheritance(&mut schema);
+                let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
+                    .with_modifiers(config.modifiers.clone())
+                    .with_membership_semantics(config.membership.clone());
                 for diag in validator.validate(&file) {
                     push_diagnostic(diag, None, &line_index, &mut diagnostics);
                 }
@@ -934,6 +1017,81 @@ package demo:
                 .any(|d| d.message.contains("unresolved reference 'nonexistent'")),
             "invalid bare step ref should be flagged: {:?}",
             diags
+        );
+    }
+
+    /// RFC 0012: in registry (open) mode, the document's own definitions
+    /// type its own instances — editor parity with `nml check`.
+    #[test]
+    fn registry_mode_types_self_contained_documents() {
+        let source = "model cache:\n    maxEntries number\n\ncache Hot:\n    enabled = false\n";
+        let diags = compute(
+            source,
+            &SchemaMode::Registry {
+                models: &[],
+                enums: &[],
+                oneofs: &[],
+            },
+            &DiagnosticConfig::default(),
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("missing required field 'maxEntries'")),
+            "doc-local model must type the doc's own instance: {diags:?}"
+        );
+    }
+
+    /// RFC 0012 editor parity: an open-mode document redefining a registry
+    /// name gets the same NML2009 the CLI reports — never a silent shadow.
+    #[test]
+    fn registry_collision_reports_nml2009() {
+        let registry = nml_core::cst::extract_schema("model cache:\n    maxEntries number\n").0;
+        let source = "model cache:\n    other string?\n\ncache Hot:\n    other = \"x\"\n";
+        let diags = compute(
+            source,
+            &SchemaMode::Registry {
+                models: &registry.models,
+                enums: &registry.enums,
+                oneofs: &registry.oneofs,
+            },
+            &DiagnosticConfig::default(),
+        );
+        assert!(
+            diags.iter().any(|d| d.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "NML2009".into()
+                ))
+                && d.message.contains("duplicate model definition 'cache'")),
+            "{diags:?}"
+        );
+    }
+
+    /// A `.model.nml` document IS a registry source: its own definitions
+    /// must not self-collide (the registry already carries them).
+    #[test]
+    fn registry_source_documents_do_not_self_collide() {
+        let src = "model cache:\n    maxEntries number\n";
+        let registry = nml_core::cst::extract_schema(src).0;
+        let config = DiagnosticConfig {
+            uri_is_registry_source: true,
+            ..DiagnosticConfig::default()
+        };
+        let diags = compute(
+            src,
+            &SchemaMode::Registry {
+                models: &registry.models,
+                enums: &registry.enums,
+                oneofs: &registry.oneofs,
+            },
+            &config,
+        );
+        assert!(
+            diags.iter().all(|d| d.code
+                != Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "NML2009".into()
+                ))),
+            "{diags:?}"
         );
     }
 }

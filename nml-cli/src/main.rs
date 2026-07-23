@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use nml_core::diagnostic::{Code, Diagnostic, Severity};
-use nml_core::schema::ExtractedSchema;
 use nml_validate::schema::SchemaValidator;
 
 /// Parse a file via the CST, reporting **every** syntactic and semantic error
@@ -140,8 +139,18 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
     // the file via `--schema` would report. A file with no definitions
     // contributes nothing here.
     let file_name = path.display().to_string();
-    let (_, schema_diags) = nml_validate::loader::load_schema(&[(&file_name, &source)]);
+    let (schema, schema_diags) = nml_validate::loader::load_schema(&[(&file_name, &source)]);
     errors.extend(schema_diags);
+    // The same definition-side body pass `check` runs (field defaults,
+    // type-shape rules, misplaced arms/field definitions) — one code path,
+    // so the definition verbs can never disagree.
+    if !schema.is_empty() {
+        errors.extend(
+            SchemaValidator::from(schema)
+                .composition_checked_at_load()
+                .validate_definitions(&file),
+        );
+    }
     if errors.is_empty() {
         println!("{}: ok", path.display());
         Ok(())
@@ -252,54 +261,96 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
         error_count += 1;
     }
 
-    if let Some(sd) = schema_dir {
-        let LoadedSchemaDir {
-            schema,
-            diagnostics: schema_diags,
-            sources: named_sources,
-        } = load_schema_dir(&sd)?;
+    // One schema universe per check (RFC 0012): the `--schema` directory's
+    // sources plus the checked file itself (unless it *is* one of them). A
+    // single load runs every definition pass — reserved/duplicate names,
+    // `is` composition, trait usage, oneof integrity, positional arity,
+    // cycles — with per-file attribution, and the composed schema then
+    // types instances. A self-contained file (`model cache` above
+    // `cache Foo:`) validates with no flags, and a name declared in both
+    // the file and the directory is NML2009 — never a silent shadow.
+    let mut named_sources: Vec<(String, PathBuf, String)> = Vec::new();
+    if let Some(sd) = &schema_dir {
+        for (p, text) in read_schema_dir(sd)? {
+            let load_name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("schema")
+                .to_string();
+            named_sources.push((load_name, p, text));
+        }
+    }
+    let file_canon = path.canonicalize().ok();
+    let file_is_a_source = file_canon.as_ref().is_some_and(|fc| {
+        named_sources
+            .iter()
+            .any(|(_, p, _)| p.canonicalize().ok().as_ref() == Some(fc))
+    });
+    if !file_is_a_source {
+        // The checked file's load name is its display path — unambiguous
+        // against directory basenames for attribution.
+        named_sources.push((path.display().to_string(), path.clone(), source.clone()));
+    }
+    let source_refs: Vec<(&str, &str)> = named_sources
+        .iter()
+        .map(|(n, _, t)| (n.as_str(), t.as_str()))
+        .collect();
+    let (schema, schema_diags) = nml_validate::loader::load_schema(&source_refs);
 
-        // Schema-level diagnostics (parse errors, cycles, duplicates) refer
-        // to the schema files, not the checked file: locate each against its
-        // attributed source (`diag.source` = the file name, RFC 0030) so it
-        // prints as `path:line:col` like every other finding. Cross-source
-        // findings no one file owns fall back to the dir-prefixed form.
-        for diag in &schema_diags {
-            let attributed = diag.source.as_deref().and_then(|name| {
-                named_sources
-                    .iter()
-                    .find(|(p, _)| p.file_name().and_then(|f| f.to_str()) == Some(name))
-            });
-            match attributed {
-                Some((schema_path, text)) => {
-                    first_code = first_code.or(report(
-                        schema_path,
-                        &nml_core::span::SourceMap::new(text),
-                        diag,
-                    ));
-                }
-                None => {
-                    eprintln!("{}: {}", sd.display(), diag);
-                    first_code = first_code.or(diag.code);
-                }
+    // Attributed findings print `path:line:col` against their declaring
+    // source; a finding no single definition owns falls back to a
+    // location-less line under the schema dir (or the file).
+    for diag in &schema_diags {
+        let attributed = diag
+            .source
+            .as_deref()
+            .and_then(|name| named_sources.iter().find(|(n, _, _)| n == name));
+        match attributed {
+            Some((_, src_path, text)) => {
+                first_code = first_code.or(report(
+                    src_path,
+                    &nml_core::span::SourceMap::new(text),
+                    diag,
+                ));
             }
-            if matches!(diag.severity, Severity::Error) {
-                error_count += 1;
+            None => {
+                match &schema_dir {
+                    Some(sd) => eprintln!("{}: {}", sd.display(), diag),
+                    None => eprintln!("{}: {}", path.display(), diag),
+                }
+                first_code = first_code.or(diag.code);
             }
         }
+        if matches!(diag.severity, Severity::Error) {
+            error_count += 1;
+        }
+    }
 
-        if !schema.is_empty() {
-            let mut validator = SchemaValidator::from(schema);
-            // --strict: unknown properties and unmodeled keywords become
-            // errors (CI posture; the same profile package bindings can set).
-            if strict {
-                validator = validator.strict();
-            }
-            for diag in validator.validate(&file) {
-                first_code = first_code.or(report(&path, &source_map, &diag));
-                if matches!(diag.severity, Severity::Error) {
-                    error_count += 1;
-                }
+    // `--strict` promises enforcement; with an empty schema universe there
+    // is nothing to enforce, and silently degrading to parse-only checking
+    // is how a CI pipeline points at the wrong path and stays green
+    // forever. Fail the *invocation*, naming the actual mistake.
+    if strict && schema.is_empty() {
+        return Err(
+            "--strict has nothing to enforce: no schema definitions found \
+             (no --schema directory given and none declared in the file)"
+                .to_string(),
+        );
+    }
+
+    if !schema.is_empty() {
+        // Definition composition is covered by the single load above —
+        // instance-only here, so no finding is ever reported twice.
+        let mut validator = SchemaValidator::from(schema).composition_checked_at_load();
+        // --strict: unknown properties and unmodeled keywords become
+        // errors (CI posture; the same profile package bindings can set).
+        if strict {
+            validator = validator.strict();
+        }
+        for diag in validator.validate(&file) {
+            first_code = first_code.or(report(&path, &source_map, &diag));
+            if matches!(diag.severity, Severity::Error) {
+                error_count += 1;
             }
         }
     }
@@ -317,15 +368,10 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
 /// Parse all `*.model.nml` / `*.schema.nml` files in `dir` and run them
 /// through the schema-loading pipeline (inheritance resolution, cycle and
 /// duplicate detection).
-/// A loaded schema directory: the composed schema, its load diagnostics, and
-/// the named sources (kept so schema diagnostics print `file:line:col`).
-struct LoadedSchemaDir {
-    schema: ExtractedSchema,
-    diagnostics: Vec<Diagnostic>,
-    sources: Vec<(PathBuf, String)>,
-}
-
-fn load_schema_dir(dir: &PathBuf) -> Result<LoadedSchemaDir, String> {
+/// Read a schema directory's sources (`*.model.nml` / `*.schema.nml`),
+/// sorted for determinism. Loading happens once, in `cmd_check`'s single
+/// schema universe (RFC 0012), so the checked file composes with these.
+fn read_schema_dir(dir: &PathBuf) -> Result<Vec<(PathBuf, String)>, String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("failed to read schema dir {}: {e}", dir.display()))?;
 
@@ -340,30 +386,13 @@ fn load_schema_dir(dir: &PathBuf) -> Result<LoadedSchemaDir, String> {
         .collect();
     paths.sort();
 
-    // Read every schema source; `load_schema` parses over the CST and surfaces
-    // any parse error as a diagnostic (reported alongside cycle/duplicate
-    // diagnostics) rather than aborting on the first malformed file.
-    let sources = paths
-        .iter()
-        .map(read_file)
-        .collect::<Result<Vec<String>, _>>()?;
-    // Named sources (RFC 0030): diagnostics attribute the offending file.
-    let refs: Vec<(&str, &str)> = paths
-        .iter()
-        .zip(&sources)
-        .map(|(p, s)| {
-            (
-                p.file_name().and_then(|n| n.to_str()).unwrap_or("schema"),
-                s.as_str(),
-            )
-        })
-        .collect();
-    let (schema, diagnostics) = nml_validate::loader::load_schema(&refs);
-    Ok(LoadedSchemaDir {
-        schema,
-        diagnostics,
-        sources: paths.into_iter().zip(sources).collect(),
-    })
+    // `load_schema` later parses over the CST and surfaces any parse error
+    // as an attributed diagnostic rather than aborting on the first
+    // malformed file — reading here only fails on I/O.
+    paths
+        .into_iter()
+        .map(|p| read_file(&p).map(|text| (p, text)))
+        .collect()
 }
 
 fn require_file_arg(args: &[String], cmd: &str) -> Result<PathBuf, String> {

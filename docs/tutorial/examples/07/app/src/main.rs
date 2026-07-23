@@ -39,7 +39,9 @@ struct DatabaseConfig {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Endpoint {
-    /// Injected from the list item's label (`- Api:` → `"Api"`).
+    /// Injected from the list item's label (`- Api:` → `"Api"`). Bare
+    /// positional items (`- "https://…"`) carry no label, so default it.
+    #[serde(default)]
     name: String,
     url: String,
     timeout: String,
@@ -110,9 +112,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.endpoints.len(),
     );
     for ep in &config.endpoints {
+        let name = if ep.name.is_empty() {
+            "(unnamed)"
+        } else {
+            &ep.name
+        };
         println!(
             "  - {} {} (timeout {}, every {}, regions: {})",
-            ep.name,
+            name,
             ep.url,
             ep.timeout,
             ep.check_interval,

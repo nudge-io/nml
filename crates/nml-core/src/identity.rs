@@ -22,7 +22,6 @@ use crate::ast::{
     Arm, ArmSelector, ArmTarget, Body, BodyEntry, BodyEntryKind, Identifier, ListItem,
     ListItemKind, NestedBlock, Property,
 };
-use crate::error::NmlError;
 use crate::model::{FieldType, ModelDef, OneOfDef};
 use crate::schema_index::{FieldTarget, SchemaIndex};
 use crate::span::Span;
@@ -46,10 +45,11 @@ const MAX_POSITIONAL_DEPTH: u32 = 64;
 pub struct Materialized {
     /// The item's body with its identity injected (best-effort).
     pub body: Body,
-    /// Diagnostics produced while materializing. The only one is **dropped-key** (a
-    /// scalar whose model declares no shorthand field). Injection itself never errors
-    /// — an explicit value simply wins (see [`inject`]).
-    pub diagnostics: Vec<NmlError>,
+    /// Findings produced while materializing, coded at the source
+    /// (`NML2049` dropped key, `NML2050` arm-shorthand mismatch) so no
+    /// consumer ever has to guess which is which. Injection itself never
+    /// errors — an explicit value simply wins (see [`inject`]).
+    pub diagnostics: Vec<crate::diagnostic::Diagnostic>,
     /// `false` when the item could not be placed — a scalar with no shorthand field,
     /// or a reference/link. Callers surface `diagnostics` but must **not** run
     /// instance validation on `body` (an empty body would add noise — e.g. spurious
@@ -112,6 +112,7 @@ pub fn materialize_item(item: &ListItem, model: &ModelDef) -> Materialized {
                                 entries: Vec::new(),
                             },
                             diagnostics: vec![error(
+                                crate::diagnostic::codes::ARM_SHORTHAND_MISMATCH,
                                 format!(
                                     "a {} cannot fill the arm-set shorthand field '{}' on model \
                                  '{}' (an arm target is a name or a string)",
@@ -139,6 +140,7 @@ pub fn materialize_item(item: &ListItem, model: &ModelDef) -> Materialized {
                         entries: Vec::new(),
                     },
                     diagnostics: vec![error(
+                        crate::diagnostic::codes::DROPPED_ITEM_KEY,
                         format!(
                             "the value has no shorthand field on model '{}' and would be dropped",
                             model.name
@@ -243,8 +245,14 @@ fn inject_arm(body: &Body, field: &str, target: ArmTarget, span: Span) -> Body {
     Body { entries }
 }
 
-fn error(message: String, span: Span) -> NmlError {
-    NmlError::Validation { message, span }
+fn error(
+    code: crate::diagnostic::Code,
+    message: String,
+    span: Span,
+) -> crate::diagnostic::Diagnostic {
+    crate::diagnostic::Diagnostic::error(message)
+        .with_code(code)
+        .with_span(span)
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +441,7 @@ mod tests {
     fn model(fields: Vec<FieldDef>) -> ModelDef {
         ModelDef {
             kind: ModelKind::Model,
+            source: None,
             name: "m".into(),
             extends: vec![],
             fields,
@@ -626,12 +635,15 @@ mod tests {
         let r = materialize_item(&numeric, &m);
         assert!(!r.validatable);
         assert_eq!(r.diagnostics.len(), 1);
-        let NmlError::Validation { message, .. } = &r.diagnostics[0] else {
-            panic!()
-        };
+        let d = &r.diagnostics[0];
         assert!(
-            message.contains("cannot fill the arm-set shorthand"),
-            "{message}"
+            d.message.contains("cannot fill the arm-set shorthand"),
+            "{}",
+            d.message
+        );
+        assert_eq!(
+            d.code,
+            Some(crate::diagnostic::codes::ARM_SHORTHAND_MISMATCH)
         );
 
         // An explicit PROPERTY named like the field also suppresses the fill
@@ -669,9 +681,8 @@ mod tests {
         // Dropped key → flagged AND not validatable (so the caller won't add noise).
         assert!(!r.validatable);
         assert_eq!(r.diagnostics.len(), 1);
-        let NmlError::Validation { message, .. } = &r.diagnostics[0] else {
-            panic!()
-        };
-        assert!(message.contains("no shorthand field"), "{message}");
+        let d = &r.diagnostics[0];
+        assert!(d.message.contains("no shorthand field"), "{}", d.message);
+        assert_eq!(d.code, Some(crate::diagnostic::codes::DROPPED_ITEM_KEY));
     }
 }

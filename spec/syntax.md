@@ -124,8 +124,9 @@ A decimal value followed by a space and an ISO 4217 currency code (3 uppercase l
 
 ### Duration Literals
 
-Duration strings represent time spans. They are quoted strings with a numeric value
-followed by a unit suffix:
+Duration strings represent time spans. They are quoted strings with an
+**unsigned integer** immediately followed by one unit suffix (no sign, no
+decimals, no compound forms like `"1h30m"`); violations are `NML2029`:
 
 ```
 "72h"       // 72 hours
@@ -172,6 +173,36 @@ Role and identity references use the `@` prefix:
 @nudge:research/admin
 @nudge/{org}/admin/{dept}/update
 ```
+
+### Role Conjunctions
+
+A single `&` between role references forms a **role-conjunction
+expression** — one value carrying every atom (RFC 0014):
+
+```
+gate = @role/a & @role/b
+|allow = [@role/admin & @role/editor, @plan/Pro]
+|allow:
+    - @member/acme & @role/billing
+```
+
+`&` is not a role-path character, so an unquoted `&` always terminates
+the preceding role token: `@role/a&@role/b` lexes identically to
+`@role/a & @role/b`. Conjunction binds tighter than a fallback chain and
+is accepted wherever a role value appears — scalar values, inline array
+elements, and block-list items. Arm selectors (`@selector -> target`)
+name exactly one selector and do not accept conjunctions.
+
+**Canonical form (normative):** a conjunction's value text is its atoms
+joined with `" & "` — single spaces, regardless of source spacing. The
+value layer lowers to this form and the formatter re-renders from it;
+anything that prints selectors emits it, so a printed selector is always
+valid source. The language carries the expression opaquely; consumers
+assign the AND semantics.
+
+Malformed conjunctions are parse errors with targeted guidance: a
+dangling `&` ("expected a selector after '&'") and `&&` ("'&' is the
+conjunction operator; '&&' is not needed").
 
 ## Structural Syntax
 
@@ -333,8 +364,17 @@ The `|` prefix marks access control modifiers:
 
 ### Shared Properties (`.` prefix)
 
-The `.` prefix on a property within an array declaration sets a default value
-inherited by all list children:
+The `.` prefix on a property sets a default value inherited by the list
+items of the body it appears in. **Every body is its own scope, at any
+nesting depth**: an array declaration's shared properties apply to that
+array's items; a nested list field's shared properties apply to that nested
+list's items; an item's own body may declare shared properties for lists
+inside it. Scopes never leak into siblings or parents.
+
+Precedence, weakest to strongest: schema default → shared property → the
+item's own entry. Bodyless scalar items are bare values with no fields, so
+shared properties never apply to them (a scalar item *with* a body
+participates like a named item).
 
 ```
 []endpoint registrationEndpoints:
@@ -374,7 +414,7 @@ Body            <- (FieldDef / Property / NestedBlock / Modifier / SharedProp
 ArrayBody       <- (ListItem / Modifier / SharedProp / Property / Comment / NEWLINE)*
 FieldDef        <- Identifier FieldType "?"? ("=" ValueOrFallback)? NEWLINE
 FieldType       <- "[]" Identifier / Identifier
-ListItem        <- "-" (NamedItem / ShorthandItem / ReferenceItem / RoleRef)
+ListItem        <- "-" (NamedItem / ShorthandItem / ReferenceItem / RoleExpr)
 NamedItem       <- Identifier ":" NEWLINE INDENT Body DEDENT
 ShorthandItem   <- StringLiteral NEWLINE
 ReferenceItem   <- Identifier NEWLINE
@@ -387,7 +427,7 @@ SharedProp      <- "." Identifier ":" NEWLINE INDENT Body DEDENT
 ListBody        <- (ListItem / Comment / NEWLINE)*
 ValueOrFallback <- Value ("|" Value)*
 Value           <- MoneyLiteral / NumberLiteral / BoolLiteral / StringLiteral
-                 / SecretRef / ArrayLiteral / RoleRef / Identifier
+                 / SecretRef / ArrayLiteral / RoleExpr / Identifier
 MoneyLiteral    <- Decimal CurrencyCode
 NumberLiteral   <- "-"? [0-9]+ ("." [0-9]+)?
 BoolLiteral     <- "true" / "false"
@@ -400,6 +440,7 @@ ArrayLiteral    <- "[" (Value ("," Value)*)? "]"
 CurrencyCode    <- [A-Z]{3}
 Decimal         <- "-"? [0-9]+ ("." [0-9]+)?
 Identifier      <- [a-zA-Z_][a-zA-Z0-9_-]*
+RoleExpr        <- RoleRef ("&" RoleRef)*
 RoleRef         <- "@" RolePath
 RolePath        <- [a-zA-Z0-9_/:@{}.+-]+
 Keyword         <- Identifier

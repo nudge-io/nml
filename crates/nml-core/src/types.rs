@@ -138,6 +138,49 @@ impl SpannedValue {
     }
 }
 
+/// A duration's unit (spec/syntax.md §Duration Literals).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurationUnit {
+    Hours,
+    Minutes,
+    Seconds,
+    Milliseconds,
+}
+
+impl DurationUnit {
+    /// The unit's source suffix (`"h"`, `"m"`, `"s"`, `"ms"`).
+    pub fn suffix(self) -> &'static str {
+        match self {
+            DurationUnit::Hours => "h",
+            DurationUnit::Minutes => "m",
+            DurationUnit::Seconds => "s",
+            DurationUnit::Milliseconds => "ms",
+        }
+    }
+}
+
+/// Parse a duration per the spec grammar — an unsigned integer immediately
+/// followed by one unit suffix (`"72h"`, `"30m"`, `"5s"`, `"500ms"`); no
+/// sign, no decimals, no compound forms. The **single source of truth** for
+/// duration syntax: schema validation (`NML2029`) and consumers parse the
+/// same grammar, so "validated" and "parseable at runtime" cannot drift.
+pub fn parse_duration(text: &str) -> Option<(u64, DurationUnit)> {
+    // `ms` first: it must win over its `m`/`s` suffix prefixes.
+    const UNITS: [(&str, DurationUnit); 4] = [
+        ("ms", DurationUnit::Milliseconds),
+        ("h", DurationUnit::Hours),
+        ("m", DurationUnit::Minutes),
+        ("s", DurationUnit::Seconds),
+    ];
+    let (digits, unit) = UNITS
+        .iter()
+        .find_map(|(suffix, unit)| text.strip_suffix(suffix).map(|d| (d, *unit)))?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().map(|n| (n, unit))
+}
+
 /// A field directive (RFC 0032): `#name` / `#name(value)` trailing a field
 /// definition. **Opaque to nml-core** — the language parses and syntax-checks
 /// directives (one per key per field) but assigns no meaning; consumers (e.g.

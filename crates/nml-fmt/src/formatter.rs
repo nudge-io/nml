@@ -1172,7 +1172,7 @@ service App: // main
         assert_eq!(formatted, "service App:\n    port = 8080\n");
     }
 
-    /// RFC 0011: the formatter renders role conjunctions from the LOWERED
+    /// RFC 0014: the formatter renders role conjunctions from the LOWERED
     /// value, so tight/ragged source spacing canonicalizes to `" & "`
     /// automatically — and the output is idempotent.
     #[test]

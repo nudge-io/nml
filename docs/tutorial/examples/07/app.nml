@@ -2,7 +2,9 @@
 // Chapter 7: the config becomes typed Rust data. Endpoints move inline —
 // the serde pipeline deserializes bodies; declaration references stay
 // late-bound for the host app (notifiers still reference alertNotifiers,
-// which the program simply doesn't deserialize).
+// which the program simply doesn't deserialize). The shared `.timeout`
+// and the bare positional item flow through the pipeline like everything
+// else: shared beats the trait default, item values beat shared.
 
 role admin:
     label = "Skylight operators"
@@ -54,6 +56,8 @@ service Api:
         poolSize = 10
 
     endpoints:
+        .timeout = "10s"
+
         - Api:
             url = "https://api.skylight.dev"
             regions = ["us-east", "eu-west"]
@@ -65,8 +69,7 @@ service Api:
             url = "https://admin.skylight.dev"
             |allow = [@role/admin]
 
-        - Docs:
-            url = "https://docs.skylight.dev"
+        - "https://docs.skylight.dev"
 
     notifiers = alertNotifiers
 

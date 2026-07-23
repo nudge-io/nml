@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
@@ -27,11 +27,34 @@ const UNION_SHORTHAND_MSG: &str =
 /// keywords, or built-in references are assumed.  Embedders opt in to
 /// domain-specific checks via builder methods.
 #[derive(Debug)]
+/// Schema names a single checked file declares, for the validator's in-file
+/// composition checks (RFC 0011): `composables` (models/traits) resolve as
+/// `is` targets; `wrong_kind` (enums/oneofs) classify as non-composable.
+/// Instance *typing* still comes exclusively from the loaded schema set.
+struct FileLocalSchema<'a> {
+    composables: HashSet<&'a str>,
+    wrong_kind: HashMap<&'a str, &'static str>,
+}
+
+#[derive(Debug)]
 pub struct SchemaValidator {
     index: SchemaIndex,
     valid_modifiers: Vec<String>,
     strict_unknown_fields: bool,
     membership: MembershipSemantics,
+    /// When set, in-file `is`-composition checks are skipped: the caller
+    /// routes definitions through the loader pipeline
+    /// (`find_composition_errors`), which sees the whole file and reports
+    /// once. The editor keeps them on — its validators run without a
+    /// loader pass over the open document.
+    composition_checked_at_load: bool,
+    /// Closed vocabulary (RFC 0012): this validator's schema set is the
+    /// *entire* authority (a package binding). In-file schema definitions
+    /// have no effect and draw NML2026 — a tenant file can neither shadow
+    /// an operator schema nor mint keywords past strict's unknown-keyword
+    /// wall. Set only by [`crate::package::SchemaPackage::validator`]
+    /// (authority follows provenance; there is no user-facing knob).
+    closed_vocabulary: bool,
 }
 
 /// Opt-in configuration for embedders that model membership / access-control
@@ -65,6 +88,8 @@ impl SchemaValidator {
             valid_modifiers: Vec::new(),
             strict_unknown_fields: false,
             membership: MembershipSemantics::default(),
+            composition_checked_at_load: false,
+            closed_vocabulary: false,
         }
     }
 
@@ -79,6 +104,39 @@ impl SchemaValidator {
     pub fn strict(mut self) -> Self {
         self.strict_unknown_fields = true;
         self
+    }
+
+    /// Declare that definition composition (`is` targets, RFC 0011) is
+    /// validated by a loader pass over the same content, so the in-file twin
+    /// stays silent instead of double-reporting. Instance validation and
+    /// field-default checks are unaffected.
+    pub fn composition_checked_at_load(mut self) -> Self {
+        self.composition_checked_at_load = true;
+        self
+    }
+
+    /// Mark this validator's schema set as a closed vocabulary (RFC 0012) —
+    /// see the field docs. Called by the package layer only.
+    pub fn closed_vocabulary(mut self) -> Self {
+        self.closed_vocabulary = true;
+        self
+    }
+
+    /// The NML2026 refusal for a schema definition authored in a file
+    /// governed by a closed binding: warning in lenient mode (the definition
+    /// is inert, the file still passes), error under strict (CI posture).
+    fn ineffective_definition(&self, kind: &str, span: Span) -> Diagnostic {
+        let message = format!(
+            "in-file {kind} definitions have no effect under this schema package \
+             binding — the package's schemas are the vocabulary"
+        );
+        let diag = if self.strict_unknown_fields {
+            Diagnostic::error(message)
+        } else {
+            Diagnostic::warning(message)
+        };
+        diag.with_code(codes::INEFFECTIVE_DEFINITIONS)
+            .with_span(span)
     }
 
     /// Set valid modifier names. When non-empty, unknown modifiers produce
@@ -142,8 +200,21 @@ impl SchemaValidator {
     /// declared fields when one is close enough. The suggestion span is the
     /// property-name token, so the quick-fix is machine-applicable.
     fn unknown_property_diagnostic(&self, name: &str, model: &ModelDef, span: Span) -> Diagnostic {
+        self.unknown_name_diagnostic("property", name, model, span)
+    }
+
+    /// The unknown-name treatment shared by properties and shared
+    /// properties: warning lenient / error strict, NML2001, did-you-mean
+    /// over the model's fields, machine-applicable at the name token.
+    fn unknown_name_diagnostic(
+        &self,
+        noun: &str,
+        name: &str,
+        model: &ModelDef,
+        span: Span,
+    ) -> Diagnostic {
         let message = format!(
-            "unknown property '{name}' (not defined in model '{}')",
+            "unknown {noun} '{name}' (not defined in model '{}')",
             model.name
         );
         let diag = if self.strict_unknown_fields {
@@ -159,6 +230,205 @@ impl SchemaValidator {
         }
     }
 
+    /// Collect a nested list body's `.prop` entries and validate them
+    /// against the element type (resolved body-independently — shared
+    /// properties precede any single item's shape).
+    fn validate_body_shared_properties(
+        &self,
+        body: &Body,
+        inner: &FieldType,
+        depth: u32,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        let shared: Vec<&SharedProperty> = body
+            .entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                BodyEntryKind::SharedProperty(sp) => Some(sp),
+                _ => None,
+            })
+            .collect();
+        if shared.is_empty() {
+            return;
+        }
+        // A union element type gets subset semantics over its model variants
+        // (the `oneof` rule generalized): resolving against an empty body
+        // would arbitrarily pick the first variant and flag names a later
+        // variant legitimately defines.
+        if let FieldType::Union(variants) = inner {
+            let models: Vec<&ModelDef> = variants
+                .iter()
+                .filter_map(|v| match v {
+                    FieldType::ModelRef(name) => self.find_model(name).filter(|m| !m.is_trait()),
+                    _ => None,
+                })
+                .collect();
+            if !models.is_empty() {
+                self.validate_shared_properties_union(&shared, &models, diags);
+                return;
+            }
+        }
+        let empty = Body {
+            entries: Vec::new(),
+        };
+        let elem = self.index.resolve_type_in_body(inner, &empty);
+        self.validate_shared_properties(&shared, &elem, depth, diags);
+    }
+
+    /// Union-element subset semantics for shared properties: a name is known
+    /// if ANY model variant defines it, and its value must satisfy at least
+    /// one defining variant's field type — checked through the standard
+    /// union value check, so the mismatch message and code are the ones
+    /// every union value gets. Block-valued shared properties are covered by
+    /// per-item validation once merged (which knows each item's concrete
+    /// variant).
+    fn validate_shared_properties_union(
+        &self,
+        shared: &[&SharedProperty],
+        models: &[&ModelDef],
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        for sp in shared {
+            let name = sp.name.name.as_str();
+            let defining: Vec<&FieldDef> = models
+                .iter()
+                .filter_map(|m| m.fields.iter().find(|f| f.name == name))
+                .collect();
+            if defining.is_empty() {
+                let listed = models
+                    .iter()
+                    .map(|m| format!("'{}'", m.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let message = format!(
+                    "unknown shared property '.{name}' — no union variant ({listed}) defines it"
+                );
+                let mut diag = if self.strict_unknown_fields {
+                    Diagnostic::error(message)
+                } else {
+                    Diagnostic::warning(message)
+                }
+                .with_code(codes::UNKNOWN_PROPERTY)
+                .with_span(sp.name.span);
+                let mut candidates: Vec<&str> = models
+                    .iter()
+                    .flat_map(|m| m.fields.iter().map(|f| f.name.as_str()))
+                    .collect();
+                candidates.sort_unstable();
+                candidates.dedup();
+                if let Some(s) = nml_core::suggest::suggest(name, candidates) {
+                    diag = diag.with_suggestion(s, sp.name.span);
+                }
+                diags.push(diag);
+                continue;
+            }
+            if let SharedPropertyKind::Scalar(sv) = &sp.kind {
+                if let [only] = defining.as_slice() {
+                    self.validate_value_against_type(
+                        &sv.value,
+                        &only.field_type,
+                        name,
+                        "for shared property",
+                        sv.span,
+                        diags,
+                    );
+                } else {
+                    let union =
+                        FieldType::Union(defining.iter().map(|f| f.field_type.clone()).collect());
+                    self.validate_value_against_type(
+                        &sv.value,
+                        &union,
+                        name,
+                        "for shared property",
+                        sv.span,
+                        diags,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Validate shared properties against their list's element type,
+    /// anchored at the `.prop` token itself (pre-merge — the merged copies
+    /// inside items are covered by per-item validation). Unknown names get
+    /// the unknown-property treatment (NML2001: warning lenient, error
+    /// strict, did-you-mean); known scalar values type-check against the
+    /// field. For a `oneof` element, a name is flagged only when the
+    /// discriminator and every variant lack it — it may legitimately serve
+    /// a subset of variants.
+    fn validate_shared_properties(
+        &self,
+        shared: &[&SharedProperty],
+        elem: &FieldTarget<'_>,
+        depth: u32,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        for sp in shared {
+            let name = sp.name.name.as_str();
+            match elem {
+                FieldTarget::Model(model) => {
+                    let Some(field) = model.fields.iter().find(|f| f.name == name) else {
+                        diags.push(self.unknown_name_diagnostic(
+                            "shared property",
+                            &format!(".{name}"),
+                            model,
+                            sp.name.span,
+                        ));
+                        continue;
+                    };
+                    match &sp.kind {
+                        SharedPropertyKind::Scalar(sv) => {
+                            self.validate_value_against_type(
+                                &sv.value,
+                                &field.field_type,
+                                name,
+                                "for shared property",
+                                sv.span,
+                                diags,
+                            );
+                        }
+                        SharedPropertyKind::Block(body) => {
+                            if let FieldTarget::Model(inner) = self.index.resolve_field(field) {
+                                self.validate_instance_against_model(
+                                    body,
+                                    inner,
+                                    depth + 1,
+                                    Some(sp.name.span),
+                                    diags,
+                                );
+                            }
+                        }
+                    }
+                }
+                FieldTarget::OneOf(oneof) => {
+                    let known = name == oneof.discriminator
+                        || oneof.variants.iter().any(|(_, variant)| {
+                            self.find_model(variant)
+                                .is_some_and(|m| m.fields.iter().any(|f| f.name == name))
+                        });
+                    if !known {
+                        let message = format!(
+                            "unknown shared property '.{name}' — neither the discriminator \
+                             nor any variant of oneof '{}' defines it",
+                            oneof.name
+                        );
+                        let diag = if self.strict_unknown_fields {
+                            Diagnostic::error(message)
+                        } else {
+                            Diagnostic::warning(message)
+                        }
+                        .with_code(codes::UNKNOWN_PROPERTY)
+                        .with_span(sp.name.span);
+                        diags.push(diag);
+                    }
+                }
+                // Unions/lists-of resolve per item; free-form targets have
+                // no fields to check against.
+                _ => {}
+            }
+        }
+    }
+
     pub fn find_model(&self, name: &str) -> Option<&ModelDef> {
         self.index.model(name)
     }
@@ -171,23 +441,79 @@ impl SchemaValidator {
         self.index.oneof(name)
     }
 
+    /// Validate the file's **definition-side** facts: the same body pass
+    /// `check` runs over `model`/`trait`/`enum` declarations (field
+    /// defaults vs declared types, RFC 0007 §4.3 type-shape rules,
+    /// misplaced arms/field definitions, modifier declarations) — one code
+    /// path, so a new definition-side check can never split the verbs
+    /// again. Instance typing stays exclusively in [`Self::validate`].
+    pub fn validate_definitions(&self, file: &File) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        for decl in &file.declarations {
+            if let DeclarationKind::Block(block) = &decl.kind {
+                let keyword = block.keyword.name.as_str();
+                if matches!(keyword, "model" | "trait" | "enum") {
+                    self.validate_body(&block.body, true, keyword, &mut diagnostics);
+                    if matches!(keyword, "model" | "trait") {
+                        self.validate_field_defaults(block, &mut diagnostics);
+                    }
+                }
+            }
+        }
+        diagnostics
+    }
+
     /// Validate a parsed NML file against the loaded models.
     pub fn validate(&self, file: &File) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
+        // Schema names the *file itself* declares, split by composability.
+        // In-file schema definitions are validated when a schema set is
+        // loaded, not here — so in-file checks (the `is`-target twin below)
+        // must resolve a self-contained file's own trait/model instead of
+        // flagging it against a foreign schema set, and must classify a
+        // file-local enum/oneof target as the wrong *kind*, not unknown.
+        let mut local_composables: HashSet<&str> = HashSet::new();
+        let mut local_wrong_kind: HashMap<&str, &'static str> = HashMap::new();
+        for decl in &file.declarations {
+            match &decl.kind {
+                DeclarationKind::Block(b) => match b.keyword.name.as_str() {
+                    "model" | "trait" => {
+                        local_composables.insert(b.name.name.as_str());
+                    }
+                    "enum" => {
+                        local_wrong_kind.insert(b.name.name.as_str(), "an enum");
+                    }
+                    _ => {}
+                },
+                DeclarationKind::OneOf(o) => {
+                    local_wrong_kind.insert(o.name.name.as_str(), "a oneof");
+                }
+                _ => {}
+            }
+        }
+        let file_locals = FileLocalSchema {
+            composables: local_composables,
+            wrong_kind: local_wrong_kind,
+        };
+
         for decl in &file.declarations {
             match &decl.kind {
                 DeclarationKind::Block(block) => {
-                    self.validate_block(block, &mut diagnostics);
+                    self.validate_block(block, &file_locals, &mut diagnostics);
                 }
                 DeclarationKind::Array(arr) => {
                     self.validate_array(arr, &mut diagnostics);
                 }
                 // `oneof` declarations are schema definitions, validated when
-                // the schema is loaded; they carry no instance data here.
-                DeclarationKind::Const(_)
-                | DeclarationKind::Template(_)
-                | DeclarationKind::OneOf(_) => {}
+                // the schema is loaded; they carry no instance data here —
+                // but under a closed binding they are inert and say so.
+                DeclarationKind::OneOf(o) => {
+                    if self.closed_vocabulary {
+                        diagnostics.push(self.ineffective_definition("oneof", o.name.span));
+                    }
+                }
+                DeclarationKind::Const(_) | DeclarationKind::Template(_) => {}
             }
         }
 
@@ -196,17 +522,37 @@ impl SchemaValidator {
         diagnostics
     }
 
-    fn validate_block(&self, block: &BlockDecl, diags: &mut Vec<Diagnostic>) {
+    fn validate_block(
+        &self,
+        block: &BlockDecl,
+        file_locals: &FileLocalSchema<'_>,
+        diags: &mut Vec<Diagnostic>,
+    ) {
         let keyword = &block.keyword.name;
         let is_schema_def = matches!(keyword.as_str(), "model" | "enum" | "trait");
+
+        if is_schema_def && self.closed_vocabulary {
+            diags.push(self.ineffective_definition(keyword, block.keyword.span));
+        }
 
         if matches!(keyword.as_str(), "model" | "trait") {
             // The in-file twin of `nml_core::schema::find_composition_errors`
             // (RFC 0011): schema declarations authored in a *checked* file get
             // the same `is`-target diagnostics, with the same code and a
-            // machine-applicable did-you-mean at the target token.
-            for parent in &block.extends {
-                if self.find_model(&parent.name).is_some() {
+            // machine-applicable did-you-mean at the target token. Targets the
+            // file itself declares resolve — a self-contained file is never
+            // flagged against a foreign schema set. Skipped entirely when the
+            // caller runs the loader pipeline over this content
+            // (`composition_checked_at_load`) — one finding, one owner.
+            let parents = if self.composition_checked_at_load {
+                [].iter()
+            } else {
+                block.extends.iter()
+            };
+            for parent in parents {
+                if self.find_model(&parent.name).is_some()
+                    || file_locals.composables.contains(parent.name.as_str())
+                {
                     continue;
                 }
                 let wrong_kind = if self.find_enum(&parent.name).is_some() {
@@ -214,7 +560,7 @@ impl SchemaValidator {
                 } else if self.find_oneof(&parent.name).is_some() {
                     Some("a oneof")
                 } else {
-                    None
+                    file_locals.wrong_kind.get(parent.name.as_str()).copied()
                 };
                 diags.push(match wrong_kind {
                     Some(kind_name) => Diagnostic::error(format!(
@@ -232,7 +578,11 @@ impl SchemaValidator {
                         .with_span(parent.span);
                         if let Some(s) = nml_core::suggest::suggest(
                             &parent.name,
-                            self.index.models().iter().map(|m| m.name.as_str()),
+                            self.index
+                                .models()
+                                .iter()
+                                .map(|m| m.name.as_str())
+                                .chain(file_locals.composables.iter().copied()),
                         ) {
                             diag = diag.with_suggestion(s, parent.span);
                         }
@@ -283,8 +633,13 @@ impl SchemaValidator {
     }
 
     fn validate_array(&self, arr: &ArrayDecl, diags: &mut Vec<Diagnostic>) {
+        // Array-level modifiers cover the items, so the *element* model's
+        // modifier fields are the vocabulary.
+        let elem_governing = self
+            .find_model(&arr.item_keyword.name)
+            .filter(|m| !m.is_trait());
         for modifier in &arr.body.modifiers {
-            self.validate_modifier_name(modifier, diags);
+            self.validate_modifier_name(modifier, elem_governing, diags);
             self.validate_modifier_content(modifier, diags);
         }
 
@@ -300,6 +655,8 @@ impl SchemaValidator {
         // block-keyword dispatch in `validate_block` — resolved once and reused
         // both for the strict check and to validate each item below.
         let elem = self.index.resolve_ref(keyword);
+        let shared: Vec<&SharedProperty> = arr.body.shared_properties.iter().collect();
+        self.validate_shared_properties(&shared, &elem, 0, diags);
         let resolves =
             !is_schema_def && matches!(elem, FieldTarget::Model(_) | FieldTarget::OneOf(_));
 
@@ -388,7 +745,9 @@ impl SchemaValidator {
                 }
                 ListItemKind::Shorthand { value, .. } if matches!(elem, FieldTarget::OneOf(_)) => {
                     diags.push(
-                        Diagnostic::error(UNION_SHORTHAND_MSG.to_string()).with_span(value.span),
+                        Diagnostic::error(UNION_SHORTHAND_MSG.to_string())
+                            .with_code(codes::UNION_SHORTHAND)
+                            .with_span(value.span),
                     )
                 }
                 _ => {}
@@ -396,12 +755,13 @@ impl SchemaValidator {
         }
     }
 
-    /// Surface a materialization's diagnostics (the only one is dropped-key) and
-    /// validate the enriched body against `model` — unless the item is unplaceable (a
-    /// scalar with no shorthand field), in which case the required-field scan is
-    /// skipped so it doesn't pile noise on the dropped-key diagnostic. The single
-    /// "materialize → validate" path shared by list items (`materialize_item`) and
-    /// block declarations (`materialize_named`).
+    /// Surface a materialization's findings (coded at their source —
+    /// `NML2049` dropped key, `NML2050` arm-shorthand mismatch) and validate
+    /// the enriched body against `model` — unless the item is unplaceable, in
+    /// which case the required-field scan is skipped so it doesn't pile noise
+    /// on the materialization finding. The single "materialize → validate"
+    /// path shared by list items (`materialize_item`) and block declarations
+    /// (`materialize_named`).
     fn validate_materialized(
         &self,
         result: nml_core::identity::Materialized,
@@ -410,9 +770,7 @@ impl SchemaValidator {
         header: Option<Span>,
         diags: &mut Vec<Diagnostic>,
     ) {
-        for err in result.diagnostics {
-            diags.push(Diagnostic::error(err.message()).with_span(err.span()));
-        }
+        diags.extend(result.diagnostics);
         if result.validatable {
             self.validate_instance_against_model(&result.body, model, depth, header, diags);
         }
@@ -455,10 +813,13 @@ impl SchemaValidator {
         keyword: &str,
         diags: &mut Vec<Diagnostic>,
     ) {
+        // The governing model (concrete only) supplies the modifier
+        // vocabulary when it declares modifier fields.
+        let governing = self.find_model(keyword).filter(|m| !m.is_trait());
         for entry in &body.entries {
             match &entry.kind {
                 BodyEntryKind::Modifier(m) => {
-                    self.validate_modifier_name(m, diags);
+                    self.validate_modifier_name(m, governing, diags);
                     self.validate_modifier_content(m, diags);
                     // RFC 0007 §4.3: a modifier's instance value is an inline
                     // value or a list block — an arm body can never appear
@@ -478,6 +839,7 @@ impl SchemaValidator {
                         Diagnostic::error(format!(
                             "field definitions are only allowed in model declarations, not '{keyword}'"
                         ))
+                        .with_code(codes::MISPLACED_FIELD_DEFINITION)
                         .with_span(entry.span),
                     );
                 }
@@ -495,6 +857,7 @@ impl SchemaValidator {
                             "routing arms are not allowed in '{keyword}' declarations; declare \
                              the field as '(K -> V)' and write the arms in the instance block"
                         ))
+                        .with_code(codes::ARMS_IN_DEFINITION)
                         .with_span(entry.span),
                     );
                 }
@@ -506,7 +869,51 @@ impl SchemaValidator {
         }
     }
 
-    fn validate_modifier_name(&self, m: &Modifier, diags: &mut Vec<Diagnostic>) {
+    fn validate_modifier_name(
+        &self,
+        m: &Modifier,
+        governing: Option<&ModelDef>,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        // A model that declares modifier *fields* (`|allow []role?`) is the
+        // vocabulary for its blocks — per-block precision the global list
+        // can't give, and it types the values too. The manifest/project
+        // list stays the fallback for blocks whose model declares none.
+        if let Some(model) = governing {
+            let declared: Vec<&str> = model
+                .fields
+                .iter()
+                .filter(|f| matches!(f.field_type, FieldType::Modifier(_)))
+                .map(|f| f.name.as_str())
+                .collect();
+            if !declared.is_empty() {
+                if !declared.contains(&m.name.name.as_str()) {
+                    let listed = declared
+                        .iter()
+                        .map(|d| format!("|{d}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let message = format!(
+                        "unknown modifier '|{}' — model '{}' declares: {listed}",
+                        m.name.name, model.name
+                    );
+                    let mut diag = if self.strict_unknown_fields {
+                        Diagnostic::error(message)
+                    } else {
+                        Diagnostic::warning(message)
+                    }
+                    .with_code(codes::UNKNOWN_MODIFIER)
+                    .with_span(m.name.span);
+                    if let Some(sugg) =
+                        nml_core::suggest::suggest(&m.name.name, declared.iter().copied())
+                    {
+                        diag = diag.with_suggestion(sugg, m.name.span);
+                    }
+                    diags.push(diag);
+                }
+                return;
+            }
+        }
         if self.valid_modifiers.is_empty() {
             return;
         }
@@ -601,17 +1008,7 @@ impl SchemaValidator {
                         items.push(item);
                     }
                 }
-                for (i, item) in items.iter().enumerate() {
-                    if items[..i].iter().any(|prev| set_items_equal(prev, item)) {
-                        diags.push(
-                            Diagnostic::error(format!(
-                                "duplicate set element{} — set elements must be unique",
-                                set_item_label(item)
-                            ))
-                            .with_span(item.span),
-                        );
-                    }
-                }
+                push_duplicate_set_items(&items, diags);
                 true
             }
             FieldTarget::Arms { key, target } => {
@@ -647,6 +1044,7 @@ impl SchemaValidator {
                         "expected a routing arm ('@selector -> Target' or 'else -> Target'); \
                          this field is typed '({key} -> …)' and holds only arms"
                     ))
+                    .with_code(codes::ARMS_BODY_ENTRY)
                     .with_span(entry.span),
                 );
                 continue;
@@ -660,6 +1058,7 @@ impl SchemaValidator {
                                 "duplicate 'else' arm; an arm set has at most one catch-all"
                                     .to_string(),
                             )
+                            .with_code(codes::DUPLICATE_ARM)
                             .with_span(arm.selector_span),
                         );
                     }
@@ -672,6 +1071,7 @@ impl SchemaValidator {
                                 "arm '{selector}' is unreachable: arms match first-to-last, \
                                  so 'else' must be the final arm"
                             ))
+                            .with_code(codes::UNREACHABLE_ARM)
                             .with_span(arm.selector_span),
                         );
                     }
@@ -681,12 +1081,14 @@ impl SchemaValidator {
                                 "arm key '{selector}' does not conform to the declared key \
                                  type '{key}'"
                             ))
+                            .with_code(codes::ARM_KEY_MISMATCH)
                             .with_span(arm.selector_span),
                         );
                     }
                     if keys_seen.contains(&selector.as_str()) {
                         diags.push(
                             Diagnostic::error(format!("duplicate arm key '{selector}'"))
+                                .with_code(codes::DUPLICATE_ARM)
                                 .with_span(arm.selector_span),
                         );
                     }
@@ -727,6 +1129,7 @@ impl SchemaValidator {
                     "a string-literal arm target requires a scalar target type, but this arm \
                      set targets '{v}'; use a declared name ('-> {v}Name') instead"
                 ))
+                .with_code(codes::ARM_TARGET_MISMATCH)
                 .with_span(*span),
             );
         }
@@ -762,13 +1165,7 @@ impl SchemaValidator {
         diags: &mut Vec<Diagnostic>,
     ) {
         if depth >= MAX_VALIDATION_DEPTH {
-            let mut diag = Diagnostic::warning(format!(
-                "validation truncated: nesting exceeds maximum depth of {MAX_VALIDATION_DEPTH}; deeper entries were not checked"
-            ));
-            if let Some(span) = header_span.or_else(|| body.entries.first().map(|e| e.span)) {
-                diag = diag.with_span(span);
-            }
-            diags.push(diag);
+            diags.push(truncation_advisory(body, header_span));
             return;
         }
 
@@ -818,6 +1215,7 @@ impl SchemaValidator {
                                 let empty = Body {
                                     entries: Vec::new(),
                                 };
+                                self.validate_body_shared_properties(&nb.body, inner, depth, diags);
                                 for entry in &nb.body.entries {
                                     let BodyEntryKind::ListItem(item) = &entry.kind else {
                                         continue;
@@ -838,6 +1236,7 @@ impl SchemaValidator {
                                 let empty = Body {
                                     entries: Vec::new(),
                                 };
+                                self.validate_body_shared_properties(&nb.body, inner, depth, diags);
                                 let mut items: Vec<&ListItem> = Vec::new();
                                 for entry in &nb.body.entries {
                                     let BodyEntryKind::ListItem(item) = &entry.kind else {
@@ -856,18 +1255,7 @@ impl SchemaValidator {
                                 // load errors at the second occurrence, with
                                 // span-blind value identity for scalar items
                                 // and name identity for named items.
-                                for (i, item) in items.iter().enumerate() {
-                                    if items[..i].iter().any(|p| set_items_equal(p, item)) {
-                                        diags.push(
-                                            Diagnostic::error(format!(
-                                                "duplicate set element{} — set elements must \
-                                                 be unique",
-                                                set_item_label(item)
-                                            ))
-                                            .with_span(item.span),
-                                        );
-                                    }
-                                }
+                                push_duplicate_set_items(&items, diags);
                             }
                             FieldType::Arms { key, target } => {
                                 self.validate_instance_against_arms(&nb.body, key, target, diags);
@@ -917,6 +1305,7 @@ impl SchemaValidator {
                              arms belong under a field typed '(K -> V)'",
                             model.name
                         ))
+                        .with_code(codes::ARMS_NOT_EXPECTED)
                         .with_span(entry.span),
                     );
                 }
@@ -989,13 +1378,7 @@ impl SchemaValidator {
         diags: &mut Vec<Diagnostic>,
     ) {
         if depth >= MAX_VALIDATION_DEPTH {
-            let mut diag = Diagnostic::warning(format!(
-                "validation truncated: nesting exceeds maximum depth of {MAX_VALIDATION_DEPTH}; deeper entries were not checked"
-            ));
-            if let Some(span) = header_span.or_else(|| body.entries.first().map(|e| e.span)) {
-                diag = diag.with_span(span);
-            }
-            diags.push(diag);
+            diags.push(truncation_advisory(body, header_span));
             return;
         }
 
@@ -1045,6 +1428,7 @@ impl SchemaValidator {
                     name = oneof.name,
                     values = valid_values(),
                 ))
+                .with_code(codes::MISSING_DISCRIMINATOR)
                 .with_span(fallback_span()),
             );
             return;
@@ -1058,6 +1442,7 @@ impl SchemaValidator {
                     oneof.name,
                     valid_values(),
                 ))
+                .with_code(codes::INVALID_DISCRIMINATOR)
                 .with_span(discriminator.value.span),
             );
             return;
@@ -1145,6 +1530,7 @@ impl SchemaValidator {
                                 "type mismatch for '{}': expected {}, got array",
                                 field.name, declared
                             ))
+                            .with_code(codes::TYPE_MISMATCH)
                             .with_span(m.name.span),
                         );
                         return;
@@ -1179,17 +1565,7 @@ impl SchemaValidator {
                     // RFC 0032 uniqueness — same rule and reporting as every
                     // other set surface: error at the second occurrence,
                     // span-blind value identity.
-                    for (i, item) in items.iter().enumerate() {
-                        if items[..i].iter().any(|p| set_items_equal(p, item)) {
-                            diags.push(
-                                Diagnostic::error(format!(
-                                    "duplicate set element{} — set elements must be unique",
-                                    set_item_label(item)
-                                ))
-                                .with_span(item.span),
-                            );
-                        }
-                    }
+                    push_duplicate_set_items(&items.iter().collect::<Vec<_>>(), diags);
                 }
             }
             ModifierValue::TypeAnnotation { .. } => {}
@@ -1257,6 +1633,7 @@ impl SchemaValidator {
                             "type mismatch {context} '{field_name}': expected {field_type}, got {}",
                             value_type_name(value)
                         ))
+                        .with_code(codes::TYPE_MISMATCH)
                         .with_span(span),
                     );
                 }
@@ -1285,6 +1662,7 @@ impl SchemaValidator {
                                      elements must be unique",
                                     value_label(&item.value)
                                 ))
+                                .with_code(codes::DUPLICATE_SET_ELEMENT)
                                 .with_span(item.span),
                             );
                         }
@@ -1298,6 +1676,7 @@ impl SchemaValidator {
                             "type mismatch {context} '{field_name}': expected {field_type}, got {}",
                             value_type_name(value)
                         ))
+                        .with_code(codes::TYPE_MISMATCH)
                         .with_span(span),
                     );
                 }
@@ -1314,6 +1693,7 @@ impl SchemaValidator {
                             "type mismatch {context} '{field_name}': expected one of {expected}; got {}",
                             value_type_name(value)
                         ))
+                        .with_code(codes::UNION_TYPE_MISMATCH)
                         .with_span(span),
                     );
                 }
@@ -1329,6 +1709,7 @@ impl SchemaValidator {
                          ('{field_type}'), got {}",
                         value_type_name(value)
                     ))
+                    .with_code(codes::TYPE_MISMATCH)
                     .with_span(span),
                 );
             }
@@ -1394,16 +1775,43 @@ impl SchemaValidator {
         diags: &mut Vec<Diagnostic>,
     ) {
         if value_matches_primitive(value, prim) {
+            // Right kind — for durations, also the right *format* (NML2029):
+            // the spec grammar is an integer plus one unit suffix, checked by
+            // the same `parse_duration` consumers use, so "validates" and
+            // "parses at runtime" cannot drift. Template strings resolve
+            // later and are skipped, like every deferred reference.
+            if *prim == PrimitiveType::Duration {
+                if let Value::String(text) | Value::Duration(text) = value {
+                    if nml_core::types::parse_duration(text).is_none() {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "invalid duration \"{text}\" {context} '{field_name}': \
+                                 expected an integer with unit h, m, s, or ms (e.g. \"30s\")"
+                            ))
+                            .with_code(codes::INVALID_DURATION)
+                            .with_span(span),
+                        );
+                    }
+                }
+            }
             return;
         }
         if *prim == PrimitiveType::Role {
             if let Value::String(s) = value {
-                let msg = if s.starts_with('@') {
-                    format!("role field '{field_name}': use {s} instead of \"{s}\"")
+                // Machine-fixable: the replacement spans the WHOLE quoted
+                // string (quotes removed), yielding the bare role reference.
+                let replacement = if s.starts_with('@') {
+                    s.clone()
                 } else {
-                    format!("role field '{field_name}': use @{s} instead of \"{s}\"")
+                    format!("@{s}")
                 };
-                diags.push(Diagnostic::warning(msg).with_span(span));
+                let msg = format!("role field '{field_name}': roles are references, not strings");
+                diags.push(
+                    Diagnostic::warning(msg)
+                        .with_code(codes::ROLE_LITERAL)
+                        .with_span(span)
+                        .with_suggestion(replacement, span),
+                );
                 return;
             }
         }
@@ -1481,6 +1889,7 @@ impl SchemaValidator {
                         variants(),
                         value_type_name(value)
                     ))
+                    .with_code(codes::TYPE_MISMATCH)
                     .with_span(span),
                 );
             }
@@ -1508,6 +1917,7 @@ impl SchemaValidator {
                         ref_name,
                         value_type_name(value)
                     ))
+                    .with_code(codes::TYPE_MISMATCH)
                     .with_span(span),
                 );
             }
@@ -1531,6 +1941,7 @@ impl SchemaValidator {
                                 Diagnostic::warning(format!(
                                     "{prefix} references are intended for members lists, not access control rules"
                                 ))
+                                .with_code(codes::USER_REF_IN_ACL)
                                 .with_span(item.span),
                             );
                         }
@@ -1554,6 +1965,7 @@ impl SchemaValidator {
                     Diagnostic::warning(format!(
                         "{prefix} references are intended for members lists, not access control rules",
                     ))
+                    .with_code(codes::USER_REF_IN_ACL)
                     .with_span(span),
                 );
             }
@@ -1597,6 +2009,7 @@ impl SchemaValidator {
                                 Diagnostic::warning(
                                     "built-in access levels should not appear in members lists",
                                 )
+                                .with_code(codes::BUILTIN_IN_MEMBERS)
                                 .with_span(item.span),
                             );
                         }
@@ -1666,9 +2079,10 @@ impl SchemaValidator {
                 .copied()
                 .collect::<Vec<_>>()
                 .join(" -> ");
-            diags.push(Diagnostic::warning(format!(
-                "circular membership detected: {desc}"
-            )));
+            diags.push(
+                Diagnostic::warning(format!("circular membership detected: {desc}"))
+                    .with_code(codes::MEMBERSHIP_CYCLE),
+            );
         });
     }
 }
@@ -1694,6 +2108,39 @@ fn collect_member_refs(body: &Body, prefixes: &[String]) -> Vec<String> {
         }
     }
     refs
+}
+
+/// The NML2044 advisory pushed when instance validation stops at
+/// `MAX_VALIDATION_DEPTH` — one constructor for every truncation site, so
+/// the message, code, and span policy can never diverge.
+fn truncation_advisory(body: &Body, header_span: Option<Span>) -> Diagnostic {
+    let mut diag = Diagnostic::warning(format!(
+        "validation truncated: nesting exceeds maximum depth of \
+         {MAX_VALIDATION_DEPTH}; deeper entries were not checked"
+    ))
+    .with_code(codes::VALIDATION_TRUNCATED);
+    if let Some(span) = header_span.or_else(|| body.entries.first().map(|e| e.span)) {
+        diag = diag.with_span(span);
+    }
+    diag
+}
+
+/// RFC 0032 set uniqueness over list items — the one emitter for every
+/// item-set surface: error at the second occurrence, span-blind value
+/// identity for scalars, name identity for named items.
+fn push_duplicate_set_items(items: &[&ListItem], diags: &mut Vec<Diagnostic>) {
+    for (i, item) in items.iter().enumerate() {
+        if items[..i].iter().any(|p| set_items_equal(p, item)) {
+            diags.push(
+                Diagnostic::error(format!(
+                    "duplicate set element{} — set elements must be unique",
+                    set_item_label(item)
+                ))
+                .with_code(codes::DUPLICATE_SET_ELEMENT)
+                .with_span(item.span),
+            );
+        }
+    }
 }
 
 fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
@@ -1760,6 +2207,7 @@ fn field_type_shape_errors(
                          variant is selected by body shape, and an arms-shaped body always \
                          selects the first, so the others would be unreachable"
                     ))
+                    .with_code(codes::INVALID_TYPE_SHAPE)
                     .with_span(span),
                 );
             }
@@ -1774,6 +2222,7 @@ fn field_type_shape_errors(
                         "'{field_type}': an arm set describes a field's body and cannot be \
                          {context} (it has no instance form there)"
                     ))
+                    .with_code(codes::INVALID_TYPE_SHAPE)
                     .with_span(span),
                 );
             }
@@ -2929,7 +3378,8 @@ workflow W:
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("use @public instead of \"@public\"")),
+                .any(|d| d.message.contains("roles are references, not strings")
+                    && d.suggestion.as_ref().map(|s| s.replacement.as_str()) == Some("@public")),
             "should suggest removing quotes for role field; diags: {:?}",
             diags
         );
@@ -2946,7 +3396,8 @@ workflow W:
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("use @admin instead of \"admin\"")),
+                .any(|d| d.message.contains("roles are references, not strings")
+                    && d.suggestion.as_ref().map(|s| s.replacement.as_str()) == Some("@admin")),
             "should suggest adding @ prefix for role field; diags: {:?}",
             diags
         );
@@ -2982,7 +3433,8 @@ workflow W:
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("use @admin instead of \"@admin\"")),
+                .any(|d| d.message.contains("roles are references, not strings")
+                    && d.suggestion.as_ref().map(|s| s.replacement.as_str()) == Some("@admin")),
             "should warn about quoted string in role array; diags: {:?}",
             diags
         );
@@ -4523,10 +4975,333 @@ mod trait_instance_tests {
     }
 
     #[test]
+    fn self_contained_file_is_targets_resolve_against_its_own_declarations() {
+        // A checked file declaring both the trait and the model that mixes it
+        // in must not be flagged against a foreign schema set (its
+        // definitions are fully checked by the loader pipeline instead).
+        let diags = check(
+            "trait audited:\n    auditedBy string?\n\nmodel widget is audited:\n    name string?\n",
+            false,
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn composition_checked_at_load_silences_the_in_file_twin() {
+        // One finding, one owner: a caller that routes definitions through
+        // the loader turns the validator's in-file `is` twin off.
+        let source = "model child is nonexistent:\n    value string\n";
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
+        let diags = loaded_validator(SCHEMA)
+            .composition_checked_at_load()
+            .validate(&file);
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.code.map(|c| c.to_string()).as_deref() != Some("NML2020")),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
     fn trait_declarations_in_checked_files_are_schema_defs() {
         // A `trait` block in a checked file is a schema definition, not an
         // unknown instance keyword — even under strict.
         let diags = check("trait audited:\n    auditedBy string?\n", true);
         assert!(diags.is_empty(), "{diags:?}");
+    }
+}
+
+#[cfg(test)]
+mod closed_vocabulary_tests {
+    //! RFC 0012: a package-bound validator is a closed vocabulary — in-file
+    //! definitions are inert and say so; tenant files can neither shadow nor
+    //! extend the operator's schema set.
+
+    use super::*;
+    use nml_core::diagnostic::Severity;
+
+    fn closed(strict: bool) -> SchemaValidator {
+        let schema = nml_core::cst::extract_schema("model server:\n    port number\n").0;
+        let v =
+            SchemaValidator::new(schema.models, schema.enums, schema.oneofs).closed_vocabulary();
+        if strict {
+            v.strict()
+        } else {
+            v
+        }
+    }
+
+    fn codes_of(diags: &[Diagnostic]) -> Vec<(String, Severity)> {
+        diags
+            .iter()
+            .filter_map(|d| d.code.map(|c| (c.to_string(), d.severity.clone())))
+            .collect()
+    }
+
+    #[test]
+    fn in_file_definitions_draw_nml2026_warning_in_lenient() {
+        let file = nml_core::cst::parse_to_ast("model smuggled:\n    x string?\n").unwrap();
+        let diags = closed(false).validate(&file);
+        assert_eq!(
+            codes_of(&diags),
+            vec![("NML2026".to_string(), Severity::Warning)],
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn strict_closed_mode_errors_and_still_walls_the_minted_keyword() {
+        // The vocabulary-extension attack: define a model, use its keyword.
+        // The definition is refused AND the instance still hits strict's
+        // unknown-keyword wall — the tenant gains nothing.
+        let file = nml_core::cst::parse_to_ast(
+            "model smuggled:\n    x string?\n\nsmuggled Foo:\n    x = \"boo\"\n",
+        )
+        .unwrap();
+        let diags = closed(true).validate(&file);
+        let codes: Vec<String> = diags
+            .iter()
+            .filter_map(|d| d.code.map(|c| c.to_string()))
+            .collect();
+        assert!(codes.contains(&"NML2026".to_string()), "{diags:?}");
+        assert!(codes.contains(&"NML2004".to_string()), "{diags:?}");
+        assert!(
+            diags.iter().all(|d| d.severity == Severity::Error),
+            "strict closed mode is all-errors: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn oneof_and_trait_definitions_are_refused_too() {
+        let file = nml_core::cst::parse_to_ast(
+            "trait cap:\n    x string?\n\noneof n by kind:\n    \"a\" -> server\n",
+        )
+        .unwrap();
+        let diags = closed(false).validate(&file);
+        let n = diags
+            .iter()
+            .filter(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2026"))
+            .count();
+        assert_eq!(n, 2, "one per definition kind: {diags:?}");
+    }
+
+    #[test]
+    fn open_validators_never_emit_nml2026() {
+        let schema = nml_core::cst::extract_schema("model server:\n    port number\n").0;
+        let v = SchemaValidator::new(schema.models, schema.enums, schema.oneofs).strict();
+        let file = nml_core::cst::parse_to_ast("model extra:\n    x string?\n").unwrap();
+        assert!(
+            v.validate(&file)
+                .iter()
+                .all(|d| d.code.map(|c| c.to_string()).as_deref() != Some("NML2026")),
+            "open mode: definitions are legitimate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod duration_tests {
+    //! NML2029: duration values must match the spec grammar — the same
+    //! `nml_core::types::parse_duration` consumers use.
+
+    use super::*;
+
+    fn diags_for(value: &str) -> Vec<Diagnostic> {
+        let schema = nml_core::cst::extract_schema("model job:\n    timeout duration\n").0;
+        let v = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
+        let src = format!("job Nightly:\n    timeout = {value}\n");
+        v.validate(&nml_core::cst::parse_to_ast(&src).unwrap())
+    }
+
+    #[test]
+    fn spec_grammar_accepted_and_violations_coded() {
+        for ok in ["\"72h\"", "\"30m\"", "\"5s\"", "\"500ms\""] {
+            assert!(diags_for(ok).is_empty(), "{ok} is spec-valid");
+        }
+        for bad in ["\"30x\"", "\"1.5h\"", "\"-3s\"", "\"s\"", "\"12\""] {
+            assert!(
+                diags_for(bad)
+                    .iter()
+                    .any(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2029")),
+                "{bad} must be NML2029"
+            );
+        }
+        // Wrong KIND stays NML2008 — format checking never absorbs it.
+        assert!(diags_for("30")
+            .iter()
+            .any(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2008")),);
+    }
+}
+
+#[cfg(test)]
+mod shared_property_validation_tests {
+    //! 6c: shared properties and modifiers stop being invisible — unknown
+    //! names get the unknown-property treatment at the `.prop`/`|name`
+    //! token, values type-check, and model-declared modifier fields are the
+    //! per-block vocabulary.
+
+    use super::*;
+    use nml_core::diagnostic::Severity;
+
+    const SCHEMA: &str = "trait monitored:\n    timeout duration = \"5s\"\n\n\
+                          trait accessControlled:\n    |allow []role?\n    |deny []role?\n\n\
+                          model endpoint is monitored, accessControlled:\n    url string+\n\n\
+                          model service:\n    endpoints []endpoint\n";
+
+    fn check(source: &str, strict: bool) -> Vec<Diagnostic> {
+        let (schema, diags) = crate::loader::load_schema(&[("t.model.nml", SCHEMA)]);
+        assert!(diags.is_empty(), "{diags:?}");
+        let v = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
+        let v = if strict { v.strict() } else { v };
+        v.validate(&nml_core::cst::parse_to_ast(source).unwrap())
+    }
+
+    #[test]
+    fn unknown_shared_property_warns_with_suggestion_and_errors_strict() {
+        let src = "service Api:\n    endpoints:\n        .timeuot = \"10s\"\n\n        - A:\n            url = \"https://a\"\n";
+        let diags = check(src, false);
+        let hit = diags
+            .iter()
+            .find(|d| d.message.contains("unknown shared property '.timeuot'"))
+            .expect("flagged at the shared token");
+        assert_eq!(hit.severity, Severity::Warning);
+        assert_eq!(
+            hit.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            Some("timeout")
+        );
+        assert!(check(src, true).iter().any(
+            |d| d.message.contains("unknown shared property") && d.severity == Severity::Error
+        ));
+    }
+
+    #[test]
+    fn shared_property_value_type_checks() {
+        let src = "service Api:\n    endpoints:\n        .timeout = 9\n\n        - A:\n            url = \"https://a\"\n";
+        assert!(
+            check(src, false)
+                .iter()
+                .any(|d| d.message.contains("shared property")
+                    && d.message.contains("'timeout'")
+                    && d.code.map(|c| c.to_string()).as_deref() == Some("NML2008")),
+            "{:?}",
+            check(src, false)
+        );
+    }
+
+    #[test]
+    fn array_level_shared_properties_are_validated_too() {
+        let src =
+            "[]endpoint eps:\n    .timeuot = \"10s\"\n\n    - A:\n        url = \"https://a\"\n";
+        assert!(check(src, false)
+            .iter()
+            .any(|d| d.message.contains("unknown shared property '.timeuot'")));
+    }
+
+    #[test]
+    fn model_declared_modifier_fields_are_the_vocabulary() {
+        // `|alow` typo against endpoint's accessControlled-inherited fields:
+        // flagged with a did-you-mean even with NO manifest modifier list.
+        let bad =
+            "[]endpoint eps:\n    |alow = [@public]\n\n    - A:\n        url = \"https://a\"\n";
+        let diags = check(bad, false);
+        let hit = diags
+            .iter()
+            .find(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2002"))
+            .expect("unknown modifier flagged from model vocabulary");
+        assert!(hit.message.contains("model 'endpoint' declares"), "{hit:?}");
+        assert_eq!(
+            hit.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            Some("allow")
+        );
+        // A correct modifier stays silent.
+        let good =
+            "[]endpoint eps:\n    |allow = [@public]\n\n    - A:\n        url = \"https://a\"\n";
+        assert!(check(good, false)
+            .iter()
+            .all(|d| d.code.map(|c| c.to_string()).as_deref() != Some("NML2002")));
+    }
+}
+
+#[cfg(test)]
+mod union_shared_property_tests {
+    //! Union-element subset semantics: a shared property is known if ANY
+    //! model variant defines it; values check against the defining
+    //! variants' types through the standard union value check.
+
+    use super::*;
+    use nml_core::diagnostic::Severity;
+
+    const SCHEMA: &str = "model alpha:\n    speed number?\n    size number?\n\n\
+                          model beta:\n    label string?\n    size string?\n\n\
+                          model service:\n    parts [](alpha | beta)\n";
+
+    fn check(source: &str, strict: bool) -> Vec<Diagnostic> {
+        let (schema, diags) = crate::loader::load_schema(&[("u.model.nml", SCHEMA)]);
+        assert!(diags.is_empty(), "{diags:?}");
+        let v = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
+        let v = if strict { v.strict() } else { v };
+        v.validate(&nml_core::cst::parse_to_ast(source).unwrap())
+    }
+
+    fn codes(diags: &[Diagnostic]) -> Vec<String> {
+        diags
+            .iter()
+            .filter_map(|d| d.code.map(|c| c.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn name_defined_on_any_variant_is_known() {
+        // `.label` lives only on beta — the first variant must not gatekeep.
+        let src = "service Api:\n    parts:\n        .label = \"x\"\n\n        - A:\n            speed = 1\n";
+        let diags = check(src, false);
+        assert!(!codes(&diags).contains(&"NML2001".to_string()), "{diags:?}");
+    }
+
+    #[test]
+    fn name_on_no_variant_warns_with_cross_variant_suggestion() {
+        let src = "service Api:\n    parts:\n        .labl = \"x\"\n\n        - A:\n            speed = 1\n";
+        let diags = check(src, false);
+        let hit = diags
+            .iter()
+            .find(|d| d.message.contains("no union variant"))
+            .expect("flagged at the shared token");
+        assert_eq!(hit.severity, Severity::Warning);
+        assert!(
+            hit.message.contains("'alpha'") && hit.message.contains("'beta'"),
+            "{hit:?}"
+        );
+        assert_eq!(
+            hit.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            Some("label")
+        );
+        assert!(check(src, true)
+            .iter()
+            .any(|d| d.message.contains("no union variant") && d.severity == Severity::Error));
+    }
+
+    #[test]
+    fn value_checks_against_defining_variants() {
+        // `size` differs by variant (number | string): either shape passes…
+        for ok in ["3", "\"big\""] {
+            let src = format!(
+                "service Api:\n    parts:\n        .size = {ok}\n\n        - A:\n            speed = 1\n"
+            );
+            let diags = check(&src, false);
+            assert!(
+                !codes(&diags)
+                    .iter()
+                    .any(|c| c == "NML2032" || c == "NML2008"),
+                "{ok}: {diags:?}"
+            );
+        }
+        // …a bool satisfies neither → the standard union mismatch.
+        let src = "service Api:\n    parts:\n        .size = true\n\n        - A:\n            speed = 1\n";
+        assert!(codes(&check(src, false)).contains(&"NML2032".to_string()));
+        // A single-defining name type-checks directly against that field.
+        let src =
+            "service Api:\n    parts:\n        .label = 9\n\n        - A:\n            speed = 1\n";
+        assert!(codes(&check(src, false)).contains(&"NML2008".to_string()));
     }
 }

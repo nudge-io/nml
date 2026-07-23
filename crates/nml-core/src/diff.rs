@@ -388,6 +388,7 @@ pub fn synthesize_config_root(root_name: &str, fields: &[ConfigRootField]) -> Mo
     ModelDef {
         name: root_name.to_string(),
         kind: crate::model::ModelKind::Model,
+        source: None,
         extends: Vec::new(),
         fields,
         span: nospan,
@@ -442,29 +443,43 @@ pub fn wrap_file_as_body(file: &File) -> Body {
 /// wholesale by [`diff_oneof_instance`]. One resolver serves BOTH call sites
 /// (field-level bodies and collection elements), so their oneof behavior can
 /// never diverge.
-enum Target<'a> {
-    Model(&'a crate::model::ModelDef),
-    OneOf(&'a crate::model::OneOfDef),
-}
-
-/// Resolve a field type to its instance-diff target: unwrap `Modifier`,
-/// follow `ModelRef` (to a model OR a oneof), and walk `Union` variants to the
-/// first ref that resolves (a union here is already known to be a keyed-body
-/// instance — arms and list shapes were dispatched before this point, so
-/// scalar variants are impossible).
-fn resolve_instance_target<'a>(index: &'a SchemaIndex, ft: &'a FieldType) -> Option<Target<'a>> {
-    match ft {
-        FieldType::Modifier(inner) => resolve_instance_target(index, inner),
-        FieldType::ModelRef(name) => match index.resolve_ref(name) {
-            FieldTarget::Model(m) => Some(Target::Model(m)),
-            FieldTarget::OneOf(o) => Some(Target::OneOf(o)),
-            _ => None,
-        },
-        FieldType::Union(variants) => variants
-            .iter()
-            .find_map(|v| resolve_instance_target(index, v)),
-        _ => None,
-    }
+/// Resolve a keyed-body instance's type to the ONE canonical
+/// [`FieldTarget`](SchemaIndex) via [`SchemaIndex::resolve_type_in_body`] — the
+/// same body-shape variant selection the validator, defaulter, identity walk,
+/// and LSP share, so the differ can never diverge from them (previously it
+/// carried a private order-based union resolver). The body is `new`-side
+/// preferred (last-file-wins), else `old`, else empty: for a non-union the body
+/// is irrelevant (both sides resolve identically); for a union the effective
+/// body's shape (arms / list items / neither) selects the variant, matching the
+/// single-target diff already in force. Callers act on `Model`/`OneOf`; every
+/// other target (`ListOf`/`SetOf`/`Object`/`Union`/`Arms`/`Leaf` — arms,
+/// collections, and object fields are dispatched EARLIER) degrades to the
+/// visible `opaque_if_different` fall-through, exactly as the remainder walk
+/// did. When a real list/multi-model union appears, the conformance harness
+/// flags it and the precise arm is added then.
+fn resolve_diff_target<'a>(
+    index: &'a SchemaIndex,
+    ft: &'a FieldType,
+    new_bodies: &[(PathBuf, &'a Body)],
+    old_bodies: &[(PathBuf, &'a Body)],
+    empty: &'a Body,
+) -> FieldTarget<'a> {
+    // The union variant-shape rule keys off entry KINDS (arms / list-items /
+    // keyed / scalar), and under multi-file overlay the last file that sets the
+    // instance carries its effective shape — so the last non-empty body
+    // (new-side rev-first, else old) is the shape in force. A well-formed
+    // instance has ONE shape across files; a contradictory split (keyed here,
+    // list-items there) is validator-rejected and merely degrades visibly.
+    // For a non-union type the body is ignored (resolves identically both
+    // sides), so the choice only matters for unions.
+    let body = new_bodies
+        .iter()
+        .rev()
+        .chain(old_bodies.iter().rev())
+        .map(|(_, b)| *b)
+        .find(|b| !b.entries.is_empty())
+        .unwrap_or(empty);
+    index.resolve_type_in_body(ft, body)
 }
 
 /// The model a body diffs against, plus a property name the remainder walk
@@ -1084,8 +1099,11 @@ fn diff_bodies(
         Effective::Bodies(b) => b,
         _ => &empty,
     };
-    match resolve_instance_target(index, &field.field_type) {
-        Some(Target::Model(m)) => diff_model(
+    let empty_body = Body {
+        entries: Vec::new(),
+    };
+    match resolve_diff_target(index, &field.field_type, n, o, &empty_body) {
+        FieldTarget::Model(m) => diff_model(
             index,
             ModelCtx {
                 model: m,
@@ -1097,12 +1115,16 @@ fn diff_bodies(
             depth + 1,
             out,
         ),
-        Some(Target::OneOf(of)) => diff_oneof_instance(index, of, o, n, path, depth + 1, out),
-        None => {
+        FieldTarget::OneOf(of) => diff_oneof_instance(index, of, o, n, path, depth + 1, out),
+        _ => {
             // Bodies that neither arms, elements, nor a resolvable target
             // consumed: a shape the schema cannot describe (model↔grammar
             // drift — a renamed/missing model, a body under a scalar-typed
-            // field). Visible, never silent (module invariant).
+            // field). Visible, never silent (module invariant). No
+            // scalar-element recursion is needed here (unlike the element-level
+            // resolve): a list-item body was already dispatched to
+            // `diff_collections` above, so a union can only resolve here to a
+            // keyed→Model (handled) or a scalar/empty→Leaf, never to `ListOf`.
             opaque_if_different(o, n, path, out);
         }
     }
@@ -1349,8 +1371,17 @@ fn diff_collections(
             .body
             .map(|b| vec![(n.file.map(Path::to_path_buf).unwrap_or_default(), b)])
             .unwrap_or_default();
-        match resolve_instance_target(index, elem_type(&field.field_type)) {
-            Some(Target::Model(m)) => {
+        let empty_body = Body {
+            entries: Vec::new(),
+        };
+        match resolve_diff_target(
+            index,
+            elem_type(&field.field_type),
+            &n_files,
+            &o_files,
+            &empty_body,
+        ) {
+            FieldTarget::Model(m) => {
                 diff_model(
                     index,
                     ModelCtx {
@@ -1364,10 +1395,10 @@ fn diff_collections(
                     out,
                 );
             }
-            Some(Target::OneOf(of)) => {
+            FieldTarget::OneOf(of) => {
                 diff_oneof_instance(index, of, &o_files, &n_files, &elem_path, depth + 1, out);
             }
-            None => {
+            _ => {
                 // Scalar-typed elements whose bodies carry config content — e.g.
                 // `|block set<string>` with namespaced `- egress:` entries (the RFC
                 // 0032 |block blind spot): there is no model to recurse into, but
@@ -2412,6 +2443,47 @@ mod tests {
             d.iter()
                 .any(|c| p(c) == "e.title" && matches!(c.kind, ChangeKind::Removed { .. })),
             "removed block's fields precise: {d:?}"
+        );
+    }
+
+    /// The `[](step | []step)` workflow shape (nudge's `parallel`): a branch
+    /// element whose body is a LIST of steps selects the `[]step` (ListOf)
+    /// union variant. Resolution returns `ListOf` (not Model/OneOf), so the
+    /// generic fall-through takes over — and PRECISELY: the scalar-element
+    /// recursion re-diffs the branch's body items as a collection, each nested
+    /// step resolving to its model via the keyed-body RULE-COMPLETION. So the
+    /// union list-variant needs no bespoke arm — existing machinery + the
+    /// rule-completion make it precise (no coarse `OpaqueChanged`). This test
+    /// GUARDS that: if it ever regresses to opaque, the ListOf precision was
+    /// lost and a dedicated arm is warranted.
+    #[test]
+    fn union_listof_element_variant_diffs_precisely() {
+        let schema = "model step:\n    name string+\n    id string?\n    parallel [](step | []step)?\n\nmodel server:\n    steps []step?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let src = |cid: &str| {
+            format!(
+            "server s:\n    steps:\n        - A:\n            parallel:\n                - br:\n                    - C:\n                        id = \"{cid}\"\n                    - D:\n                        id = \"d\"\n"
+        )
+        };
+        let old = parse_doc(&src("c1"));
+        let new = parse_doc(&src("c2"));
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        assert_eq!(d.len(), 1, "one precise change: {d:?}");
+        assert_eq!(
+            p(&d[0]),
+            "steps.A.parallel.br.C.id",
+            "the nested step's field, fully pathed: {d:?}"
+        );
+        assert!(
+            matches!(&d[0].kind, ChangeKind::Modified { .. }),
+            "precise, not a coarse OpaqueChanged: {d:?}"
         );
     }
 
