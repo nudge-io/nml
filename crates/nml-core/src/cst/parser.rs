@@ -180,6 +180,13 @@ impl<'a> Parser<'a> {
     }
 
     fn error(&mut self, message: &str) {
+        self.error_kind(crate::error::ParseErrorKind::Generic(message.to_string()));
+    }
+
+    /// Classified emission (RFC 0009); [`Self::error`] wraps legacy prose in
+    /// the transitional `Generic` kind, so classifying a site is a one-line
+    /// local change.
+    fn error_kind(&mut self, kind: crate::error::ParseErrorKind) {
         if self.errors.len() < super::MAX_ERRORS {
             let offset = self
                 .toks
@@ -187,7 +194,7 @@ impl<'a> Parser<'a> {
                 .or_else(|| self.toks.last())
                 .map_or(0, |t| t.offset);
             self.errors
-                .push(NmlError::parse(message.to_string(), Span::empty(offset)));
+                .push(NmlError::parse_kind(kind, Span::empty(offset)));
         }
     }
 
@@ -195,6 +202,14 @@ impl<'a> Parser<'a> {
     /// one token ⇒ forward progress.
     fn err_recover(&mut self, message: &str) {
         self.error(message);
+        if !self.at_eof() {
+            self.bump_as(SyntaxKind::Error);
+        }
+    }
+
+    /// [`Self::err_recover`] with a classified kind (RFC 0009).
+    fn err_recover_kind(&mut self, kind: crate::error::ParseErrorKind) {
+        self.error_kind(kind);
         if !self.at_eof() {
             self.bump_as(SyntaxKind::Error);
         }
@@ -301,7 +316,12 @@ impl<'a> Parser<'a> {
     /// — the guidance is owned once, not re-remembered per production.
     fn expect_arrow(&mut self) {
         if self.at(SyntaxKind::FatArrow) {
-            self.err_recover("'=>' was replaced by '->' (RFC 0006)");
+            // Classified (RFC 0009): the ReplacedSyntax kind derives the
+            // message, the NML0001 code, and the machine-applicable `->` fix.
+            self.err_recover_kind(crate::error::ParseErrorKind::ReplacedSyntax {
+                old: "=>",
+                new: "->",
+            });
         } else {
             self.expect(SyntaxKind::Arrow, "'->'");
         }

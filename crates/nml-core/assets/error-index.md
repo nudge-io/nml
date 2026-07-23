@@ -11,6 +11,31 @@ Bands (allocation convenience, not API): 0001–0999 lex/parse ·
 1000–1999 symbols & resolution · 2000–2999 schema loading & validation ·
 3000–3999 values & money · 4000–4999 packages & store · 5000–5999 editor/LSP.
 
+## NML0001
+
+**Replaced syntax.** This syntax was removed by a language migration and has
+a mechanical replacement — the fix is machine-applicable (editors offer it
+as a quick-fix; the message names the exact rewrite). This is the
+[stability policy](../../../docs/stability.md)'s "breaking changes ship with
+fixers" commitment, as a diagnostic.
+
+```nml check expect-error='[NML0001]'
+oneof email by kind:
+    "log" => emailLog
+```
+
+**Fix:** apply the suggestion (here: `->`).
+
+**Migration ledger** (every rename this code has covered):
+
+| Removed | Replacement | Since |
+|---|---|---|
+| `=>` (arm arrow) | `->` | RFC 0006 |
+
+Earlier pre-code migrations, for the record: the `!` positional marker
+became `+` (RFC 0005 rev. 1), and the never-implemented angle-bracket
+shorthand annotation was removed in favor of `+` (RFC 0005).
+
 ## NML1000
 
 **Duplicate declaration.** Two top-level declarations share one name; names

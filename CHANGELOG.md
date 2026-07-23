@@ -15,6 +15,11 @@
   (`DefaultPrt` → `DefaultPort`), unknown currency codes (`USE` → `USD`,
   from the ISO 4217 table), and unknown template namespaces — each with a
   machine-applicable quick-fix span.
+- **Structured parse errors (RFC 0009 foundations)**: syntax errors carry a
+  payload kind from which message, code, and fix derive; **`NML0001`
+  Replaced syntax** is live — writing `=>` now yields a machine-applicable
+  `->` fix in the CLI and as an editor quick-fix, with the error index
+  carrying the migration ledger.
 - **`nml explain NML2007`**: the error index is embedded in the binary
   (canonical file: `crates/nml-core/assets/error-index.md`, exposed as
   `nml_core::diagnostic::explain`), so explanations work offline; the CLI

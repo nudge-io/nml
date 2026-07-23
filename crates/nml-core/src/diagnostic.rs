@@ -99,6 +99,11 @@ pub mod codes {
     use super::Code;
 
     codes! {
+        /// Removed syntax with a mechanical replacement — see the migration
+        /// ledger in the error index (the fixers commitment,
+        /// `docs/stability.md`).
+        REPLACED_SYNTAX = 1;
+
         /// The same name is declared more than once in one namespace.
         DUPLICATE_DECLARATION = 1000;
         /// A value references a name that no declaration defines.
@@ -183,7 +188,6 @@ pub fn explain(code: &str) -> Option<&'static str> {
         (head.trim() == code).then(|| body.trim())
     })
 }
-
 /// One reported finding. Constructed via the builders ([`Diagnostic::error`]
 /// et al.) — `non_exhaustive`, so fields may be added without a breaking
 /// change.
