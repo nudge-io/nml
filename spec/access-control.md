@@ -137,12 +137,12 @@ trait accessControlled:
     |allow []@roleRef
     |deny []@roleRef
 
-model service (accessControlled):
+model service is accessControlled:
     localMount path
     resources []resource
     endpoints []endpoint
 
-model resource (accessControlled):
-    path path <shorthand>
+model resource is accessControlled:
+    path path+
     method httpMethod = "GET"
 ```

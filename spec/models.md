@@ -41,7 +41,6 @@ Constraints are specified in angle brackets after the type:
 | `<secret>` | string | Masked in logs, supports `$ENV.X` resolution |
 | `<token>` | string | Used as a lookup identifier |
 | `<distinct>` | lists | All items must be unique |
-| `<shorthand>` | any | Bare string list items expand to this field |
 | `<integer>` | number | Must be a whole number |
 | `<min = N>` | number | Minimum value (inclusive) |
 | `<max = N>` | number | Maximum value (inclusive) |
@@ -88,21 +87,26 @@ model endpoint:
 When used in a `[]endpoint` array, `.healthCheck` applies to every element
 unless overridden by a specific element.
 
-### Shorthand Field
+### Positional Field (`+`)
 
-The `<shorthand>` constraint identifies which field receives the value when
-a list item is a bare string:
+The `+` marker after a field's type identifies which field receives the value
+when a list item is a bare scalar. A model may declare at most one positional
+field; `?+` marks an optional positional field:
 
-```
+```nml check
 model resource:
-    path path <shorthand>
+    path path+
     method httpMethod = "GET"
+
+enum httpMethod:
+    - "GET"
+    - "POST"
 ```
 
 This means:
 ```
 []resource resources:
-    - "/test/matt"           // expands to: - _: path = "/test/matt"
+    - "/test/matt"           // fills the positional field: path = "/test/matt"
     - HomePage:
         path = "/"           // explicit form
 ```
@@ -123,27 +127,39 @@ trait traitName:
 
 A model includes traits by listing them in parentheses:
 
-```
+```nml check
 trait accessControlled:
-    |allow []@roleRef
-    |deny []@roleRef
+    |allow []role
+    |deny []role
 
-model resource (accessControlled):
-    path path <shorthand>
+model resource is accessControlled:
+    path path+
     method httpMethod = "GET"
 
-// Equivalent to:
+enum httpMethod:
+    - "GET"
+    - "POST"
+```
+
+The composed form is equivalent to declaring the trait's fields directly:
+
+```
 model resource:
-    |allow []@roleRef
-    |deny []@roleRef
-    path path <shorthand>
+    |allow []role
+    |deny []role
+    path path+
     method httpMethod = "GET"
 ```
 
-Multiple traits are comma-separated:
+Multiple traits are comma-separated after `is`:
 
-```
-model myThing (accessControlled, auditable):
+```nml check
+trait accessControlled:
+    |allow []role
+trait auditable:
+    auditLog string?
+
+model myThing is accessControlled, auditable:
     name string
 ```
 

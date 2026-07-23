@@ -1,7 +1,7 @@
 use nml_core::ast::*;
+use nml_core::diagnostic::{codes, Severity};
 use nml_core::model::{EnumDef, ModelDef, OneOfDef};
 use nml_core::types::{TemplateSegment, Value};
-use nml_validate::diagnostics::Severity;
 use nml_validate::schema::{MembershipSemantics, SchemaValidator};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
@@ -50,23 +50,23 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
     // instead of going dark on the first syntax error.
     let (file, parse_errors) = nml_core::cst::parse_to_ast_all(source);
 
-    for err in &parse_errors {
-        diagnostics.push(nml_error_to_diagnostic(err, &line_index));
+    for diag in parse_errors {
+        push_diagnostic(diag, None, &line_index, &mut diagnostics);
     }
 
     let mut symbols = nml_core::symbols::SymbolTable::new();
     symbols.register_file(&file);
 
-    for err in symbols.find_duplicates() {
-        diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
+    for diag in symbols.find_duplicates() {
+        push_diagnostic(diag, None, &line_index, &mut diagnostics);
     }
 
-    for err in symbols.find_unresolved_references(&file) {
-        diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
+    for diag in symbols.find_unresolved_references(&file) {
+        push_diagnostic(diag, None, &line_index, &mut diagnostics);
     }
 
-    for err in symbols.find_const_cycles() {
-        diagnostics.push(nml_error_to_diagnostic(&err, &line_index));
+    for diag in symbols.find_const_cycles() {
+        push_diagnostic(diag, None, &line_index, &mut diagnostics);
     }
 
     match mode {
@@ -81,7 +81,7 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
                         .with_modifiers(config.modifiers.clone())
                         .with_membership_semantics(config.membership.clone());
                 for diag in validator.validate(&file) {
-                    push_validator_diagnostic(diag, None, &line_index, &mut diagnostics);
+                    push_diagnostic(diag, None, &line_index, &mut diagnostics);
                 }
             }
         }
@@ -90,7 +90,7 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
             identity,
         } => {
             for diag in validator.validate(&file) {
-                push_validator_diagnostic(diag, Some(identity), &line_index, &mut diagnostics);
+                push_diagnostic(diag, Some(identity), &line_index, &mut diagnostics);
             }
         }
     }
@@ -105,12 +105,15 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
     diagnostics
 }
 
-/// Lower one validator diagnostic to LSP form: map severity, suffix the
-/// binding identity onto package-mode errors, and carry any structured
-/// suggestion into `Diagnostic.data` so the code-action handler can offer a
-/// one-keystroke fix without re-deriving (or worse, message-parsing) it.
-fn push_validator_diagnostic(
-    diag: nml_validate::diagnostics::Diagnostic,
+/// Lower one core diagnostic to LSP form — **the** converter (RFC 0008):
+/// every producer (parse, symbols, validator, templates, directives,
+/// advisory notices) flows through here. Maps severity three ways, carries
+/// the stable code as the LSP string `code`, suffixes the binding identity
+/// onto package-mode errors, and rides the structured suggestion in
+/// `Diagnostic.data` so the code-action handler offers a one-keystroke fix
+/// without re-deriving (or worse, message-parsing) it.
+fn push_diagnostic(
+    diag: nml_core::diagnostic::Diagnostic,
     identity: Option<&str>,
     line_index: &LineIndex,
     out: &mut Vec<Diagnostic>,
@@ -123,9 +126,11 @@ fn push_validator_diagnostic(
         return;
     };
     let is_error = matches!(diag.severity, Severity::Error);
+    // `rendered_message` appends the standard did-you-mean hint derived from
+    // the structured suggestion — the one renderer every surface shares.
     let message = match identity {
-        Some(id) if is_error => format!("{} (schema: {id})", diag.message),
-        _ => diag.message,
+        Some(id) if is_error => format!("{} (schema: {id})", diag.rendered_message()),
+        _ => diag.rendered_message(),
     };
     let data = diag.suggestion.as_ref().map(|s| {
         serde_json::json!({
@@ -138,11 +143,17 @@ fn push_validator_diagnostic(
     });
     out.push(Diagnostic {
         range: line_index.range(span),
-        severity: Some(if is_error {
-            DiagnosticSeverity::ERROR
-        } else {
-            DiagnosticSeverity::WARNING
+        severity: Some(match diag.severity {
+            Severity::Error => DiagnosticSeverity::ERROR,
+            Severity::Warning => DiagnosticSeverity::WARNING,
+            // Info and any future advisory levels surface as INFORMATION.
+            _ => DiagnosticSeverity::INFORMATION,
         }),
+        // Stable code (RFC 0008) — the LSP spec types `code` as
+        // number-or-string; the formatted form is the public identity.
+        code: diag
+            .code
+            .map(|c| tower_lsp::lsp_types::NumberOrString::String(c.to_string())),
         message,
         source: Some("nml".to_string()),
         data,
@@ -170,8 +181,8 @@ pub fn schema_source_pass(
     let mut out = Vec::new();
     let line_index = LineIndex::new(source);
     let (schema, errors) = nml_core::cst::extract_schema(source);
-    for err in &errors {
-        out.push(nml_error_to_diagnostic(err, &line_index));
+    for diag in errors {
+        push_diagnostic(diag, None, &line_index, &mut out);
     }
     let vocab_names: Vec<String> = vocab.directives.iter().map(|d| d.name.clone()).collect();
     let vocab_has = |name: &str| vocab_names.iter().any(|n| n == name);
@@ -203,39 +214,46 @@ pub fn schema_source_pass(
                     } else {
                         live.span
                     };
-                    out.push(Diagnostic {
-                        range: line_index.range(span),
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: "'#live' and '#restart' contradict — pick one".to_string(),
-                        source: Some("nml".to_string()),
-                        ..Default::default()
-                    });
+                    push_diagnostic(
+                        nml_core::diagnostic::Diagnostic::error(
+                            "'#live' and '#restart' contradict — pick one",
+                        )
+                        .with_code(codes::DIRECTIVE_CONFLICT)
+                        .with_span(span),
+                        None,
+                        &line_index,
+                        &mut out,
+                    );
                 }
             }
         }
     }
     if vocab.undeclared_sibling {
-        out.push(Diagnostic {
-            range: tower_lsp::lsp_types::Range::default(),
-            severity: Some(DiagnosticSeverity::INFORMATION),
-            message: format!(
+        // `Severity::Info` (RFC 0008): advisory, expressible in the unified
+        // model — the last producer that needed a hand-built LSP diagnostic.
+        push_diagnostic(
+            nml_core::diagnostic::Diagnostic::info(format!(
                 "not part of package '{}'; add a []schema entry to participate",
                 vocab.package_name
-            ),
-            source: Some("nml".to_string()),
-            ..Default::default()
-        });
+            ))
+            .with_code(codes::UNDECLARED_SIBLING)
+            .with_span(nml_core::span::Span::empty(0)),
+            None,
+            &line_index,
+            &mut out,
+        );
     }
     out
 }
 
 /// The byte span of a directive's *name* token. `Directive.span` covers the
-/// whole construct (`#` through the close); the did-you-mean replacement must
-/// cover the name only, so applying it yields a valid directive without
-/// touching the `#` or any argument. Located by searching the directive's own
-/// slice rather than assuming `start + 1` — the parser tolerates trivia
-/// between `#` and the name, and a wrong span would make the quick-fix mangle
-/// the source.
+/// whole construct (`#` through the close); the did-you-mean quick-fix spans
+/// from the `#` **through this name span's end** (sigil-inclusive replacement
+/// `#name`, never touching any argument), so the precise question here is
+/// where the name *ends*. Located by searching the directive's own slice
+/// rather than assuming `start + 1` — the parser tolerates trivia between
+/// `#` and the name, and a wrong end would make the quick-fix mangle the
+/// argument.
 fn directive_name_span(
     directive: &nml_core::types::Directive,
     source: &str,
@@ -279,34 +297,29 @@ fn check_directive(
     }
     let decl = vocab.directives.iter().find(|d| d.name == directive.name);
     let Some(decl) = decl else {
-        let mut message = format!(
+        // Built as a validator-style diagnostic and lowered by the shared
+        // converter, so the hint prose and the quick-fix wire shape are the
+        // same as every other suggestion in the system.
+        let mut vdiag = nml_core::diagnostic::Diagnostic::error(format!(
             "unknown directive '#{}' (package '{}')",
             directive.name, vocab.package_name
-        );
-        let mut data = None;
+        ))
+        .with_code(codes::UNKNOWN_DIRECTIVE)
+        .with_span(directive.span);
         if let Some(suggested) =
-            nml_validate::schema::suggest_directive(&directive.name, vocab_names)
+            nml_core::suggest::suggest(&directive.name, vocab_names.iter().map(String::as_str))
         {
-            message.push_str(&format!(" — did you mean '#{suggested}'?"));
-            let name_span = directive_name_span(directive, source);
-            // Same wire shape as the validator's enum suggestion — one
-            // code-action consumer for both.
-            data = Some(serde_json::json!({
-                "suggestion": {
-                    "replacement": suggested,
-                    "start": name_span.start,
-                    "end": name_span.end,
-                }
-            }));
+            // The fix replaces from the `#` through the name with the
+            // sigil-inclusive form, so the hint reads exactly what the user
+            // types (`did you mean "#live"?`) — and applying it normalizes
+            // any stray trivia between `#` and the name.
+            let fix_span = nml_core::span::Span::new(
+                directive.span.start,
+                directive_name_span(directive, source).end,
+            );
+            vdiag = vdiag.with_suggestion(format!("#{suggested}"), fix_span);
         }
-        out.push(Diagnostic {
-            range: line_index.range(directive.span),
-            severity: Some(DiagnosticSeverity::ERROR),
-            message,
-            source: Some("nml".to_string()),
-            data,
-            ..Default::default()
-        });
+        push_diagnostic(vdiag, None, line_index, out);
         return;
     };
     // Wording matches nudge's boot gate (`verify_directive_vocabulary` in
@@ -319,13 +332,14 @@ fn check_directive(
         (_, true) => None,
     };
     if let Some(message) = arity_error {
-        out.push(Diagnostic {
-            range: line_index.range(directive.span),
-            severity: Some(DiagnosticSeverity::ERROR),
-            message,
-            source: Some("nml".to_string()),
-            ..Default::default()
-        });
+        push_diagnostic(
+            nml_core::diagnostic::Diagnostic::error(message)
+                .with_code(codes::DIRECTIVE_BAD_ARITY)
+                .with_span(directive.span),
+            None,
+            line_index,
+            out,
+        );
     }
 }
 
@@ -438,32 +452,19 @@ fn validate_value_templates(
             } = seg
             {
                 if !valid_ns.is_empty() && !valid_ns.contains(&namespace.as_str()) {
-                    diags.push(Diagnostic {
-                        range: line_index.range(*span),
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        message: format!("unknown template namespace '{namespace}'"),
-                        source: Some("nml".to_string()),
-                        ..Default::default()
-                    });
+                    let mut diag = nml_core::diagnostic::Diagnostic::warning(format!(
+                        "unknown template namespace '{namespace}'"
+                    ))
+                    .with_code(codes::UNKNOWN_TEMPLATE_NAMESPACE)
+                    .with_span(*span);
+                    if let Some(s) = nml_core::suggest::suggest(namespace, valid_ns.iter().copied())
+                    {
+                        diag = diag.with_suggestion(s, *span);
+                    }
+                    push_diagnostic(diag, None, line_index, diags);
                 }
             }
         }
-    }
-}
-
-/// Convert a single NML error to an LSP diagnostic.
-fn nml_error_to_diagnostic(err: &nml_core::error::NmlError, line_index: &LineIndex) -> Diagnostic {
-    let severity = match err {
-        nml_core::error::NmlError::Validation { .. } => DiagnosticSeverity::WARNING,
-        _ => DiagnosticSeverity::ERROR,
-    };
-
-    Diagnostic {
-        range: line_index.range(err.span()),
-        severity: Some(severity),
-        message: err.message().to_string(),
-        source: Some("nml".to_string()),
-        ..Default::default()
     }
 }
 
@@ -516,6 +517,13 @@ package demo:
             .iter()
             .find(|d| d.message.contains("did you mean \"Lax\""))
             .expect("did-you-mean");
+        // The stable code rides the LSP wire as a string (RFC 0008).
+        assert_eq!(
+            dym.code,
+            Some(tower_lsp::lsp_types::NumberOrString::String(
+                "NML2000".to_string()
+            ))
+        );
         assert!(
             dym.message
                 .contains("(schema: demo blake3:12345678, store current)"),
@@ -560,7 +568,7 @@ package demo:
             .find(|d| d.message.contains("unknown directive '#lvie'"))
             .expect("unknown directive flagged");
         assert!(
-            diag.message.contains("did you mean '#live'"),
+            diag.message.contains("did you mean \"#live\""),
             "{}",
             diag.message
         );

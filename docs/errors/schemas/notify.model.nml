@@ -1,0 +1,11 @@
+// Schemas backing the error-index examples for oneof-related codes.
+
+model emailLog:
+    path string?
+
+model emailPostmark:
+    apiKey string?
+
+oneof email by kind:
+    "log"      -> emailLog
+    "postmark" -> emailPostmark

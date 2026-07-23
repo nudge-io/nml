@@ -3,12 +3,13 @@ name = "nml-lsp"
 description = "Language Server Protocol implementation for NML"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 
 [lib]
 name = "nml_lsp"

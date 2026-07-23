@@ -19,11 +19,17 @@
 //!   keyed, references, or roles, never anonymous — so paired elements
 //!   recurse and report precise leaf paths. (This is why the RFC's `#key`
 //!   escape hatch never shipped: the language's own grammar subsumes it.)
+//! - **routing arms** (RFC 0007): selector-paired per-arm diff over the same
+//!   LCS — a retarget is one `Modified` at the arm's element path; a move is
+//!   a -/+ pair of the full arm at its two file:lines.
 //!
 //! **Invariant — visible, never silent:** content the schema model cannot
 //! represent (model↔grammar drift: a shape the grammar accepts but the model
 //! does not describe) must degrade to a *visible* [`ChangeKind::OpaqueChanged`]
-//! at the nearest describable field path — never to silence. Silence is
+//! at the nearest describable field path — never to silence. This includes the
+//! **unmodeled remainder**: content inside a body whose model RESOLVED but
+//! whose fields do not cover it (bare element lists, uncovered named entries) —
+//! the shape where even a resolution-failure fallback sees nothing. Silence is
 //! indistinguishable from equality, and for a security-classification consumer
 //! that turns drift into invisibly-skipped changes (the `|block` incident this
 //! invariant was written from). `OpaqueChanged` is payload-free by design: the
@@ -78,6 +84,14 @@ pub enum ChangeKind {
     /// payload-free: the schema cannot know which parts of an undescribable
     /// shape are secrets, so no content is carried.
     OpaqueChanged,
+    /// The sides differ inside a field the schema DECLARES opaque
+    /// (`object`-typed): an embedded domain sub-language the model
+    /// intentionally does not describe (e.g. a capability-grant DSL). The
+    /// typed twin of [`ChangeKind::OpaqueChanged`] — same payload-free
+    /// discipline (the schema cannot know the domain body's secrets), but the
+    /// OPPOSITE meaning: this is design, not drift. Consumers key semantic
+    /// domain differs off it and never raise a drift warning for it.
+    ObjectChanged,
 }
 
 /// A schema-field hop along a [`FieldPath`]: its name plus the schema facts a
@@ -269,7 +283,18 @@ pub fn diff_config(
     let Some(model) = index.model(root_model) else {
         return out;
     };
-    diff_model(index, model, old, new, &FieldPath::default(), 0, &mut out);
+    diff_model(
+        index,
+        ResolvedModel {
+            model,
+            discriminator: None,
+        },
+        old,
+        new,
+        &FieldPath::default(),
+        0,
+        &mut out,
+    );
     out
 }
 
@@ -411,15 +436,24 @@ pub fn wrap_file_as_body(file: &File) -> Body {
     Body { entries }
 }
 
+/// A model an instance body resolved to, plus the oneof discriminator that
+/// selected it (covered content the model's own fields don't list).
+#[derive(Clone, Copy)]
+struct ResolvedModel<'a> {
+    model: &'a crate::model::ModelDef,
+    discriminator: Option<&'a str>,
+}
+
 fn diff_model(
     index: &SchemaIndex,
-    model: &crate::model::ModelDef,
+    resolved: ResolvedModel<'_>,
     old: &[(PathBuf, &Body)],
     new: &[(PathBuf, &Body)],
     prefix: &FieldPath,
     depth: u32,
     out: &mut Vec<FieldChange>,
 ) {
+    let model = resolved.model;
     if depth >= MAX_DEPTH {
         // The resource boundary honors the module invariant: content the walk
         // cannot descend into is structurally compared and surfaces as a
@@ -430,6 +464,130 @@ fn diff_model(
     for field in &model.fields {
         let path = prefix.appended(PathSeg::Field(FieldStep::from_field(field)));
         diff_field(index, field, old, new, &path, depth, out);
+    }
+    // The UNMODELED REMAINDER (module invariant, completeness edition): a
+    // resolvable model whose instance bodies carry content its fields do not
+    // describe — bare list items (e.g. `tenantGrants`' tenant→plugin lists)
+    // and named entries matching no field. Without this, such content is
+    // invisible even to the OpaqueChanged fall-through (the model DID
+    // resolve) — the tenantGrants silent-diff bug class.
+    diff_unmodeled_remainder(index, resolved, old, new, prefix, depth, out);
+}
+
+/// Diff the parts of a model-instance body the model's fields do not cover.
+/// Bare list items diff as an identity-paired collection (element-level
+/// precision — an added/removed item is a real per-element change; paired
+/// items' bodies recurse via the scalar-element machinery, degrading to a
+/// pathed OpaqueChanged where no model applies). Uncovered NAMED entries
+/// (matching no field, and not the oneof discriminator) compare structurally
+/// and surface as one OpaqueChanged at the model's path when they differ.
+fn diff_unmodeled_remainder(
+    index: &SchemaIndex,
+    resolved: ResolvedModel<'_>,
+    old: &[(PathBuf, &Body)],
+    new: &[(PathBuf, &Body)],
+    prefix: &FieldPath,
+    depth: u32,
+    out: &mut Vec<FieldChange>,
+) {
+    let (model, discriminator) = (resolved.model, resolved.discriminator);
+    // (a) Bare list items. Two cases, one mechanism:
+    //  * the model DECLARES a body-positional list field (RFC 0005 `+` on a
+    //    list/set — e.g. `plugins []tenantGrantPlugin+`): the items diff
+    //    against the REAL field, so elements get true model recursion
+    //    (validated fields, `object`-typed leaves → `ObjectChanged`);
+    //  * no declaration (unmodeled): a synthetic `[]string` field — elements
+    //    pair by identity; paired bodies take the scalar-element recursion
+    //    (items → deeper collections, else a pathed OpaqueChanged).
+    // Either way changes emit at `prefix` (the grammar has no field name to
+    // hop through — the operator never wrote one), so classification folds the
+    // REAL field hops on `prefix`.
+    let o_eff = Effective::Bodies(old.to_vec());
+    let n_eff = Effective::Bodies(new.to_vec());
+    let o_items = collect_elems(&o_eff);
+    let n_items = collect_elems(&n_eff);
+    if !o_items.is_empty() || !n_items.is_empty() {
+        let synth = FieldDef {
+            name: String::new(),
+            field_type: FieldType::List(Box::new(FieldType::Primitive(
+                crate::types::PrimitiveType::String,
+            ))),
+            optional: true,
+            shorthand: false,
+            default_value: None,
+            directives: Vec::new(),
+            doc: None,
+            span: Span { start: 0, end: 0 },
+        };
+        let items_field = model
+            .fields
+            .iter()
+            .find(|f| f.shorthand && matches!(f.field_type, FieldType::List(_) | FieldType::Set(_)))
+            .unwrap_or(&synth);
+        diff_collections(
+            index,
+            items_field,
+            &o_items,
+            &n_items,
+            prefix,
+            depth + 1,
+            out,
+        );
+    }
+
+    // (b) Named entries no field covers.
+    let covered: std::collections::HashSet<&str> =
+        model.fields.iter().map(|f| f.name.as_str()).collect();
+    fn uncovered<'b>(
+        files: &'b [(PathBuf, &'b Body)],
+        covered: &std::collections::HashSet<&str>,
+        discriminator: Option<&str>,
+    ) -> Vec<(&'b Path, &'b BodyEntry)> {
+        let mut out_e = Vec::new();
+        for (file, body) in files {
+            for e in &body.entries {
+                let keep = match &e.kind {
+                    BodyEntryKind::Property(p) => {
+                        !covered.contains(p.name.name.as_str())
+                            && Some(p.name.name.as_str()) != discriminator
+                    }
+                    BodyEntryKind::NestedBlock(nb) => !covered.contains(nb.name.name.as_str()),
+                    BodyEntryKind::Modifier(m) => !covered.contains(m.name.name.as_str()),
+                    // An arm outside an arms-typed field's body is unmodeled.
+                    BodyEntryKind::Arm(_) => true,
+                    // Items handled in (a); authoring/resolved constructs carry
+                    // no config values.
+                    BodyEntryKind::ListItem(_)
+                    | BodyEntryKind::SharedProperty(_)
+                    | BodyEntryKind::FieldDefinition(_) => false,
+                };
+                if keep {
+                    out_e.push((file.as_path(), e));
+                }
+            }
+        }
+        out_e
+    }
+    let o_rem = uncovered(old, &covered, discriminator);
+    let n_rem = uncovered(new, &covered, discriminator);
+    if o_rem.is_empty() && n_rem.is_empty() {
+        return;
+    }
+    let eq = o_rem.len() == n_rem.len()
+        && o_rem
+            .iter()
+            .zip(&n_rem)
+            .all(|((_, a), (_, b))| entry_structural_eq(a, b, depth));
+    if !eq {
+        let origin = n_rem
+            .first()
+            .or_else(|| o_rem.first())
+            .map(|(f, e)| Origin::File {
+                file: f.to_path_buf(),
+                span: e.span,
+            })
+            .unwrap_or(Origin::Default);
+        push(prefix, ChangeKind::OpaqueChanged, origin, out);
     }
 }
 
@@ -447,6 +605,19 @@ fn diff_field(
     let old_eff = effective(old, &field.name, field);
     let new_eff = effective(new, &field.name, field);
 
+    // A DECLARED-opaque field (`object`-typed): an embedded domain body the
+    // model intentionally does not describe. Never recurse into it (a
+    // structural walk would mis-read the domain grammar through a schema that
+    // by design says nothing about it) — structurally compare the raw bodies
+    // and surface any difference as the typed [`ChangeKind::ObjectChanged`].
+    if matches!(
+        field.field_type,
+        FieldType::Primitive(PrimitiveType::Object)
+    ) {
+        diff_declared_object(&old_eff, &new_eff, path, out);
+        return;
+    }
+
     match (&old_eff, &new_eff) {
         (Effective::Absent, Effective::Absent) => {}
         // Scalar-ish values (inline properties / modifier inline / defaults).
@@ -460,6 +631,72 @@ fn diff_field(
                 diff_values_at(field, o, n, path, out);
             }
         }
+    }
+}
+
+/// Compare a declared-`object` field's two sides without interpreting them:
+/// per-file body sequences via the span-ignoring structural equality, inline
+/// values via `semantic_eq`. Any difference — including a body appearing or
+/// disappearing, or a body↔value shape change — is one payload-free
+/// [`ChangeKind::ObjectChanged`] at the field path.
+fn diff_declared_object(
+    old_eff: &Effective,
+    new_eff: &Effective,
+    path: &FieldPath,
+    out: &mut Vec<FieldChange>,
+) {
+    let changed = match (old_eff, new_eff) {
+        (Effective::Absent, Effective::Absent) => false,
+        (Effective::Bodies(o), Effective::Bodies(n)) => {
+            !(o.len() == n.len()
+                && o.iter()
+                    .zip(n)
+                    .all(|((_, a), (_, b))| body_structural_eq(a, b)))
+        }
+        (Effective::Items(o, _), Effective::Items(n, _)) => {
+            !(o.len() == n.len() && o.iter().zip(n.iter()).all(|(a, b)| list_item_eq(a, b, 0)))
+        }
+        (
+            Effective::Value(o, _) | Effective::Default(o),
+            Effective::Value(n, _) | Effective::Default(n),
+        ) => !o.value.semantic_eq(&n.value),
+        // Shape changed across sides (body ↔ value ↔ items ↔ absent).
+        _ => true,
+    };
+    if changed {
+        // Prefer the new side's origin; a REMOVED block (new side absent)
+        // falls back to the old side so the report still carries file:line.
+        let eff_for_origin = if matches!(new_eff, Effective::Absent) {
+            old_eff
+        } else {
+            new_eff
+        };
+        let origin = match eff_for_origin {
+            Effective::Bodies(b) => b
+                .first()
+                .map(|(f, body)| Origin::File {
+                    file: f.clone(),
+                    span: body
+                        .entries
+                        .first()
+                        .map(|e| e.span)
+                        .unwrap_or(Span { start: 0, end: 0 }),
+                })
+                .unwrap_or(Origin::Default),
+            Effective::Items(items, f) => items
+                .first()
+                .map(|i| Origin::File {
+                    file: f.to_path_buf(),
+                    span: i.span,
+                })
+                .unwrap_or(Origin::Default),
+            Effective::Value(sv, f) => Origin::File {
+                file: f.to_path_buf(),
+                span: sv.span,
+            },
+            _ => Origin::Default,
+        };
+        push(path, ChangeKind::ObjectChanged, origin, out);
     }
 }
 
@@ -633,45 +870,20 @@ fn diff_bodies(
     depth: u32,
     out: &mut Vec<FieldChange>,
 ) {
-    // Arm sets (RFC 0007 routing blocks): ordered, first-match — compare the
-    // whole rendered arm list (coarse but honest and deterministic; per-arm
-    // granularity can come later). Last file carrying arms wins, like every
-    // collection.
-    let old_arms = collect_arms(old);
-    let new_arms = collect_arms(new);
+    // Arm sets (RFC 0007 routing blocks): PER-ARM diff — selector-paired
+    // retargets, full-arm add/remove (a move = a -/+ pair), each with its own
+    // file:line. Last file carrying arms wins, like every collection. A side
+    // with no arms diffs as the empty list, so a whole block appearing renders
+    // as per-arm Addeds rather than one blob.
+    let old_arms = collect_arm_entries(old);
+    let new_arms = collect_arm_entries(new);
     if old_arms.is_some() || new_arms.is_some() {
-        match (old_arms, new_arms) {
-            (Some((o, _)), Some((n, origin))) => {
-                if o != n {
-                    push(
-                        path,
-                        ChangeKind::Modified {
-                            old: Value::String(o),
-                            new: Value::String(n),
-                        },
-                        origin,
-                        out,
-                    );
-                }
-            }
-            (None, Some((n, origin))) => push(
-                path,
-                ChangeKind::Added {
-                    new: Value::String(n),
-                },
-                origin,
-                out,
-            ),
-            (Some((o, origin)), None) => push(
-                path,
-                ChangeKind::Removed {
-                    old: Value::String(o),
-                },
-                origin,
-                out,
-            ),
-            (None, None) => unreachable!(),
-        }
+        diff_arms(
+            &old_arms.unwrap_or_default(),
+            &new_arms.unwrap_or_default(),
+            path,
+            out,
+        );
         return;
     }
 
@@ -694,8 +906,19 @@ fn diff_bodies(
         Effective::Bodies(b) => b,
         _ => &empty,
     };
-    if let Some(model) = resolve_instance_model(index, &field.field_type, n, o) {
-        diff_model(index, model, o, n, path, depth + 1, out)
+    if let Some((model, discr)) = resolve_instance_model(index, &field.field_type, n, o) {
+        diff_model(
+            index,
+            ResolvedModel {
+                model,
+                discriminator: discr,
+            },
+            o,
+            n,
+            path,
+            depth + 1,
+            out,
+        )
     } else {
         // Bodies that neither arms, elements, nor a resolvable model consumed:
         // a shape the schema cannot describe (model↔grammar drift — a renamed/
@@ -761,12 +984,16 @@ fn opaque_if_different(
 /// refs and, for a `oneof`, the **instance's own discriminator value** (the
 /// new side's, falling back to the old side's), so exactly the variant in use
 /// is walked (RFC 0032 P2: instance-aware, never a pessimistic union).
+/// Returns the resolved model plus, when resolution went through a `oneof`,
+/// the discriminator property name the instance used — the remainder check
+/// must treat that property as covered (it belongs to the oneof, not the
+/// variant model's fields).
 fn resolve_instance_model<'a>(
     index: &'a SchemaIndex,
     ft: &'a FieldType,
     new_bodies: &[(PathBuf, &Body)],
     old_bodies: &[(PathBuf, &Body)],
-) -> Option<&'a crate::model::ModelDef> {
+) -> Option<(&'a crate::model::ModelDef, Option<&'a str>)> {
     match ft {
         FieldType::Modifier(inner) => resolve_instance_model(index, inner, new_bodies, old_bodies),
         FieldType::ModelRef(name) => model_from_ref(index, name, new_bodies, old_bodies),
@@ -790,9 +1017,9 @@ fn model_from_ref<'a>(
     name: &str,
     new_bodies: &[(PathBuf, &Body)],
     old_bodies: &[(PathBuf, &Body)],
-) -> Option<&'a crate::model::ModelDef> {
+) -> Option<(&'a crate::model::ModelDef, Option<&'a str>)> {
     match index.resolve_ref(name) {
-        FieldTarget::Model(m) => Some(m),
+        FieldTarget::Model(m) => Some((m, None)),
         FieldTarget::OneOf(o) => {
             let discr = lookup_property(new_bodies, &o.discriminator)
                 .or_else(|| lookup_property(old_bodies, &o.discriminator))
@@ -803,7 +1030,7 @@ fn model_from_ref<'a>(
                 .find(|(v, _)| v == discr)
                 .map(|(_, m)| m.as_str())?;
             match index.resolve_ref(variant) {
-                FieldTarget::Model(m) => Some(m),
+                FieldTarget::Model(m) => Some((m, Some(o.discriminator.as_str()))),
                 _ => None,
             }
         }
@@ -981,10 +1208,21 @@ fn diff_collections(
             .body
             .map(|b| vec![(n.file.map(Path::to_path_buf).unwrap_or_default(), b)])
             .unwrap_or_default();
-        if let Some(model) =
+        if let Some((model, discr)) =
             resolve_instance_model(index, elem_type(&field.field_type), &n_files, &o_files)
         {
-            diff_model(index, model, &o_files, &n_files, &elem_path, depth + 1, out);
+            diff_model(
+                index,
+                ResolvedModel {
+                    model,
+                    discriminator: discr,
+                },
+                &o_files,
+                &n_files,
+                &elem_path,
+                depth + 1,
+                out,
+            );
         } else {
             // Scalar-typed elements whose bodies carry config content — e.g.
             // `|block set<string>` with namespaced `- egress:` entries (the RFC
@@ -1041,17 +1279,31 @@ fn diff_collections(
 /// Canonical single-arm rendering ("sel -> target") — shared by the wholesale
 /// arms diff and the structural body equality, so the two can never disagree
 /// about what an arm "is".
-fn render_arm(a: &crate::ast::Arm) -> String {
-    use crate::ast::{ArmSelector, ArmTarget};
-    let sel = match &a.selector {
+fn arm_selector_str(a: &crate::ast::Arm) -> &str {
+    use crate::ast::ArmSelector;
+    match &a.selector {
         ArmSelector::Role(r) => r.as_str(),
         ArmSelector::Else => "else",
-    };
-    let tgt = match &a.target {
+    }
+}
+
+fn arm_target_str(a: &crate::ast::Arm) -> String {
+    use crate::ast::ArmTarget;
+    match &a.target {
         ArmTarget::Reference(id) => id.name.clone(),
         ArmTarget::Literal { value, .. } => format!("{value:?}"),
-    };
-    format!("{sel} -> {tgt}")
+    }
+}
+
+/// The one arm rendering (`sel -> target`) — every consumer (wholesale eq,
+/// per-arm add/remove payloads) formats through here, so the shape can never
+/// fork.
+fn format_arm(selector: &str, target: &str) -> String {
+    format!("{selector} -> {target}")
+}
+
+fn render_arm(a: &crate::ast::Arm) -> String {
+    format_arm(arm_selector_str(a), &arm_target_str(a))
 }
 
 /// Span-ignoring structural equality over config-instance bodies — the
@@ -1077,8 +1329,16 @@ fn body_eq_bounded(a: &Body, b: &Body, depth: u32) -> bool {
     if depth >= MAX_DEPTH {
         return false;
     }
-    fn entry_eq(a: &BodyEntry, b: &BodyEntry, depth: u32) -> bool {
-        use crate::ast::SharedPropertyKind;
+    a.entries.len() == b.entries.len()
+        && a.entries
+            .iter()
+            .zip(&b.entries)
+            .all(|(x, y)| entry_structural_eq(x, y, depth))
+}
+
+fn entry_structural_eq(a: &BodyEntry, b: &BodyEntry, depth: u32) -> bool {
+    use crate::ast::SharedPropertyKind;
+    {
         match (&a.kind, &b.kind) {
             (BodyEntryKind::Property(x), BodyEntryKind::Property(y)) => {
                 x.name.name == y.name.name && x.value.value.semantic_eq(&y.value.value)
@@ -1108,57 +1368,61 @@ fn body_eq_bounded(a: &Body, b: &Body, depth: u32) -> bool {
             _ => false,
         }
     }
-    fn modifier_value_eq(a: &ModifierValue, b: &ModifierValue, depth: u32) -> bool {
-        match (a, b) {
-            (ModifierValue::Inline(x), ModifierValue::Inline(y)) => x.value.semantic_eq(&y.value),
-            (ModifierValue::Block(x), ModifierValue::Block(y)) => {
-                x.len() == y.len() && x.iter().zip(y).all(|(i, j)| list_item_eq(i, j, depth))
-            }
-            // Authoring construct: carries no config values.
-            (ModifierValue::TypeAnnotation { .. }, ModifierValue::TypeAnnotation { .. }) => true,
-            _ => false,
-        }
-    }
-    fn list_item_eq(a: &ListItem, b: &ListItem, depth: u32) -> bool {
-        match (&a.kind, &b.kind) {
-            (
-                ListItemKind::Named { name: an, body: ab },
-                ListItemKind::Named { name: bn, body: bb },
-            ) => an.name == bn.name && body_eq_bounded(ab, bb, depth + 1),
-            (
-                ListItemKind::Shorthand {
-                    value: av,
-                    body: ab,
-                },
-                ListItemKind::Shorthand {
-                    value: bv,
-                    body: bb,
-                },
-            ) => {
-                av.value.semantic_eq(&bv.value)
-                    && match (ab, bb) {
-                        (Some(x), Some(y)) => body_eq_bounded(x, y, depth + 1),
-                        (None, None) => true,
-                        _ => false,
-                    }
-            }
-            (ListItemKind::Reference(x), ListItemKind::Reference(y)) => x.name == y.name,
-            (ListItemKind::Role(x), ListItemKind::Role(y)) => x == y,
-            _ => false,
-        }
-    }
-    a.entries.len() == b.entries.len()
-        && a.entries
-            .iter()
-            .zip(&b.entries)
-            .all(|(x, y)| entry_eq(x, y, depth))
 }
 
-/// The effective arm list of a routing block, rendered canonically
-/// ("sel -> target; ..."), with the winning file's origin. Last file carrying
-/// arms wins wholesale (arms are ordered first-match — order IS meaning, so a
-/// reorder is honestly a change).
-fn collect_arms(e: &Effective) -> Option<(String, Origin)> {
+fn modifier_value_eq(a: &ModifierValue, b: &ModifierValue, depth: u32) -> bool {
+    match (a, b) {
+        (ModifierValue::Inline(x), ModifierValue::Inline(y)) => x.value.semantic_eq(&y.value),
+        (ModifierValue::Block(x), ModifierValue::Block(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(i, j)| list_item_eq(i, j, depth))
+        }
+        // Authoring construct: carries no config values.
+        (ModifierValue::TypeAnnotation { .. }, ModifierValue::TypeAnnotation { .. }) => true,
+        _ => false,
+    }
+}
+
+fn list_item_eq(a: &ListItem, b: &ListItem, depth: u32) -> bool {
+    match (&a.kind, &b.kind) {
+        (
+            ListItemKind::Named { name: an, body: ab },
+            ListItemKind::Named { name: bn, body: bb },
+        ) => an.name == bn.name && body_eq_bounded(ab, bb, depth + 1),
+        (
+            ListItemKind::Shorthand {
+                value: av,
+                body: ab,
+            },
+            ListItemKind::Shorthand {
+                value: bv,
+                body: bb,
+            },
+        ) => {
+            av.value.semantic_eq(&bv.value)
+                && match (ab, bb) {
+                    (Some(x), Some(y)) => body_eq_bounded(x, y, depth + 1),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        (ListItemKind::Reference(x), ListItemKind::Reference(y)) => x.name == y.name,
+        (ListItemKind::Role(x), ListItemKind::Role(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// One effective routing arm, with its own origin (the selector's span in the
+/// winning file) so per-arm changes carry real file:line.
+struct ArmEntry {
+    selector: String,
+    target: String,
+    origin: Origin,
+}
+
+/// The effective arm list of a routing block. Last file carrying arms wins
+/// wholesale (arms are ordered first-match — collections overlay by
+/// replacement, and order IS meaning).
+fn collect_arm_entries(e: &Effective) -> Option<Vec<ArmEntry>> {
     let bodies: &[(PathBuf, &Body)] = match e {
         Effective::Bodies(b) => b,
         _ => return None,
@@ -1168,30 +1432,85 @@ fn collect_arms(e: &Effective) -> Option<(String, Origin)> {
             .iter()
             .any(|en| matches!(en.kind, BodyEntryKind::Arm(_)))
     })?;
-    let mut rendered = Vec::new();
-    let mut first_span = None;
+    let mut arms = Vec::new();
     for entry in &body.entries {
         if let BodyEntryKind::Arm(a) = &entry.kind {
-            first_span.get_or_insert(a.selector_span);
-            rendered.push(render_arm(a));
+            arms.push(ArmEntry {
+                selector: arm_selector_str(a).to_string(),
+                target: arm_target_str(a),
+                origin: Origin::File {
+                    file: file.clone(),
+                    span: a.selector_span,
+                },
+            });
         }
     }
-    Some((
-        rendered.join("; "),
-        Origin::File {
-            file: file.clone(),
-            span: first_span.unwrap_or(Span { start: 0, end: 0 }),
-        },
-    ))
+    Some(arms)
+}
+
+/// Per-arm diff of a routing block (RFC 0007): arms pair by SELECTOR — unique
+/// by validation (duplicate arm keys and duplicate `else` are rejected) — via
+/// the same deterministic LCS the ordered lists use, so order stays meaning:
+/// * a paired arm with a new target → `Modified(old_target → new_target)` at
+///   the arm's selector element path;
+/// * an unpaired arm → `Added`/`Removed` carrying the FULL `sel -> target`
+///   rendering, so a MOVED arm reads as a -/+ pair of identical text at its
+///   two file:lines (deterministic — a security report never guesses).
+fn diff_arms(old: &[ArmEntry], new: &[ArmEntry], path: &FieldPath, out: &mut Vec<FieldChange>) {
+    let matched = lcs_pairs_by(old, new, |a, b| a.selector == b.selector);
+    for &(i, j) in &matched {
+        if old[i].target != new[j].target {
+            push(
+                &path.appended(PathSeg::Element(ElemKey::Name(new[j].selector.clone()))),
+                ChangeKind::Modified {
+                    old: Value::String(old[i].target.clone()),
+                    new: Value::String(new[j].target.clone()),
+                },
+                new[j].origin.clone(),
+                out,
+            );
+        }
+    }
+    for (j, a) in new.iter().enumerate() {
+        if !matched.iter().any(|&(_, jj)| jj == j) {
+            push(
+                &path.appended(PathSeg::Element(ElemKey::Name(a.selector.clone()))),
+                ChangeKind::Added {
+                    new: Value::String(format_arm(&a.selector, &a.target)),
+                },
+                a.origin.clone(),
+                out,
+            );
+        }
+    }
+    for (i, a) in old.iter().enumerate() {
+        if !matched.iter().any(|&(ii, _)| ii == i) {
+            push(
+                &path.appended(PathSeg::Element(ElemKey::Name(a.selector.clone()))),
+                ChangeKind::Removed {
+                    old: Value::String(format_arm(&a.selector, &a.target)),
+                },
+                a.origin.clone(),
+                out,
+            );
+        }
+    }
 }
 
 fn lcs_pairs(old: &[Elem<'_>], new: &[Elem<'_>]) -> Vec<(usize, usize)> {
+    lcs_pairs_by(old, new, |a, b| a.id.eq(&b.id))
+}
+
+/// Deterministic LCS pairing over any identity relation (Myers-class O(n·m)
+/// DP — trivial at config scale). One implementation for ordered scalars AND
+/// routing arms, so their alignment semantics can never diverge.
+fn lcs_pairs_by<T>(old: &[T], new: &[T], eq: impl Fn(&T, &T) -> bool) -> Vec<(usize, usize)> {
     let n = old.len();
     let m = new.len();
     let mut dp = vec![vec![0u32; m + 1]; n + 1];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            dp[i][j] = if old[i].id.eq(&new[j].id) {
+            dp[i][j] = if eq(&old[i], &new[j]) {
                 dp[i + 1][j + 1] + 1
             } else {
                 dp[i + 1][j].max(dp[i][j + 1])
@@ -1200,7 +1519,7 @@ fn lcs_pairs(old: &[Elem<'_>], new: &[Elem<'_>]) -> Vec<(usize, usize)> {
     }
     let (mut i, mut j, mut out) = (0, 0, Vec::new());
     while i < n && j < m {
-        if old[i].id.eq(&new[j].id) {
+        if eq(&old[i], &new[j]) {
             out.push((i, j));
             i += 1;
             j += 1;
@@ -1356,11 +1675,13 @@ mod tests {
         assert_eq!(p(&d[0]), "denial");
     }
 
-    /// r10 fix 2 — ARM blocks diff: a retargeted arm is a Modified (rendered
-    /// arm lists), unchanged arms are silent, and a REORDER is honestly a
-    /// change (arms are ordered first-match — order IS meaning).
+    /// ARM blocks diff PER-ARM (RFC 0007): a retargeted arm is one `Modified`
+    /// of target values at ITS selector element path; unchanged arms are
+    /// silent; a REORDER is honestly a -/+ pair of the full moved arm (arms
+    /// are ordered first-match — order IS meaning); a brand-new arm is one
+    /// full-arm `Added` at its selector path.
     #[test]
-    fn arm_blocks_diff_including_reorder() {
+    fn arm_blocks_diff_per_arm_including_reorder() {
         let schema = "model server:\n    route (role -> string)?\n";
         let (sch, errs) = crate::cst::extract_schema(schema);
         assert!(errs.is_empty(), "{errs:?}");
@@ -1375,18 +1696,53 @@ mod tests {
             )
         };
         let base = "server s:\n    route:\n        @role/a -> X\n        else -> Y\n";
+
+        // Retarget: precise target-only Modified at the arm's own path.
         let retarget = "server s:\n    route:\n        @role/a -> Z\n        else -> Y\n";
         let d = diff2(base, retarget);
         assert_eq!(d.len(), 1, "{d:?}");
-        assert_eq!(p(&d[0]), "route");
+        assert_eq!(p(&d[0]), "route.@role/a");
         assert!(
-            matches!(&d[0].kind, ChangeKind::Modified { new, .. }
-                if matches!(new, Value::String(s) if s.contains("-> Z"))),
+            matches!(&d[0].kind, ChangeKind::Modified { old, new }
+                if matches!(old, Value::String(s) if s == "X")
+                    && matches!(new, Value::String(s) if s == "Z")),
+            "target-only payloads: {d:?}"
+        );
+
+        assert!(diff2(base, base).is_empty(), "unchanged arms are silent");
+
+        // Reorder: the moved arm reads as a -/+ pair of the SAME full arm text
+        // (deterministic LCS picks which arm moved), at its selector path.
+        let reorder = "server s:\n    route:\n        else -> Y\n        @role/a -> X\n";
+        let d = diff2(base, reorder);
+        assert_eq!(d.len(), 2, "a move is a -/+ pair: {d:?}");
+        let texts: Vec<&str> = d
+            .iter()
+            .map(|c| match &c.kind {
+                ChangeKind::Added {
+                    new: Value::String(s),
+                }
+                | ChangeKind::Removed {
+                    old: Value::String(s),
+                } => s.as_str(),
+                k => panic!("expected full-arm Added/Removed, got {k:?}"),
+            })
+            .collect();
+        assert!(
+            texts.iter().all(|t| *t == "@role/a -> X"),
+            "both sides of the pair carry the moved arm verbatim: {texts:?}"
+        );
+        assert!(d.iter().all(|c| p(c) == "route.@role/a"), "{d:?}");
+
+        // A brand-new arm: one full-arm Added at its selector path.
+        let grown = "server s:\n    route:\n        @role/a -> X\n        @role/b -> W\n        else -> Y\n";
+        let d = diff2(base, grown);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(p(&d[0]), "route.@role/b");
+        assert!(
+            matches!(&d[0].kind, ChangeKind::Added { new: Value::String(s) } if s == "@role/b -> W"),
             "{d:?}"
         );
-        assert!(diff2(base, base).is_empty(), "unchanged arms are silent");
-        let reorder = "server s:\n    route:\n        else -> Y\n        @role/a -> X\n";
-        assert_eq!(diff2(base, reorder).len(), 1, "arm reorder IS a change");
     }
 
     /// The flagship consumer path (nudge RFC 0031): `server → sandboxCeiling
@@ -1575,6 +1931,162 @@ mod tests {
             &[(PathBuf::from("server.nml"), &old)],
         );
         assert!(same.is_empty(), "{same:?}");
+    }
+
+    /// A DECLARED-opaque field (`object`-typed, e.g. an embedded grant DSL):
+    /// the differ never interprets the domain body — an inner edit is exactly
+    /// ONE payload-free `ObjectChanged` at the field path (no mis-structural
+    /// recursion into a grammar the schema says nothing about), identical
+    /// content is silent, and the payload-free discipline means nothing from
+    /// the domain body can leak.
+    #[test]
+    fn declared_object_fields_diff_opaque_by_design() {
+        let schema = "model plugin:\n    package string+\n    egress object?\n\nmodel server:\n    p plugin?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let src = |cidr: &str| {
+            format!(
+                "server s:\n    p:\n        package = \"x\"\n        egress:\n            - http:\n                - \"{cidr}\"\n"
+            )
+        };
+        let d2 = |o: &str, n: &str| {
+            let (of, nf) = (parse_doc(o), parse_doc(n));
+            diff_config(
+                &idx,
+                "server",
+                &[(PathBuf::from("f.nml"), server_body(&of))],
+                &[(PathBuf::from("f.nml"), server_body(&nf))],
+            )
+        };
+        let d = d2(&src("10.0.5.0/24"), &src("10.0.6.0/24"));
+        assert_eq!(d.len(), 1, "one typed opaque change: {d:?}");
+        assert_eq!(p(&d[0]), "p.egress");
+        assert!(matches!(d[0].kind, ChangeKind::ObjectChanged), "{d:?}");
+        // Payload-free: the domain body's content cannot leak.
+        let rendered = format!("{:?}", d[0]);
+        assert!(
+            !rendered.contains("10.0.5.0") && !rendered.contains("10.0.6.0"),
+            "DECLARED-OPAQUE LEAKED: {rendered}"
+        );
+        // Identical ⇒ silent; other sibling fields still diff precisely.
+        assert!(d2(&src("10.0.5.0/24"), &src("10.0.5.0/24")).is_empty());
+    }
+
+    /// The COMPOSED end-state (body-positional shorthand + declared-object
+    /// leaf — the tenantGrants architecture): `plugins []tenantGrantPlugin+`
+    /// binds the bare body items to a REAL field, so elements get true model
+    /// recursion — and the `egress object` leaf inside surfaces as ONE typed
+    /// `ObjectChanged` at its full element path. A plugin ADD stays a precise
+    /// per-element change; identical content is silent.
+    #[test]
+    fn body_positional_shorthand_composes_with_declared_object_leaf() {
+        let schema = "model tgp:\n    package string+\n    egress object?\n\nmodel tg:\n    tenant string+\n    plugins []tgp+\n\nmodel server:\n    grants []tg?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let src = |cidr: &str| {
+            format!(
+                "server s:\n    grants:\n        - \"_op\":\n            - \"[v]-a.v1\":\n                egress:\n                    - http:\n                        - \"{cidr}\"\n"
+            )
+        };
+        let d2 = |o: &str, n: &str| {
+            let (of, nf) = (parse_doc(o), parse_doc(n));
+            diff_config(
+                &idx,
+                "server",
+                &[(PathBuf::from("f.nml"), server_body(&of))],
+                &[(PathBuf::from("f.nml"), server_body(&nf))],
+            )
+        };
+        // The grant-DSL edit: ONE typed ObjectChanged at the FULL element path
+        // (through the real model recursion the declared field unlocked).
+        let d = d2(&src("10.0.5.0/24"), &src("10.0.6.0/24"));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(matches!(d[0].kind, ChangeKind::ObjectChanged), "{d:?}");
+        assert_eq!(p(&d[0]), "grants[\"_op\"][\"[v]-a.v1\"].egress");
+        // Payload-free: the domain body cannot leak.
+        let rendered = format!("{:?}", d[0]);
+        assert!(!rendered.contains("10.0."), "LEAKED: {rendered}");
+        // Identical ⇒ silent.
+        assert!(d2(&src("10.0.5.0/24"), &src("10.0.5.0/24")).is_empty());
+    }
+
+    /// The UNMODELED REMAINDER (the tenantGrants silent-diff class): a model
+    /// that RESOLVES but has no field for its body's bare element list — the
+    /// items now diff as an identity-paired collection: an added element is a
+    /// precise per-element `Added`; a paired element's un-modelable body edit
+    /// is a pathed `OpaqueChanged` at that element — and identical content
+    /// stays silent.
+    #[test]
+    fn unmodeled_body_items_diff_with_element_precision() {
+        // `tg` mirrors tenantGrant: shorthand scalar, NO field for body items.
+        let schema = "model tg:\n    tenant string+\n\nmodel server:\n    grants []tg?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let src = |plugins: &str| format!("server s:\n    grants:\n        - \"_op\":\n{plugins}");
+        let one = src("            - \"[v]-a.v1\":\n                egress:\n                    - http:\n                        - \"10.0.5.0/24\"\n");
+        let two = src("            - \"[v]-a.v1\":\n                egress:\n                    - http:\n                        - \"10.0.5.0/24\"\n            - \"[v]-b.v1\":\n                egress:\n                    - http:\n                        - \"10.0.9.0/24\"\n");
+        let edited = src("            - \"[v]-a.v1\":\n                egress:\n                    - http:\n                        - \"10.0.6.0/24\"\n");
+        let d2 = |o: &str, n: &str| {
+            let (of, nf) = (parse_doc(o), parse_doc(n));
+            diff_config(
+                &idx,
+                "server",
+                &[(PathBuf::from("f.nml"), server_body(&of))],
+                &[(PathBuf::from("f.nml"), server_body(&nf))],
+            )
+        };
+        // A new plugin element: ONE precise Added carrying its identity.
+        let d = d2(&one, &two);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            matches!(&d[0].kind, ChangeKind::Added { new }
+                if new.semantic_eq(&Value::String("[v]-b.v1".into()))),
+            "{d:?}"
+        );
+        // An edit INSIDE a plugin's (un-modelable) body: VISIBLE as a pathed
+        // OpaqueChanged at that element — never silent (the bug this closes).
+        let d = d2(&one, &edited);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(matches!(d[0].kind, ChangeKind::OpaqueChanged), "{d:?}");
+        assert!(
+            p(&d[0]).contains("[v]-a.v1"),
+            "pathed at the element: {}",
+            p(&d[0])
+        );
+        // Identical content: silent (no false positives from the remainder walk).
+        assert!(d2(&one, &one).is_empty());
+    }
+
+    /// Uncovered NAMED entries (matching no model field) surface as one
+    /// OpaqueChanged at the model's path when they differ — and the oneof
+    /// DISCRIMINATOR property is exempt (it belongs to the oneof, not the
+    /// variant model), so ordinary oneof bodies stay clean.
+    #[test]
+    fn unmodeled_named_entries_surface_and_discriminator_is_exempt() {
+        let (sch, errs) = crate::cst::extract_schema(SCHEMA);
+        assert!(errs.is_empty());
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        // `limits` has one field `cap`; `mystery` matches no field.
+        let with =
+            |v: u32| format!("server s:\n    limits:\n        cap = 5\n        mystery = {v}\n");
+        let d2 = |o: &str, n: &str| {
+            let (of, nf) = (parse_doc(o), parse_doc(n));
+            diff_config(
+                &idx,
+                "server",
+                &[(PathBuf::from("f.nml"), server_body(&of))],
+                &[(PathBuf::from("f.nml"), server_body(&nf))],
+            )
+        };
+        let d = d2(&with(1), &with(2));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(p(&d[0]), "limits");
+        assert!(matches!(d[0].kind, ChangeKind::OpaqueChanged), "{d:?}");
+        // Unchanged unmodeled entry ⇒ silent.
+        assert!(d2(&with(1), &with(1)).is_empty());
     }
 
     /// Model↔grammar drift, shape 1 — a `ModelRef` to a model MISSING from the

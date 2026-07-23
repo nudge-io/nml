@@ -42,6 +42,13 @@ pub fn parse_money(amount_str: &str, currency: &str, span: Span) -> Result<Money
             return Err(NmlError::InvalidMoney {
                 message: format!("unknown currency code: {currency}"),
                 span,
+                // The currency is the literal's trailing token, so its own
+                // sub-span is the last `currency.len()` bytes (ASCII) —
+                // captured structurally for the ISO-4217 did-you-mean.
+                currency: Some((
+                    currency.to_string(),
+                    Span::new(span.end.saturating_sub(currency.len()), span.end),
+                )),
             });
         }
     };
@@ -81,12 +88,14 @@ fn parse_minor_units(
                 frac_str.len()
             ),
             span,
+            currency: None,
         });
     }
 
     let whole: i64 = whole_str.parse().map_err(|_| NmlError::InvalidMoney {
         message: format!("invalid number: \"{amount_str}\""),
         span,
+        currency: None,
     })?;
 
     let frac: i64 = if frac_str.is_empty() {
@@ -96,6 +105,7 @@ fn parse_minor_units(
         padded.parse().map_err(|_| NmlError::InvalidMoney {
             message: format!("invalid fractional part: \"{frac_str}\""),
             span,
+            currency: None,
         })?
     };
 
@@ -106,40 +116,53 @@ fn parse_minor_units(
         .ok_or_else(|| NmlError::InvalidMoney {
             message: format!("amount out of range: \"{amount_str}\""),
             span,
+            currency: None,
         })?;
 
     Ok(if negative { -abs_amount } else { abs_amount })
 }
 
+// ISO 4217 codes grouped by exponent — the single source for both exponent
+// lookup and the unknown-currency did-you-mean candidates (RFC 0008), so the
+// two can never drift.
+const EXPONENT_0: &[&str] = &[
+    "BIF", "CLP", "DJF", "GNF", "ISK", "JPY", "KMF", "KRW", "PYG", "RWF", "UGX", "UYI", "VND",
+    "VUV", "XAF", "XOF", "XPF",
+];
+const EXPONENT_2: &[&str] = &[
+    "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "ARS", "AUD", "AWG", "AZN", "BAM", "BBD", "BDT",
+    "BGN", "BMD", "BND", "BOB", "BRL", "BSD", "BTN", "BWP", "BYN", "BZD", "CAD", "CDF", "CHF",
+    "CNY", "COP", "CRC", "CUP", "CVE", "CZK", "DKK", "DOP", "DZD", "EGP", "ERN", "ETB", "EUR",
+    "FJD", "FKP", "GBP", "GEL", "GHS", "GIP", "GMD", "GTQ", "GYD", "HKD", "HNL", "HTG", "HUF",
+    "IDR", "ILS", "INR", "IRR", "JMD", "KES", "KGS", "KHR", "KYD", "KZT", "LAK", "LBP", "LKR",
+    "LRD", "LSL", "MAD", "MDL", "MGA", "MKD", "MMK", "MNT", "MOP", "MRU", "MUR", "MVR", "MWK",
+    "MXN", "MYR", "MZN", "NAD", "NGN", "NIO", "NOK", "NPR", "NZD", "PAB", "PEN", "PGK", "PHP",
+    "PKR", "PLN", "QAR", "RON", "RSD", "RUB", "SAR", "SBD", "SCR", "SDG", "SEK", "SGD", "SHP",
+    "SLE", "SOS", "SRD", "SSP", "STN", "SYP", "SZL", "THB", "TJS", "TMT", "TOP", "TRY", "TTD",
+    "TWD", "TZS", "UAH", "USD", "UYU", "UZS", "VES", "WST", "XCD", "YER", "ZAR", "ZMW", "ZWL",
+];
+const EXPONENT_3: &[&str] = &["BHD", "IQD", "JOD", "KWD", "LYD", "OMR", "TND"];
+const EXPONENT_4: &[&str] = &["CLF", "UYW"];
+
+const CURRENCY_BANDS: &[(&[&str], u8)] = &[
+    (EXPONENT_0, 0),
+    (EXPONENT_2, 2),
+    (EXPONENT_3, 3),
+    (EXPONENT_4, 4),
+];
+
+/// Every known ISO 4217 code — the unknown-currency suggestion candidates.
+pub(crate) fn currency_codes() -> impl Iterator<Item = &'static str> {
+    CURRENCY_BANDS
+        .iter()
+        .flat_map(|(codes, _)| codes.iter().copied())
+}
+
 /// Returns the ISO 4217 exponent (minor unit count) for a currency code.
 pub fn currency_exponent(code: &str) -> Option<u8> {
-    match code {
-        // Exponent 0 (no minor unit)
-        "BIF" | "CLP" | "DJF" | "GNF" | "ISK" | "JPY" | "KMF" | "KRW" | "PYG" | "RWF" | "UGX"
-        | "UYI" | "VND" | "VUV" | "XAF" | "XOF" | "XPF" => Some(0),
-
-        // Exponent 3
-        "BHD" | "IQD" | "JOD" | "KWD" | "LYD" | "OMR" | "TND" => Some(3),
-
-        // Exponent 4
-        "CLF" | "UYW" => Some(4),
-
-        // Exponent 2 (the vast majority of currencies)
-        "AED" | "AFN" | "ALL" | "AMD" | "ANG" | "AOA" | "ARS" | "AUD" | "AWG" | "AZN" | "BAM"
-        | "BBD" | "BDT" | "BGN" | "BMD" | "BND" | "BOB" | "BRL" | "BSD" | "BTN" | "BWP" | "BYN"
-        | "BZD" | "CAD" | "CDF" | "CHF" | "CNY" | "COP" | "CRC" | "CUP" | "CVE" | "CZK" | "DKK"
-        | "DOP" | "DZD" | "EGP" | "ERN" | "ETB" | "EUR" | "FJD" | "FKP" | "GBP" | "GEL" | "GHS"
-        | "GIP" | "GMD" | "GTQ" | "GYD" | "HKD" | "HNL" | "HTG" | "HUF" | "IDR" | "ILS" | "INR"
-        | "IRR" | "JMD" | "KES" | "KGS" | "KHR" | "KYD" | "KZT" | "LAK" | "LBP" | "LKR" | "LRD"
-        | "LSL" | "MAD" | "MDL" | "MGA" | "MKD" | "MMK" | "MNT" | "MOP" | "MRU" | "MUR" | "MVR"
-        | "MWK" | "MXN" | "MYR" | "MZN" | "NAD" | "NGN" | "NIO" | "NOK" | "NPR" | "NZD" | "PAB"
-        | "PEN" | "PGK" | "PHP" | "PKR" | "PLN" | "QAR" | "RON" | "RSD" | "RUB" | "SAR" | "SBD"
-        | "SCR" | "SDG" | "SEK" | "SGD" | "SHP" | "SLE" | "SOS" | "SRD" | "SSP" | "STN" | "SYP"
-        | "SZL" | "THB" | "TJS" | "TMT" | "TOP" | "TRY" | "TTD" | "TWD" | "TZS" | "UAH" | "USD"
-        | "UYU" | "UZS" | "VES" | "WST" | "XCD" | "YER" | "ZAR" | "ZMW" | "ZWL" => Some(2),
-
-        _ => None,
-    }
+    CURRENCY_BANDS
+        .iter()
+        .find_map(|(codes, exponent)| codes.contains(&code).then_some(*exponent))
 }
 
 #[cfg(test)]
@@ -148,6 +171,28 @@ mod tests {
 
     fn span() -> Span {
         Span::new(0, 0)
+    }
+
+    #[test]
+    fn unknown_currency_captures_code_and_subspan_for_suggestion() {
+        // Literal "19.99 USE" occupying bytes 10..19: the captured sub-span
+        // must cover exactly the trailing code, and the diagnostic bridge
+        // must turn it into a machine-applicable ISO-4217 did-you-mean.
+        let err = parse_money("19.99", "USE", Span::new(10, 19)).unwrap_err();
+        let NmlError::InvalidMoney {
+            currency: Some((code, code_span)),
+            ..
+        } = &err
+        else {
+            panic!("expected structured currency capture: {err:?}");
+        };
+        assert_eq!(code, "USE");
+        assert_eq!((code_span.start, code_span.end), (16, 19));
+        let diag = err.to_diagnostic();
+        assert_eq!(diag.code, Some(crate::diagnostic::codes::UNKNOWN_CURRENCY));
+        let sug = diag.suggestion.expect("ISO-4217 did-you-mean");
+        assert_eq!(sug.replacement, "USD");
+        assert_eq!((sug.span.start, sug.span.end), (16, 19));
     }
 
     #[test]

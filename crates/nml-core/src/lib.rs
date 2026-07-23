@@ -58,6 +58,12 @@ pub mod ast;
 pub mod cst;
 pub mod de;
 pub mod defaults;
+/// The unified diagnostics model (RFC 0008): one `Diagnostic` type — with
+/// stable codes, severities, spans, and machine-applicable suggestions —
+/// shared by every finding-reporting surface (validator, symbols, parse
+/// error lists, LSP, CLI). `error::NmlError` remains the thin `Result`
+/// abort error; this module is the findings report.
+pub mod diagnostic;
 pub mod diff;
 pub mod error;
 pub mod identity;
@@ -73,6 +79,9 @@ pub mod resolve;
 pub mod schema;
 pub mod schema_index;
 pub mod span;
+/// The near-miss suggestion engine (RFC 0008; formerly in nml-validate) —
+/// one metric and one policy behind every "did you mean" hint.
+pub mod suggest;
 pub mod symbols;
 pub mod template;
 pub mod types;

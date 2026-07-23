@@ -1,5 +1,5 @@
-// RFC 0005 fixture: exercises the scalar shorthand marker (`!`), the `name`
-// identity field, and optional shorthand (`?!`), alongside inheritance, modifiers,
+// RFC 0005 fixture: exercises the positional field marker (`+`), the `name`
+// identity field, and optional positional (`?+`), alongside inheritance, modifiers,
 // a nested block, and list fields. Guarded by a parse + extract test so it can no
 // longer rot. (This is an nml language fixture, not a copy of any consumer schema.)
 

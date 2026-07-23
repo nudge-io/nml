@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Example `config.nml`:
 
-```nml
+```nml check
 service MyApp:
     host = "0.0.0.0"
     port = 8080
@@ -88,7 +88,7 @@ The serde bridge handles nested NML structures automatically.
 
 A nested block deserializes into a nested struct field:
 
-```nml
+```nml check
 service MyApp:
     host = "0.0.0.0"
     port = 8080
@@ -127,7 +127,7 @@ struct ServiceConfig {
 Named list items (`- ItemName: ...`) deserialize into a `Vec<T>` where each
 item's label is injected as a `name` field:
 
-```nml
+```nml check
 workflow MyWorkflow:
     steps:
         - classify:
@@ -193,6 +193,25 @@ let resolved_body = resolver.resolve_body(&body)?;
 This recursively resolves all secrets and fallbacks within every property,
 nested block, and list item.
 
+Array declarations (`[]resources Name:`) have their own body type; resolve
+them with `resolve_array_body`:
+
+```rust
+let resolved = resolver.resolve_array_body(&array_body)?;
+```
+
+### Deserializing a Single Value: `from_value`
+
+To deserialize one already-extracted `Value` (rather than a whole block body)
+into a Rust type:
+
+```rust
+use nml_core::de::from_value;
+
+let value = doc.block("service", "MyApp").property("tags").value().unwrap();
+let tags: Vec<String> = from_value(value)?;
+```
+
 ### Combined Pipeline: `from_body_resolved`
 
 For the common case of resolve + deserialize, use the combined pipeline:
@@ -225,6 +244,9 @@ let merged_body = apply_shared_properties(&body);
 
 Items that define the same property override the shared default.
 
+For array declarations, `apply_array_shared_properties(&array_body)` performs
+the same merge and returns the list of items with shared defaults applied.
+
 ## Query API
 
 The `Document` query API provides fluent access without serde:
@@ -240,6 +262,9 @@ doc.block("service", "MyApp").nested("database").property("url").as_str();
 
 // Constants
 doc.const_value("MaxRetries").as_f64();
+
+// Template declarations
+doc.template_value("WelcomeMessage").as_str();
 
 // List all blocks of a kind
 for (name, block) in doc.blocks("service") {
@@ -284,7 +309,7 @@ value.as_array();  // Option<&[SpannedValue]> -- Array
 
 Define models in `.model.nml` files and validate instances against them:
 
-```nml
+```nml check
 // schemas/service.model.nml
 model service:
     host string
@@ -293,13 +318,16 @@ model service:
 ```
 
 ```rust
-use nml_core::model_extract;
+use nml_validate::loader::load_schema;
+use nml_validate::schema::SchemaValidator;
 
 let schema_source = std::fs::read_to_string("schemas/service.model.nml")?;
-let schema_file = parse(&schema_source)?;
-let schema = model_extract::extract(&schema_file);
+let (schema, schema_diagnostics) = load_schema(&[("service.model.nml", &schema_source)]);
+for d in &schema_diagnostics {
+    eprintln!("schema: {}", d.message);
+}
 
-let validator = nml_validate::schema::SchemaValidator::new(schema.models, schema.enums);
+let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
 let diagnostics = validator.validate(&config_file);
 for d in diagnostics {
     eprintln!("{}: {}", d.severity, d.message);
@@ -316,7 +344,7 @@ nml check --schema schemas/ config.nml
 
 Create an `nml-project.nml` at your workspace root to configure the NML tooling:
 
-```nml
+```nml check
 project MyProject:
     schema:
         - "schemas/service.model.nml"
@@ -337,7 +365,7 @@ This file is automatically detected by the NML language server and affects:
 
 NML's parser is generic -- any identifier works as a block keyword:
 
-```nml
+```nml check
 database Primary:
     host = "localhost"
     port = 5432

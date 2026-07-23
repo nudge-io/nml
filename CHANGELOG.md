@@ -4,6 +4,56 @@
 
 ### Added
 
+- **Unified diagnostics model** (`nml-core::diagnostic`, RFC 0008): one
+  `Diagnostic` type — severity (now incl. `Info`), span, source, structured
+  suggestion, and a **stable error code** (`NML0000`-style, never renumbered
+  or reused once released) — shared by the parser's error list, symbols,
+  the validator, the LSP, and the CLI. One renderer, one LSP converter
+  (replacing three hand-rolled bridges); the CLI prints rustc-style
+  `error[NML2000]:` prefixes.
+- New did-you-mean hints from core diagnostics: unresolved references
+  (`DefaultPrt` → `DefaultPort`), unknown currency codes (`USE` → `USD`,
+  from the ISO 4217 table), and unknown template namespaces — each with a
+  machine-applicable quick-fix span.
+- **`nml explain NML2007`**: the error index is embedded in the binary
+  (canonical file: `crates/nml-core/assets/error-index.md`, exposed as
+  `nml_core::diagnostic::explain`), so explanations work offline; the CLI
+  prints a rustc-style "for more information" hint after coded diagnostics.
+- The oneof umbrella code split by fix-pattern: `NML2012` is now
+  arm-references-unknown-model only, with `NML2015`–`NML2019` covering
+  duplicate discriminator, name collision, bad default, non-enum
+  discriminator type, and non-exhaustive enum arms.
+- **Error index** (`docs/errors/README.md`): every stable code has a
+  documented section, most with CI-verified examples; a bidirectional
+  docs-test guard means a new code cannot ship without its documentation.
+- `nml check --strict`: unknown properties and unmodeled keywords become
+  errors (CI posture).
+- Schema diagnostics from `nml check --schema` now locate as
+  `file:line:col` against the attributed schema source instead of printing
+  raw byte spans.
+- **Changed:** every public findings API now returns `Vec<Diagnostic>` —
+  `cst::parse_to_ast_all`, `cst::extract_schema`, the `SymbolTable` finders,
+  and the schema-integrity finders (`find_oneof_errors`,
+  `find_shorthand_errors`, `find_model_cycles`, `find_extends_cycles`) —
+  with codes assigned (NML2007–NML2014 incl. missing-required-field,
+  type-mismatch, duplicate-definition, reserved-type-name, cycle classes)
+  and severity carried at the source; `nml_validate::diagnostics`/`::suggest` moved to
+  `nml_core::diagnostic`/`::suggest` (no re-export shims); the LSP now
+  reports duplicate/unresolved findings at their true severity (error),
+  matching the CLI.
+- **Unified did-you-mean engine** (`nml-core::suggest`): one OSA
+  (restricted Damerau-Levenshtein) metric behind every suggestion, so
+  transpositions (`"wran"` → `"warn"`) are caught; case-insensitive exact
+  match wins outright; deterministic tie-breaking. Replaces the two divergent
+  per-site suggesters.
+- Did-you-mean suggestions (with machine-applicable quick-fix spans) at
+  previously uncovered sites: unknown properties, unknown modifiers, unknown
+  `oneof` discriminator values, and strict-mode unknown block keywords.
+- `Diagnostic::rendered_message()`: the hint is derived from the structured
+  suggestion by one renderer shared by the CLI, `Display`, and the LSP —
+  producers no longer bake hint prose into messages. The `nml` CLI now prints
+  hints for all suggesting diagnostics.
+
 - Core parser with indentation-aware lexer
 - AST types for all NML constructs (blocks, arrays, properties, modifiers, shared properties)
 - Money type with ISO 4217 currency table and minor-unit storage
@@ -59,6 +109,9 @@
 
 ### Fixed
 
+- `nml check`/`nml validate` did not detect const/template reference cycles
+  (the LSP did) — now reported as `NML1002`, caught by the error index's own
+  verified example
 - Money `format_display` now correctly handles negative fractional amounts
   (e.g. `-$0.50` was previously displayed as `$0.50`)
 - Serde bridge now uses `format_display()` for money values instead of raw
@@ -71,3 +124,11 @@
 - Integration guide for using NML in Rust projects
 - Formal language specification with PEG grammar
 - Template expression, fallback value, and const declaration documentation
+- README rewritten around a CI-verified 30-second demo, an honest comparison
+  table ("when NOT to use NML" included), and a Rust embed quickstart
+- Docs verification harness (`just docs-test` + CI job): tagged ```` ```nml ````
+  blocks in the Markdown docs run through the real CLI, including asserted
+  error examples, so documentation examples cannot rot
+- Per-crate READMEs, CONTRIBUTING (docs-required gate), SECURITY policy,
+  PR template, RFC status index, and a stability & compatibility policy
+  (`docs/stability.md`); workspace `rust-version` declared

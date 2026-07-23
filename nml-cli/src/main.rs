@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process;
 
+use nml_core::diagnostic::{Code, Diagnostic, Severity};
 use nml_core::schema::ExtractedSchema;
-use nml_validate::diagnostics::{Diagnostic, Severity};
 use nml_validate::schema::SchemaValidator;
 
 /// Parse a file via the CST, reporting **every** syntactic and semantic error
@@ -14,11 +14,46 @@ fn parse_or_report_all(path: &Path, source: &str) -> Result<nml_core::ast::File,
         return Ok(file);
     }
     let source_map = nml_core::span::SourceMap::new(source);
+    let mut first_code = None;
     for e in &errors {
-        let loc = source_map.location(e.span().start);
-        eprintln!("{}:{}:{}: {}", path.display(), loc.line, loc.column, e);
+        first_code = first_code.or(report(path, &source_map, e));
     }
+    explain_hint(first_code);
     Err(format!("{} parse error(s)", errors.len()))
+}
+
+/// The one diagnostic printer: `path:line:col: <Display>` — `Display` renders
+/// severity, the stable `[NML0000]` code when assigned, and the did-you-mean
+/// hint derived from the structured suggestion (RFC 0008).
+/// After a run's diagnostics, point at the offline explanation for the first
+/// coded finding — rustc's "for more information" pattern, printed once.
+fn explain_hint(first_code: Option<Code>) {
+    if let Some(code) = first_code {
+        eprintln!("for more information, run: nml explain {code}");
+    }
+}
+
+fn report(path: &Path, source_map: &nml_core::span::SourceMap, diag: &Diagnostic) -> Option<Code> {
+    let (line, column) = match diag.span {
+        Some(span) => {
+            let loc = source_map.location(span.start);
+            (loc.line, loc.column)
+        }
+        None => (0, 0),
+    };
+    // `line:col` already locates the finding — the raw byte-span suffix that
+    // `Display` adds for span-less contexts would be noise here.
+    let code = diag.code.map(|c| format!("[{c}]")).unwrap_or_default();
+    eprintln!(
+        "{}:{}:{}: {}{}: {}",
+        path.display(),
+        line,
+        column,
+        diag.severity,
+        code,
+        diag.rendered()
+    );
+    diag.code
 }
 
 fn main() {
@@ -34,6 +69,7 @@ fn main() {
         "validate" => cmd_validate(&args[2..]),
         "fmt" => cmd_fmt(&args[2..]),
         "check" => cmd_check(&args[2..]),
+        "explain" => cmd_explain(&args[2..]),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -66,7 +102,10 @@ COMMANDS:
     parse                           Parse an NML file and dump the AST as JSON
     validate                        Validate an NML file for duplicates and unresolved references
     fmt                             Format NML files in canonical style
-    check [--schema <dir>] <file>   Parse + validate + schema check (CI-friendly)
+    check [--schema <dir>] [--strict] <file>
+                                    Parse + validate + schema check (CI-friendly);
+                                    --strict makes unknown properties/keywords errors
+    explain <code>                  Explain a diagnostic code (e.g. nml explain NML2007)
     help                            Show this help message
     version                         Show version information"
     );
@@ -94,16 +133,37 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
 
     let mut errors = symbols.find_duplicates();
     errors.extend(symbols.find_unresolved_references(&file));
+    errors.extend(symbols.find_const_cycles());
     if errors.is_empty() {
         println!("{}: ok", path.display());
         Ok(())
     } else {
         let source_map = nml_core::span::SourceMap::new(&source);
+        let mut first_code = None;
         for err in &errors {
-            let loc = source_map.location(err.span().start);
-            eprintln!("{}:{}:{}: {}", path.display(), loc.line, loc.column, err);
+            first_code = first_code.or(report(&path, &source_map, err));
         }
+        explain_hint(first_code);
         Err(format!("{} validation error(s)", errors.len()))
+    }
+}
+
+/// `nml explain NML2007` — the embedded error index (offline; the same
+/// source the docs render). Coverage over every code is guaranteed by the
+/// index's bidirectional CI guard plus a unit test in `nml-core`.
+fn cmd_explain(args: &[String]) -> Result<(), String> {
+    let [code] = args else {
+        return Err("usage: nml explain <code>   (e.g. nml explain NML2007)".to_string());
+    };
+    let normalized = code.to_ascii_uppercase();
+    match nml_core::diagnostic::explain(&normalized) {
+        Some(body) => {
+            println!("{normalized}\n\n{body}");
+            Ok(())
+        }
+        None => Err(format!(
+            "no such diagnostic code: {code} (codes look like NML2007; see the error index)"
+        )),
     }
 }
 
@@ -124,6 +184,7 @@ fn cmd_fmt(args: &[String]) -> Result<(), String> {
 
 fn cmd_check(args: &[String]) -> Result<(), String> {
     let mut schema_dir: Option<PathBuf> = None;
+    let mut strict = false;
     let mut file_args: Vec<&String> = Vec::new();
 
     let mut i = 0;
@@ -134,6 +195,8 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
                 return Err("--schema requires a path argument".to_string());
             }
             schema_dir = Some(PathBuf::from(&args[i]));
+        } else if args[i] == "--strict" {
+            strict = true;
         } else {
             file_args.push(&args[i]);
         }
@@ -141,11 +204,11 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     }
 
     if file_args.is_empty() {
-        return Err("usage: nml check [--schema <dir>] <file>".to_string());
+        return Err("usage: nml check [--schema <dir>] [--strict] <file>".to_string());
     }
     if file_args.len() > 1 {
         return Err(format!(
-            "usage: nml check [--schema <dir>] <file> (got {} files)",
+            "usage: nml check [--schema <dir>] [--strict] <file> (got {} files)",
             file_args.len()
         ));
     }
@@ -160,47 +223,62 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     let source_map = nml_core::span::SourceMap::new(&source);
     let mut error_count = 0;
 
-    for err in symbols.find_duplicates() {
-        let loc = source_map.location(err.span().start);
-        eprintln!("{}:{}:{}: {}", path.display(), loc.line, loc.column, err);
-        error_count += 1;
-    }
-    for err in symbols.find_unresolved_references(&file) {
-        let loc = source_map.location(err.span().start);
-        eprintln!("{}:{}:{}: {}", path.display(), loc.line, loc.column, err);
+    let mut first_code = None;
+    for err in symbols
+        .find_duplicates()
+        .into_iter()
+        .chain(symbols.find_unresolved_references(&file))
+        .chain(symbols.find_const_cycles())
+    {
+        first_code = first_code.or(report(&path, &source_map, &err));
         error_count += 1;
     }
 
     if let Some(sd) = schema_dir {
-        let (schema, schema_diags) = load_schema_dir(&sd)?;
+        let LoadedSchemaDir {
+            schema,
+            diagnostics: schema_diags,
+            sources: named_sources,
+        } = load_schema_dir(&sd)?;
 
-        // Schema-level diagnostics (cycles, duplicates) refer to the schema
-        // files, not the checked file; report them against the schema dir.
+        // Schema-level diagnostics (parse errors, cycles, duplicates) refer
+        // to the schema files, not the checked file: locate each against its
+        // attributed source (`diag.source` = the file name, RFC 0030) so it
+        // prints as `path:line:col` like every other finding. Cross-source
+        // findings no one file owns fall back to the dir-prefixed form.
         for diag in &schema_diags {
-            eprintln!("{}: {}", sd.display(), diag);
+            let attributed = diag.source.as_deref().and_then(|name| {
+                named_sources
+                    .iter()
+                    .find(|(p, _)| p.file_name().and_then(|f| f.to_str()) == Some(name))
+            });
+            match attributed {
+                Some((schema_path, text)) => {
+                    first_code = first_code.or(report(
+                        schema_path,
+                        &nml_core::span::SourceMap::new(text),
+                        diag,
+                    ));
+                }
+                None => {
+                    eprintln!("{}: {}", sd.display(), diag);
+                    first_code = first_code.or(diag.code);
+                }
+            }
             if matches!(diag.severity, Severity::Error) {
                 error_count += 1;
             }
         }
 
         if !schema.is_empty() {
-            let validator = SchemaValidator::from(schema);
+            let mut validator = SchemaValidator::from(schema);
+            // --strict: unknown properties and unmodeled keywords become
+            // errors (CI posture; the same profile package bindings can set).
+            if strict {
+                validator = validator.strict();
+            }
             for diag in validator.validate(&file) {
-                let (line, column) = match diag.span {
-                    Some(span) => {
-                        let loc = source_map.location(span.start);
-                        (loc.line, loc.column)
-                    }
-                    None => (0, 0),
-                };
-                eprintln!(
-                    "{}:{}:{}: {}: {}",
-                    path.display(),
-                    line,
-                    column,
-                    diag.severity,
-                    diag.message
-                );
+                first_code = first_code.or(report(&path, &source_map, &diag));
                 if matches!(diag.severity, Severity::Error) {
                     error_count += 1;
                 }
@@ -208,6 +286,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
         }
     }
 
+    explain_hint(first_code);
     let decl_count = file.declarations.len();
     if error_count == 0 {
         println!("{}: ok ({decl_count} declaration(s))", path.display());
@@ -220,7 +299,15 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
 /// Parse all `*.model.nml` / `*.schema.nml` files in `dir` and run them
 /// through the schema-loading pipeline (inheritance resolution, cycle and
 /// duplicate detection).
-fn load_schema_dir(dir: &PathBuf) -> Result<(ExtractedSchema, Vec<Diagnostic>), String> {
+/// A loaded schema directory: the composed schema, its load diagnostics, and
+/// the named sources (kept so schema diagnostics print `file:line:col`).
+struct LoadedSchemaDir {
+    schema: ExtractedSchema,
+    diagnostics: Vec<Diagnostic>,
+    sources: Vec<(PathBuf, String)>,
+}
+
+fn load_schema_dir(dir: &PathBuf) -> Result<LoadedSchemaDir, String> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("failed to read schema dir {}: {e}", dir.display()))?;
 
@@ -253,7 +340,12 @@ fn load_schema_dir(dir: &PathBuf) -> Result<(ExtractedSchema, Vec<Diagnostic>), 
             )
         })
         .collect();
-    Ok(nml_validate::loader::load_schema(&refs))
+    let (schema, diagnostics) = nml_validate::loader::load_schema(&refs);
+    Ok(LoadedSchemaDir {
+        schema,
+        diagnostics,
+        sources: paths.into_iter().zip(sources).collect(),
+    })
 }
 
 fn require_file_arg(args: &[String], cmd: &str) -> Result<PathBuf, String> {

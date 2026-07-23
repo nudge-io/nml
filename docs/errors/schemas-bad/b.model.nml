@@ -1,0 +1,3 @@
+// NML2009: duplicates `model widget` from a.model.nml.
+model widget:
+    name string+

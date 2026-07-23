@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
-use crate::error::NmlError;
+use crate::diagnostic::{codes, Diagnostic};
 use crate::span::Span;
 use crate::types::Value;
 
@@ -125,16 +125,17 @@ impl SymbolTable {
         self.declarations.get(name).map(|v| v.as_slice())
     }
 
-    /// Check for duplicate declarations and return errors.
-    pub fn find_duplicates(&self) -> Vec<NmlError> {
+    /// Check for duplicate declarations and return diagnostics.
+    pub fn find_duplicates(&self) -> Vec<Diagnostic> {
         let mut errors = Vec::new();
         for (name, decls) in &self.declarations {
             if decls.len() > 1 {
                 for dup in &decls[1..] {
-                    errors.push(NmlError::Validation {
-                        message: format!("duplicate declaration: '{name}'"),
-                        span: dup.span,
-                    });
+                    errors.push(
+                        Diagnostic::error(format!("duplicate declaration: '{name}'"))
+                            .with_code(codes::DUPLICATE_DECLARATION)
+                            .with_span(dup.span),
+                    );
                 }
             }
         }
@@ -149,7 +150,7 @@ impl SymbolTable {
     /// Find all unresolved references in the file.
     /// Uses scope-aware resolution: named list items within a block (e.g. workflow
     /// steps) are valid targets only within that same block, not globally.
-    pub fn find_unresolved_references(&self, file: &File) -> Vec<NmlError> {
+    pub fn find_unresolved_references(&self, file: &File) -> Vec<Diagnostic> {
         let mut errors = Vec::new();
         for decl in &file.declarations {
             match &decl.kind {
@@ -181,7 +182,7 @@ impl SymbolTable {
     ///
     /// A cycle exists when `const A = B` and `const B = A` (or longer chains).
     /// Returns an error for each const that participates in a cycle.
-    pub fn find_const_cycles(&self) -> Vec<NmlError> {
+    pub fn find_const_cycles(&self) -> Vec<Diagnostic> {
         let mut errors = Vec::new();
         let mut globally_visited = HashSet::new();
 
@@ -200,7 +201,7 @@ impl SymbolTable {
         name: &str,
         path: &mut Vec<String>,
         globally_visited: &mut HashSet<String>,
-        errors: &mut Vec<NmlError>,
+        errors: &mut Vec<Diagnostic>,
     ) {
         if let Some(pos) = path.iter().position(|n| n == name) {
             let cycle: Vec<_> = path[pos..].to_vec();
@@ -211,8 +212,8 @@ impl SymbolTable {
                     .and_then(|v| v.first())
                     .map(|d| d.span)
                     .unwrap_or(Span::empty(0));
-                errors.push(NmlError::Validation {
-                    message: format!(
+                errors.push(
+                    Diagnostic::error(format!(
                         "circular reference in const/template chain: {}",
                         cycle
                             .iter()
@@ -220,9 +221,10 @@ impl SymbolTable {
                             .cloned()
                             .collect::<Vec<_>>()
                             .join(" -> ")
-                    ),
-                    span,
-                });
+                    ))
+                    .with_code(codes::CONST_CYCLE)
+                    .with_span(span),
+                );
             }
             return;
         }
@@ -246,17 +248,28 @@ impl SymbolTable {
         &self,
         body: &Body,
         local_names: &HashSet<String>,
-        errors: &mut Vec<NmlError>,
+        errors: &mut Vec<Diagnostic>,
     ) {
         for entry in &body.entries {
             match &entry.kind {
                 BodyEntryKind::Property(prop) => {
                     if let Value::Reference(name) = &prop.value.value {
                         if self.lookup(name).is_none() && !local_names.contains(name.as_str()) {
-                            errors.push(NmlError::Validation {
-                                message: format!("unresolved reference '{name}'"),
-                                span: prop.value.span,
-                            });
+                            // A bare reference token: the suggestion span IS the
+                            // value span (no quotes), so the fix is
+                            // machine-applicable. Candidates are every name a
+                            // reference here could legally resolve to.
+                            let mut diag =
+                                Diagnostic::error(format!("unresolved reference '{name}'"))
+                                    .with_code(codes::UNRESOLVED_REFERENCE)
+                                    .with_span(prop.value.span);
+                            if let Some(s) = crate::suggest::suggest(
+                                name,
+                                self.names().chain(local_names.iter().map(String::as_str)),
+                            ) {
+                                diag = diag.with_suggestion(s, prop.value.span);
+                            }
+                            errors.push(diag);
                         }
                     }
                 }
@@ -327,7 +340,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.message().contains("unresolved reference 'lasda'")),
+                .any(|e| e.message.contains("unresolved reference 'lasda'")),
             "should flag unresolved reference; errors: {:?}",
             errors
         );
@@ -359,7 +372,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.message().contains("unresolved reference 'NonExistent'")),
+                .any(|e| e.message.contains("unresolved reference 'NonExistent'")),
             "should flag unresolved reference inside list item; errors: {:?}",
             errors
         );
@@ -391,7 +404,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.message().contains("unresolved reference 'respond'")),
+                .any(|e| e.message.contains("unresolved reference 'respond'")),
             "step 'respond' in workflow A should be unresolved (only exists in B); errors: {:?}",
             errors
         );
@@ -455,7 +468,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.message().contains("circular reference")),
+                .any(|e| e.message.contains("circular reference")),
             "error should mention circular reference; errors: {:?}",
             errors
         );
@@ -642,7 +655,7 @@ mod tests {
 
         let errors = symbols.find_const_cycles();
         let has_path = errors.iter().any(|e| {
-            let msg = e.message();
+            let msg = &e.message;
             msg.contains("A -> B") || msg.contains("B -> C") || msg.contains("C -> A")
         });
         assert!(

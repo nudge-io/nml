@@ -23,7 +23,15 @@ pub enum NmlError {
 
     /// An invalid money literal (e.g., bad currency code).
     #[error("invalid money value: {message}")]
-    InvalidMoney { message: String, span: Span },
+    InvalidMoney {
+        message: String,
+        span: Span,
+        /// The offending currency code and its own sub-span, captured
+        /// structurally at the parse site (RFC 0008) so the ISO-4217
+        /// did-you-mean attaches without message parsing. `None` for money
+        /// errors that aren't about the currency code.
+        currency: Option<(String, Span)>,
+    },
 }
 
 impl NmlError {
@@ -44,6 +52,30 @@ impl NmlError {
             | NmlError::Lex { message, .. }
             | NmlError::Validation { message, .. }
             | NmlError::InvalidMoney { message, .. } => message,
+        }
+    }
+
+    /// Lower this abort error into the unified findings model (RFC 0008) —
+    /// the single `NmlError` → [`Diagnostic`] bridge, replacing the three
+    /// hand-rolled converters that previously lived in the loader, the LSP,
+    /// and the CLI. Unknown-currency errors attach an ISO-4217 did-you-mean
+    /// from the structurally captured code — never from message text.
+    pub fn to_diagnostic(&self) -> crate::diagnostic::Diagnostic {
+        use crate::diagnostic::{codes, Diagnostic};
+        let diag = Diagnostic::error(self.to_string()).with_span(self.span());
+        match self {
+            NmlError::InvalidMoney {
+                currency: Some((code, code_span)),
+                ..
+            } => {
+                let diag = diag.with_code(codes::UNKNOWN_CURRENCY);
+                match crate::suggest::suggest(code, crate::money::currency_codes()) {
+                    Some(s) => diag.with_suggestion(s, *code_span),
+                    None => diag,
+                }
+            }
+            NmlError::InvalidMoney { .. } => diag.with_code(codes::INVALID_MONEY),
+            _ => diag,
         }
     }
 

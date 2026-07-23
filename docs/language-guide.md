@@ -116,12 +116,13 @@ A bare identifier in a list references an instance defined elsewhere:
 - AuthDevByPass
 ```
 
-### Shorthand List Items
+### Positional List Items
 
-When a model defines a `<shorthand>` field, bare strings expand to that field:
+When a model marks one field as positional (`path path+`), a bare scalar
+list item fills that field:
 
 ```
-- "/test/matt"    // expands to: path = "/test/matt"
+- "/test/matt"    // fills the positional field: path = "/test/matt"
 ```
 
 ## Types
@@ -298,7 +299,6 @@ price money <currency = "USD">
 | `<secret>` | string | Masked in logs, supports `$ENV.X` resolution |
 | `<token>` | string | Used as a lookup identifier |
 | `<distinct>` | lists | All items must be unique |
-| `<shorthand>` | any | Bare string list items expand to this field |
 | `<integer>` | number | Must be a whole number |
 | `<min = N>` | number | Minimum value (inclusive) |
 | `<max = N>` | number | Maximum value (inclusive) |
@@ -311,20 +311,29 @@ price money <currency = "USD">
 
 Traits are reusable groups of fields that can be mixed into models:
 
-```
+```nml check
 trait accessControlled:
-    |allow []@roleRef
-    |deny []@roleRef
+    |allow []role
+    |deny []role
 
-model resource (accessControlled):
-    path path <shorthand>
+model resource is accessControlled:
+    path path+
     method httpMethod = "GET"
+
+enum httpMethod:
+    - "GET"
+    - "POST"
 ```
 
-Multiple traits are comma-separated:
+Multiple traits are comma-separated after `is`:
 
-```
-model service (accessControlled, auditable):
+```nml check
+trait accessControlled:
+    |allow []role
+trait auditable:
+    auditLog string?
+
+model service is accessControlled, auditable:
     localMount path
 ```
 

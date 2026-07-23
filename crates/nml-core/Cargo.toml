@@ -3,12 +3,13 @@ name = "nml-core"
 description = "Core parsing and AST library for the NML configuration language"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 
 [dependencies]
 thiserror = { workspace = true }

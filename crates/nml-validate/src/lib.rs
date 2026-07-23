@@ -1,4 +1,3 @@
-pub mod diagnostics;
 pub mod glob;
 pub mod loader;
 pub mod package;

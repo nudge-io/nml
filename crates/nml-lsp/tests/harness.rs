@@ -421,10 +421,10 @@ async fn declared_model_file_gets_directive_did_you_mean() {
         })
         .unwrap_or_else(|| panic!("no unknown-directive diagnostic in: {published}"));
     let message = dym["message"].as_str().expect("message");
-    assert!(message.contains("did you mean '#live'"), "{message}");
+    assert!(message.contains("did you mean \"#live\""), "{message}");
     assert_eq!(
         dym["data"]["suggestion"]["replacement"],
-        json!("live"),
+        json!("#live"),
         "structured suggestion must ride Diagnostic.data: {dym}"
     );
 }

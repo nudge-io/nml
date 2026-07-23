@@ -7,7 +7,7 @@ use nml_core::schema_index::{FieldTarget, SchemaIndex};
 use nml_core::span::Span;
 use nml_core::types::{PrimitiveType, Value};
 
-use crate::diagnostics::Diagnostic;
+use nml_core::diagnostic::{codes, Diagnostic};
 
 const MAX_VALIDATION_DEPTH: u32 = 64;
 
@@ -97,11 +97,36 @@ impl SchemaValidator {
         self
     }
 
-    fn unknown_property_diagnostic(&self, message: String) -> Diagnostic {
-        if self.strict_unknown_fields {
+    /// Candidate names for an unknown-keyword suggestion: every declared
+    /// model and `oneof` — the two targets a block or array keyword can
+    /// resolve to.
+    fn keyword_candidates(&self) -> impl Iterator<Item = &str> + '_ {
+        self.index
+            .models()
+            .iter()
+            .map(|m| m.name.as_str())
+            .chain(self.index.oneofs().iter().map(|o| o.name.as_str()))
+    }
+
+    /// An "unknown property" diagnostic (warning by default, error under
+    /// [`Self::strict`]) with a near-miss suggestion against the model's
+    /// declared fields when one is close enough. The suggestion span is the
+    /// property-name token, so the quick-fix is machine-applicable.
+    fn unknown_property_diagnostic(&self, name: &str, model: &ModelDef, span: Span) -> Diagnostic {
+        let message = format!(
+            "unknown property '{name}' (not defined in model '{}')",
+            model.name
+        );
+        let diag = if self.strict_unknown_fields {
             Diagnostic::error(message)
         } else {
             Diagnostic::warning(message)
+        }
+        .with_code(codes::UNKNOWN_PROPERTY)
+        .with_span(span);
+        match nml_core::suggest::suggest(name, model.fields.iter().map(|f| f.name.as_str())) {
+            Some(s) => diag.with_suggestion(s, span),
+            None => diag,
         }
     }
 
@@ -183,10 +208,14 @@ impl SchemaValidator {
                 ),
             };
             if !resolved && self.strict_unknown_fields {
-                diags.push(
+                let mut diag =
                     Diagnostic::error(format!("block keyword '{keyword}' has no model definition"))
-                        .with_span(block.keyword.span),
-                );
+                        .with_code(codes::UNKNOWN_BLOCK_KEYWORD)
+                        .with_span(block.keyword.span);
+                if let Some(s) = nml_core::suggest::suggest(keyword, self.keyword_candidates()) {
+                    diag = diag.with_suggestion(s, block.keyword.span);
+                }
+                diags.push(diag);
             }
         }
     }
@@ -217,12 +246,15 @@ impl SchemaValidator {
             .any(|i| matches!(&i.kind, ListItemKind::Named { .. }));
 
         if !is_schema_def && !resolves && has_named_items && self.strict_unknown_fields {
-            diags.push(
-                Diagnostic::error(format!(
-                    "array item keyword '{keyword}' has no model or oneof definition"
-                ))
-                .with_span(arr.item_keyword.span),
-            );
+            let mut diag = Diagnostic::error(format!(
+                "array item keyword '{keyword}' has no model or oneof definition"
+            ))
+            .with_code(codes::UNKNOWN_ARRAY_KEYWORD)
+            .with_span(arr.item_keyword.span);
+            if let Some(s) = nml_core::suggest::suggest(keyword, self.keyword_candidates()) {
+                diag = diag.with_suggestion(s, arr.item_keyword.span);
+            }
+            diags.push(diag);
         }
 
         for item in &arr.body.items {
@@ -411,18 +443,24 @@ impl SchemaValidator {
             return;
         }
         if !self.valid_modifiers.iter().any(|v| v == &m.name.name) {
-            diags.push(
-                Diagnostic::warning(format!(
-                    "unknown modifier '|{}'; expected one of: {}",
-                    m.name.name,
-                    self.valid_modifiers
-                        .iter()
-                        .map(|s| format!("|{s}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-                .with_span(m.name.span),
-            );
+            let mut diag = Diagnostic::warning(format!(
+                "unknown modifier '|{}'; expected one of: {}",
+                m.name.name,
+                self.valid_modifiers
+                    .iter()
+                    .map(|s| format!("|{s}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .with_code(codes::UNKNOWN_MODIFIER)
+            .with_span(m.name.span);
+            if let Some(s) = nml_core::suggest::suggest(
+                &m.name.name,
+                self.valid_modifiers.iter().map(String::as_str),
+            ) {
+                diag = diag.with_suggestion(s, m.name.span);
+            }
+            diags.push(diag);
         }
     }
 
@@ -684,13 +722,7 @@ impl SchemaValidator {
                             diags,
                         );
                     } else {
-                        diags.push(
-                            self.unknown_property_diagnostic(format!(
-                                "unknown property '{name}' (not defined in model '{}')",
-                                model.name
-                            ))
-                            .with_span(prop.name.span),
-                        );
+                        diags.push(self.unknown_property_diagnostic(name, model, prop.name.span));
                     }
                 }
                 BodyEntryKind::NestedBlock(nb) => {
@@ -792,14 +824,11 @@ impl SchemaValidator {
                             _ => {}
                         }
                     } else {
-                        diags.push(
-                            self.unknown_property_diagnostic(format!(
-                                "unknown property '{name}' (not defined in model '{model_name}')",
-                                name = nb.name.name,
-                                model_name = model.name
-                            ))
-                            .with_span(nb.name.span),
-                        );
+                        diags.push(self.unknown_property_diagnostic(
+                            &nb.name.name,
+                            model,
+                            nb.name.span,
+                        ));
                     }
                 }
                 BodyEntryKind::Modifier(m) => {
@@ -823,6 +852,34 @@ impl SchemaValidator {
                         .with_span(entry.span),
                     );
                 }
+                // A bare list item in a model body fills the model's
+                // body-positional list field (RFC 0005 `+` on a list/set —
+                // e.g. `plugins []tenantGrantPlugin+`): validate it deeply
+                // against the declared element type, exactly as a named
+                // `field:` list would be. A model with NO such field keeps the
+                // historical lenient skip (additive rule — no new rejections).
+                BodyEntryKind::ListItem(item) => {
+                    if let Some(field_def) = model.fields.iter().find(|f| {
+                        f.shorthand
+                            && matches!(f.field_type, FieldType::List(_) | FieldType::Set(_))
+                    }) {
+                        seen_fields.push(&field_def.name);
+                        let inner = match &field_def.field_type {
+                            FieldType::List(i) | FieldType::Set(i) => i,
+                            _ => unreachable!("guarded by the find predicate"),
+                        };
+                        let empty = Body {
+                            entries: Vec::new(),
+                        };
+                        let probe = match &item.kind {
+                            ListItemKind::Named { body, .. } => body,
+                            ListItemKind::Shorthand { body: Some(b), .. } => b,
+                            _ => &empty,
+                        };
+                        let elem = self.index.resolve_type_in_body(inner, probe);
+                        self.validate_inline_item(item, &elem, depth + 1, diags);
+                    }
+                }
                 _ => {}
             }
         }
@@ -837,6 +894,7 @@ impl SchemaValidator {
                         "missing required field '{}' (defined in model '{}')",
                         field.name, model.name
                     ))
+                    .with_code(codes::MISSING_REQUIRED_FIELD)
                     .with_span(
                         header_span
                             .or_else(|| body.entries.first().map(|e| e.span))
@@ -938,16 +996,23 @@ impl SchemaValidator {
         };
 
         let Some((_, model_name)) = oneof.variants.iter().find(|(v, _)| v == value) else {
-            diags.push(
-                Diagnostic::error(format!(
-                    "unknown {} \"{}\" for oneof '{}'; expected one of: {}",
-                    oneof.discriminator,
-                    value,
-                    oneof.name,
-                    valid_values(),
-                ))
-                .with_span(discriminator.value.span),
-            );
+            let mut diag = Diagnostic::error(format!(
+                "unknown {} \"{}\" for oneof '{}'; expected one of: {}",
+                oneof.discriminator,
+                value,
+                oneof.name,
+                valid_values(),
+            ))
+            .with_code(codes::UNKNOWN_DISCRIMINANT)
+            .with_span(discriminator.value.span);
+            if let Some(v) =
+                nml_core::suggest::suggest(value, oneof.variants.iter().map(|(k, _)| k.as_str()))
+            {
+                // The discriminator is a string literal (guarded above); the
+                // fix replaces its content, not its quotes.
+                diag = diag.with_suggestion(v, string_content_span(discriminator.value.span));
+            }
+            diags.push(diag);
             return;
         };
 
@@ -1279,13 +1344,19 @@ impl SchemaValidator {
         } else {
             prim.as_str().to_string()
         };
-        diags.push(
-            Diagnostic::error(format!(
-                "type mismatch {context} '{field_name}': expected {expected}, got {}",
-                value_type_name(value)
-            ))
-            .with_span(span),
-        );
+        let mut diag = Diagnostic::error(format!(
+            "type mismatch {context} '{field_name}': expected {expected}, got {}",
+            value_type_name(value)
+        ))
+        .with_span(span);
+        diag = if *prim == PrimitiveType::Secret {
+            // Literal credential material in a `secret` field — the security
+            // invariant the type exists for (see docs/stability.md).
+            diag.with_code(codes::SECRET_LITERAL)
+        } else {
+            diag.with_code(codes::TYPE_MISMATCH)
+        };
+        diags.push(diag);
     }
 
     fn validate_enum_value(
@@ -1308,27 +1379,24 @@ impl SchemaValidator {
         match value {
             Value::String(s) | Value::Reference(s) => {
                 if !enum_def.variants.iter().any(|v| v == s) {
-                    // Acceptance stays exact; the suggestion is fuzzy (a wrong-
-                    // cased or lightly-typo'd value gets a `did you mean` hint).
-                    let suggested = suggest_variant(s, &enum_def.variants);
-                    let hint = match &suggested {
-                        Some(v) => format!(" (did you mean \"{v}\"?)"),
-                        None => String::new(),
-                    };
+                    // Acceptance stays exact; the near-miss hint comes from
+                    // the shared engine (`nml_core::suggest`) and is rendered
+                    // centrally (`Diagnostic::rendered_message`).
                     let mut diag = Diagnostic::error(format!(
-                        "invalid value \"{s}\" for '{field_name}': expected one of {}{hint}",
+                        "invalid value \"{s}\" for '{field_name}': expected one of {}",
                         variants()
                     ))
+                    .with_code(codes::INVALID_ENUM_VALUE)
                     .with_span(span);
-                    if let Some(v) = suggested {
+                    if let Some(v) =
+                        nml_core::suggest::suggest(s, enum_def.variants.iter().map(String::as_str))
+                    {
                         // Machine-applicable fix (RFC 0030): replace the value
                         // *content* with the canonical variant. A string
                         // literal's span includes its quotes, so the content
                         // span excludes them; a bare reference has none.
                         let content_span = match value {
-                            Value::String(_) if span.end > span.start + 1 => {
-                                Span::new(span.start + 1, span.end - 1)
-                            }
+                            Value::String(_) => string_content_span(span),
                             _ => span,
                         };
                         diag = diag.with_suggestion(v, content_span);
@@ -1705,72 +1773,21 @@ fn value_type_name(value: &Value) -> &'static str {
     }
 }
 
-/// The nearest enum variant to `input`, for a "did you mean" hint on an invalid
-/// value. A case-insensitive match wins outright (the overwhelmingly common
-/// near-miss is wrong casing); otherwise the closest variant by edit distance,
-/// but only when it is "close enough" — within a third of the longer string's
-/// length (short values demand near-exact, long values tolerate a typo or two).
-/// This is a **diagnostics-only** helper: acceptance stays exact-match, so a
-/// suggestion never widens what the language accepts.
-fn suggest_variant<'a>(input: &str, variants: &'a [String]) -> Option<&'a str> {
-    if let Some(v) = variants.iter().find(|v| v.eq_ignore_ascii_case(input)) {
-        return Some(v.as_str());
+/// The content span of a string literal: the literal's span includes its
+/// quotes, so a machine-applicable replacement targets the inside. Degenerate
+/// spans (too short to contain quotes) are returned unchanged.
+fn string_content_span(span: Span) -> Span {
+    if span.end > span.start + 1 {
+        Span::new(span.start + 1, span.end - 1)
+    } else {
+        span
     }
-    variants
-        .iter()
-        .map(|v| (levenshtein(input, v), v.as_str()))
-        .filter(|(dist, v)| *dist <= (input.chars().count().max(v.chars().count()) / 3).max(1))
-        .min_by_key(|(dist, _)| *dist)
-        .map(|(_, v)| v)
-}
-
-/// Directive-name near-miss (RFC 0030's `#lvie → #live`), for the LSP's
-/// directive-vocabulary pass. Same metric as [`suggest_variant`] but tuned
-/// for short identifiers, where the dominant typo is a transposition — plain
-/// Levenshtein distance 2 — which the enum threshold (a third of the length)
-/// rejects for typical 3–8 char directive names. Distance ≤ 2, capped at
-/// half the longer name's length so very short names still demand near-exact.
-/// Diagnostics-only, like its sibling: a suggestion never widens what a
-/// vocabulary accepts.
-pub fn suggest_directive<'a>(input: &str, names: &'a [String]) -> Option<&'a str> {
-    if let Some(name) = names.iter().find(|n| n.eq_ignore_ascii_case(input)) {
-        return Some(name.as_str());
-    }
-    names
-        .iter()
-        .map(|n| (levenshtein(input, n), n.as_str()))
-        .filter(|(dist, n)| {
-            let cap = 2usize
-                .min(input.chars().count().max(n.chars().count()) / 2)
-                .max(1);
-            *dist <= cap
-        })
-        .min_by_key(|(dist, _)| *dist)
-        .map(|(_, n)| n)
-}
-
-/// Levenshtein edit distance (two-row DP). Used only to rank "did you mean"
-/// suggestions, never to accept a value.
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    let mut curr = vec![0usize; b.len() + 1];
-    for (i, ca) in a.iter().enumerate() {
-        curr[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    prev[b.len()]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diagnostics::Severity;
+    use nml_core::diagnostic::Severity;
 
     fn make_validator(schema_source: &str) -> SchemaValidator {
         let schema = nml_core::cst::extract_schema(schema_source).0;
@@ -1802,7 +1819,7 @@ mod tests {
         );
         let diag = d
             .iter()
-            .find(|x| x.message.contains("did you mean \"Lax\""))
+            .find(|x| x.rendered_message().contains("did you mean \"Lax\""))
             .expect("did-you-mean diagnostic");
         let sug = diag.suggestion.as_ref().expect("structured suggestion");
         assert_eq!(sug.replacement, "Lax");
@@ -2147,10 +2164,13 @@ mod tests {
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("invalid value \"lax\"")
-                    && d.message.contains("did you mean \"Lax\"?")),
+                .any(|d| d.rendered_message().contains("invalid value \"lax\"")
+                    && d.rendered_message().contains("did you mean \"Lax\"?")),
             "case-only miss must suggest the canonical variant: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+            diags
+                .iter()
+                .map(|d| d.rendered_message())
+                .collect::<Vec<_>>()
         );
 
         // A light typo → nearest by edit distance.
@@ -2158,15 +2178,134 @@ mod tests {
         assert!(validator
             .validate(&file)
             .iter()
-            .any(|d| d.message.contains("did you mean \"Strict\"?")));
+            .any(|d| d.rendered_message().contains("did you mean \"Strict\"?")));
 
-        // Something far from every variant → no (misleading) suggestion.
-        let file = nml_core::cst::parse_to_ast("c C:\n    policy = \"whatever\"\n").unwrap();
+        // A transposition — the dominant real-world typo — must be caught
+        // even on a short value (OSA distance 1; plain Levenshtein would
+        // score it 2 and miss it).
+        let file = nml_core::cst::parse_to_ast("c C:\n    policy = \"aLx\"\n").unwrap();
         assert!(validator
             .validate(&file)
             .iter()
-            .any(|d| d.message.contains("invalid value \"whatever\"")
-                && !d.message.contains("did you mean")));
+            .any(|d| d.rendered_message().contains("did you mean \"Lax\"?")));
+
+        // Something far from every variant → no (misleading) suggestion.
+        let file = nml_core::cst::parse_to_ast("c C:\n    policy = \"whatever\"\n").unwrap();
+        assert!(validator.validate(&file).iter().any(|d| d
+            .rendered_message()
+            .contains("invalid value \"whatever\"")
+            && !d.rendered_message().contains("did you mean")));
+    }
+
+    #[test]
+    fn unknown_property_gets_field_suggestion() {
+        // Typo'd property → nearest declared field, as a machine-applicable
+        // fix on the property-name token (rustc's unknown-field experience).
+        let validator = make_validator("model service:\n    provider string?\n    port number?\n");
+        let source = "service S:\n    provder = \"x\"\n";
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
+        let diags = validator.validate(&file);
+        let diag = diags
+            .iter()
+            .find(|d| d.message.contains("unknown property 'provder'"))
+            .expect("unknown property flagged");
+        let sug = diag.suggestion.as_ref().expect("field suggestion");
+        assert_eq!(sug.replacement, "provider");
+        // Applying the fix must produce the declared field name exactly.
+        let fixed = format!(
+            "{}{}{}",
+            &source[..sug.span.start],
+            sug.replacement,
+            &source[sug.span.end..]
+        );
+        assert!(fixed.contains("provider = \"x\""), "{fixed}");
+        assert!(
+            diag.rendered_message()
+                .contains("did you mean \"provider\"?"),
+            "{}",
+            diag.rendered_message()
+        );
+    }
+
+    #[test]
+    fn unknown_modifier_gets_suggestion() {
+        let validator = make_validator_with_modifiers("", &["allow", "deny"]);
+        let file = nml_core::cst::parse_to_ast("service S:\n    |alow = [@admin]\n").unwrap();
+        let diags = validator.validate(&file);
+        let diag = diags
+            .iter()
+            .find(|d| d.message.contains("unknown modifier '|alow'"))
+            .expect("unknown modifier flagged");
+        assert_eq!(
+            diag.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            Some("allow")
+        );
+    }
+
+    #[test]
+    fn unknown_oneof_discriminator_gets_suggestion() {
+        let schema = "model emailLog:\n    path string?\nmodel emailPostmark:\n    apiKey string?\noneof email by kind:\n    \"log\"      -> emailLog\n    \"postmark\" -> emailPostmark\n";
+        let validator = make_validator(schema);
+        let file = nml_core::cst::parse_to_ast("email E:\n    kind = \"postmrak\"\n").unwrap();
+        let diags = validator.validate(&file);
+        let diag = diags
+            .iter()
+            .find(|d| d.message.contains("unknown kind \"postmrak\""))
+            .expect("unknown discriminator flagged");
+        // Transposition → suggested; span excludes the quotes.
+        let sug = diag.suggestion.as_ref().expect("discriminator suggestion");
+        assert_eq!(sug.replacement, "postmark");
+        assert_eq!(sug.span.end - sug.span.start, "postmrak".len());
+    }
+
+    #[test]
+    fn strict_unknown_block_keyword_gets_model_suggestion() {
+        let validator = make_validator("model service:\n    port number?\n").strict();
+        let file = nml_core::cst::parse_to_ast("servce S:\n    port = 1\n").unwrap();
+        let diags = validator.validate(&file);
+        let diag = diags
+            .iter()
+            .find(|d| d.message.contains("block keyword 'servce'"))
+            .expect("strict unknown keyword flagged");
+        assert_eq!(
+            diag.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            Some("service")
+        );
+    }
+
+    #[test]
+    fn strict_unknown_block_keyword_suggests_oneofs_too() {
+        // Keywords resolve to models OR oneofs; the suggestion pool must
+        // cover both.
+        let schema =
+            "model emailLog:\n    path string?\noneof email by kind:\n    \"log\" -> emailLog\n";
+        let validator = make_validator(schema).strict();
+        let file = nml_core::cst::parse_to_ast("emial E:\n    kind = \"log\"\n").unwrap();
+        let diags = validator.validate(&file);
+        let diag = diags
+            .iter()
+            .find(|d| d.message.contains("block keyword 'emial'"))
+            .expect("strict unknown keyword flagged");
+        assert_eq!(
+            diag.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            Some("email")
+        );
+    }
+
+    #[test]
+    fn strict_unknown_array_keyword_gets_suggestion() {
+        let validator = make_validator("model resource:\n    name string+\n").strict();
+        let file =
+            nml_core::cst::parse_to_ast("[]resorce R:\n    - a:\n        name = \"x\"\n").unwrap();
+        let diags = validator.validate(&file);
+        let diag = diags
+            .iter()
+            .find(|d| d.message.contains("array item keyword 'resorce'"))
+            .expect("strict unknown array keyword flagged");
+        assert_eq!(
+            diag.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            Some("resource")
+        );
     }
 
     #[test]

@@ -3,12 +3,13 @@ name = "nml-fmt"
 description = "Canonical formatter for the NML configuration language"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 
 [dependencies]
 # Parses via the RFC 0004 CST (comments read from the lossless tree).

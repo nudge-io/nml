@@ -504,7 +504,7 @@ impl<'a> Parser<'a> {
         self.bump(); // -
         match self.current() {
             // A scalar key: `- "/api"` or, with a body, `- "/api":` + indented block
-            // (scalar-key-with-body — the shorthand fills the model's `!` field, the
+            // (scalar-key-with-body — the shorthand fills the model's `+` field, the
             // body fills the rest).
             SyntaxKind::String | SyntaxKind::Number => {
                 self.value();

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::error::NmlError;
+use crate::diagnostic::{codes, Code, Diagnostic, Severity};
 use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
 
 /// Schema definitions (models / enums / oneofs) extracted from a source file.
@@ -24,20 +24,23 @@ impl ExtractedSchema {
 /// - every arm model must be a declared `model`,
 /// - discriminator values must be unique within a union,
 /// - a union name must not collide with a model or enum name.
-pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<NmlError> {
+pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
     let model_names: HashSet<&str> = schema.models.iter().map(|m| m.name.as_str()).collect();
     let enum_names: HashSet<&str> = schema.enums.iter().map(|e| e.name.as_str()).collect();
     let mut errors = Vec::new();
 
     for oneof in &schema.oneofs {
         // Every diagnostic for this union points at its declaration span.
-        let err = |message: String| NmlError::Validation {
-            message,
-            span: oneof.span,
+        // One code per fix-pattern (RFC 0008): the code names what to do,
+        // the message names the specifics.
+        let err = |code: Code, message: String| {
+            Diagnostic::error(message)
+                .with_code(code)
+                .with_span(oneof.span)
         };
 
         if model_names.contains(oneof.name.as_str()) || enum_names.contains(oneof.name.as_str()) {
-            errors.push(err(format!(
+            errors.push(err(codes::ONEOF_NAME_COLLISION, format!(
                 "name '{}' is declared as both a oneof and a model/enum; names must be unique across model/enum/oneof",
                 oneof.name
             )));
@@ -46,26 +49,35 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<NmlError> {
         let mut seen_values: HashSet<&str> = HashSet::new();
         for (value, model) in &oneof.variants {
             if !seen_values.insert(value.as_str()) {
-                errors.push(err(format!(
-                    "oneof '{}' has duplicate discriminator value \"{}\"",
-                    oneof.name, value
-                )));
+                errors.push(err(
+                    codes::DUPLICATE_DISCRIMINANT,
+                    format!(
+                        "oneof '{}' has duplicate discriminator value \"{}\"",
+                        oneof.name, value
+                    ),
+                ));
             }
             if !model_names.contains(model.as_str()) {
-                errors.push(err(format!(
-                    "oneof '{}' arm \"{}\" references unknown model '{}'",
-                    oneof.name, value, model
-                )));
+                errors.push(err(
+                    codes::ONEOF_INTEGRITY,
+                    format!(
+                        "oneof '{}' arm \"{}\" references unknown model '{}'",
+                        oneof.name, value, model
+                    ),
+                ));
             }
         }
 
         // A declared default discriminator must name one of the arms.
         if let Some(default) = &oneof.default_discriminator {
             if !oneof.variants.iter().any(|(value, _)| value == default) {
-                errors.push(err(format!(
-                    "oneof '{}' default discriminator \"{}\" does not match any arm",
-                    oneof.name, default
-                )));
+                errors.push(err(
+                    codes::ONEOF_BAD_DEFAULT,
+                    format!(
+                        "oneof '{}' default discriminator \"{}\" does not match any arm",
+                        oneof.name, default
+                    ),
+                ));
             }
         }
 
@@ -74,10 +86,13 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<NmlError> {
         // no arm outside the enum).
         if let Some(type_name) = &oneof.discriminator_type {
             match schema.enums.iter().find(|e| &e.name == type_name) {
-                None => errors.push(err(format!(
-                    "oneof '{}' discriminator type '{}' is not a declared enum",
-                    oneof.name, type_name
-                ))),
+                None => errors.push(err(
+                    codes::ONEOF_BAD_DISCRIMINANT_TYPE,
+                    format!(
+                        "oneof '{}' discriminator type '{}' is not a declared enum",
+                        oneof.name, type_name
+                    ),
+                )),
                 Some(enum_def) => {
                     let variants: HashSet<&str> =
                         enum_def.variants.iter().map(String::as_str).collect();
@@ -86,18 +101,24 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<NmlError> {
                     // Iterate in source order so diagnostics are deterministic.
                     for variant in &enum_def.variants {
                         if !arms.contains(variant.as_str()) {
-                            errors.push(err(format!(
-                                "oneof '{}' is missing an arm for enum '{}' variant \"{}\"",
-                                oneof.name, type_name, variant
-                            )));
+                            errors.push(err(
+                                codes::ONEOF_NOT_EXHAUSTIVE,
+                                format!(
+                                    "oneof '{}' is missing an arm for enum '{}' variant \"{}\"",
+                                    oneof.name, type_name, variant
+                                ),
+                            ));
                         }
                     }
                     for (value, _) in &oneof.variants {
                         if !variants.contains(value.as_str()) {
-                            errors.push(err(format!(
-                                "oneof '{}' arm \"{}\" is not a variant of enum '{}'",
-                                oneof.name, value, type_name
-                            )));
+                            errors.push(err(
+                                codes::ONEOF_NOT_EXHAUSTIVE,
+                                format!(
+                                    "oneof '{}' arm \"{}\" is not a variant of enum '{}'",
+                                    oneof.name, value, type_name
+                                ),
+                            ));
                         }
                     }
                 }
@@ -114,28 +135,49 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<NmlError> {
 /// Run **after** [`resolve_model_inheritance`] so an inherited `!` and a child
 /// `!` are caught together (a child cannot add a second shorthand atop a
 /// parent's). RFC 0005 §8.
-pub fn find_shorthand_errors(schema: &ExtractedSchema) -> Vec<NmlError> {
+pub fn find_shorthand_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
+    use crate::model::FieldType;
     let mut errors = Vec::new();
     for model in &schema.models {
-        let shorthand: Vec<&str> = model
-            .fields
-            .iter()
-            .filter(|f| f.shorthand)
-            .map(|f| f.name.as_str())
-            .collect();
-        if shorthand.len() > 1 {
-            let names = shorthand
-                .iter()
-                .map(|n| format!("'{n}'"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            errors.push(NmlError::Validation {
-                message: format!(
-                    "model '{}' declares more than one shorthand field ({names}); a bare scalar fills a single field",
-                    model.name
-                ),
-                span: model.span,
-            });
+        // RFC 0005 positional shorthand is AXIS-aware, and the axis is fully
+        // determined by the field's type — no second marker needed:
+        //  * a SCALAR `+` field is filled by the list item's KEY (`- "id":`);
+        //  * a LIST/SET `+` field is filled by the body's BARE list items.
+        // At most one of each: two same-axis markers would be ambiguous.
+        let (mut key_fill, mut body_fill): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+        for f in model.fields.iter().filter(|f| f.shorthand) {
+            match f.field_type {
+                FieldType::List(_) | FieldType::Set(_) => body_fill.push(f.name.as_str()),
+                _ => key_fill.push(f.name.as_str()),
+            }
+        }
+        for (axis, names, what) in [
+            (
+                "scalar",
+                &key_fill,
+                "a bare item key fills a single scalar field",
+            ),
+            (
+                "list",
+                &body_fill,
+                "bare body items fill a single list field",
+            ),
+        ] {
+            if names.len() > 1 {
+                let joined = names
+                    .iter()
+                    .map(|n| format!("'{n}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                errors.push(
+                    Diagnostic::error(format!(
+                        "model '{}' declares more than one {axis} shorthand field ({joined}); {what}",
+                        model.name
+                    ))
+                    .with_code(codes::MULTIPLE_POSITIONAL_FIELDS)
+                    .with_span(model.span),
+                );
+            }
         }
     }
     errors
@@ -145,7 +187,7 @@ pub fn find_shorthand_errors(schema: &ExtractedSchema) -> Vec<NmlError> {
 ///
 /// Builds a directed graph of model-to-model edges via `FieldType::ModelRef`
 /// (including through `List` and `Union` wrappers) and reports any cycles found.
-pub fn find_model_cycles(schema: &ExtractedSchema) -> Vec<NmlError> {
+pub fn find_model_cycles(schema: &ExtractedSchema) -> Vec<Diagnostic> {
     let model_names: HashSet<&str> = schema.models.iter().map(|m| m.name.as_str()).collect();
 
     // A field that references a `oneof` depends transitively on each of its
@@ -180,6 +222,10 @@ pub fn find_model_cycles(schema: &ExtractedSchema) -> Vec<NmlError> {
                 schema,
                 cycle,
                 "circular dependency in model definitions",
+                codes::MODEL_REFERENCE_CYCLE,
+                // Advisory at the source (RFC 0008 severity-at-source): a
+                // reference cycle is legal, merely suspicious.
+                Severity::Warning,
                 &mut errors,
             )
         },
@@ -293,7 +339,9 @@ fn push_cycle_errors(
     schema: &ExtractedSchema,
     cycle: &[&str],
     kind: &str,
-    errors: &mut Vec<NmlError>,
+    code: Code,
+    severity: Severity,
+    errors: &mut Vec<Diagnostic>,
 ) {
     let desc = cycle
         .iter()
@@ -308,10 +356,11 @@ fn push_cycle_errors(
             .find(|m| m.name == member)
             .map(|m| m.span)
             .unwrap_or_else(|| crate::span::Span::empty(0));
-        errors.push(NmlError::Validation {
-            message: format!("{kind}: {desc}"),
-            span,
-        });
+        let mut diag = Diagnostic::error(format!("{kind}: {desc}"))
+            .with_code(code)
+            .with_span(span);
+        diag.severity = severity.clone();
+        errors.push(diag);
     }
 }
 
@@ -412,7 +461,7 @@ pub fn resolve_model_inheritance(schema: &mut ExtractedSchema) {
 /// Detect cycles in the model `extends` (inheritance) graph.
 ///
 /// Returns one error per model participating in a cycle.
-pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<NmlError> {
+pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<Diagnostic> {
     let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
     for model in &schema.models {
         edges.insert(
@@ -430,6 +479,8 @@ pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<NmlError> {
                 schema,
                 cycle,
                 "circular inheritance in model definitions",
+                codes::EXTENDS_CYCLE,
+                Severity::Error,
                 &mut errors,
             )
         },
@@ -457,14 +508,11 @@ mod tests {
         let bad = extract_src("model r:\n    a string+\n    b path+\n");
         let errs = find_shorthand_errors(&bad);
         assert_eq!(errs.len(), 1);
-        match &errs[0] {
-            NmlError::Validation { message, .. } => {
-                assert!(message.contains("'a'"), "{message}");
-                assert!(message.contains("'b'"), "{message}");
-                assert!(message.contains("shorthand"), "{message}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let message = &errs[0].message;
+        assert!(message.contains("'a'"), "{message}");
+        assert!(message.contains("'b'"), "{message}");
+        assert!(message.contains("shorthand"), "{message}");
+        assert_eq!(errs[0].code, Some(codes::MULTIPLE_POSITIONAL_FIELDS));
     }
 
     #[test]
@@ -541,7 +589,7 @@ mod tests {
         assert_eq!(errors.len(), 3, "one diagnostic per cycle member");
         assert!(errors
             .iter()
-            .all(|e| e.message().contains("circular inheritance")));
+            .all(|e| e.message.contains("circular inheritance")));
     }
 
     #[test]
@@ -650,7 +698,7 @@ mod tests {
         );
         let errs = find_oneof_errors(&schema);
         assert!(
-            errs.iter().any(|e| e.message().contains("emailPostmark")),
+            errs.iter().any(|e| e.message.contains("emailPostmark")),
             "expected unknown-arm-model error; got {errs:?}"
         );
     }
@@ -663,7 +711,7 @@ mod tests {
         let errs = find_oneof_errors(&schema);
         assert!(
             errs.iter()
-                .any(|e| e.message().contains("duplicate discriminator value")),
+                .any(|e| e.message.contains("duplicate discriminator value")),
             "expected duplicate-value error; got {errs:?}"
         );
     }
@@ -676,7 +724,7 @@ mod tests {
         let errs = find_oneof_errors(&schema);
         assert!(
             errs.iter().any(|e| e
-                .message()
+                .message
                 .contains("default discriminator \"bogus\" does not match any arm")),
             "expected default-mismatch error; got {errs:?}"
         );
@@ -712,8 +760,8 @@ mod tests {
         );
         let errs = find_oneof_errors(&schema);
         assert!(
-            errs.iter().any(|e| e.message().contains("missing an arm")
-                && e.message().contains("postmark")),
+            errs.iter()
+                .any(|e| e.message.contains("missing an arm") && e.message.contains("postmark")),
             "missing enum variant should be reported; got {errs:?}"
         );
     }
@@ -726,8 +774,8 @@ mod tests {
         let errs = find_oneof_errors(&schema);
         assert!(
             errs.iter()
-                .any(|e| e.message().contains("not a variant of enum")
-                    && e.message().contains("postmark")),
+                .any(|e| e.message.contains("not a variant of enum")
+                    && e.message.contains("postmark")),
             "arm outside the enum should be reported; got {errs:?}"
         );
     }
@@ -740,7 +788,7 @@ mod tests {
         let errs = find_oneof_errors(&schema);
         assert!(
             errs.iter()
-                .any(|e| e.message().contains("is not a declared enum")),
+                .any(|e| e.message.contains("is not a declared enum")),
             "unknown discriminator type should be reported; got {errs:?}"
         );
     }
@@ -753,7 +801,7 @@ mod tests {
         let errs = find_oneof_errors(&schema);
         assert!(
             errs.iter()
-                .any(|e| e.message().contains("both a oneof and a model")),
+                .any(|e| e.message.contains("both a oneof and a model")),
             "expected name-collision error; got {errs:?}"
         );
     }
@@ -768,7 +816,7 @@ mod tests {
         assert!(
             cycles
                 .iter()
-                .any(|e| e.message().contains("circular dependency")),
+                .any(|e| e.message.contains("circular dependency")),
             "cycle through oneof variant should be detected; got {cycles:?}"
         );
     }
@@ -896,7 +944,7 @@ model user:\n    name string\n    status status\n";
         assert!(
             errors
                 .iter()
-                .any(|e| e.message().contains("circular dependency")),
+                .any(|e| e.message.contains("circular dependency")),
             "error should mention circular dependency; errors: {:?}",
             errors
         );
@@ -1014,7 +1062,7 @@ model user:\n    name string\n    status status\n";
 
         let errors = find_model_cycles(&schema);
         let has_path = errors.iter().any(|e| {
-            let msg = e.message();
+            let msg = &e.message;
             msg.contains("A -> B") || msg.contains("B -> C") || msg.contains("C -> A")
         });
         assert!(
@@ -1149,7 +1197,7 @@ model D is B, C:\n    d string\n";
         assert!(
             errors
                 .iter()
-                .any(|e| e.message().contains("circular inheritance")),
+                .any(|e| e.message.contains("circular inheritance")),
             "error should mention circular inheritance; errors: {:?}",
             errors
         );
@@ -1165,7 +1213,7 @@ model D is B, C:\n    d string\n";
         assert!(
             errors
                 .iter()
-                .any(|e| e.message().contains("circular inheritance")),
+                .any(|e| e.message.contains("circular inheritance")),
             "error should mention circular inheritance; errors: {:?}",
             errors
         );

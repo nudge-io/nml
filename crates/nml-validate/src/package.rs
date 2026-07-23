@@ -18,9 +18,9 @@ use nml_core::ast::{ArrayDecl, Body, BodyEntryKind, DeclarationKind, File, ListI
 use nml_core::span::Span;
 use nml_core::types::{SpannedValue, Value};
 
-use crate::diagnostics::Diagnostic;
 use crate::loader::load_schema;
 use crate::schema::{MembershipSemantics, SchemaValidator};
+use nml_core::diagnostic::Diagnostic;
 
 /// The package-format version this build of nml understands. A manifest
 /// declaring a newer `formatVersion` must be rejected *before*
@@ -303,7 +303,7 @@ impl SchemaPackage {
         let (schema, diags) = load_schema(&selected);
         let errors: Vec<Diagnostic> = diags
             .into_iter()
-            .filter(|d| matches!(d.severity, crate::diagnostics::Severity::Error))
+            .filter(|d| matches!(d.severity, nml_core::diagnostic::Severity::Error))
             .collect();
         if !errors.is_empty() {
             return Err(PackageError::Sources { errors });
@@ -461,7 +461,7 @@ pub fn parse_manifest(text: &str) -> Result<PackageManifest, PackageError> {
     let errors: Vec<Diagnostic> = validator
         .validate(&file)
         .into_iter()
-        .filter(|d| matches!(d.severity, crate::diagnostics::Severity::Error))
+        .filter(|d| matches!(d.severity, nml_core::diagnostic::Severity::Error))
         .collect();
     if !errors.is_empty() {
         return Err(PackageError::Manifest { errors });
@@ -936,12 +936,13 @@ model denial:
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("did you mean \"Lax\"") && d.suggestion.is_some()),
+                .any(|d| d.rendered_message().contains("did you mean \"Lax\"")
+                    && d.suggestion.is_some()),
             "{diags:?}"
         );
         assert!(
             diags.iter().any(|d| d.message.contains("unknownKey")
-                && matches!(d.severity, crate::diagnostics::Severity::Error)),
+                && matches!(d.severity, nml_core::diagnostic::Severity::Error)),
             "strict unknown key must be an error: {diags:?}"
         );
         // The cross-schema composition resolves: `denial` (from the second
@@ -1128,7 +1129,7 @@ model denial:
         let errors: Vec<_> = v
             .validate(&file)
             .into_iter()
-            .filter(|d| matches!(d.severity, crate::diagnostics::Severity::Error))
+            .filter(|d| matches!(d.severity, nml_core::diagnostic::Severity::Error))
             .collect();
         assert!(errors.is_empty(), "{errors:?}");
     }

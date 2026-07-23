@@ -9,7 +9,6 @@
 
 use std::collections::HashSet;
 
-use nml_core::error::NmlError;
 // Import the passes by name (not the module) so the bare `schema` identifier stays
 // free for the local `ExtractedSchema` value and our own `crate::schema` module.
 use nml_core::schema::{
@@ -17,7 +16,7 @@ use nml_core::schema::{
     resolve_model_inheritance, ExtractedSchema,
 };
 
-use crate::diagnostics::{Diagnostic, Severity};
+use nml_core::diagnostic::Diagnostic;
 
 /// Load a schema from one or more NML source documents.
 ///
@@ -54,9 +53,7 @@ pub fn load_schema(sources: &[(&str, &str)]) -> (ExtractedSchema, Vec<Diagnostic
     let mut seen_oneofs = HashSet::new();
     for (name, text) in sources {
         let (extracted, errors) = nml_core::cst::extract_schema(text);
-        for err in &errors {
-            diagnostics.push(to_diagnostic(err, Severity::Error).with_source(*name));
-        }
+        diagnostics.extend(errors.into_iter().map(|d| d.with_source(*name)));
         for m in &extracted.models {
             check_definition_name(
                 "model",
@@ -92,27 +89,20 @@ pub fn load_schema(sources: &[(&str, &str)]) -> (ExtractedSchema, Vec<Diagnostic
         schema.oneofs.extend(extracted.oneofs);
     }
 
-    for err in find_extends_cycles(&schema) {
-        diagnostics.push(to_diagnostic(&err, Severity::Error));
-    }
+    diagnostics.extend(find_extends_cycles(&schema));
 
     resolve_model_inheritance(&mut schema);
 
-    // At most one scalar-shorthand (`!`) field per model — checked post-inheritance
+    // Positional-shorthand (`+`, RFC 0005) arity — axis-aware, checked post-inheritance
     // so an inherited `!` and a child `!` are caught together (RFC 0005 §8).
-    for err in find_shorthand_errors(&schema) {
-        diagnostics.push(to_diagnostic(&err, Severity::Error));
-    }
+    diagnostics.extend(find_shorthand_errors(&schema));
 
     // `oneof` integrity (arm models exist, unique values, name collisions) is
     // an error: a malformed union cannot be validated against.
-    for err in find_oneof_errors(&schema) {
-        diagnostics.push(to_diagnostic(&err, Severity::Error));
-    }
+    diagnostics.extend(find_oneof_errors(&schema));
 
-    for err in find_model_cycles(&schema) {
-        diagnostics.push(to_diagnostic(&err, Severity::Warning));
-    }
+    // Severity travels with the diagnostic (warning at the source).
+    diagnostics.extend(find_model_cycles(&schema));
 
     (schema, diagnostics)
 }
@@ -140,6 +130,7 @@ fn check_definition_name(
             Diagnostic::error(format!(
                 "'{name}' is a reserved type-constructor name (RFC 0032) — rename the {kind}"
             ))
+            .with_code(nml_core::diagnostic::codes::RESERVED_TYPE_NAME)
             .with_span(span)
             .with_source(source),
         );
@@ -147,23 +138,17 @@ fn check_definition_name(
     if !seen.insert(name.to_string()) {
         diagnostics.push(
             Diagnostic::error(format!("duplicate {kind} definition '{name}'"))
+                .with_code(nml_core::diagnostic::codes::DUPLICATE_DEFINITION)
                 .with_span(span)
                 .with_source(source),
         );
     }
 }
 
-fn to_diagnostic(err: &NmlError, severity: Severity) -> Diagnostic {
-    let diag = match severity {
-        Severity::Error => Diagnostic::error(err.message()),
-        Severity::Warning => Diagnostic::warning(err.message()),
-    };
-    diag.with_span(err.span())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nml_core::diagnostic::Severity;
 
     /// Wrap anonymous test sources as named ones (`src0`, `src1`, …) — tests
     /// exercising attribution pass named tuples to `load_schema` directly.

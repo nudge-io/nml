@@ -3,7 +3,7 @@
 //! A declaration's *identity token* fills a declared field:
 //!   - an **ident** name — a list item `- editor:` *or* a block `role editor:` →
 //!     the model's `name` field ([`materialize_named`]);
-//!   - a **scalar** list key (`- "/api"`) → the model's shorthand (`!`) field
+//!   - a **scalar** list key (`- "/api"`) → the model's positional (`+`) field
 //!     ([`materialize_item`]).
 //!
 //! These are the single definition of that rule. They are traversal-free — the caller
@@ -83,8 +83,8 @@ pub fn materialize_named(name: &Identifier, body: &Body, model: &ModelDef) -> Ma
 pub fn materialize_item(item: &ListItem, model: &ModelDef) -> Materialized {
     match &item.kind {
         ListItemKind::Named { name, body } => materialize_named(name, body, model),
-        // Scalar key → the shorthand (`!`) field, injected into the item's body (the
-        // optional `- "/api": <body>` form) or a fresh one. No `!` field ⇒ dropped key,
+        // Scalar key → the positional (`+`) field, injected into the item's body (the
+        // optional `- "/api": <body>` form) or a fresh one. No `+` field ⇒ dropped key,
         // and the item has no placement, so it is not validatable.
         ListItemKind::Shorthand { value, body } => {
             match model.fields.iter().find(|f| f.shorthand) {
@@ -253,10 +253,10 @@ fn error(message: String, span: Span) -> NmlError {
 
 /// Materialize every **scalar** list item into a body so the schema-blind `de` can
 /// deserialize it as a struct. Walks `body` against the model `root`, and for each
-/// list field whose element model declares a shorthand (`!`) field, rewrites each
+/// list field whose element model declares a positional (`+`) field, rewrites each
 /// `Shorthand` item to carry a body with the scalar injected into that field
 /// (reusing [`materialize_item`]). Named items and bodyless scalars whose element has
-/// no `!` field are left unchanged — `de` handles them (`NamedItemDeserializer` for
+/// no `+` field are left unchanged — `de` handles them (`NamedItemDeserializer` for
 /// names, the bare value otherwise). The pass recurses into nested bodies so nested
 /// lists are materialized too.
 ///
@@ -267,7 +267,7 @@ fn error(message: String, span: Span) -> NmlError {
 pub fn apply_positional(index: &SchemaIndex, root: &str, body: &Body) -> Body {
     match index.model(root) {
         Some(model) => Positionalizer { index }.model_body(model, body, 0),
-        // A non-model root carries no list-of-`!`-model fields to materialize here.
+        // A non-model root carries no list-of-`+`-model fields to materialize here.
         None => body.clone(),
     }
 }
@@ -369,7 +369,7 @@ impl Positionalizer<'_> {
         match &item.kind {
             // Scalar with a shorthand target: inject the value (via the shared
             // primitive), then recurse the materialized body. `validatable == false`
-            // means no `!` field (dropped key) — leave the bare value for `de`.
+            // means no `+` field (dropped key) — leave the bare value for `de`.
             ListItemKind::Shorthand { value, .. } => {
                 let materialized = materialize_item(item, m);
                 if materialized.validatable {

@@ -57,6 +57,12 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
+# Verify the tagged ```nml blocks in the Markdown docs against the real CLI
+# (see scripts/docs_test.py for the tag grammar). Matches the CI docs job.
+docs-test:
+    unset CARGO_TARGET_DIR && cargo build -p nml-cli
+    python3 scripts/docs_test.py
+
 # Clean build artifacts
 clean:
     cargo clean

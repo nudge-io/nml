@@ -1,0 +1,55 @@
+// Deliberately broken schemas backing the error-index examples for
+// schema-loading codes (NML2009–NML2014). Every load of this directory
+// fires each of them once.
+
+model widget:
+    name string+
+
+// NML2010: reserved type-constructor name.
+model set:
+    x string?
+
+// NML2011: two positional (`+`) fields.
+model twoPositional:
+    a string+
+    b string+
+
+// NML2012: arm references an unknown model.
+oneof thing by kind:
+    "x" -> missingModel
+
+// NML2013: inheritance cycle.
+model cycleA is cycleB:
+    x string?
+model cycleB is cycleA:
+    y string?
+
+// NML2014 (warning): model-reference cycle.
+model node:
+    next otherNode?
+model otherNode:
+    back node?
+
+// NML2015: duplicate discriminator value.
+oneof dupValue by kind:
+    "x" -> widget
+    "x" -> widget
+
+// NML2016: oneof name collides with a model name.
+oneof widget by kind:
+    "w" -> widget
+
+// NML2017: default discriminator matches no arm.
+oneof withDefault by kind = "zzz":
+    "a" -> widget
+
+// NML2019: enum-typed arms must cover the enum exactly.
+enum letters:
+    - "a"
+    - "b"
+oneof exhaustive by kind as letters:
+    "a" -> widget
+
+// NML2018: discriminator type is not a declared enum.
+oneof badType by kind as notAnEnum:
+    "a" -> widget

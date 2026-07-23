@@ -1,0 +1,15 @@
+// The schema behind the README's 30-second demo. The docs-test harness
+// validates the README's config blocks against this directory, so the demo
+// can never drift from the real validator.
+
+enum logLevel:
+    - "debug"
+    - "info"
+    - "warn"
+    - "error"
+
+model service:
+    host string
+    port number
+    logLevel logLevel = "info"
+    apiKey secret

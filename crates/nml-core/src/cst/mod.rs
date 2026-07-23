@@ -94,10 +94,13 @@ pub fn parse(source: &str) -> Parse {
 /// [`lower::to_ast_with_errors`] pass collects those, merged with the syntactic
 /// errors. Use this to report every problem at once; [`parse_to_ast`] is the
 /// single-error drop-in derived from it.
-pub fn parse_to_ast_all(source: &str) -> (crate::ast::File, Vec<NmlError>) {
+pub fn parse_to_ast_all(source: &str) -> (crate::ast::File, Vec<crate::diagnostic::Diagnostic>) {
     let (_parsed, file, mut errors) = parse_lowered(source);
-    errors.truncate(MAX_ERRORS); // bounded output (RFC 0004 §9)
-    (file, errors)
+    // Bounded output (RFC 0004 §9).
+    errors.truncate(MAX_ERRORS);
+    // The public reporting boundary speaks the unified findings model
+    // (RFC 0008); NmlError stays the internal/abort currency.
+    (file, errors.iter().map(NmlError::to_diagnostic).collect())
 }
 
 /// Shared core: parse to the CST, lower to the semantic AST, and merge the
@@ -118,7 +121,9 @@ fn parse_lowered(source: &str) -> (Parse, crate::ast::File, Vec<NmlError>) {
 /// drop-in for the legacy `crate::parse`. Derived from [`parse_to_ast_all`];
 /// callers wanting every diagnostic use that directly.
 pub fn parse_to_ast(source: &str) -> crate::error::NmlResult<crate::ast::File> {
-    let (file, errors) = parse_to_ast_all(source);
+    // Derived from `parse_lowered` (not `parse_to_ast_all`): the abort path
+    // keeps `NmlError`; only the findings-report boundary speaks Diagnostic.
+    let (_parsed, file, errors) = parse_lowered(source);
     match errors.into_iter().next() {
         Some(e) => Err(e),
         None => Ok(file),
@@ -143,14 +148,23 @@ pub fn parse_best_effort(source: &str) -> crate::ast::File {
 /// definitions from the well-formed parts are always returned, so a mid-edit
 /// schema file still contributes what it can. This is the single schema-loading
 /// primitive shared by the validator's loader, the LSP registry, and embedders.
-pub fn extract_schema(source: &str) -> (crate::schema::ExtractedSchema, Vec<NmlError>) {
+pub fn extract_schema(
+    source: &str,
+) -> (
+    crate::schema::ExtractedSchema,
+    Vec<crate::diagnostic::Diagnostic>,
+) {
     use ast::AstNode as _;
     // One parse; the canonical lower pass yields every diagnostic, and `extract`
-    // reads the same tree for the schema itself.
+    // reads the same tree for the schema itself. Like `parse_to_ast_all`, the
+    // public reporting boundary speaks the unified findings model (RFC 0008).
     let (parsed, _ast, mut errors) = parse_lowered(source);
     errors.truncate(MAX_ERRORS);
     let root = ast::Root::cast(parsed.syntax()).expect("parse always yields a Root node");
-    (extract::extract(&root), errors)
+    (
+        extract::extract(&root),
+        errors.iter().map(NmlError::to_diagnostic).collect(),
+    )
 }
 
 /// The leading documentation comment of the top-level declaration named `name`
@@ -323,7 +337,7 @@ mod tests {
             );
             // The single error is the parser's syntactic one, not a duplicate
             // "empty value" decode error (which would be earlier by position).
-            assert!(!errors[0].message().contains("empty value"));
+            assert!(!errors[0].message.contains("empty value"));
         }
     }
 
@@ -517,14 +531,9 @@ mod tests {
         let src = "model m:\n    x number = 9.999 USD\n";
         let errors = extract_schema(src).1;
         assert!(
-            errors
-                .iter()
-                .any(|e| e.message().contains("decimal places")),
+            errors.iter().any(|e| e.message.contains("decimal places")),
             "semantic default error must surface: {:?}",
-            errors
-                .iter()
-                .map(|e| e.message().to_string())
-                .collect::<Vec<_>>()
+            errors.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
         // Parity with the canonical all-errors entry point.
         assert_eq!(errors.len(), parse_to_ast_all(src).1.len());
@@ -595,13 +604,13 @@ mod tests {
         assert!(
             errors
                 .windows(2)
-                .all(|w| w[0].span().start <= w[1].span().start),
+                .all(|w| w[0].span.unwrap().start <= w[1].span.unwrap().start),
             "errors must be position-sorted"
         );
         // And the single-error drop-in returns exactly the first of them.
         assert_eq!(
             parse_to_ast(src).unwrap_err().span().start,
-            errors[0].span().start
+            errors[0].span.unwrap().start
         );
     }
 
@@ -876,7 +885,7 @@ mod tests {
     #[test]
     fn core_model_fixture_parses_and_extracts_clean() {
         // The repurposed RFC 0005 fixture parses + extracts with no errors, and its
-        // `!` / `?!` markers land. Guards the fixture against rot.
+        // `+` / `?+` markers land. Guards the fixture against rot.
         let src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/valid/models/core.model.nml"

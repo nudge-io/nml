@@ -240,7 +240,7 @@ keyword Name:
     body...
 ```
 
-Keywords are either built-in (`model`, `trait`, `enum`) or user-defined via models.
+Keywords are either built-in (`model`, `trait`, `enum`, `oneof`, `role`) or user-defined via models.
 
 ### Properties (Key-Value Pairs)
 
@@ -299,12 +299,13 @@ List items can have names, creating addressable entries:
     tls = "dev:auto"
 ```
 
-### Bare String List Items (Shorthand)
+### Bare Scalar List Items (Positional)
 
-When a model defines a `<shorthand>` field, bare string list items expand to that field:
+When a model marks a field as positional (`path path+`), a bare scalar list
+item fills that field:
 
 ```
-- "/test/matt"          // equivalent to: - _: path="/test/matt"
+- "/test/matt"          // fills the positional field: path = "/test/matt"
 ```
 
 ### Reference List Items

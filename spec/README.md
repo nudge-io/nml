@@ -6,6 +6,10 @@ NML is a typed, indentation-based configuration language designed for
 defining services, access control, infrastructure, and structured data with a built-in
 type system, model definitions, and composable traits.
 
+> **New to NML?** Start with the [Language Guide](../docs/language-guide.md) —
+> this directory is the formal specification, written for implementers.
+> Embedding NML in a Rust project? See the [Integration Guide](../docs/integration.md).
+
 ## Specification Documents
 
 | Document | Description |

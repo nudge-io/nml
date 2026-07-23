@@ -11,6 +11,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Declared as the toolchain we build and test with; may be relaxed after a
+# cargo-msrv pass establishes the true floor.
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nicknudge/nml"
 homepage = "https://github.com/nicknudge/nml"
@@ -18,9 +21,11 @@ keywords = ["configuration", "config", "language", "parser", "schema"]
 categories = ["config", "parser-implementations"]
 
 [workspace.dependencies]
-nml-core = { path = "crates/nml-core" }
-nml-validate = { path = "crates/nml-validate" }
-nml-fmt = { path = "crates/nml-fmt" }
+# Internal deps carry both path (workspace builds) and version (publishing:
+# crates.io strips `path`, and publish fails without a version requirement).
+nml-core = { path = "crates/nml-core", version = "0.1.0" }
+nml-validate = { path = "crates/nml-validate", version = "0.1.0" }
+nml-fmt = { path = "crates/nml-fmt", version = "0.1.0" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
