@@ -1,0 +1,5 @@
+trait monitored:
+    t duration?
+
+model endpoint is monitred:
+    url string+

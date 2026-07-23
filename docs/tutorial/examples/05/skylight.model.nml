@@ -1,0 +1,61 @@
+// Skylight's schema — Chapter 5.
+// Alerts fan out through a discriminated union: one `notifier` type,
+// three shapes, selected by `kind`.
+
+enum logLevel:
+    - "debug"
+    - "info"
+    - "warn"
+    - "error"
+
+trait monitored:
+    checkInterval duration = "60s"
+    timeout duration = "5s"
+
+model database:
+    url string
+    poolSize number = 10
+
+model endpoint is monitored:
+    url string+
+    healthPath path = "/health"
+    regions set<string>?
+
+model notifierLog:
+    level logLevel = "warn"
+
+model notifierEmail:
+    from string
+    to string
+    serverToken secret
+
+model notifierWebhook:
+    url string
+    signingSecret secret?
+
+oneof notifier by kind = "log":
+    "log"     -> notifierLog
+    "email"   -> notifierEmail
+    "webhook" -> notifierWebhook
+
+model service:
+    host string
+    port number
+    publicUrl string
+    logLevel logLevel = "info"
+    requestTimeout duration = "30s"
+    retries number = 3
+    banner string?
+    welcome string?
+    tags []string
+    apiKey secret
+    database database
+    endpoints []endpoint
+    notifiers []notifier
+    maintenanceContact (string | []string)?
+
+model plan:
+    name string
+    monthlyPrice money
+    annualPrice money?
+    trialDays number = 14

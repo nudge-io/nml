@@ -286,3 +286,47 @@ fn test_fmt_preserves_comments() {
 
     std::fs::remove_file(&temp).ok();
 }
+
+#[test]
+fn test_validate_runs_schema_finders_on_model_files() {
+    // RFC 0011: `nml validate` of a schema file runs the loader's finder
+    // pipeline — an unresolved `is` target is a coded error with a
+    // did-you-mean, not a silent pass.
+    let output = nml_bin()
+        .args(["validate", "tests/fixtures/invalid/unknown-mixin.model.nml"])
+        .output()
+        .expect("failed to run nml");
+    assert!(!output.status.success(), "unknown `is` target must fail");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("NML2020"), "{combined}");
+    assert!(
+        combined.contains("did you mean \"monitored\"?"),
+        "{combined}"
+    );
+}
+
+#[test]
+fn test_check_rejects_trait_instantiation() {
+    // RFC 0011: a trait keyword is an error even in lenient mode.
+    let output = nml_bin()
+        .args([
+            "check",
+            "--schema",
+            "tests/fixtures/invalid/trait-instantiation",
+            "tests/fixtures/invalid/trait-instantiation/app.nml",
+        ])
+        .output()
+        .expect("failed to run nml");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("NML2024"), "{combined}");
+    assert!(combined.contains("cannot be instantiated"), "{combined}");
+}

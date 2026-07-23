@@ -1,0 +1,30 @@
+// Skylight — a hosted status-page service.
+// Chapter 3: the same config — now typed by skylight.model.nml.
+
+const MaxRetries = 3
+const StatusBanner =
+    """
+    All systems operational.
+    Subscribe for updates at status.skylight.dev.
+    """
+
+service Api:
+    host = "0.0.0.0"
+    port = $ENV.PORT | 8080
+    publicUrl = "https://status.skylight.dev"
+    tags = ["web", "api"]
+    requestTimeout = "30s"
+    retries = MaxRetries
+    banner = StatusBanner
+    welcome = "Welcome to {{config.appName}} — status you can trust."
+    apiKey = $ENV.SKYLIGHT_API_KEY | $ENV.SKYLIGHT_API_KEY_DEV
+
+    database:
+        url = "postgres://localhost/skylight"
+        poolSize = 10
+
+plan Pro:
+    name = "Professional"
+    monthlyPrice = 29.99 USD
+    annualPrice = 299.99 USD
+    trialDays = 30

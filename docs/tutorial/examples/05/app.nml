@@ -1,0 +1,60 @@
+// Skylight — a hosted status-page service.
+// Chapter 5: alert notifiers — one oneof, three shapes.
+
+const MaxRetries = 3
+const StatusBanner =
+    """
+    All systems operational.
+    Subscribe for updates at status.skylight.dev.
+    """
+
+[]endpoint monitoredEndpoints:
+    .timeout = "10s"
+
+    - Api:
+        url = "https://api.skylight.dev"
+        regions = ["us-east", "eu-west"]
+
+    - Marketing:
+        url = "https://www.skylight.dev"
+
+    - "https://docs.skylight.dev"
+
+[]notifier alertNotifiers:
+    - Console:
+        level = "error"
+
+    - Oncall:
+        kind = "email"
+        from = "alerts@skylight.dev"
+        to = "oncall@skylight.dev"
+        serverToken = $ENV.SKYLIGHT_POSTMARK_TOKEN
+
+    - PagerBridge:
+        kind = "webhook"
+        url = "https://hooks.pager.example/skylight"
+
+service Api:
+    host = "0.0.0.0"
+    port = $ENV.PORT | 8080
+    publicUrl = "https://status.skylight.dev"
+    tags = ["web", "api"]
+    requestTimeout = "30s"
+    retries = MaxRetries
+    banner = StatusBanner
+    welcome = "Welcome to {{config.appName}} — status you can trust."
+    apiKey = $ENV.SKYLIGHT_API_KEY | $ENV.SKYLIGHT_API_KEY_DEV
+    maintenanceContact = "oncall@skylight.dev"
+
+    database:
+        url = "postgres://localhost/skylight"
+        poolSize = 10
+
+    endpoints = monitoredEndpoints
+    notifiers = alertNotifiers
+
+plan Pro:
+    name = "Professional"
+    monthlyPrice = 29.99 USD
+    annualPrice = 299.99 USD
+    trialDays = 30

@@ -1,0 +1,31 @@
+// Skylight's schema — Chapter 3.
+// Models give block keywords types: `model service` types `service Api:`.
+
+enum logLevel:
+    - "debug"
+    - "info"
+    - "warn"
+    - "error"
+
+model database:
+    url string
+    poolSize number = 10
+
+model service:
+    host string
+    port number
+    publicUrl string
+    logLevel logLevel = "info"
+    requestTimeout duration = "30s"
+    retries number = 3
+    banner string?
+    welcome string?
+    tags []string
+    apiKey secret
+    database database
+
+model plan:
+    name string
+    monthlyPrice money
+    annualPrice money?
+    trialDays number = 14

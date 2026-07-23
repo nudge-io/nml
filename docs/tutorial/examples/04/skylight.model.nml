@@ -1,0 +1,41 @@
+// Skylight's schema — Chapter 4.
+// Traits compose into models with `is`; endpoints join the service.
+
+enum logLevel:
+    - "debug"
+    - "info"
+    - "warn"
+    - "error"
+
+trait monitored:
+    checkInterval duration = "60s"
+    timeout duration = "5s"
+
+model database:
+    url string
+    poolSize number = 10
+
+model endpoint is monitored:
+    url string+
+    healthPath path = "/health"
+    regions set<string>?
+
+model service:
+    host string
+    port number
+    publicUrl string
+    logLevel logLevel = "info"
+    requestTimeout duration = "30s"
+    retries number = 3
+    banner string?
+    welcome string?
+    tags []string
+    apiKey secret
+    database database
+    endpoints []endpoint
+
+model plan:
+    name string
+    monthlyPrice money
+    annualPrice money?
+    trialDays number = 14

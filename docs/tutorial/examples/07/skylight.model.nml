@@ -1,0 +1,71 @@
+// Skylight's schema — Chapter 7.
+// Unchanged from Chapter 6 — the Rust program loads it to validate and
+// apply defaults before deserializing.
+
+enum logLevel:
+    - "debug"
+    - "info"
+    - "warn"
+    - "error"
+
+trait accessControlled:
+    |allow []role?
+    |deny []role?
+
+model role:
+    label string?
+    description string?
+    members []role?
+
+trait monitored:
+    checkInterval duration = "60s"
+    timeout duration = "5s"
+
+model database:
+    url string
+    poolSize number = 10
+
+model endpoint is monitored, accessControlled:
+    url string+
+    healthPath path = "/health"
+    regions set<string>?
+
+model notifierLog:
+    level logLevel = "warn"
+
+model notifierEmail:
+    from string
+    to string
+    serverToken secret
+
+model notifierWebhook:
+    url string
+    signingSecret secret?
+
+oneof notifier by kind = "log":
+    "log"     -> notifierLog
+    "email"   -> notifierEmail
+    "webhook" -> notifierWebhook
+
+model service is accessControlled:
+    host string
+    port number
+    publicUrl string
+    logLevel logLevel = "info"
+    requestTimeout duration = "30s"
+    retries number = 3
+    banner string?
+    welcome string?
+    tags []string
+    apiKey secret
+    database database
+    endpoints []endpoint
+    notifiers []notifier
+    maintenanceContact (string | []string)?
+    landing (string | (role -> string))?
+
+model plan:
+    name string
+    monthlyPrice money
+    annualPrice money?
+    trialDays number = 14

@@ -22,3 +22,4 @@ docs/rfcs/
 editors/vscode/node_modules/
 editors/vscode/out/
 editors/vscode/*.vsix
+docs/DOCUMENTATION-PLAN.md

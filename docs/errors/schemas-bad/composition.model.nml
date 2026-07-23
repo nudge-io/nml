@@ -1,0 +1,26 @@
+// Deliberately broken schemas backing the error-index examples for the
+// composition codes (NML2020–NML2023, RFC 0011). Every load of this
+// directory fires each of them once.
+
+trait auditable:
+    auditedBy string?
+
+// NML2020: unknown `is` target (typo — carries a did-you-mean).
+model gadget is auditible:
+    name string?
+
+// NML2021: `is` target is an enum, not a model/trait.
+enum sizes:
+    - "s"
+    - "m"
+
+model sized is sizes:
+    n string?
+
+// NML2022: a trait used as a field type.
+model holder:
+    audit auditable?
+
+// NML2023: a oneof arm targets a trait.
+oneof entry by kind:
+    "a" -> auditable

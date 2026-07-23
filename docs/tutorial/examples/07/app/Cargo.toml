@@ -1,0 +1,13 @@
+# Chapter 7's tutorial program. In your own project the nml dependencies come
+# from crates.io/git (see the chapter's Cargo.toml listing); here they are
+# workspace path deps so CI compiles and runs this crate against the real code.
+[package]
+name = "nml-tutorial-07"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+nml-core.workspace = true
+nml-validate.workspace = true
+serde.workspace = true

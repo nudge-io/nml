@@ -1,0 +1,77 @@
+// Skylight — a hosted status-page service.
+// Chapter 8: today's config. Since yesterday (app.v1.nml): the log level
+// went back to its default, Api gained a region, the database pool grew,
+// and the API key was rotated. The reload classifier in app/ decides what
+// each change needs.
+
+role admin:
+    label = "Skylight operators"
+    members:
+        - @user/ops@skylight.dev
+
+const MaxRetries = 3
+const StatusBanner =
+    """
+    All systems operational.
+    Subscribe for updates at status.skylight.dev.
+    """
+
+[]notifier alertNotifiers:
+    - Console:
+        level = "error"
+
+    - Oncall:
+        kind = "email"
+        from = "alerts@skylight.dev"
+        to = "oncall@skylight.dev"
+        serverToken = $ENV.SKYLIGHT_POSTMARK_TOKEN
+
+    - PagerBridge:
+        kind = "webhook"
+        url = "https://hooks.pager.example/skylight"
+
+service Api:
+    |allow = [@public]
+    |deny = []
+
+    host = "0.0.0.0"
+    port = $ENV.PORT | 8080
+    publicUrl = "https://status.skylight.dev"
+    tags = ["web", "api"]
+    requestTimeout = "30s"
+    retries = MaxRetries
+    banner = StatusBanner
+    welcome = "Welcome to {{config.appName}} — status you can trust."
+    apiKey = $ENV.SKYLIGHT_API_KEY_V2 | $ENV.SKYLIGHT_API_KEY_DEV
+    maintenanceContact = "oncall@skylight.dev"
+
+    landing:
+        @role/admin -> "ops"
+        else -> "status"
+
+    database:
+        url = "postgres://localhost/skylight"
+        poolSize = 20
+
+    endpoints:
+        - Api:
+            url = "https://api.skylight.dev"
+            regions = ["us-east", "eu-west"]
+
+        - Marketing:
+            url = "https://www.skylight.dev"
+
+        - AdminConsole:
+            url = "https://admin.skylight.dev"
+            |allow = [@role/admin]
+
+        - Docs:
+            url = "https://docs.skylight.dev"
+
+    notifiers = alertNotifiers
+
+plan Pro:
+    name = "Professional"
+    monthlyPrice = 29.99 USD
+    annualPrice = 299.99 USD
+    trialDays = 30

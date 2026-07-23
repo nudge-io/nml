@@ -1,0 +1,12 @@
+// Skylight — a hosted status-page service.
+// This file grows with every chapter of the tutorial.
+
+service Api:
+    host = "0.0.0.0"
+    port = 8080
+    publicUrl = "https://status.skylight.dev"
+    tags = ["web", "api"]
+
+    database:
+        url = "postgres://localhost/skylight"
+        poolSize = 10

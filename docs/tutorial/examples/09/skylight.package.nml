@@ -1,0 +1,32 @@
+// Skylight's schema package — the delivery manifest (Chapter 9).
+// Bundles the schema sources, binds them to config files by glob, and
+// declares the directive vocabulary Chapter 8's classifier consumes.
+
+package skylight:
+    version = "0.1.0"
+    formatVersion = 1
+    rootMarkers:
+        - "app.nml"
+    modifiers:
+        - "allow"
+        - "deny"
+
+[]schema schemas:
+    - skylight:
+        file = "skylight.model.nml"
+
+[]validator validators:
+    - service:
+        files:
+            - "**/app.nml"
+        schemas:
+            - skylight
+        strict = true
+
+[]directive directives:
+    - live:
+        arg = "none"
+        doc = "Change applies to a running process without a restart."
+    - restart:
+        arg = "none"
+        doc = "Change requires a process restart to take effect."

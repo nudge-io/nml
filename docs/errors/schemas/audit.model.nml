@@ -1,0 +1,6 @@
+// A well-formed trait (RFC 0011) backing the NML2024 error-index example:
+// the schema loads cleanly; instantiating the trait is the instance error.
+
+trait notifiable:
+    channel string?
+    quiet bool = false

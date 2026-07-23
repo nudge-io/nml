@@ -309,7 +309,10 @@ price money <currency = "USD">
 
 ### Traits
 
-Traits are reusable groups of fields that can be mixed into models:
+Traits are reusable groups of fields that models mix in with `is`. Unlike
+a model, a trait can never be instantiated as a block, used as a field
+type, or targeted by a `oneof` arm — it is composition-only (RFC 0011,
+`NML2020`–`NML2024`):
 
 ```nml check
 trait accessControlled:
@@ -325,17 +328,23 @@ enum httpMethod:
     - "POST"
 ```
 
-Multiple traits are comma-separated after `is`:
+Multiple traits are comma-separated after `is`, and traits may compose
+other traits. Inherited fields keep their defaults; a model's own field
+overrides a same-named inherited one:
 
 ```nml check
 trait accessControlled:
-    |allow []role
+    |allow []role?
+    |deny []role?
 trait auditable:
     auditLog string?
 
 model service is accessControlled, auditable:
     localMount path
 ```
+
+Instantiating a trait (`accessControlled X:`) is an error even in lenient
+validation — the schema knows the name is composition-only.
 
 ### Enums
 
