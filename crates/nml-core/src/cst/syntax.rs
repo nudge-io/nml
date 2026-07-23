@@ -112,6 +112,68 @@ impl SyntaxKind {
     /// `rowan` raw→typed cast.
     const LAST: u16 = SyntaxKind::Error as u16;
 
+    /// The ONE human-name mapping for diagnostics (RFC 0009): every
+    /// "expected …, found …" renders through this, so wording cannot drift
+    /// per site. Total: a new kind cannot compile without naming itself.
+    pub(crate) fn describe(self) -> &'static str {
+        use SyntaxKind::*;
+        match self {
+            Whitespace => "whitespace",
+            Newline => "a line break",
+            Comment => "a comment",
+            Indent => "an indent",
+            Dedent => "a dedent",
+            Ident => "a name",
+            Number => "a number",
+            String => "a string",
+            Role => "a role reference",
+            Secret => "a variable reference",
+            Eq => "`=`",
+            Arrow => "`->`",
+            FatArrow => "`=>`",
+            Colon => "`:`",
+            Dash => "`-`",
+            Pipe => "`|`",
+            Dot => "`.`",
+            LBracket => "`[`",
+            RBracket => "`]`",
+            LParen => "`(`",
+            RParen => "`)`",
+            Comma => "`,`",
+            Question => "`?`",
+            Plus => "`+`",
+            Amp => "`&`",
+            Lt => "`<`",
+            Gt => "`>`",
+            Hash => "`#`",
+            ErrorToken => "an unrecognized character",
+            Eof => "end of file",
+            Root => "a document",
+            BlockDecl => "a block declaration",
+            ArrayDecl => "an array declaration",
+            ConstDecl => "a const declaration",
+            TemplateDecl => "a template declaration",
+            OneOfDecl => "a oneof declaration",
+            OneOfArm => "a oneof arm",
+            Name => "a name",
+            Extends => "an `is` clause",
+            Body => "a block body",
+            Property => "a property",
+            NestedBlock => "a nested block",
+            Modifier => "a modifier",
+            SharedProperty => "a shared property",
+            ListItem => "a list item",
+            FieldDef => "a field definition",
+            Directive => "a directive",
+            Arm => "a routing arm",
+            TypeExpr => "a type",
+            Value => "a value",
+            ArrayValue => "an array value",
+            Fallback => "a fallback chain",
+            Error => "unparsed input",
+        }
+    }
+
     /// Trivia is preserved in the tree but never seen by the parser (RFC 0004
     /// §4.2.1: trivia stays invisible; structure is explicit via layout tokens).
     pub fn is_trivia(self) -> bool {

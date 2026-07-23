@@ -34,21 +34,86 @@ impl Money {
     }
 }
 
+/// Why a money literal failed to parse (RFC 0009 D13) — fully structured:
+/// message, stable code, and the ISO-4217 did-you-mean all derive from the
+/// payload, never from message text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MoneyErrorKind {
+    /// Not in the ISO 4217 table. `code_span` is the currency token's own
+    /// sub-span, so the did-you-mean fix is machine-applicable.
+    UnknownCurrency { code: String, code_span: Span },
+    /// More fractional digits than the currency's minor unit allows.
+    Precision {
+        currency: String,
+        allowed: u8,
+        got: usize,
+        raw: String,
+    },
+    /// The whole-number part does not parse.
+    InvalidAmount { raw: String },
+    /// The fractional part does not parse.
+    InvalidFraction { raw: String },
+    /// The scaled minor-unit amount exceeds `i64` — money is exact by
+    /// design, never floated.
+    OutOfRange { raw: String },
+}
+
+impl MoneyErrorKind {
+    /// The human-facing message, derived from the payload.
+    pub fn message(&self) -> String {
+        use crate::error::echo;
+        match self {
+            MoneyErrorKind::UnknownCurrency { code, .. } => {
+                format!("unknown currency code: {}", echo(code))
+            }
+            MoneyErrorKind::Precision {
+                currency,
+                allowed,
+                got,
+                raw,
+            } => format!(
+                "{currency} has {allowed} decimal places, but got {got} in \"{}\"",
+                echo(raw)
+            ),
+            MoneyErrorKind::InvalidAmount { raw } => format!("invalid number: \"{}\"", echo(raw)),
+            MoneyErrorKind::InvalidFraction { raw } => {
+                format!("invalid fractional part: \"{}\"", echo(raw))
+            }
+            MoneyErrorKind::OutOfRange { raw } => {
+                format!("amount out of range: \"{}\"", echo(raw))
+            }
+        }
+    }
+
+    /// The stable code — total: money errors are always coded.
+    pub fn code(&self) -> crate::diagnostic::Code {
+        use crate::diagnostic::codes;
+        match self {
+            MoneyErrorKind::UnknownCurrency { .. } => codes::UNKNOWN_CURRENCY,
+            MoneyErrorKind::Precision { .. } => codes::MONEY_PRECISION,
+            MoneyErrorKind::InvalidAmount { .. } | MoneyErrorKind::InvalidFraction { .. } => {
+                codes::INVALID_MONEY
+            }
+            MoneyErrorKind::OutOfRange { .. } => codes::AMOUNT_OUT_OF_RANGE,
+        }
+    }
+}
+
 /// Parse a money literal like "19.99 USD" into a `Money` value.
 pub fn parse_money(amount_str: &str, currency: &str, span: Span) -> Result<Money, NmlError> {
     let exponent = match currency_exponent(currency) {
         Some(e) => e,
         None => {
-            return Err(NmlError::InvalidMoney {
-                message: format!("unknown currency code: {currency}"),
+            return Err(NmlError::Money {
+                kind: MoneyErrorKind::UnknownCurrency {
+                    code: crate::error::echo_capture(currency),
+                    // The currency is the literal's trailing token, so its
+                    // own sub-span is the last `currency.len()` bytes
+                    // (ASCII) — captured structurally for the did-you-mean.
+                    code_span: Span::new(span.end.saturating_sub(currency.len()), span.end),
+                },
                 span,
-                // The currency is the literal's trailing token, so its own
-                // sub-span is the last `currency.len()` bytes (ASCII) —
-                // captured structurally for the ISO-4217 did-you-mean.
-                currency: Some((
-                    currency.to_string(),
-                    Span::new(span.end.saturating_sub(currency.len()), span.end),
-                )),
             });
         }
     };
@@ -82,30 +147,33 @@ fn parse_minor_units(
     };
 
     if frac_str.len() > exponent as usize {
-        return Err(NmlError::InvalidMoney {
-            message: format!(
-                "{currency} has {exponent} decimal places, but got {} in \"{amount_str}\"",
-                frac_str.len()
-            ),
+        return Err(NmlError::Money {
+            kind: MoneyErrorKind::Precision {
+                currency: crate::error::echo_capture(currency),
+                allowed: exponent,
+                got: frac_str.len(),
+                raw: crate::error::echo_capture(amount_str),
+            },
             span,
-            currency: None,
         });
     }
 
-    let whole: i64 = whole_str.parse().map_err(|_| NmlError::InvalidMoney {
-        message: format!("invalid number: \"{amount_str}\""),
+    let whole: i64 = whole_str.parse().map_err(|_| NmlError::Money {
+        kind: MoneyErrorKind::InvalidAmount {
+            raw: crate::error::echo_capture(amount_str),
+        },
         span,
-        currency: None,
     })?;
 
     let frac: i64 = if frac_str.is_empty() {
         0
     } else {
         let padded = format!("{:0<width$}", frac_str, width = exponent as usize);
-        padded.parse().map_err(|_| NmlError::InvalidMoney {
-            message: format!("invalid fractional part: \"{frac_str}\""),
+        padded.parse().map_err(|_| NmlError::Money {
+            kind: MoneyErrorKind::InvalidFraction {
+                raw: crate::error::echo_capture(frac_str),
+            },
             span,
-            currency: None,
         })?
     };
 
@@ -113,10 +181,11 @@ fn parse_minor_units(
     let abs_amount = whole
         .checked_mul(multiplier)
         .and_then(|scaled| scaled.checked_add(frac))
-        .ok_or_else(|| NmlError::InvalidMoney {
-            message: format!("amount out of range: \"{amount_str}\""),
+        .ok_or_else(|| NmlError::Money {
+            kind: MoneyErrorKind::OutOfRange {
+                raw: crate::error::echo_capture(amount_str),
+            },
             span,
-            currency: None,
         })?;
 
     Ok(if negative { -abs_amount } else { abs_amount })
@@ -179,8 +248,8 @@ mod tests {
         // must cover exactly the trailing code, and the diagnostic bridge
         // must turn it into a machine-applicable ISO-4217 did-you-mean.
         let err = parse_money("19.99", "USE", Span::new(10, 19)).unwrap_err();
-        let NmlError::InvalidMoney {
-            currency: Some((code, code_span)),
+        let NmlError::Money {
+            kind: MoneyErrorKind::UnknownCurrency { code, code_span },
             ..
         } = &err
         else {

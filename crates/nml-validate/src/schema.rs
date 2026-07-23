@@ -2034,6 +2034,10 @@ impl SchemaValidator {
             .map(|kw| format!("@{kw}/"))
             .collect();
         let mut membership: HashMap<String, Vec<String>> = HashMap::new();
+        // Declaration-name spans, so a cycle warning anchors at the member
+        // that opens the reported cycle (every diagnostic carries a span —
+        // the LSP parity invariant).
+        let mut decl_spans: HashMap<String, Span> = HashMap::new();
 
         for decl in &file.declarations {
             match &decl.kind {
@@ -2045,6 +2049,7 @@ impl SchemaValidator {
                         .any(|k| k == &block.keyword.name)
                     {
                         let refs = collect_member_refs(&block.body, &prefixes);
+                        decl_spans.insert(block.name.name.clone(), block.name.span);
                         membership.insert(block.name.name.clone(), refs);
                     }
                 }
@@ -2058,6 +2063,7 @@ impl SchemaValidator {
                     for item in &arr.body.items {
                         if let ListItemKind::Named { name, body } = &item.kind {
                             let refs = collect_member_refs(body, &prefixes);
+                            decl_spans.insert(name.name.clone(), name.span);
                             membership.insert(name.name.clone(), refs);
                         }
                     }
@@ -2079,10 +2085,12 @@ impl SchemaValidator {
                 .copied()
                 .collect::<Vec<_>>()
                 .join(" -> ");
-            diags.push(
-                Diagnostic::warning(format!("circular membership detected: {desc}"))
-                    .with_code(codes::MEMBERSHIP_CYCLE),
-            );
+            let mut diag = Diagnostic::warning(format!("circular membership detected: {desc}"))
+                .with_code(codes::MEMBERSHIP_CYCLE);
+            if let Some(span) = decl_spans.get(cycle[0]) {
+                diag = diag.with_span(*span);
+            }
+            diags.push(diag);
         });
     }
 }
@@ -3512,13 +3520,14 @@ workflow W:
         let source = "role Admin:\n    members:\n        - @role/Editor\n\nrole Editor:\n    members:\n        - @role/Admin\n";
         let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.message.contains("circular membership")),
-            "should detect circular membership; diags: {:?}",
-            diags
-        );
+        let cycle = diags
+            .iter()
+            .find(|d| d.message.contains("circular membership"))
+            .unwrap_or_else(|| panic!("should detect circular membership; diags: {diags:?}"));
+        // Anchored at the declaration that opens the cycle (the LSP parity
+        // invariant: every diagnostic carries a span — span-less warnings
+        // would be silently dropped by the editor).
+        assert!(cycle.span.is_some(), "{cycle:?}");
     }
 
     #[test]

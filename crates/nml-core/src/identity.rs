@@ -48,7 +48,7 @@ pub struct Materialized {
     /// Findings produced while materializing, coded at the source
     /// (`NML2049` dropped key, `NML2050` arm-shorthand mismatch) so no
     /// consumer ever has to guess which is which. Injection itself never
-    /// errors — an explicit value simply wins (see [`inject`]).
+    /// errors — an explicit value simply wins (see `inject`).
     pub diagnostics: Vec<crate::diagnostic::Diagnostic>,
     /// `false` when the item could not be placed — a scalar with no shorthand field,
     /// or a reference/link. Callers surface `diagnostics` but must **not** run
@@ -60,7 +60,7 @@ pub struct Materialized {
 /// Materialize a **named declaration's** identity into its body: inject `name` from
 /// the declaration's name, if the model declares a `name` field. A model with no
 /// `name` field is the runtime-fallback case (`NamedItemDeserializer`): not injected.
-/// An explicit `name` in the body wins (lenient — see [`inject`]). Shared by list-item
+/// An explicit `name` in the body wins (lenient — see `inject`). Shared by list-item
 /// named keys (`- editor:`) and block declarations (`role editor:`).
 pub fn materialize_named(name: &Identifier, body: &Body, model: &ModelDef) -> Materialized {
     let body = if model.fields.iter().any(|f| f.name == NAME_FIELD) {

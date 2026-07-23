@@ -31,10 +31,205 @@ oneof email by kind:
 | Removed | Replacement | Since |
 |---|---|---|
 | `=>` (arm arrow) | `->` | RFC 0006 |
+| `&&` (never valid — C-family habit) | `&` | RFC 0014 |
 
 Earlier pre-code migrations, for the record: the `!` positional marker
 became `+` (RFC 0005 rev. 1), and the never-implemented angle-bracket
 shorthand annotation was removed in favor of `+` (RFC 0005).
+
+## NML0002
+
+**Unexpected token.** The parser met something that fits none of the
+alternatives valid at this position. The message lists what was expected
+— concrete tokens and grammar classes — plus what was actually found;
+when recovery tries several alternatives at one position, they merge into
+a single "expected X or Y" report.
+
+```nml check expect-error='[NML0002]'
+service Api:
+    port =
+```
+
+**Fix:** supply what the message asks for (here: a value after `=`).
+
+## NML0003
+
+**Unterminated string.** A string literal is missing its closing
+delimiter. For multi-line `"""` strings the failure surfaces at
+end-of-input — far from the cause — so a `note:` (and, in editors, a
+related-information entry) points back at the opening delimiter.
+
+```nml check expect-error='[NML0003]'
+service Api:
+    name = "abc
+```
+
+**Fix:** close the string (`"abc"`).
+
+## NML0004
+
+**Unexpected character.** A byte no NML token starts with. The character
+is echoed with control characters escaped — file content can never
+smuggle raw terminal escapes into your output.
+
+```nml check expect-error='[NML0004]'
+service Api:
+    x = ^oops
+```
+
+**Fix:** remove the character, or quote it if it belongs in a string.
+
+## NML0005
+
+**Tab in indentation.** NML's offside rule measures indentation in
+spaces; tabs would make column arithmetic depend on editor settings, so
+they are rejected outright (the file still parses — the tab is treated
+as whitespace).
+
+```nml check expect-error='[NML0005]'
+service Api:
+	port = 8080
+```
+
+**Fix:** replace tabs with spaces (most editors have "convert
+indentation to spaces").
+
+## NML0006
+
+**Inconsistent dedent — the offside rule.** Every block opens an
+indentation column, and a line can only return to a column that is still
+open. This line's indentation matches none of them; the message lists
+the open columns, so the fix is a straight pick from that list. (NML
+recovers by treating the line's column as a new level, so later lines
+still parse.)
+
+```nml check expect-error='[NML0006]'
+service Api:
+        port = 8080
+    host = "0.0.0.0"
+```
+
+Here `port` opened column 8, so `host` at column 4 matches neither the
+body (8) nor top level (0).
+
+**Fix:** align the line with one of the open columns (here: 8 to stay in
+the body, 0 for a new declaration).
+
+## NML0007
+
+**Nesting limit exceeded.** Block and type nesting are bounded (64
+levels) — a deliberate defense: parsing is resilient on untrusted input,
+and unbounded recursion would be a denial-of-service lever. Real
+configurations sit nowhere near the bound; hitting it almost always
+means generated or accidental structure. (Error *output* is bounded the
+same way: at most 128 diagnostics, with an exact suppressed count when
+clipping occurs.)
+
+**Fix:** flatten the structure, or split the document.
+
+## NML0008
+
+**Set elements separated by a comma.** `set<a, b>` is the map habit —
+set elements are *alternatives*, written `set<a | b>`. Machine-fixable:
+the comma becomes `|`.
+
+```nml check expect-error='[NML0008]'
+model deploy:
+    regions set<string, number>
+```
+
+**Fix:** apply the suggestion (`set<string | number>`).
+
+## NML0009
+
+**`map` is reserved.** `map` is held for a future map type; only `set`
+takes type arguments today.
+
+```nml check expect-error='[NML0009]'
+model cache:
+    entries map<string>
+```
+
+**Fix:** model the data another way (a nested model, or a list of keyed
+items) until a map type ships.
+
+## NML0010
+
+**Unknown type constructor.** An identifier is used with type arguments
+(`name<…>`), but only `set` is a constructor. Near-misses get a
+machine-applicable did-you-mean.
+
+```nml check expect-error='[NML0010]'
+model deploy:
+    regions sett<string>
+```
+
+**Fix:** apply the suggestion (`set`), or drop the angle brackets.
+
+## NML0011
+
+**Duplicate directive.** Each `#directive` key may appear once per field
+— repeating one is a merge with no defined winner, so it is rejected.
+
+```nml check expect-error='[NML0011]'
+model server:
+    rate number #live #live
+```
+
+**Fix:** delete the duplicate.
+
+## NML0012
+
+**Invalid string escape.** The escape is unknown, or the string ends
+mid-escape. Valid escapes: `\"` `\\` `\n` `\t` — the message lists them.
+
+```nml check expect-error='[NML0012]'
+service Api:
+    x = "a\q"
+```
+
+**Fix:** use a valid escape, or double the backslash for a literal one
+(`"a\\q"`).
+
+## NML0013
+
+**Invalid number.** The literal is not a number any numeric type parses
+— most commonly a second decimal point.
+
+```nml check expect-error='[NML0013]'
+service Api:
+    x = 1.2.3
+```
+
+**Fix:** write one decimal point (`1.23`), or quote it if it is meant as
+a string.
+
+## NML0014
+
+**Integer out of range.** NML integers are exact `i64` values by design
+— a number that does not fit is an error, never a silently rounded
+float.
+
+```nml check expect-error='[NML0014]'
+service Api:
+    x = 99999999999999999999
+```
+
+**Fix:** use a representable value, or a string if it is an identifier
+(account numbers usually are).
+
+## NML0015
+
+**Malformed variable reference.** A `$NS.key` reference needs a known
+namespace, a dot, and a key. Unknown namespaces get a machine-applicable
+did-you-mean over the valid sources.
+
+```nml check expect-error='[NML0015]'
+service Api:
+    key = $ENVV.API_KEY
+```
+
+**Fix:** apply the suggestion (`$ENV.API_KEY`).
 
 ## NML1000
 
@@ -855,16 +1050,41 @@ loop.
 
 ## NML3000
 
-**Invalid money literal.** The amount is malformed for the currency — most
-commonly more decimal places than the currency's ISO 4217 exponent allows
-(money is exact minor units, never floats).
+**Invalid money literal.** The amount or its fractional part is not a
+number (money is exact minor units, never floats).
 
 ```nml check expect-error='[NML3000]'
+product Widget:
+    price = 1..2 USD
+```
+
+**Fix:** write a plain decimal amount (`1.2 USD`).
+
+## NML3002
+
+**Money precision exceeded.** More fractional digits than the currency's
+ISO 4217 minor unit allows — the value could not be stored exactly, and
+money is never rounded silently.
+
+```nml check expect-error='[NML3002]'
 product Widget:
     price = 19.999 USD
 ```
 
-**Fix:** use the currency's precision (`19.99 USD`; JPY takes none: `1999 JPY`).
+**Fix:** use the currency's precision (`19.99 USD`; JPY takes none:
+`1999 JPY`).
+
+## NML3003
+
+**Money amount out of range.** The amount, scaled to minor units, exceeds
+`i64` — exactness is the design, so overflow is an error, never a float.
+
+```nml check expect-error='[NML3003]'
+product Widget:
+    price = 922337203685477581 USD
+```
+
+**Fix:** use a representable amount (the bound is ~92 quadrillion cents).
 
 ## NML3001
 

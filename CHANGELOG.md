@@ -4,6 +4,32 @@
 
 ### Added
 
+- **The parse-error taxonomy is closed (RFC 0009)**: every syntax
+  diagnostic derives its message, stable code, and any machine-applicable
+  fix from a payload-carrying kind — the transitional prose carrier and
+  the `Lex`/`Parse` variant split are deleted, and `NmlError` is
+  `Syntax` + `Money` with no `String` field anywhere. New stable codes
+  `NML0002`–`NML0015` (unexpected-token with expected/found/context,
+  unterminated string, unexpected character, tab-in-indent, the
+  offside-rule dedent — which lists the open columns — nesting limits,
+  set separator, reserved `map`, unknown type constructor, duplicate
+  directive, string escapes, invalid/out-of-range numbers, `$NS.key`
+  references) and `NML3002`/`NML3003` (money precision / out-of-range;
+  `NML3000` narrows to malformed amounts) — every one with a CI-verified
+  index example.
+- **Parser errors carry token-width spans** (editor squiggles cover the
+  offending token, not a caret between characters); recovery cascades at
+  one position coalesce into a single "expected X or Y" report; and the
+  fixers engine grows `&&`→`&` and `set<a, b>`→`set<a | b>`, plus
+  did-you-means for unknown type constructors and variable namespaces.
+- **Diagnostics are honest and hardened**: truncation is never silent
+  (every layer counts what it drops; one `info` line reports the exact
+  suppressed total), every render path escapes control characters (file
+  content cannot smuggle terminal escapes into CLI output or logs), and
+  `Diagnostic` gains related information — `note:` lines in the CLI,
+  spec-native `relatedInformation` in the editor — with unterminated
+  strings pointing back at their opening delimiter as the first producer.
+
 - **Total diagnostic code coverage**: every validator- and package-emitted
   finding now carries a stable code with a verified error-index entry —
   the Phase 4 sweep. New: `NML2036`–`NML2042` (arms and `oneof` instance

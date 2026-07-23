@@ -46,7 +46,7 @@ plan Broken:
 ```
 
 ```text
-app.nml:2:20: error[NML3000]: invalid money value: USD has 2 decimal places, but got 3 in "19.999"
+app.nml:2:20: error[NML3002]: invalid money value: USD has 2 decimal places, but got 3 in "19.999"
 ```
 
 Japanese yen has zero, so `1299 JPY` is valid and `12.99 JPY` is not. Typo
@@ -165,7 +165,7 @@ Merge everything into `app.nml` — constants at the top, the new values on
        trialDays = 14
    ```
 
-   `44.00 JPY` fails with `error[NML3000]: invalid money value: JPY has 0
+   `44.00 JPY` fails with `error[NML3002]: invalid money value: JPY has 0
    decimal places, but got 2 in "44.00"`.
 
    </details>
@@ -187,7 +187,7 @@ Merge everything into `app.nml` — constants at the top, the new values on
 
 - **Floats for prices.** `monthlyPrice = 29.99` is just a number; write
   `29.99 USD` and precision is guaranteed by the currency's own rules
-  (NML3000 catches wrong decimals, NML3001 catches bad codes).
+  (NML3002 catches wrong decimals, NML3001 catches bad codes).
 - **Literal fallbacks on secrets.** `$ENV.KEY | "dev-key"` — a schema-typed
   `secret` field rejects this (NML2006). Chain references instead.
 - **Single braces in templates.** `{config.appName}` is a path placeholder,

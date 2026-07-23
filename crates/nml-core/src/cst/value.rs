@@ -27,7 +27,7 @@ use crate::types::{Number, SpannedValue, Value};
 use crate::{money, template};
 
 /// Variable-reference namespaces recognized after `$` (mirrors the legacy lexer).
-const KNOWN_NAMESPACES: &[&str] = &["ENV"];
+pub(crate) const KNOWN_NAMESPACES: &[&str] = &["ENV"];
 
 /// Decode a value node (`Value`, `ArrayValue`, or `Fallback`) into a
 /// [`SpannedValue`]. Returns the first semantic error encountered.
@@ -36,8 +36,15 @@ pub fn decode_value(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
         SyntaxKind::Value => decode_scalar(node),
         SyntaxKind::ArrayValue => decode_array(node),
         SyntaxKind::Fallback => decode_fallback(node),
-        other => Err(NmlError::parse(
-            format!("expected a value node, found {other:?}"),
+        other => Err(NmlError::syntax(
+            crate::error::ParseErrorKind::Expected {
+                expected: vec![crate::error::ExpectedItem::Desc("a value node")],
+                found: Some(crate::error::FoundToken {
+                    kind: other,
+                    text: String::new(),
+                }),
+                context: None,
+            },
             node_span(node),
         )),
     }
@@ -90,8 +97,15 @@ fn decode_scalar(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
             other => Value::Reference(other.to_string()),
         },
         other => {
-            return Err(NmlError::parse(
-                format!("cannot decode value starting with {other:?}"),
+            return Err(NmlError::syntax(
+                crate::error::ParseErrorKind::Expected {
+                    expected: vec![crate::error::ExpectedItem::Desc("a value")],
+                    found: Some(crate::error::FoundToken {
+                        kind: other,
+                        text: String::new(),
+                    }),
+                    context: None,
+                },
                 span,
             ))
         }
@@ -136,9 +150,19 @@ fn decode_fallback(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .rev();
-    let mut acc = values
-        .next()
-        .ok_or_else(|| NmlError::parse("empty fallback chain", node_span(node)))?;
+    let mut acc = values.next().ok_or_else(|| {
+        NmlError::syntax(
+            crate::error::ParseErrorKind::Expected {
+                expected: vec![crate::error::ExpectedItem::Desc("a fallback arm")],
+                found: Some(crate::error::FoundToken {
+                    kind: SyntaxKind::Fallback,
+                    text: String::new(),
+                }),
+                context: None,
+            },
+            node_span(node),
+        )
+    })?;
     for v in values {
         let span = v.span.merge(acc.span);
         acc = SpannedValue::new(Value::Fallback(Box::new(v), Box::new(acc)), span);
@@ -182,14 +206,19 @@ fn decode_escapes(inner: &str, inner_start: usize) -> Result<String, NmlError> {
             Some((j, other)) => {
                 // Span the `\` (at `i`) through the escape char (ending at `j + len`).
                 let span = Span::new(inner_start + i, inner_start + j + other.len_utf8());
-                return Err(NmlError::parse(
-                    format!("unknown escape sequence: '\\{other}'"),
+                return Err(NmlError::syntax(
+                    crate::error::ParseErrorKind::InvalidEscape {
+                        escape: Some(other),
+                    },
                     span,
                 ));
             }
             None => {
                 let span = Span::new(inner_start + i, inner_start + inner.len());
-                return Err(NmlError::parse("unexpected end of string", span));
+                return Err(NmlError::syntax(
+                    crate::error::ParseErrorKind::InvalidEscape { escape: None },
+                    span,
+                ));
             }
         }
     }
@@ -238,13 +267,20 @@ fn dedent_multiline(raw: &str) -> String {
 /// (out-of-range is an error, never a silently rounded float), matching legacy.
 fn parse_number(raw: &str, span: Span) -> Result<Number, NmlError> {
     if raw.contains('.') {
-        raw.parse()
-            .map(Number::Float)
-            .map_err(|_| NmlError::parse(format!("invalid number: \"{raw}\""), span))
+        raw.parse().map(Number::Float).map_err(|_| {
+            NmlError::syntax(
+                crate::error::ParseErrorKind::InvalidNumber {
+                    raw: crate::error::echo_capture(&raw),
+                },
+                span,
+            )
+        })
     } else {
         raw.parse().map(Number::Int).map_err(|_| {
-            NmlError::parse(
-                format!("integer \"{raw}\" out of range for 64-bit integer"),
+            NmlError::syntax(
+                crate::error::ParseErrorKind::NumberOutOfRange {
+                    raw: crate::error::echo_capture(&raw),
+                },
                 span,
             )
         })
@@ -256,23 +292,28 @@ fn parse_number(raw: &str, span: Span) -> Result<Number, NmlError> {
 fn validate_secret(text: &str, span: Span) -> Result<(), NmlError> {
     let body = text.strip_prefix('$').unwrap_or(text);
     let (ns, key) = body.split_once('.').ok_or_else(|| {
-        NmlError::parse(
-            "expected '.' after the variable namespace (e.g. $ENV.MY_VAR)",
+        NmlError::syntax(
+            crate::error::ParseErrorKind::BadSecretRef {
+                reason: crate::error::SecretRefIssue::MissingDot,
+            },
             span,
         )
     })?;
     if !KNOWN_NAMESPACES.contains(&ns) {
-        return Err(NmlError::parse(
-            format!(
-                "unknown variable source '{ns}'. Valid sources: {}",
-                KNOWN_NAMESPACES.join(", ")
-            ),
+        return Err(NmlError::syntax(
+            crate::error::ParseErrorKind::BadSecretRef {
+                reason: crate::error::SecretRefIssue::UnknownNamespace(crate::error::echo_capture(
+                    ns,
+                )),
+            },
             span,
         ));
     }
     if key.is_empty() {
-        return Err(NmlError::parse(
-            format!("expected a variable name after ${ns}."),
+        return Err(NmlError::syntax(
+            crate::error::ParseErrorKind::BadSecretRef {
+                reason: crate::error::SecretRefIssue::EmptyKey(crate::error::echo_capture(ns)),
+            },
             span,
         ));
     }

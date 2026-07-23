@@ -41,6 +41,9 @@ pub(super) struct LexToken<'a> {
 pub(super) struct Lexed<'a> {
     pub tokens: Vec<LexToken<'a>>,
     pub errors: Vec<NmlError>,
+    /// Errors dropped at the `MAX_ERRORS` cap — counted, never silent
+    /// (RFC 0009: exact suppression accounting).
+    pub suppressed: usize,
 }
 
 pub(super) fn lex(src: &str) -> Lexed<'_> {
@@ -52,6 +55,7 @@ pub(super) fn lex(src: &str) -> Lexed<'_> {
         at_line_start: true,
         tokens: Vec::new(),
         errors: Vec::new(),
+        suppressed: 0,
     }
     .run()
 }
@@ -65,6 +69,7 @@ struct Lexer<'a> {
     at_line_start: bool,
     tokens: Vec<LexToken<'a>>,
     errors: Vec<NmlError>,
+    suppressed: usize,
 }
 
 impl<'a> Lexer<'a> {
@@ -86,6 +91,7 @@ impl<'a> Lexer<'a> {
         Lexed {
             tokens: self.tokens,
             errors: self.errors,
+            suppressed: self.suppressed,
         }
     }
 
@@ -111,9 +117,9 @@ impl<'a> Lexer<'a> {
         // as whitespace, so losslessness holds. (Blank lines are exempt — their
         // indentation is meaningless.)
         if has_tab && !blank {
-            self.push_error(
-                "tabs are not permitted in indentation; use spaces",
-                Span::empty(self.pos),
+            self.push_error_kind(
+                crate::error::ParseErrorKind::TabInIndent,
+                Span::new(col_start, ws_end),
             );
         }
         if blank {
@@ -126,20 +132,27 @@ impl<'a> Lexer<'a> {
             self.indent.push(width);
             self.push_empty_at(SyntaxKind::Indent, col_start);
         } else if width < top {
+            // Detect the inconsistent dedent BEFORE popping, while the stack
+            // still holds every open level — the diagnostic lists them (the
+            // offside rule, taught at the site). Zero cost when consistent.
+            if !self.indent.contains(&width) {
+                self.push_error_kind(
+                    crate::error::ParseErrorKind::BadDedent {
+                        found: width,
+                        valid: self.indent.clone(),
+                    },
+                    Span::new(col_start, ws_end),
+                );
+            }
             while *self.indent.last().expect("non-empty") > width {
                 self.indent.pop();
                 self.push_empty_at(SyntaxKind::Dedent, col_start);
             }
             if *self.indent.last().expect("non-empty") != width {
-                // Inconsistent dedent (a column matching no open level): recover
-                // by snapping to this level and recording a diagnostic — never a
-                // panic (RFC 0004 §4.2.1).
+                // Recover by snapping to this level — never a panic (RFC 0004
+                // §4.2.1). The diagnostic was recorded above, pre-pop.
                 self.indent.push(width);
                 self.push_empty_at(SyntaxKind::ErrorToken, col_start);
-                self.push_error(
-                    "inconsistent dedent: indentation matches no enclosing block",
-                    Span::empty(col_start),
-                );
             }
         }
         self.emit_ws(col_start, ws_end);
@@ -238,7 +251,14 @@ impl<'a> Lexer<'a> {
                 let end = start + utf8_len(c);
                 self.push(SyntaxKind::ErrorToken, start, end);
                 self.pos = end;
-                self.push_error("unexpected character", Span::new(start, end));
+                let ch = std::str::from_utf8(&self.bytes[start..end])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                    .unwrap_or(char::REPLACEMENT_CHARACTER);
+                self.push_error_kind(
+                    crate::error::ParseErrorKind::UnexpectedCharacter { ch },
+                    Span::new(start, end),
+                );
             }
         }
     }
@@ -263,7 +283,13 @@ impl<'a> Lexer<'a> {
                     break;
                 }
                 if end >= self.bytes.len() {
-                    self.push_error("unterminated multi-line string", Span::new(start, end));
+                    self.push_error_kind(
+                        crate::error::ParseErrorKind::UnterminatedString {
+                            open: Span::new(start, start + 3),
+                            multiline: true,
+                        },
+                        Span::new(start, end),
+                    );
                     break;
                 }
                 end += 1;
@@ -275,7 +301,13 @@ impl<'a> Lexer<'a> {
             loop {
                 match self.bytes.get(end) {
                     None | Some(b'\n') => {
-                        self.push_error("unterminated string", Span::new(start, end));
+                        self.push_error_kind(
+                            crate::error::ParseErrorKind::UnterminatedString {
+                                open: Span::new(start, start + 1),
+                                multiline: false,
+                            },
+                            Span::new(start, end),
+                        );
                         break;
                     }
                     Some(b'"') => {
@@ -364,9 +396,13 @@ impl<'a> Lexer<'a> {
     /// pathological file cannot grow the error list without bound *during*
     /// lexing (RFC 0004 §9, "bounded output"). Tokens are still emitted, so
     /// losslessness is unaffected by the cap.
-    fn push_error(&mut self, message: &str, span: Span) {
+    /// Classified emission (RFC 0009) — the lexer half of the single
+    /// channel; message, code, and fix all derive from the kind.
+    fn push_error_kind(&mut self, kind: crate::error::ParseErrorKind, span: Span) {
         if self.errors.len() < super::MAX_ERRORS {
-            self.errors.push(NmlError::lex(message, span));
+            self.errors.push(NmlError::syntax(kind, span));
+        } else {
+            self.suppressed += 1;
         }
     }
 }

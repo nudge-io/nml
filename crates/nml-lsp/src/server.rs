@@ -521,6 +521,7 @@ impl Inner {
                         identity,
                     },
                     &dc,
+                    Some(uri),
                 )
             }
             _ => {
@@ -533,6 +534,7 @@ impl Inner {
                         oneofs: &oneofs,
                     },
                     &dc,
+                    Some(uri),
                 )
             }
         };
@@ -567,7 +569,7 @@ impl Inner {
         if uri.as_str().ends_with(".model.nml") {
             match self.vocabulary_for_document(uri) {
                 packages::VocabularyOutcome::Covered(vocab) => {
-                    for diag in diagnostics::schema_source_pass(text, &vocab) {
+                    for diag in diagnostics::schema_source_pass(text, &vocab, Some(uri)) {
                         let duplicate = diags.iter().any(|d| {
                             d.range == diag.range
                                 && d.message == diag.message

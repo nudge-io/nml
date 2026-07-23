@@ -43,7 +43,12 @@ pub enum SchemaMode<'a> {
 }
 
 /// Compute diagnostics for an NML source document.
-pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -> Vec<Diagnostic> {
+pub fn compute(
+    source: &str,
+    mode: &SchemaMode<'_>,
+    config: &DiagnosticConfig,
+    uri: Option<&tower_lsp::lsp_types::Url>,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let line_index = LineIndex::new(source);
 
@@ -55,22 +60,22 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
     let (file, parse_errors) = nml_core::cst::parse_to_ast_all(source);
 
     for diag in parse_errors {
-        push_diagnostic(diag, None, &line_index, &mut diagnostics);
+        push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
     }
 
     let mut symbols = nml_core::symbols::SymbolTable::new();
     symbols.register_file(&file);
 
     for diag in symbols.find_duplicates() {
-        push_diagnostic(diag, None, &line_index, &mut diagnostics);
+        push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
     }
 
     for diag in symbols.find_unresolved_references(&file) {
-        push_diagnostic(diag, None, &line_index, &mut diagnostics);
+        push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
     }
 
     for diag in symbols.find_const_cycles() {
-        push_diagnostic(diag, None, &line_index, &mut diagnostics);
+        push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
     }
 
     match mode {
@@ -109,6 +114,7 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
                             .with_code(nml_core::diagnostic::codes::DUPLICATE_DEFINITION)
                             .with_span(m.span),
                             None,
+                            uri,
                             &line_index,
                             &mut diagnostics,
                         );
@@ -127,6 +133,7 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
                             .with_code(nml_core::diagnostic::codes::DUPLICATE_DEFINITION)
                             .with_span(e.span),
                             None,
+                            uri,
                             &line_index,
                             &mut diagnostics,
                         );
@@ -145,6 +152,7 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
                             .with_code(nml_core::diagnostic::codes::DUPLICATE_DEFINITION)
                             .with_span(o.span),
                             None,
+                            uri,
                             &line_index,
                             &mut diagnostics,
                         );
@@ -164,7 +172,7 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
                     .with_modifiers(config.modifiers.clone())
                     .with_membership_semantics(config.membership.clone());
                 for diag in validator.validate(&file) {
-                    push_diagnostic(diag, None, &line_index, &mut diagnostics);
+                    push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
                 }
             }
         }
@@ -173,7 +181,7 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
             identity,
         } => {
             for diag in validator.validate(&file) {
-                push_diagnostic(diag, Some(identity), &line_index, &mut diagnostics);
+                push_diagnostic(diag, Some(identity), uri, &line_index, &mut diagnostics);
             }
         }
     }
@@ -183,7 +191,7 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
         .iter()
         .map(|s| s.as_str())
         .collect();
-    validate_templates(&file, &ns, &line_index, &mut diagnostics);
+    validate_templates(&file, &ns, uri, &line_index, &mut diagnostics);
 
     diagnostics
 }
@@ -198,6 +206,7 @@ pub fn compute(source: &str, mode: &SchemaMode<'_>, config: &DiagnosticConfig) -
 fn push_diagnostic(
     diag: nml_core::diagnostic::Diagnostic,
     identity: Option<&str>,
+    uri: Option<&tower_lsp::lsp_types::Url>,
     line_index: &LineIndex,
     out: &mut Vec<Diagnostic>,
 ) {
@@ -240,6 +249,20 @@ fn push_diagnostic(
         message,
         source: Some("nml".to_string()),
         data,
+        // Secondary locations (RFC 0009), spec-native. Same-document by
+        // construction; the uri is required by the LSP `Location` shape.
+        related_information: uri.map(|uri| {
+            diag.related
+                .iter()
+                .map(|rel| tower_lsp::lsp_types::DiagnosticRelatedInformation {
+                    location: tower_lsp::lsp_types::Location {
+                        uri: uri.clone(),
+                        range: line_index.range(rel.span),
+                    },
+                    message: rel.message.clone(),
+                })
+                .collect()
+        }),
         ..Default::default()
     });
 }
@@ -260,12 +283,13 @@ fn push_diagnostic(
 pub fn schema_source_pass(
     source: &str,
     vocab: &crate::packages::VocabularyMatch,
+    uri: Option<&tower_lsp::lsp_types::Url>,
 ) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let line_index = LineIndex::new(source);
     let (schema, errors) = nml_core::cst::extract_schema(source);
     for diag in errors {
-        push_diagnostic(diag, None, &line_index, &mut out);
+        push_diagnostic(diag, None, uri, &line_index, &mut out);
     }
     let vocab_names: Vec<String> = vocab.directives.iter().map(|d| d.name.clone()).collect();
     let vocab_has = |name: &str| vocab_names.iter().any(|n| n == name);
@@ -277,6 +301,7 @@ pub fn schema_source_pass(
                     source,
                     vocab,
                     &vocab_names,
+                    uri,
                     &line_index,
                     &mut out,
                 );
@@ -304,6 +329,7 @@ pub fn schema_source_pass(
                         .with_code(codes::DIRECTIVE_CONFLICT)
                         .with_span(span),
                         None,
+                        uri,
                         &line_index,
                         &mut out,
                     );
@@ -322,6 +348,7 @@ pub fn schema_source_pass(
             .with_code(codes::UNDECLARED_SIBLING)
             .with_span(nml_core::span::Span::empty(0)),
             None,
+            uri,
             &line_index,
             &mut out,
         );
@@ -368,6 +395,7 @@ fn check_directive(
     source: &str,
     vocab: &crate::packages::VocabularyMatch,
     vocab_names: &[String],
+    uri: Option<&tower_lsp::lsp_types::Url>,
     line_index: &LineIndex,
     out: &mut Vec<Diagnostic>,
 ) {
@@ -402,7 +430,7 @@ fn check_directive(
             );
             vdiag = vdiag.with_suggestion(format!("#{suggested}"), fix_span);
         }
-        push_diagnostic(vdiag, None, line_index, out);
+        push_diagnostic(vdiag, None, uri, line_index, out);
         return;
     };
     // Wording matches nudge's boot gate (`verify_directive_vocabulary` in
@@ -420,6 +448,7 @@ fn check_directive(
                 .with_code(codes::DIRECTIVE_BAD_ARITY)
                 .with_span(directive.span),
             None,
+            uri,
             line_index,
             out,
         );
@@ -429,15 +458,16 @@ fn check_directive(
 fn validate_shared_property_templates(
     sp: &SharedProperty,
     valid_ns: &[&str],
+    uri: Option<&tower_lsp::lsp_types::Url>,
     line_index: &LineIndex,
     diags: &mut Vec<Diagnostic>,
 ) {
     match &sp.kind {
         SharedPropertyKind::Block(body) => {
-            validate_body_templates(body, valid_ns, line_index, diags);
+            validate_body_templates(body, valid_ns, uri, line_index, diags);
         }
         SharedPropertyKind::Scalar(sv) => {
-            validate_value_templates(&sv.value, valid_ns, line_index, diags);
+            validate_value_templates(&sv.value, valid_ns, uri, line_index, diags);
         }
     }
 }
@@ -445,29 +475,30 @@ fn validate_shared_property_templates(
 fn validate_templates(
     file: &File,
     valid_ns: &[&str],
+    uri: Option<&tower_lsp::lsp_types::Url>,
     line_index: &LineIndex,
     diags: &mut Vec<Diagnostic>,
 ) {
     for decl in &file.declarations {
         match &decl.kind {
             DeclarationKind::Block(block) => {
-                validate_body_templates(&block.body, valid_ns, line_index, diags);
+                validate_body_templates(&block.body, valid_ns, uri, line_index, diags);
             }
             DeclarationKind::Template(t) => {
-                validate_value_templates(&t.value.value, valid_ns, line_index, diags);
+                validate_value_templates(&t.value.value, valid_ns, uri, line_index, diags);
             }
             DeclarationKind::Const(c) => {
-                validate_value_templates(&c.value.value, valid_ns, line_index, diags);
+                validate_value_templates(&c.value.value, valid_ns, uri, line_index, diags);
             }
             DeclarationKind::Array(arr) => {
                 for sp in &arr.body.shared_properties {
-                    validate_shared_property_templates(sp, valid_ns, line_index, diags);
+                    validate_shared_property_templates(sp, valid_ns, uri, line_index, diags);
                 }
                 for prop in &arr.body.properties {
-                    validate_value_templates(&prop.value.value, valid_ns, line_index, diags);
+                    validate_value_templates(&prop.value.value, valid_ns, uri, line_index, diags);
                 }
                 for item in &arr.body.items {
-                    validate_list_item_templates(item, valid_ns, line_index, diags);
+                    validate_list_item_templates(item, valid_ns, uri, line_index, diags);
                 }
             }
             // `oneof` arms hold only discriminator literals and model names;
@@ -480,22 +511,23 @@ fn validate_templates(
 fn validate_body_templates(
     body: &Body,
     valid_ns: &[&str],
+    uri: Option<&tower_lsp::lsp_types::Url>,
     line_index: &LineIndex,
     diags: &mut Vec<Diagnostic>,
 ) {
     for entry in &body.entries {
         match &entry.kind {
             BodyEntryKind::Property(prop) => {
-                validate_value_templates(&prop.value.value, valid_ns, line_index, diags);
+                validate_value_templates(&prop.value.value, valid_ns, uri, line_index, diags);
             }
             BodyEntryKind::NestedBlock(nested) => {
-                validate_body_templates(&nested.body, valid_ns, line_index, diags);
+                validate_body_templates(&nested.body, valid_ns, uri, line_index, diags);
             }
             BodyEntryKind::ListItem(item) => {
-                validate_list_item_templates(item, valid_ns, line_index, diags);
+                validate_list_item_templates(item, valid_ns, uri, line_index, diags);
             }
             BodyEntryKind::SharedProperty(shared) => {
-                validate_shared_property_templates(shared, valid_ns, line_index, diags);
+                validate_shared_property_templates(shared, valid_ns, uri, line_index, diags);
             }
             _ => {}
         }
@@ -505,17 +537,18 @@ fn validate_body_templates(
 fn validate_list_item_templates(
     item: &ListItem,
     valid_ns: &[&str],
+    uri: Option<&tower_lsp::lsp_types::Url>,
     line_index: &LineIndex,
     diags: &mut Vec<Diagnostic>,
 ) {
     match &item.kind {
         ListItemKind::Named { body, .. } => {
-            validate_body_templates(body, valid_ns, line_index, diags);
+            validate_body_templates(body, valid_ns, uri, line_index, diags);
         }
         ListItemKind::Shorthand { value, body } => {
-            validate_value_templates(&value.value, valid_ns, line_index, diags);
+            validate_value_templates(&value.value, valid_ns, uri, line_index, diags);
             if let Some(body) = body {
-                validate_body_templates(body, valid_ns, line_index, diags);
+                validate_body_templates(body, valid_ns, uri, line_index, diags);
             }
         }
         _ => {}
@@ -525,6 +558,7 @@ fn validate_list_item_templates(
 fn validate_value_templates(
     value: &Value,
     valid_ns: &[&str],
+    uri: Option<&tower_lsp::lsp_types::Url>,
     line_index: &LineIndex,
     diags: &mut Vec<Diagnostic>,
 ) {
@@ -544,7 +578,7 @@ fn validate_value_templates(
                     {
                         diag = diag.with_suggestion(s, *span);
                     }
-                    push_diagnostic(diag, None, line_index, diags);
+                    push_diagnostic(diag, None, uri, line_index, diags);
                 }
             }
         }
@@ -595,6 +629,7 @@ package demo:
                 identity: "demo blake3:12345678, store current".to_string(),
             },
             &default_config(),
+            None,
         );
         let dym = diags
             .iter()
@@ -645,7 +680,7 @@ package demo:
     #[test]
     fn unknown_directive_suggestion_applies() {
         let source = "model core:\n    name string #lvie\n";
-        let diags = schema_source_pass(source, &demo_vocab(false));
+        let diags = schema_source_pass(source, &demo_vocab(false), None);
         let diag = diags
             .iter()
             .find(|d| d.message.contains("unknown directive '#lvie'"))
@@ -666,7 +701,7 @@ package demo:
             s.get("end").unwrap().as_u64().unwrap() as usize,
         );
         let fixed = format!("{}{}{}", &source[..start], replacement, &source[end..]);
-        let rediags = schema_source_pass(&fixed, &demo_vocab(false));
+        let rediags = schema_source_pass(&fixed, &demo_vocab(false), None);
         assert!(
             rediags.is_empty(),
             "applying the suggestion must yield a clean directive: {rediags:?}"
@@ -678,7 +713,7 @@ package demo:
     #[test]
     fn directive_arity_both_directions() {
         let source = "model core:\n    name string #live(3)\n    mode string? #key\n";
-        let diags = schema_source_pass(source, &demo_vocab(false));
+        let diags = schema_source_pass(source, &demo_vocab(false), None);
         assert!(
             diags
                 .iter()
@@ -693,7 +728,7 @@ package demo:
         );
         // The satisfied shapes are clean.
         let ok = "model core:\n    name string #live\n    mode string? #key(host)\n";
-        assert!(schema_source_pass(ok, &demo_vocab(false)).is_empty());
+        assert!(schema_source_pass(ok, &demo_vocab(false), None).is_empty());
     }
 
     /// Parity with nudge's boot gate (`verify_directive_vocabulary`):
@@ -702,7 +737,7 @@ package demo:
     #[test]
     fn live_restart_conflict_on_same_field() {
         let source = "model core:\n    name string #live #restart\n    mode string? #live\n";
-        let diags = schema_source_pass(source, &demo_vocab(false));
+        let diags = schema_source_pass(source, &demo_vocab(false), None);
         let conflicts: Vec<_> = diags
             .iter()
             .filter(|d| d.message == "'#live' and '#restart' contradict — pick one")
@@ -724,7 +759,7 @@ package demo:
     #[test]
     fn bare_hash_is_not_double_reported() {
         let source = "model core:\n    name string #\n";
-        let diags = schema_source_pass(source, &demo_vocab(false));
+        let diags = schema_source_pass(source, &demo_vocab(false), None);
         assert!(
             !diags
                 .iter()
@@ -739,7 +774,7 @@ package demo:
     #[test]
     fn extraction_error_surfaces() {
         let source = "model core:\n    name strin g+ @@@\n";
-        let diags = schema_source_pass(source, &demo_vocab(false));
+        let diags = schema_source_pass(source, &demo_vocab(false), None);
         assert!(
             diags
                 .iter()
@@ -753,7 +788,7 @@ package demo:
     #[test]
     fn undeclared_sibling_info() {
         let source = "model extra:\n    name string+\n";
-        let diags = schema_source_pass(source, &demo_vocab(true));
+        let diags = schema_source_pass(source, &demo_vocab(true), None);
         let info = diags
             .iter()
             .find(|d| d.severity == Some(DiagnosticSeverity::INFORMATION))
@@ -763,7 +798,7 @@ package demo:
             "not part of package 'demo'; add a []schema entry to participate"
         );
         // Declared / non-sibling coverage carries no info note.
-        assert!(schema_source_pass(source, &demo_vocab(false)).is_empty());
+        assert!(schema_source_pass(source, &demo_vocab(false), None).is_empty());
     }
 
     /// Registry-mode shim keeping the existing test bodies terse.
@@ -782,6 +817,7 @@ package demo:
                 oneofs,
             },
             config,
+            None,
         )
     }
 
@@ -1020,6 +1056,36 @@ package demo:
         );
     }
 
+    /// RFC 0009: related information reaches the editor spec-natively —
+    /// an unterminated string's diagnostic carries a `relatedInformation`
+    /// entry pointing at the opening delimiter, located in the document's
+    /// own uri.
+    #[test]
+    fn related_information_is_spec_native_with_uri() {
+        let uri = tower_lsp::lsp_types::Url::parse("file:///test.nml").unwrap();
+        let diags = compute(
+            "service Api:\n    name = \"abc\n",
+            &SchemaMode::Registry {
+                models: &[],
+                enums: &[],
+                oneofs: &[],
+            },
+            &DiagnosticConfig::default(),
+            Some(&uri),
+        );
+        let unterminated = diags
+            .iter()
+            .find(|d| d.message.contains("unterminated"))
+            .expect("unterminated-string diagnostic");
+        let related = unterminated
+            .related_information
+            .as_ref()
+            .expect("relatedInformation present when a uri is known");
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].location.uri, uri);
+        assert!(related[0].message.contains("opened here"));
+    }
+
     /// RFC 0012: in registry (open) mode, the document's own definitions
     /// type its own instances — editor parity with `nml check`.
     #[test]
@@ -1033,6 +1099,7 @@ package demo:
                 oneofs: &[],
             },
             &DiagnosticConfig::default(),
+            None,
         );
         assert!(
             diags
@@ -1056,6 +1123,7 @@ package demo:
                 oneofs: &registry.oneofs,
             },
             &DiagnosticConfig::default(),
+            None,
         );
         assert!(
             diags.iter().any(|d| d.code
@@ -1085,6 +1153,7 @@ package demo:
                 oneofs: &registry.oneofs,
             },
             &config,
+            None,
         );
         assert!(
             diags.iter().all(|d| d.code

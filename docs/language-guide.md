@@ -240,9 +240,15 @@ references.
 | Syntax | Meaning |
 |--------|---------|
 | `@roleRef` | Role or identity reference |
+| `@a & @b` | Role-conjunction expression (RFC 0011) |
 
 Fields accept both inline definitions and references to declarations
 defined elsewhere in the file.
+
+A single `&` between role references forms one conjunction expression
+(valid in scalar values, inline array elements, and block-list items); see
+[Requiring Several Roles at Once](#requiring-several-roles-at-once-) for
+usage and semantics. RFC 0011 specifies the grammar.
 
 ## Modeling
 
@@ -500,28 +506,30 @@ service AdminReports:
 ```
 
 Each list entry is an independent grant (any entry may match); `&`
-composes conditions *within* an entry. Spacing is canonicalized to
-`" & "` — `nml fmt` rewrites tight spacing for you.
+composes conditions *within* an entry — the list is the OR, `&` is the
+AND. The language carries the expression opaquely; consumers assign the
+set-intersection semantics. A conjunction lowers to one value in canonical
+`" & "`-joined form regardless of source spacing (`@a&@b` ≡ `@a & @b`),
+and `nml fmt` rewrites tight spacing for you. `&&` and dangling `&` are
+parse errors with targeted guidance (single `&`, as in type-intersection
+languages — there is no `&&` and no `and`).
 
 ### Inheritance
 
-Access control flows from parent to child. A `service` sets top-level rules;
-individual resources or endpoints can override them:
+Access control flows from parent to child, and **children narrow — they
+never widen**: nested gates mean the visitor passes *every* level, so a
+child's `|allow` can tighten the audience but cannot punch a hole in the
+parent's. (A `@public` child under an admins-only parent composes to
+admins-only — the parent's gate always applies.)
 
 ```
 service NudgeService:
     |allow:
-        - @role/admin
+        - @public             // the service is broadly reachable
 
     resources:
-        - PublicPage:
-            |allow = [@public]    // overrides service-level
-            path = "/"
-
-        - AdminPage:
-            // inherits @role/admin from service
-            path = "/admin"
-```
+        - AdminPanel:
+            |allow = [@role/admin]    // narrows: this resource is admins-only```
 
 ## Reference Assignment
 

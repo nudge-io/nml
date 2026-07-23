@@ -30,6 +30,7 @@ mod value;
 
 pub use syntax::{NmlLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 pub use value::decode_value;
+pub(crate) use value::KNOWN_NAMESPACES;
 
 use crate::error::NmlError;
 use rowan::GreenNode;
@@ -39,6 +40,7 @@ use rowan::GreenNode;
 pub struct Parse {
     green: GreenNode,
     errors: Vec<NmlError>,
+    suppressed: usize,
 }
 
 impl Parse {
@@ -48,6 +50,12 @@ impl Parse {
     }
 
     /// Every diagnostic collected during lexing and parsing.
+    /// Errors dropped past the `MAX_ERRORS` bound (RFC 0009 exact-count
+    /// honesty): `0` means [`Self::errors`] is the complete list.
+    pub fn suppressed(&self) -> usize {
+        self.suppressed
+    }
+
     pub fn errors(&self) -> &[NmlError] {
         &self.errors
     }
@@ -74,14 +82,24 @@ pub fn parse(source: &str) -> Parse {
     let lexed = lexer::lex(source);
     let mut p = parser::Parser::new(&lexed.tokens);
     p.parse_root();
-    let (events, parse_errors) = p.finish_parse();
+    let (events, parse_errors, parser_suppressed) = p.finish_parse();
     let green = parser::build_tree(&lexed.tokens, &events);
 
     let mut errors = lexed.errors;
     errors.extend(parse_errors);
-    errors.truncate(MAX_ERRORS);
+    // Exact suppression accounting (RFC 0009): layer drops + merge clip —
+    // truncation is bounded output, never silent loss.
+    let mut suppressed = lexed.suppressed + parser_suppressed;
+    if errors.len() > MAX_ERRORS {
+        suppressed += errors.len() - MAX_ERRORS;
+        errors.truncate(MAX_ERRORS);
+    }
 
-    Parse { green, errors }
+    Parse {
+        green,
+        errors,
+        suppressed,
+    }
 }
 
 /// Parse to the **semantic AST**, collecting **every** diagnostic — syntactic
@@ -95,26 +113,99 @@ pub fn parse(source: &str) -> Parse {
 /// errors. Use this to report every problem at once; [`parse_to_ast`] is the
 /// single-error drop-in derived from it.
 pub fn parse_to_ast_all(source: &str) -> (crate::ast::File, Vec<crate::diagnostic::Diagnostic>) {
-    let (_parsed, file, mut errors) = parse_lowered(source);
-    // Bounded output (RFC 0004 §9).
-    errors.truncate(MAX_ERRORS);
+    let (_parsed, file, errors, suppressed) = parse_lowered(source);
+    (file, finalize_diagnostics(errors, suppressed))
+}
+
+/// The ONE findings boundary (RFC 0009): bounded output (RFC 0004 §9) with
+/// exact-count honesty — when anything was clipped, the last entry says how
+/// much. Shared by every `Vec<Diagnostic>`-returning surface, so the CLI
+/// and the LSP inherit identical truncation behavior.
+fn finalize_diagnostics(
+    mut errors: Vec<NmlError>,
+    mut suppressed: usize,
+) -> Vec<crate::diagnostic::Diagnostic> {
+    if errors.len() > MAX_ERRORS {
+        suppressed += errors.len() - MAX_ERRORS;
+        errors.truncate(MAX_ERRORS);
+    }
     // The public reporting boundary speaks the unified findings model
     // (RFC 0008); NmlError stays the internal/abort currency.
-    (file, errors.iter().map(NmlError::to_diagnostic).collect())
+    let mut out: Vec<crate::diagnostic::Diagnostic> =
+        errors.iter().map(NmlError::to_diagnostic).collect();
+    if suppressed > 0 {
+        out.push(crate::diagnostic::Diagnostic::info(format!(
+            "{suppressed} additional error(s) suppressed (limit {MAX_ERRORS})"
+        )));
+    }
+    out
 }
 
 /// Shared core: parse to the CST, lower to the semantic AST, and merge the
 /// syntactic + semantic errors into one position-sorted list. Returns the
 /// [`Parse`] too (callers needing the tree, e.g. for comments). The single home
 /// for the parse → AST + diagnostics pipeline.
-fn parse_lowered(source: &str) -> (Parse, crate::ast::File, Vec<NmlError>) {
+fn parse_lowered(source: &str) -> (Parse, crate::ast::File, Vec<NmlError>, usize) {
     use ast::AstNode as _;
     let parsed = parse(source);
     let root = ast::Root::cast(parsed.syntax()).expect("parse always yields a Root node");
-    let (file, mut errors) = lower::to_ast_with_errors(&root);
+    let (file, mut errors, lower_suppressed) = lower::to_ast_with_errors(&root);
     errors.extend(parsed.errors().iter().cloned());
     errors.sort_by_key(|e| e.span().start);
-    (parsed, file, errors)
+    coalesce_expected(&mut errors);
+    let suppressed = parsed.suppressed + lower_suppressed;
+    (parsed, file, errors, suppressed)
+}
+
+/// Merge consecutive same-offset `Expected` diagnostics by unioning their
+/// alternatives — recovery cascades otherwise report "expected a name" AND
+/// "expected a declaration" at one position, where rustc renders a single
+/// "expected one of …". Information-lossless: only `Expected` kinds merge
+/// (a co-located lexer error is never suppressed), the first entry's
+/// found/context win, and the list is already position-sorted (stable), so
+/// adjacency is guaranteed.
+fn coalesce_expected(errors: &mut Vec<NmlError>) {
+    use crate::error::ParseErrorKind::Expected;
+    let mut i = 0;
+    while i + 1 < errors.len() {
+        let same_start = errors[i].span().start == errors[i + 1].span().start;
+        let both_expected = matches!(
+            &errors[i],
+            NmlError::Syntax {
+                kind: Expected { .. },
+                ..
+            }
+        ) && matches!(
+            &errors[i + 1],
+            NmlError::Syntax {
+                kind: Expected { .. },
+                ..
+            }
+        );
+        if same_start && both_expected {
+            let NmlError::Syntax {
+                kind: Expected { expected: add, .. },
+                ..
+            } = errors.remove(i + 1)
+            else {
+                unreachable!("matched Expected above");
+            };
+            let NmlError::Syntax {
+                kind: Expected { expected, .. },
+                ..
+            } = &mut errors[i]
+            else {
+                unreachable!("matched Expected above");
+            };
+            for item in add {
+                if !expected.contains(&item) {
+                    expected.push(item);
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Parse to the owned AST, returning the **first** error by source position — a
@@ -123,7 +214,7 @@ fn parse_lowered(source: &str) -> (Parse, crate::ast::File, Vec<NmlError>) {
 pub fn parse_to_ast(source: &str) -> crate::error::NmlResult<crate::ast::File> {
     // Derived from `parse_lowered` (not `parse_to_ast_all`): the abort path
     // keeps `NmlError`; only the findings-report boundary speaks Diagnostic.
-    let (_parsed, file, errors) = parse_lowered(source);
+    let (_parsed, file, errors, _suppressed) = parse_lowered(source);
     match errors.into_iter().next() {
         Some(e) => Err(e),
         None => Ok(file),
@@ -158,12 +249,11 @@ pub fn extract_schema(
     // One parse; the canonical lower pass yields every diagnostic, and `extract`
     // reads the same tree for the schema itself. Like `parse_to_ast_all`, the
     // public reporting boundary speaks the unified findings model (RFC 0008).
-    let (parsed, _ast, mut errors) = parse_lowered(source);
-    errors.truncate(MAX_ERRORS);
+    let (parsed, _ast, errors, suppressed) = parse_lowered(source);
     let root = ast::Root::cast(parsed.syntax()).expect("parse always yields a Root node");
     (
         extract::extract(&root),
-        errors.iter().map(NmlError::to_diagnostic).collect(),
+        finalize_diagnostics(errors, suppressed),
     )
 }
 
@@ -217,7 +307,7 @@ pub struct Comment {
 pub fn parse_with_comments(
     source: &str,
 ) -> crate::error::NmlResult<(crate::ast::File, Vec<Comment>)> {
-    let (parsed, file, errors) = parse_lowered(source);
+    let (parsed, file, errors, _suppressed) = parse_lowered(source);
     match errors.into_iter().next() {
         Some(e) => Err(e),
         None => Ok((file, comments_of(&parsed.syntax()))),
@@ -575,6 +665,26 @@ mod tests {
     }
 
     #[test]
+    fn error_payload_captures_are_bounded() {
+        // Memory-amplification hardening: a pathological multi-megabyte
+        // token is captured one char past the render bound, never cloned
+        // wholesale into the payload. The rendered message ellipsizes.
+        let huge = "9".repeat(1_000_000);
+        let src = format!("service Api:\n    x = {huge}.2.3\n");
+        let (_ast, diags) = parse_to_ast_all(&src);
+        let num = diags
+            .iter()
+            .find(|d| d.message.contains("invalid number"))
+            .expect("invalid-number diagnostic");
+        assert!(
+            num.message.len() < 200,
+            "payload capture must be bounded, message was {} bytes",
+            num.message.len()
+        );
+        assert!(num.message.contains('…'), "{}", num.message);
+    }
+
+    #[test]
     fn parse_to_ast_all_bounds_error_output() {
         // Hundreds of semantic errors must not produce an unbounded list — the
         // output is capped at MAX_ERRORS like the parser's (RFC 0004 §9).
@@ -582,11 +692,27 @@ mod tests {
         for i in 0..400 {
             src.push_str(&format!("    k{i} = 9.999 USD\n"));
         }
-        let (_ast, errors) = parse_to_ast_all(&src);
+        let (_ast, diags) = parse_to_ast_all(&src);
+        // Bounded output PLUS honesty (RFC 0009): at most MAX_ERRORS real
+        // findings, and clipping appends ONE Info marker naming the exact
+        // count — truncation is never silent.
         assert!(
-            errors.len() <= MAX_ERRORS,
+            diags.len() <= MAX_ERRORS + 1,
             "unbounded error output: {}",
-            errors.len()
+            diags.len()
+        );
+        let errors = diags
+            .iter()
+            .filter(|d| d.severity == crate::diagnostic::Severity::Error)
+            .count();
+        assert!(errors <= MAX_ERRORS, "{errors}");
+        let marker = diags.last().expect("clipped run has a marker");
+        assert_eq!(marker.severity, crate::diagnostic::Severity::Info);
+        // 400 emitted − 128 kept = 272 suppressed, counted exactly.
+        assert!(
+            marker.message.contains("272") && marker.message.contains("suppressed"),
+            "{:?}",
+            marker.message
         );
     }
 

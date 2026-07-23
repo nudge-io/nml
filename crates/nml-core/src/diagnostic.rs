@@ -2,21 +2,23 @@
 //! reports (RFC 0008).
 //!
 //! **Abort vs. report:** [`crate::error::NmlError`] is the *abort* error for
-//! `Result` signatures (it implements `std::error::Error`); [`Diagnostic`]
-//! is a *findings report* — data, deliberately not an error trait object.
-//! Every surface that reports findings (validator, symbols, parser error
-//! lists, LSP, CLI) speaks this type, so hints, codes, and rendering exist
-//! exactly once.
+//! `Result` signatures (it implements `std::error::Error`);
+//! [`Diagnostic`](crate::diagnostic::Diagnostic) is a *findings report* —
+//! data, deliberately not an error trait object. Every surface that reports
+//! findings (validator, symbols, parser error lists, LSP, CLI) speaks this
+//! type, so hints, codes, and rendering exist exactly once.
 //!
 //! **Hints are derived, never hand-written:** producers attach a structured
-//! [`Suggestion`]; [`Diagnostic::rendered_message`] is the single renderer
-//! that turns it into the human-facing `(did you mean "…"?)` text. Baking
-//! hint prose into `message` is a bug.
+//! [`Suggestion`](crate::diagnostic::Suggestion);
+//! [`rendered_message`](crate::diagnostic::Diagnostic::rendered_message) is
+//! the single renderer that turns it into the human-facing
+//! `(did you mean "…"?)` text. Baking hint prose into `message` is a bug.
 //!
-//! **Codes are forever:** a [`Code`] is stable from the first published
-//! release onward — never renumbered, never reused (see `docs/stability.md`).
-//! The constants in [`codes`] are the only way to mint one, so the rule is
-//! enforced by construction. Their doc comments seed the error-index pages.
+//! **Codes are forever:** a [`Code`](crate::diagnostic::Code) is stable from
+//! the first published release onward — never renumbered, never reused (see
+//! `docs/stability.md`). The constants in [`codes`](crate::diagnostic::codes)
+//! are the only way to mint one, so the rule is enforced by construction.
+//! Their doc comments seed the error-index pages.
 
 use std::fmt;
 
@@ -103,6 +105,38 @@ pub mod codes {
         /// ledger in the error index (the fixers commitment,
         /// `docs/stability.md`).
         REPLACED_SYNTAX = 1;
+        /// The parser met a token that fits no expected alternative.
+        UNEXPECTED_TOKEN = 2;
+        /// A string literal is missing its closing delimiter.
+        UNTERMINATED_STRING = 3;
+        /// A byte no NML token starts with.
+        UNEXPECTED_CHARACTER = 4;
+        /// A tab character in indentation (the spec requires spaces).
+        TAB_IN_INDENT = 5;
+        /// A dedent to a column that matches no enclosing block (the
+        /// offside rule).
+        BAD_DEDENT = 6;
+        /// A deliberate nesting bound was exceeded (DoS defense on
+        /// untrusted input; the index documents the limits).
+        NESTING_LIMIT = 7;
+        /// `set<a, b>` — set elements are alternatives (`|`), not a list.
+        /// Machine-fixable.
+        SET_SEPARATOR = 8;
+        /// `map` is reserved for a future map type.
+        RESERVED_TYPE_KEYWORD = 9;
+        /// An identifier takes type arguments but only `set` is a
+        /// constructor; comes with a did-you-mean.
+        UNKNOWN_TYPE_CONSTRUCTOR = 10;
+        /// The same `#directive` key twice on one field.
+        DUPLICATE_DIRECTIVE = 11;
+        /// An unknown or unterminated string escape.
+        INVALID_ESCAPE = 12;
+        /// A numeric literal no number parses from.
+        INVALID_NUMBER = 13;
+        /// An integer outside `i64` (numbers are exact by design).
+        NUMBER_OUT_OF_RANGE = 14;
+        /// A malformed `$NS.key` variable reference.
+        BAD_SECRET_REF = 15;
 
         /// The same name is declared more than once in one namespace.
         DUPLICATE_DECLARATION = 1000;
@@ -249,10 +283,16 @@ pub mod codes {
         /// of an unintended self-reference).
         MODEL_REFERENCE_CYCLE = 2014;
 
-        /// A money literal is malformed.
+        /// A money literal is malformed (unparseable amount or fraction).
         INVALID_MONEY = 3000;
         /// A money literal names a currency code not in the ISO 4217 table.
         UNKNOWN_CURRENCY = 3001;
+        /// More fractional digits than the currency's minor unit allows
+        /// (`19.999 USD` — USD has 2).
+        MONEY_PRECISION = 3002;
+        /// The scaled minor-unit amount exceeds `i64` (money is exact by
+        /// design, never floated).
+        AMOUNT_OUT_OF_RANGE = 3003;
 
         /// A directive name is not in the covering package's vocabulary.
         UNKNOWN_DIRECTIVE = 5000;
@@ -302,6 +342,18 @@ pub struct Diagnostic {
     pub source: Option<String>,
     /// A machine-applicable fix, when one is derivable.
     pub suggestion: Option<Suggestion>,
+    /// Secondary locations that explain the primary one (RFC 0009) — e.g.
+    /// an unterminated string's opening quote, far from where the failure
+    /// surfaces. The LSP maps these to spec-native
+    /// `DiagnosticRelatedInformation`; the CLI prints `note:` lines.
+    pub related: Vec<Related>,
+}
+
+/// One secondary location on a [`Diagnostic`] — see [`Diagnostic::related`].
+#[derive(Debug, Clone)]
+pub struct Related {
+    pub span: Span,
+    pub message: String,
 }
 
 impl Diagnostic {
@@ -313,6 +365,7 @@ impl Diagnostic {
             span: None,
             source: None,
             suggestion: None,
+            related: Vec::new(),
         }
     }
 
@@ -340,6 +393,14 @@ impl Diagnostic {
 
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
+        self
+    }
+
+    pub fn with_related(mut self, span: Span, message: impl Into<String>) -> Self {
+        self.related.push(Related {
+            span,
+            message: message.into(),
+        });
         self
     }
 
@@ -371,11 +432,31 @@ impl Diagnostic {
 /// See [`Diagnostic::rendered`].
 pub struct Rendered<'a>(&'a Diagnostic);
 
+/// Write `text` with control characters escaped (`\n` → `\u{a}`-style),
+/// still zero-alloc. Diagnostics echo *untrusted source text* (found
+/// tokens, bad literals, enum values); a malicious file must not be able
+/// to smuggle terminal escape sequences into CLI output or log lines.
+/// One choke point — every render path goes through [`Rendered`], so no
+/// producer has to remember.
+fn write_sanitized(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
+    use fmt::Write as _;
+    for ch in text.chars() {
+        if ch.is_control() {
+            write!(f, "{}", ch.escape_default())?;
+        } else {
+            f.write_char(ch)?;
+        }
+    }
+    Ok(())
+}
+
 impl fmt::Display for Rendered<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0.message)?;
+        write_sanitized(f, &self.0.message)?;
         if let Some(s) = &self.0.suggestion {
-            write!(f, " (did you mean \"{}\"?)", s.replacement)?;
+            f.write_str(" (did you mean \"")?;
+            write_sanitized(f, &s.replacement)?;
+            f.write_str("\"?)")?;
         }
         Ok(())
     }
@@ -454,6 +535,16 @@ mod tests {
             diag.to_string(),
             "error: invalid value \"wran\" (did you mean \"warn\"?)"
         );
+    }
+
+    #[test]
+    fn rendered_escapes_control_characters() {
+        // Diagnostics echo untrusted source text; a malicious file must not
+        // smuggle terminal escapes into CLI output through ANY render path.
+        let d = Diagnostic::error("bad \u{1b}[31mred\u{7} value".to_string());
+        let out = d.rendered_message();
+        assert!(!out.contains('\u{1b}') && !out.contains('\u{7}'), "{out:?}");
+        assert!(out.contains("\\u{1b}"), "escaped visibly: {out:?}");
     }
 
     #[test]

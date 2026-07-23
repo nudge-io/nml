@@ -545,7 +545,7 @@ impl FieldDef {
     }
     /// The leading own-line comment block documenting this field (RFC 0004
     /// §4.3) — the same contiguous-block rule as [`ListItem::doc_comment`],
-    /// via the shared [`entry_doc_comment`] walk.
+    /// via the shared `entry_doc_comment` walk.
     pub fn doc_comment(&self) -> Option<String> {
         entry_doc_comment(&self.0)
     }

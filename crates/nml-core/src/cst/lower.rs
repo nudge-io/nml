@@ -25,18 +25,23 @@ pub fn to_ast(root: &ast::Root) -> File {
 /// in a single pass. The CST defers value validation to decode, so this is where
 /// those diagnostics surface — once, as the AST is built (no second decode pass).
 /// Powers [`parse_to_ast`](crate::cst::parse_to_ast).
-pub fn to_ast_with_errors(root: &ast::Root) -> (File, Vec<NmlError>) {
-    let mut cx = Lower { errors: Vec::new() };
+pub fn to_ast_with_errors(root: &ast::Root) -> (File, Vec<NmlError>, usize) {
+    let mut cx = Lower {
+        errors: Vec::new(),
+        suppressed: 0,
+    };
     let file = File {
         declarations: root.decls().map(|d| cx.declaration(d)).collect(),
     };
-    (file, cx.errors)
+    (file, cx.errors, cx.suppressed)
 }
 
 /// Lowering state: the diagnostics accumulator (rust-analyzer's pattern — a
 /// stateful walk with a diagnostic sink, rather than threading `Result`).
 struct Lower {
     errors: Vec<NmlError>,
+    /// Errors dropped at the `MAX_ERRORS` cap — counted, never silent.
+    suppressed: usize,
 }
 
 impl Lower {
@@ -324,6 +329,8 @@ impl Lower {
     fn push_error(&mut self, e: NmlError) {
         if self.errors.len() < super::MAX_ERRORS {
             self.errors.push(e);
+        } else {
+            self.suppressed += 1;
         }
     }
 

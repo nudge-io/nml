@@ -54,6 +54,9 @@ pub(super) struct Parser<'a> {
     depth: u32,
     events: Vec<Event>,
     errors: Vec<NmlError>,
+    /// Errors dropped at the `MAX_ERRORS` cap — counted, never silent
+    /// (RFC 0009: exact suppression accounting).
+    suppressed: usize,
 }
 
 /// An open node. Completed into a real node or abandoned (its tombstone is then
@@ -102,6 +105,7 @@ impl<'a> Parser<'a> {
             depth: 0,
             events: Vec::new(),
             errors: Vec::new(),
+            suppressed: 0,
         }
     }
 
@@ -173,35 +177,72 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect(&mut self, kind: SyntaxKind, what: &str) {
+    fn expect(&mut self, kind: SyntaxKind) {
         if !self.eat(kind) {
-            self.error(&format!("expected {what}"));
+            self.expected(vec![crate::error::ExpectedItem::Kind(kind)], None);
         }
     }
 
-    fn error(&mut self, message: &str) {
-        self.error_kind(crate::error::ParseErrorKind::Generic(message.to_string()));
+    /// [`Self::expect`] with a grammar-class description richer than the
+    /// token's generic name ("an item keyword", not "a name").
+    fn expect_desc(&mut self, kind: SyntaxKind, desc: &'static str) {
+        if !self.eat(kind) {
+            self.expected(vec![crate::error::ExpectedItem::Desc(desc)], None);
+        }
     }
 
-    /// Classified emission (RFC 0009); [`Self::error`] wraps legacy prose in
-    /// the transitional `Generic` kind, so classifying a site is a one-line
-    /// local change.
+    /// The `Expected` workhorse (RFC 0009): alternatives + the found token,
+    /// captured here so no site ever states "found" by hand.
+    fn expected(
+        &mut self,
+        expected: Vec<crate::error::ExpectedItem>,
+        context: Option<&'static str>,
+    ) {
+        let found = self.toks.get(self.pos).map(|t| crate::error::FoundToken {
+            kind: t.kind,
+            text: crate::error::echo_capture(t.text),
+        });
+        self.error_kind(crate::error::ParseErrorKind::Expected {
+            expected,
+            found,
+            context,
+        });
+    }
+
+    /// The current token's full span (RFC 0009: squiggles cover the token,
+    /// never a caret between characters); empty at end-of-input.
+    fn current_span(&self) -> Span {
+        match self.toks.get(self.pos) {
+            Some(t) => Span::new(t.offset, t.offset + t.text.len()),
+            None => Span::empty(self.toks.last().map_or(0, |t| t.offset + t.text.len())),
+        }
+    }
+
+    /// Classified emission (RFC 0009), anchored at the current token.
     fn error_kind(&mut self, kind: crate::error::ParseErrorKind) {
+        let span = self.current_span();
+        self.error_kind_at(kind, span);
+    }
+
+    /// The span-override entry of the single emission channel — for errors
+    /// whose true extent is not the current token (e.g. `&&`, whose fix
+    /// must cover both amps). Span policy stays explicit and central.
+    fn error_kind_at(&mut self, kind: crate::error::ParseErrorKind, span: Span) {
         if self.errors.len() < super::MAX_ERRORS {
-            let offset = self
-                .toks
-                .get(self.pos)
-                .or_else(|| self.toks.last())
-                .map_or(0, |t| t.offset);
-            self.errors
-                .push(NmlError::parse_kind(kind, Span::empty(offset)));
+            self.errors.push(NmlError::syntax(kind, span));
+        } else {
+            self.suppressed += 1;
         }
     }
 
-    /// Panic-mode recovery: wrap the current token in an `Error` node. Consumes
-    /// one token ⇒ forward progress.
-    fn err_recover(&mut self, message: &str) {
-        self.error(message);
+    /// [`Self::expected`] + panic-mode recovery (one token consumed ⇒
+    /// forward progress).
+    fn err_recover_expected(
+        &mut self,
+        expected: Vec<crate::error::ExpectedItem>,
+        context: Option<&'static str>,
+    ) {
+        self.expected(expected, context);
         if !self.at_eof() {
             self.bump_as(SyntaxKind::Error);
         }
@@ -235,7 +276,10 @@ impl<'a> Parser<'a> {
                 _ => self.block_decl(),
             }
         } else {
-            self.err_recover("expected a declaration");
+            self.err_recover_expected(
+                vec![crate::error::ExpectedItem::Desc("a declaration")],
+                None,
+            );
         }
     }
 
@@ -255,8 +299,8 @@ impl<'a> Parser<'a> {
     fn array_decl(&mut self) {
         let m = self.start();
         self.bump(); // [
-        self.expect(SyntaxKind::RBracket, "']'");
-        self.expect(SyntaxKind::Ident, "an item keyword"); // item keyword
+        self.expect(SyntaxKind::RBracket);
+        self.expect_desc(SyntaxKind::Ident, "an item keyword");
         self.name();
         if self.eat(SyntaxKind::Colon) {
             self.body();
@@ -269,7 +313,7 @@ impl<'a> Parser<'a> {
         let m = self.start();
         self.bump(); // const
         self.name();
-        self.expect(SyntaxKind::Eq, "'='");
+        self.expect(SyntaxKind::Eq);
         self.value_block();
         m.complete(self, SyntaxKind::ConstDecl);
     }
@@ -279,7 +323,7 @@ impl<'a> Parser<'a> {
         let m = self.start();
         self.bump(); // template
         self.name();
-        self.expect(SyntaxKind::Colon, "':'");
+        self.expect(SyntaxKind::Colon);
         self.value_block();
         m.complete(self, SyntaxKind::TemplateDecl);
     }
@@ -291,18 +335,21 @@ impl<'a> Parser<'a> {
         self.name();
         if self.at_kw("by") {
             self.bump();
-            self.expect(SyntaxKind::Ident, "a discriminator");
+            self.expect_desc(SyntaxKind::Ident, "a discriminator");
         } else {
-            self.error("expected 'by <discriminator>'");
+            self.expected(
+                vec![crate::error::ExpectedItem::Desc("`by <discriminator>`")],
+                None,
+            );
         }
         if self.at_kw("as") {
             self.bump();
-            self.expect(SyntaxKind::Ident, "an enum name");
+            self.expect_desc(SyntaxKind::Ident, "an enum name");
         }
         if self.eat(SyntaxKind::Eq) {
-            self.expect(SyntaxKind::String, "a quoted default discriminator value");
+            self.expect_desc(SyntaxKind::String, "a quoted default discriminator value");
         }
-        self.expect(SyntaxKind::Colon, "':'");
+        self.expect(SyntaxKind::Colon);
         if self.eat(SyntaxKind::Indent) {
             self.repeat_until_dedent(Self::oneof_arm);
         }
@@ -323,16 +370,16 @@ impl<'a> Parser<'a> {
                 new: "->",
             });
         } else {
-            self.expect(SyntaxKind::Arrow, "'->'");
+            self.expect(SyntaxKind::Arrow);
         }
     }
 
     /// `"value" -> Model`
     fn oneof_arm(&mut self) {
         let m = self.start();
-        self.expect(SyntaxKind::String, "a quoted discriminator value");
+        self.expect_desc(SyntaxKind::String, "a quoted discriminator value");
         self.expect_arrow();
-        self.expect(SyntaxKind::Ident, "a variant model name");
+        self.expect_desc(SyntaxKind::Ident, "a variant model name");
         m.complete(self, SyntaxKind::OneOfArm);
     }
 
@@ -343,9 +390,9 @@ impl<'a> Parser<'a> {
         }
         let m = self.start();
         self.bump(); // is
-        self.expect(SyntaxKind::Ident, "a parent name");
+        self.expect_desc(SyntaxKind::Ident, "a parent name");
         while self.eat(SyntaxKind::Comma) {
-            self.expect(SyntaxKind::Ident, "a parent name");
+            self.expect_desc(SyntaxKind::Ident, "a parent name");
         }
         m.complete(self, SyntaxKind::Extends);
     }
@@ -355,7 +402,10 @@ impl<'a> Parser<'a> {
         if self.at(SyntaxKind::Ident) {
             self.bump_as(SyntaxKind::Name);
         } else {
-            self.error("expected a name");
+            self.expected(
+                vec![crate::error::ExpectedItem::Kind(SyntaxKind::Ident)],
+                None,
+            );
         }
     }
 
@@ -366,7 +416,7 @@ impl<'a> Parser<'a> {
         }
         self.depth += 1;
         if self.depth > MAX_DEPTH {
-            self.error("maximum nesting depth exceeded");
+            self.error_kind(crate::error::ParseErrorKind::NestingLimit { what: "block" });
             self.skip_block();
             self.depth -= 1;
             return;
@@ -401,7 +451,10 @@ impl<'a> Parser<'a> {
                 self.arm()
             }
             SyntaxKind::Ident => self.ident_entry(),
-            _ => self.err_recover("unexpected token in block body"),
+            _ => self.err_recover_expected(
+                vec![crate::error::ExpectedItem::Desc("a block entry")],
+                Some("in a block body"),
+            ),
         }
     }
 
@@ -420,7 +473,12 @@ impl<'a> Parser<'a> {
         if matches!(self.current(), SyntaxKind::Ident | SyntaxKind::String) {
             self.bump();
         } else {
-            self.error("expected an arm target (a name or a string literal)");
+            self.expected(
+                vec![crate::error::ExpectedItem::Desc(
+                    "an arm target (a name or a string)",
+                )],
+                None,
+            );
         }
         m.complete(self, SyntaxKind::Arm);
     }
@@ -448,7 +506,14 @@ impl<'a> Parser<'a> {
             self.field_directives();
             m.complete(self, SyntaxKind::FieldDef);
         } else {
-            self.error("expected '=', ':', or a type");
+            self.expected(
+                vec![
+                    crate::error::ExpectedItem::Kind(SyntaxKind::Eq),
+                    crate::error::ExpectedItem::Kind(SyntaxKind::Colon),
+                    crate::error::ExpectedItem::Desc("a type"),
+                ],
+                None,
+            );
             m.complete(self, SyntaxKind::Error);
         }
     }
@@ -457,7 +522,7 @@ impl<'a> Parser<'a> {
     fn modifier(&mut self) {
         let m = self.start();
         self.bump(); // |
-        self.expect(SyntaxKind::Ident, "a modifier name");
+        self.expect_desc(SyntaxKind::Ident, "a modifier name");
         if self.eat(SyntaxKind::Eq) {
             self.value_block();
         } else if self.eat(SyntaxKind::Colon) {
@@ -469,7 +534,14 @@ impl<'a> Parser<'a> {
             // []string? #live`) — it takes directives like any field.
             self.field_directives();
         } else {
-            self.error("expected '=', ':', or a type after a modifier");
+            self.expected(
+                vec![
+                    crate::error::ExpectedItem::Kind(SyntaxKind::Eq),
+                    crate::error::ExpectedItem::Kind(SyntaxKind::Colon),
+                    crate::error::ExpectedItem::Desc("a type"),
+                ],
+                Some("after a modifier"),
+            );
         }
         m.complete(self, SyntaxKind::Modifier);
     }
@@ -488,16 +560,19 @@ impl<'a> Parser<'a> {
             if self.at(SyntaxKind::Ident) {
                 let name = self.current_text().to_string();
                 if seen.contains(&name) {
-                    self.error("duplicate directive — each directive may appear once per field");
+                    self.error_kind(crate::error::ParseErrorKind::DuplicateDirective);
                 }
                 seen.push(name);
                 self.bump();
             } else {
-                self.error("expected a directive name after '#'");
+                self.expected(
+                    vec![crate::error::ExpectedItem::Desc("a directive name")],
+                    Some("after '#'"),
+                );
             }
             if self.eat(SyntaxKind::LParen) {
                 self.value();
-                self.expect(SyntaxKind::RParen, "')'");
+                self.expect(SyntaxKind::RParen);
             }
             d.complete(self, SyntaxKind::Directive);
         }
@@ -507,13 +582,19 @@ impl<'a> Parser<'a> {
     fn shared_property(&mut self) {
         let m = self.start();
         self.bump(); // .
-        self.expect(SyntaxKind::Ident, "a shared-property name");
+        self.expect_desc(SyntaxKind::Ident, "a shared-property name");
         if self.eat(SyntaxKind::Colon) {
             self.body();
         } else if self.eat(SyntaxKind::Eq) {
             self.value_block();
         } else {
-            self.error("expected ':' or '=' after a shared property");
+            self.expected(
+                vec![
+                    crate::error::ExpectedItem::Kind(SyntaxKind::Colon),
+                    crate::error::ExpectedItem::Kind(SyntaxKind::Eq),
+                ],
+                Some("after a shared property"),
+            );
         }
         m.complete(self, SyntaxKind::SharedProperty);
     }
@@ -543,7 +624,10 @@ impl<'a> Parser<'a> {
                     self.body();
                 }
             }
-            _ => self.error("expected a list item after '-'"),
+            _ => self.expected(
+                vec![crate::error::ExpectedItem::Desc("a list item")],
+                Some("after '-'"),
+            ),
         }
         m.complete(self, SyntaxKind::ListItem);
     }
@@ -571,7 +655,7 @@ impl<'a> Parser<'a> {
         }
         let m = self.start();
         if self.eat(SyntaxKind::LBracket) {
-            self.expect(SyntaxKind::RBracket, "']'");
+            self.expect(SyntaxKind::RBracket);
             self.type_expr();
         } else if self.eat(SyntaxKind::LParen) {
             self.type_expr();
@@ -588,7 +672,7 @@ impl<'a> Parser<'a> {
                     self.type_expr();
                 }
             }
-            self.expect(SyntaxKind::RParen, "')'");
+            self.expect(SyntaxKind::RParen);
         } else if self.at(SyntaxKind::Ident) && self.nth(1) == SyntaxKind::Lt {
             // `set<T>` — a type constructor (RFC 0032). `set` is a *contextual*
             // keyword: an ident is a constructor only when directly followed by
@@ -598,9 +682,11 @@ impl<'a> Parser<'a> {
             // tree structured and the diagnostic singular).
             if self.current_text() != "set" {
                 if self.current_text() == "map" {
-                    self.error("'map' is reserved for a future map type — only 'set' takes type arguments today");
+                    self.error_kind(crate::error::ParseErrorKind::ReservedTypeKeyword);
                 } else {
-                    self.error("unknown type constructor (only 'set' takes type arguments)");
+                    self.error_kind(crate::error::ParseErrorKind::UnknownTypeConstructor {
+                        found: crate::error::echo_capture(self.current_text()),
+                    });
                 }
             }
             self.bump(); // constructor name
@@ -615,16 +701,21 @@ impl<'a> Parser<'a> {
             // Arms keep their parens even here — `(K -> V)` parens are part of
             // the arms construct (RFC 0007), never grouping.
             if matches!(self.current(), SyntaxKind::Arrow | SyntaxKind::FatArrow) {
-                self.error("arm types keep their parens: write set<(K -> V)>");
+                self.expected(
+                    vec![crate::error::ExpectedItem::Desc(
+                        "a parenthesized arm type — write set<(K -> V)>",
+                    )],
+                    None,
+                );
             }
             // A comma is the map-habit typo (`set<a, b>`); point at the fix
             // rather than a bare "expected '>'".
             if self.at(SyntaxKind::Comma) {
-                self.error("set elements are alternatives separated by '|', not ','");
+                self.error_kind(crate::error::ParseErrorKind::SetSeparator);
             }
-            self.expect(SyntaxKind::Gt, "'>'");
+            self.expect(SyntaxKind::Gt);
         } else {
-            self.expect(SyntaxKind::Ident, "a type name");
+            self.expect_desc(SyntaxKind::Ident, "a type name");
         }
         m.complete(self, SyntaxKind::TypeExpr);
         self.depth -= 1;
@@ -636,7 +727,7 @@ impl<'a> Parser<'a> {
     fn depth_guarded_type(&mut self) -> bool {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
-            self.error("maximum type nesting depth exceeded");
+            self.error_kind(crate::error::ParseErrorKind::NestingLimit { what: "type" });
             self.depth -= 1;
             if !self.at_eof() {
                 self.bump_as(SyntaxKind::Error);
@@ -686,11 +777,21 @@ impl<'a> Parser<'a> {
         while self.at(SyntaxKind::Amp) {
             self.bump();
             if self.at(SyntaxKind::Amp) {
-                self.error("'&' is the conjunction operator; '&&' is not needed");
+                // Anchor across BOTH amps (the just-bumped first + the
+                // current second), so the `&&`→`&` fix covers the exact
+                // bytes.
+                let first = self.toks[self.pos - 1].offset;
+                self.error_kind_at(
+                    crate::error::ParseErrorKind::DoubleAmp,
+                    Span::new(first, first + 2),
+                );
             } else if self.at(SyntaxKind::Role) {
                 self.bump();
             } else {
-                self.error("expected a selector after '&'");
+                self.expected(
+                    vec![crate::error::ExpectedItem::Desc("a selector")],
+                    Some("after '&'"),
+                );
             }
         }
     }
@@ -713,10 +814,13 @@ impl<'a> Parser<'a> {
                 if self.at(SyntaxKind::Number) {
                     self.number_value();
                 } else {
-                    self.error("expected a number after '-'");
+                    self.expected(
+                        vec![crate::error::ExpectedItem::Kind(SyntaxKind::Number)],
+                        Some("after '-'"),
+                    );
                 }
             }
-            _ => self.error("expected a value"),
+            _ => self.expected(vec![crate::error::ExpectedItem::Desc("a value")], None),
         }
         m.complete(self, SyntaxKind::Value);
     }
@@ -757,12 +861,21 @@ impl<'a> Parser<'a> {
                     let before = self.pos;
                     self.value();
                     if !self.eat(SyntaxKind::Comma) && !self.at(SyntaxKind::RBracket) {
-                        self.error("expected ',' or ']' in array literal");
+                        self.expected(
+                            vec![
+                                crate::error::ExpectedItem::Kind(SyntaxKind::Comma),
+                                crate::error::ExpectedItem::Kind(SyntaxKind::RBracket),
+                            ],
+                            Some("in an array literal"),
+                        );
                     }
                     if self.pos == before {
                         // value() did not advance (unexpected token): recover so
                         // the loop cannot spin.
-                        self.err_recover("unexpected token in array literal");
+                        self.err_recover_expected(
+                            vec![crate::error::ExpectedItem::Desc("an array element")],
+                            Some("in an array literal"),
+                        );
                     }
                 }
             }
@@ -785,7 +898,10 @@ impl<'a> Parser<'a> {
                     let before = self.pos;
                     f(self);
                     if self.pos == before {
-                        self.err_recover("unexpected token");
+                        self.err_recover_expected(
+                            vec![crate::error::ExpectedItem::Desc("an array element")],
+                            Some("in an array literal"),
+                        );
                     }
                 }
             }
@@ -817,8 +933,8 @@ impl<'a> Parser<'a> {
         m.complete(self, SyntaxKind::Error);
     }
 
-    pub(super) fn finish_parse(self) -> (Vec<Event>, Vec<NmlError>) {
-        (self.events, self.errors)
+    pub(super) fn finish_parse(self) -> (Vec<Event>, Vec<NmlError>, usize) {
+        (self.events, self.errors, self.suppressed)
     }
 }
 

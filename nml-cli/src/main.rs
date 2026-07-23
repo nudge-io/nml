@@ -52,6 +52,18 @@ fn report(path: &Path, source_map: &nml_core::span::SourceMap, diag: &Diagnostic
         code,
         diag.rendered()
     );
+    // Secondary locations (RFC 0009) — rustc's `note:` shape, from the one
+    // shared model, so every consumer prints the same explanation.
+    for rel in &diag.related {
+        let loc = source_map.location(rel.span.start);
+        eprintln!(
+            "{}:{}:{}: note: {}",
+            path.display(),
+            loc.line,
+            loc.column,
+            rel.message
+        );
+    }
     diag.code
 }
 
