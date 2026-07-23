@@ -1499,6 +1499,109 @@ workflow W:
         from_block(body)
     }
 
+    // ── RFC 0011: role-conjunction expressions (`&`) ──────────────────────
+
+    #[derive(Deserialize, Debug)]
+    struct AclConfig {
+        allow: Vec<String>,
+    }
+
+    fn parse_allow(nml: &str) -> Result<AclConfig, Error> {
+        let file = parse_to_ast(nml).unwrap();
+        let doc = crate::query::Document::new(&file);
+        let body = doc.block("server", "App").body().unwrap();
+        from_block(body)
+    }
+
+    /// THE cross-repo contract (RFC 0011): a role-conjunction expression
+    /// lowers to ONE string in canonical `" & "`-joined form — single-spaced
+    /// regardless of source spacing — because that exact text is what
+    /// consumers (nudge's selector parser, its `Display`, its effective-
+    /// policy output) parse and emit. If this test changes shape, the
+    /// consumer contract changes with it.
+    #[test]
+    fn role_conjunction_lowers_to_canonical_joined_text() {
+        // Inline array, canonical spacing.
+        let c = parse_allow(
+            "server App:
+    allow = [@role/a & @role/b, @plan/Pro]
+",
+        )
+        .unwrap();
+        assert_eq!(c.allow, vec!["@role/a & @role/b", "@plan/Pro"]);
+
+        // Tight spacing canonicalizes: `&` is never part of a role token, so
+        // the lexer splits regardless and lowering re-joins single-spaced.
+        let c = parse_allow(
+            "server App:
+    allow = [@role/a&@role/b]
+",
+        )
+        .unwrap();
+        assert_eq!(c.allow, vec!["@role/a & @role/b"]);
+
+        // Block-list items take the same expression and the same canonical form.
+        let c = parse_allow(
+            "server App:
+    allow:
+        - @role/a & @plan/Pro
+",
+        )
+        .unwrap();
+        assert_eq!(c.allow, vec!["@role/a & @plan/Pro"]);
+
+        // Three atoms chain.
+        let c = parse_allow(
+            "server App:
+    allow = [@role/a & @role/b & @scope/x]
+",
+        )
+        .unwrap();
+        assert_eq!(c.allow, vec!["@role/a & @role/b & @scope/x"]);
+
+        // A scalar (non-list) value position composes too.
+        #[derive(Deserialize, Debug)]
+        struct One {
+            gate: String,
+        }
+        let file = parse_to_ast(
+            "server App:
+    gate = @role/a & @role/b
+",
+        )
+        .unwrap();
+        let doc = crate::query::Document::new(&file);
+        let one: One = from_block(doc.block("server", "App").body().unwrap()).unwrap();
+        assert_eq!(one.gate, "@role/a & @role/b");
+    }
+
+    /// Malformed conjunctions are parse errors with targeted guidance —
+    /// never silently swallowed tokens (the language-level mirror of the
+    /// consumer's no-silent-misparse rule).
+    #[test]
+    fn role_conjunction_errors_are_targeted() {
+        assert!(parse_to_ast(
+            "server App:
+    allow = [@role/a &]
+"
+        )
+        .is_err());
+        assert!(parse_to_ast(
+            "server App:
+    allow = [& @role/a]
+"
+        )
+        .is_err());
+        let err = parse_to_ast(
+            "server App:
+    allow = [@role/a && @role/b]
+",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("&&"), "targeted '&&' guidance, got: {err}");
+    }
+
     #[test]
     fn test_u16_valid_port() {
         let config = parse_port("server App:\n    port = 8080\n").unwrap();

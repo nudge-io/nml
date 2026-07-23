@@ -66,7 +66,20 @@ fn decode_scalar(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
         }
         SyntaxKind::Number => number_or_money(&toks[..], span, false)?,
         SyntaxKind::Dash => number_or_money(&toks[..], span, true)?,
-        SyntaxKind::Role => Value::Role(first.text().to_string()),
+        SyntaxKind::Role => {
+            // RFC 0011: a role-conjunction expression (`Role (& Role)*`)
+            // lowers to ONE `Value::Role` carrying the canonical
+            // `" & "`-joined text — single-spaced regardless of source
+            // spacing. This exact form is the cross-repo contract consumers
+            // (nudge) parse and display; the formatter re-renders from this
+            // value, so canonicalization is automatic.
+            let mut text = first.text().to_string();
+            for tok in toks.iter().skip(1).filter(|t| t.kind() == SyntaxKind::Role) {
+                text.push_str(" & ");
+                text.push_str(tok.text());
+            }
+            Value::Role(text)
+        }
         SyntaxKind::Secret => {
             validate_secret(first.text(), span)?;
             Value::Secret(first.text().to_string())

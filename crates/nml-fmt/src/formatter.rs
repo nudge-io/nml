@@ -242,6 +242,16 @@ impl<'a> Formatter<'a> {
                 self.arm_run(&entries[i..i + run], depth);
                 i += run;
             } else {
+                // Canonical grouping, matching `array_body`: a blank line
+                // separates a shared-property header from the items it
+                // covers — the same construct must not format differently
+                // by nesting context.
+                if i > 0
+                    && matches!(entries[i].kind, BodyEntryKind::ListItem(_))
+                    && matches!(entries[i - 1].kind, BodyEntryKind::SharedProperty(_))
+                {
+                    self.out.push('\n');
+                }
                 self.emit_comments_before(entries[i].span.start, depth);
                 self.body_entry(&entries[i], depth);
                 i += 1;
@@ -1160,6 +1170,25 @@ service App: // main
         let file = parse("service App:\n    port = 8080 // gone\n").unwrap();
         let formatted = format(&file);
         assert_eq!(formatted, "service App:\n    port = 8080\n");
+    }
+
+    /// RFC 0011: the formatter renders role conjunctions from the LOWERED
+    /// value, so tight/ragged source spacing canonicalizes to `" & "`
+    /// automatically — and the output is idempotent.
+    #[test]
+    fn role_conjunction_canonicalizes_and_is_idempotent() {
+        let src = "service App:\n    gate = @role/a&@role/b\n    allow = [@role/x  &  @role/y, @plan/Pro]\n";
+        let formatted = format_source(src).unwrap();
+        assert!(
+            formatted.contains("gate = @role/a & @role/b"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains("[@role/x & @role/y, @plan/Pro]"),
+            "{formatted}"
+        );
+        let again = format_source(&formatted).unwrap();
+        assert_eq!(formatted, again, "conjunction formatting is not idempotent");
     }
 
     // -------------------------------------------------------------------

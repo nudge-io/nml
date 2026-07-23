@@ -245,8 +245,18 @@ impl Lower {
                 value: self.decode(&v),
                 body: l.body().map(|b| self.lower_body(b)),
             }
-        } else if let Some(role) = l.role() {
-            ListItemKind::Role(role.text().to_string())
+        } else if l.role().is_some() {
+            // RFC 0011: join a role-conjunction item (`- @role/a & @role/b`)
+            // into the same canonical `" & "` form the value layer produces.
+            let joined = l
+                .syntax()
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| t.kind() == crate::cst::syntax::SyntaxKind::Role)
+                .map(|t| t.text().to_string())
+                .collect::<Vec<_>>()
+                .join(" & ");
+            ListItemKind::Role(joined)
         } else if let Some(name) = l.name() {
             if let Some(body) = l.body() {
                 ListItemKind::Named {

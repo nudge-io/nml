@@ -244,6 +244,10 @@
           "match": "="
         },
         {
+          "name": "keyword.operator.conjunction.nml",
+          "match": "&"
+        },
+        {
           "name": "punctuation.separator.comma.nml",
           "match": ","
         }

@@ -208,6 +208,7 @@ impl<'a> Lexer<'a> {
             // `@role` (where it is a role-continue char, consumed by `scan_role`)
             // or a string literal is only ever this marker.
             b'+' => self.single(SyntaxKind::Plus),
+            b'&' => self.single(SyntaxKind::Amp),
             b'@' => self.scan_role(),
             b'$' => self.scan_secret(),
             c if is_ident_start(c) => {

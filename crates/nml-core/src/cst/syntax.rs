@@ -50,6 +50,10 @@ pub enum SyntaxKind {
     Comma,    // ,
     Question, // ?
     Plus,     // +  (positional-field marker — RFC 0005 §16)
+    /// `&` — the selector-conjunction operator (RFC 0011): valid only
+    /// between `Role` tokens in value position (`@role/admin & @role/editor`).
+    /// The language carries it opaquely; consumers assign the AND semantics.
+    Amp, // &
     /// `<` — opens a type-constructor argument list (`set<cidr>`, RFC 0032).
     /// `set` is a contextual keyword: an `Ident` is a constructor only when
     /// immediately followed by `Lt` in type position; bare `set` stays a name.

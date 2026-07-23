@@ -532,7 +532,11 @@ impl<'a> Parser<'a> {
                     self.body();
                 }
             }
-            SyntaxKind::Role | SyntaxKind::Secret => self.bump(),
+            SyntaxKind::Role => {
+                self.bump();
+                self.role_conjunction_tail();
+            }
+            SyntaxKind::Secret => self.bump(),
             SyntaxKind::Ident => {
                 self.bump();
                 if self.eat(SyntaxKind::Colon) {
@@ -673,6 +677,24 @@ impl<'a> Parser<'a> {
         self.at(SyntaxKind::Pipe) && !self.newline_before()
     }
 
+    /// RFC 0011: the `(& Role)*` tail of a role-conjunction expression.
+    /// The atoms stay separate tokens inside one node (lossless CST); the
+    /// value layer joins them into the canonical `" & "` form. `&` is valid
+    /// ONLY between role tokens — dangling or doubled operators get targeted
+    /// guidance, same pattern as the `=>` rejection (RFC 0006).
+    fn role_conjunction_tail(&mut self) {
+        while self.at(SyntaxKind::Amp) {
+            self.bump();
+            if self.at(SyntaxKind::Amp) {
+                self.error("'&' is the conjunction operator; '&&' is not needed");
+            } else if self.at(SyntaxKind::Role) {
+                self.bump();
+            } else {
+                self.error("expected a selector after '&'");
+            }
+        }
+    }
+
     fn value(&mut self) {
         if self.at(SyntaxKind::LBracket) {
             self.array_value();
@@ -680,9 +702,11 @@ impl<'a> Parser<'a> {
         }
         let m = self.start();
         match self.current() {
-            SyntaxKind::String | SyntaxKind::Role | SyntaxKind::Secret | SyntaxKind::Ident => {
-                self.bump()
+            SyntaxKind::Role => {
+                self.bump();
+                self.role_conjunction_tail();
             }
+            SyntaxKind::String | SyntaxKind::Secret | SyntaxKind::Ident => self.bump(),
             SyntaxKind::Number => self.number_value(),
             SyntaxKind::Dash => {
                 self.bump();
