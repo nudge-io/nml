@@ -113,7 +113,10 @@ This means:
 
 ## Trait Definitions
 
-Traits define reusable groups of fields that can be mixed into models.
+Traits define reusable groups of fields that models (and other traits)
+mix in with `is`. A trait is **not instantiable**: it never types a block
+keyword, never appears as a field type, and is never a `oneof` arm target
+— it exists only to compose (RFC 0011).
 
 ### Syntax
 
@@ -125,7 +128,7 @@ trait traitName:
 
 ### Usage
 
-A model includes traits by listing them in parentheses:
+A model mixes traits in after `is`:
 
 ```nml check
 trait accessControlled:
@@ -162,6 +165,22 @@ trait auditable:
 model myThing is accessControlled, auditable:
     name string
 ```
+
+### Semantics
+
+- Traits share the model **namespace**: a trait and a model may not use
+  the same name (NML2009), and every `is` target must resolve to a
+  declared model or trait (NML2020, with a did-you-mean; an enum or
+  `oneof` target is NML2021).
+- Fields merge ancestor-first; a definition's own field overrides a
+  same-named inherited one. Defaults, `?`/`+` markers, modifier fields,
+  and `#directives` all travel with the merge. The single-positional rule
+  (NML2011) applies to the *merged* field set.
+- A trait cannot be instantiated (`monitored Probe:` is NML2024 — an
+  error even in lenient validation), used as a field type (NML2022), or
+  targeted by a `oneof` arm (NML2023).
+- Traits may themselves compose (`trait a is b:`), including mixing in
+  models; the `extends` graph is cycle-checked (NML2013).
 
 ## Enum Definitions
 

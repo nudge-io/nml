@@ -88,9 +88,10 @@ serde = { version = "1", features = ["derive"] }
 - **9 primitive types** — `string`, `number` (exact `i64` semantics), `money`
   (ISO 4217, integer minor units — `19.99 USD` never becomes `19.990000001`),
   `bool`, `duration`, `path`, `secret`, `object`, `role`
-- **Schemas as part of the language** — `model`, `trait` (mixins), `enum`,
+- **Schemas as part of the language** — `model`, `trait` (composable,
+  non-instantiable mixins), `enum`,
   `oneof` discriminated unions, typed arm maps `(K -> V)`, `set<T>`,
-  field constraints, defaults, optional `?` and positional `+` markers
+  defaults, optional `?` and positional `+` markers
 - **Secrets done right** — `secret` fields hold *references* (`$ENV.API_KEY`,
   with reference fallback chains like `$ENV.API_KEY | $ENV.API_KEY_DEV`),
   resolved by a pluggable `ValueResolver` (env, vault, your lookup). Literal
@@ -146,6 +147,7 @@ editor quick-fixes apply what can be applied mechanically).
 
 | Start here | |
 |---|---|
+| [Tutorial](docs/tutorial/README.md) | Nine chapters, one growing config — from first file to shipped schemas |
 | [Language Guide](docs/language-guide.md) | Writing NML — syntax and features |
 | [Integration Guide](docs/integration.md) | Embedding NML in a Rust project |
 | [Language Specification](spec/README.md) | Formal grammar and semantics, for implementers |
@@ -154,7 +156,9 @@ editor quick-fixes apply what can be applied mechanically).
 | [RFC index](docs/rfcs/README.md) | Language evolution and design records |
 
 Docs examples are executable: tagged ```` ```nml ```` blocks run through the
-real CLI in CI (`just docs-test`), so what you read is what the tools do.
+real CLI in CI (`just docs-test`), every tutorial chapter's finished config
+is a validated fixture, and the tutorial's Rust programs compile and run in
+CI with their printed output asserted — so what you read is what the tools do.
 
 ## Project structure
 

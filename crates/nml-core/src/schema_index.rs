@@ -183,10 +183,12 @@ fn first_wins<T>(items: &[T], name: impl Fn(&T) -> &str) -> HashMap<String, usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ModelKind;
     use crate::span::Span;
 
     fn model(name: &str, fields: Vec<FieldDef>) -> ModelDef {
         ModelDef {
+            kind: ModelKind::Model,
             name: name.to_string(),
             extends: Vec::new(),
             fields,

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostic::{codes, Code, Diagnostic, Severity};
-use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
+use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, ModelKind, OneOfDef};
 
 /// Schema definitions (models / enums / oneofs) extracted from a source file.
 /// Produced by [`crate::cst::extract`] over the CST; the validation/inheritance
@@ -26,6 +26,12 @@ impl ExtractedSchema {
 /// - a union name must not collide with a model or enum name.
 pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
     let model_names: HashSet<&str> = schema.models.iter().map(|m| m.name.as_str()).collect();
+    let trait_names: HashSet<&str> = schema
+        .models
+        .iter()
+        .filter(|m| m.is_trait())
+        .map(|m| m.name.as_str())
+        .collect();
     let enum_names: HashSet<&str> = schema.enums.iter().map(|e| e.name.as_str()).collect();
     let mut errors = Vec::new();
 
@@ -57,7 +63,18 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
                     ),
                 ));
             }
-            if !model_names.contains(model.as_str()) {
+            if trait_names.contains(model.as_str()) {
+                // A trait is declared but not instantiable — a distinct fix
+                // pattern from an unknown name (RFC 0011).
+                errors.push(err(
+                    codes::TRAIT_ONEOF_VARIANT,
+                    format!(
+                        "oneof '{}' arm \"{}\" targets trait '{}' — variants must be \
+                         instantiable models",
+                        oneof.name, value, model
+                    ),
+                ));
+            } else if !model_names.contains(model.as_str()) {
                 errors.push(err(
                     codes::ONEOF_INTEGRITY,
                     format!(
@@ -127,6 +144,117 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
     }
 
     errors
+}
+
+/// Validate composition (`is`) and trait usage across the schema (RFC 0011):
+/// - every `is` target must resolve to a declared model or trait (with a
+///   machine-applicable did-you-mean over both when it doesn't),
+/// - an `is` target must not name an enum or a `oneof`,
+/// - a trait must never appear as a field's value type — traits are
+///   composition-only (through lists, sets, unions, modifier types, and
+///   `(K -> V)` arm positions alike).
+///
+/// Run **before** [`resolve_model_inheritance`]: fields are still owned by
+/// the definition that wrote them, so each violation reports exactly once,
+/// at its declaring model/trait.
+pub fn find_composition_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
+    let defs: HashMap<&str, ModelKind> = schema
+        .models
+        .iter()
+        .map(|m| (m.name.as_str(), m.kind))
+        .collect();
+    let enum_names: HashSet<&str> = schema.enums.iter().map(|e| e.name.as_str()).collect();
+    let oneof_names: HashSet<&str> = schema.oneofs.iter().map(|o| o.name.as_str()).collect();
+    let mut errors = Vec::new();
+
+    for model in &schema.models {
+        for parent in &model.extends {
+            if defs.contains_key(parent.name.as_str()) {
+                continue;
+            }
+            let wrong_kind = if enum_names.contains(parent.name.as_str()) {
+                Some("an enum")
+            } else if oneof_names.contains(parent.name.as_str()) {
+                Some("a oneof")
+            } else {
+                None
+            };
+            errors.push(match wrong_kind {
+                Some(kind_name) => Diagnostic::error(format!(
+                    "`is` target '{}' in {} '{}' is {} — only models and traits compose",
+                    parent.name,
+                    model.kind.label(),
+                    model.name,
+                    kind_name,
+                ))
+                .with_code(codes::INVALID_MIXIN_KIND)
+                .with_span(parent.span),
+                None => {
+                    let mut diag = Diagnostic::error(format!(
+                        "unknown `is` target '{}' in {} '{}' — no model or trait with that name",
+                        parent.name,
+                        model.kind.label(),
+                        model.name,
+                    ))
+                    .with_code(codes::UNKNOWN_MIXIN)
+                    .with_span(parent.span);
+                    if let Some(s) = crate::suggest::suggest(&parent.name, defs.keys().copied()) {
+                        diag = diag.with_suggestion(s, parent.span);
+                    }
+                    diag
+                }
+            });
+        }
+
+        for field in &model.fields {
+            let mut referenced = Vec::new();
+            collect_trait_refs(&field.field_type, &defs, &mut referenced);
+            for trait_name in referenced {
+                errors.push(
+                    Diagnostic::error(format!(
+                        "field '{}' of {} '{}' is typed by trait '{}' — a trait is not a \
+                         value type; mix it into a model with `is` instead",
+                        field.name,
+                        model.kind.label(),
+                        model.name,
+                        trait_name,
+                    ))
+                    .with_code(codes::TRAIT_AS_FIELD_TYPE)
+                    .with_span(field.span),
+                );
+            }
+        }
+    }
+
+    errors
+}
+
+/// Collect every trait name a field type references, at any nesting depth.
+fn collect_trait_refs<'a>(
+    ft: &'a FieldType,
+    defs: &HashMap<&str, ModelKind>,
+    out: &mut Vec<&'a str>,
+) {
+    match ft {
+        FieldType::ModelRef(name) => {
+            if defs.get(name.as_str()) == Some(&ModelKind::Trait) {
+                out.push(name.as_str());
+            }
+        }
+        FieldType::List(inner) | FieldType::Set(inner) | FieldType::Modifier(inner) => {
+            collect_trait_refs(inner, defs, out)
+        }
+        FieldType::Union(parts) => {
+            for part in parts {
+                collect_trait_refs(part, defs, out);
+            }
+        }
+        FieldType::Arms { key, target } => {
+            collect_trait_refs(key, defs, out);
+            collect_trait_refs(target, defs, out);
+        }
+        FieldType::Primitive(_) => {}
+    }
 }
 
 /// Each model may declare **at most one** scalar-shorthand (`!`) field: a bare
@@ -419,7 +547,7 @@ pub fn resolve_model_inheritance(schema: &mut ExtractedSchema) {
                     color[i] = Color::InProgress;
                     stack.push(Work::Build(i));
                     for parent in &schema.models[i].extends {
-                        if let Some(&p) = index.get(parent.as_str()) {
+                        if let Some(&p) = index.get(parent.name.as_str()) {
                             if color[p] == Color::Unvisited {
                                 stack.push(Work::Enter(p));
                             }
@@ -437,7 +565,7 @@ pub fn resolve_model_inheritance(schema: &mut ExtractedSchema) {
                         .collect();
                     let mut fields = Vec::new();
                     for parent in &schema.models[i].extends {
-                        if let Some(&p) = index.get(parent) {
+                        if let Some(&p) = index.get(parent.name.as_str()) {
                             for field in &resolved[p] {
                                 if seen.insert(field.name.clone()) {
                                     fields.push(field.clone());
@@ -466,7 +594,7 @@ pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<Diagnostic> {
     for model in &schema.models {
         edges.insert(
             model.name.as_str(),
-            model.extends.iter().map(|s| s.as_str()).collect(),
+            model.extends.iter().map(|s| s.name.as_str()).collect(),
         );
     }
 
@@ -492,6 +620,7 @@ pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<Diagnostic> {
 mod tests {
     use super::*;
     use crate::cst::extract_schema;
+    use crate::model::MixinRef;
     use crate::types::PrimitiveType;
 
     fn extract_src(src: &str) -> ExtractedSchema {
@@ -525,9 +654,10 @@ mod tests {
         const DEPTH: usize = 200_000;
         let models: Vec<ModelDef> = (0..DEPTH)
             .map(|i| ModelDef {
+                kind: ModelKind::Model,
                 name: format!("m{i}"),
                 extends: if i + 1 < DEPTH {
-                    vec![format!("m{}", i + 1)]
+                    vec![MixinRef::synthetic(format!("m{}", i + 1))]
                 } else {
                     vec![]
                 },
@@ -552,9 +682,10 @@ mod tests {
         const DEPTH: usize = 200_000;
         let models: Vec<ModelDef> = (0..DEPTH)
             .map(|i| ModelDef {
+                kind: ModelKind::Model,
                 name: format!("m{i}"),
                 extends: if i + 1 < DEPTH {
-                    vec![format!("m{}", i + 1)]
+                    vec![MixinRef::synthetic(format!("m{}", i + 1))]
                 } else {
                     vec![]
                 },
@@ -575,8 +706,9 @@ mod tests {
         // Correctness of the iterative detector: a→b→c→a is found, with one
         // diagnostic per member (each pointing at that model).
         let model = |name: &str, parent: &str| ModelDef {
+            kind: ModelKind::Model,
             name: name.to_string(),
-            extends: vec![parent.to_string()],
+            extends: vec![MixinRef::synthetic(parent)],
             fields: vec![],
             span: crate::span::Span::empty(0),
         };
@@ -598,8 +730,9 @@ mod tests {
         // resolution must still terminate (no hang, no panic) on a best-effort basis,
         // each model at minimum retaining its own field.
         let model = |name: &str, parent: &str, f: &str| ModelDef {
+            kind: ModelKind::Model,
             name: name.to_string(),
-            extends: vec![parent.to_string()],
+            extends: vec![MixinRef::synthetic(parent)],
             fields: vec![FieldDef {
                 name: f.to_string(),
                 field_type: FieldType::Primitive(PrimitiveType::String),
@@ -640,8 +773,9 @@ mod tests {
             span: crate::span::Span::empty(0),
         };
         let model = |name: &str, extends: &[&str], f: &str| ModelDef {
+            kind: ModelKind::Model,
             name: name.to_string(),
-            extends: extends.iter().map(|s| s.to_string()).collect(),
+            extends: extends.iter().map(|s| MixinRef::synthetic(*s)).collect(),
             fields: vec![field(f)],
             span: crate::span::Span::empty(0),
         };
@@ -1230,5 +1364,106 @@ model D is B, C:\n    d string\n";
             "should not detect cycle in acyclic inheritance; errors: {:?}",
             errors
         );
+    }
+}
+
+#[cfg(test)]
+mod composition_tests {
+    //! RFC 0011: composition (`is`) and trait-usage integrity.
+
+    use super::*;
+    use crate::cst::extract_schema;
+
+    fn find(src: &str) -> Vec<Diagnostic> {
+        let (schema, errs) = extract_schema(src);
+        assert!(errs.is_empty(), "clean extraction expected: {errs:?}");
+        find_composition_errors(&schema)
+    }
+
+    fn codes_of(diags: &[Diagnostic]) -> Vec<String> {
+        diags
+            .iter()
+            .filter_map(|d| d.code.map(|c| c.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn clean_composition_has_no_findings() {
+        let errs = find(
+            "trait monitored:\n    timeout duration = \"5s\"\n\n\
+             trait audited is monitored:\n    auditedBy string?\n\n\
+             model endpoint is audited:\n    url string+\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn unknown_is_target_reports_2020_with_suggestion_at_target_token() {
+        let src =
+            "trait monitored:\n    t duration?\n\nmodel endpoint is monitred:\n    url string?\n";
+        let errs = find(src);
+        assert_eq!(codes_of(&errs), vec!["NML2020"]);
+        let d = &errs[0];
+        // The did-you-mean is machine-applicable at exactly the target token.
+        let s = d.suggestion.as_ref().expect("suggestion");
+        assert_eq!(s.replacement, "monitored");
+        let span = d.span.expect("span");
+        assert_eq!(&src[span.start..span.end], "monitred");
+    }
+
+    #[test]
+    fn enum_and_oneof_is_targets_report_2021() {
+        let errs = find("enum level:\n    - \"a\"\n\nmodel m is level:\n    x string?\n");
+        assert_eq!(codes_of(&errs), vec!["NML2021"]);
+        assert!(errs[0].message.contains("an enum"));
+
+        let errs = find(
+            "model log:\n    x string?\n\noneof n by kind:\n    \"log\" -> log\n\nmodel m is n:\n    y string?\n",
+        );
+        assert_eq!(codes_of(&errs), vec!["NML2021"]);
+        assert!(errs[0].message.contains("a oneof"));
+    }
+
+    #[test]
+    fn trait_as_field_type_reports_2022_at_every_nesting() {
+        // Direct, list, set, union, modifier, and both arm positions.
+        let errs = find(
+            "trait cap:\n    x string?\n\n\
+             model m:\n    a cap?\n    b []cap?\n    c set<cap>?\n    d (string | cap)?\n    |e cap?\n    f (cap -> string)?\n",
+        );
+        assert_eq!(errs.len(), 6, "{errs:?}");
+        assert!(errs
+            .iter()
+            .all(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2022")));
+    }
+
+    #[test]
+    fn oneof_arm_targeting_trait_reports_2023_not_2012() {
+        let (schema, errs) =
+            extract_schema("trait cap:\n    x string?\n\noneof entry by kind:\n    \"a\" -> cap\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        let errs = find_oneof_errors(&schema);
+        assert_eq!(codes_of(&errs), vec!["NML2023"]);
+    }
+
+    #[test]
+    fn inheritance_merges_trait_fields_with_defaults() {
+        let (mut schema, errs) = extract_schema(
+            "trait monitored:\n    timeout duration = \"5s\"\n    interval duration = \"60s\"\n\n\
+             model endpoint is monitored:\n    url string+\n    timeout duration = \"9s\"\n",
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        resolve_model_inheritance(&mut schema);
+        let endpoint = schema.models.iter().find(|m| m.name == "endpoint").unwrap();
+        let field = |n: &str| endpoint.fields.iter().find(|f| f.name == n).unwrap();
+        let default_text = |n: &str| match field(n).default_value.as_ref().map(|sv| &sv.value) {
+            Some(crate::types::Value::String(s)) | Some(crate::types::Value::Duration(s)) => {
+                s.clone()
+            }
+            other => panic!("expected a textual default for '{n}', got {other:?}"),
+        };
+        // Inherited default comes along; the model's own field overrides.
+        assert_eq!(default_text("interval"), "60s");
+        assert_eq!(default_text("timeout"), "9s");
     }
 }

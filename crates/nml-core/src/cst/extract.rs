@@ -7,9 +7,9 @@
 //! are reused unchanged.
 
 use crate::cst::ast::{AstNode, BlockDecl, Decl, Entry, OneOfDecl, Root, TypeExpr, TypeExprKind};
-use crate::cst::syntax::node_span;
+use crate::cst::syntax::{node_span, token_span};
 use crate::cst::value::decode_string_token;
-use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
+use crate::model::{EnumDef, FieldDef, FieldType, MixinRef, ModelDef, ModelKind, OneOfDef};
 use crate::schema::ExtractedSchema;
 use crate::types::{PrimitiveType, Value};
 
@@ -19,7 +19,11 @@ pub fn extract(root: &Root) -> ExtractedSchema {
     for decl in root.decls() {
         match decl {
             Decl::Block(block) => match block.keyword().as_ref().map(|t| t.text()) {
-                Some("model") => schema.models.push(extract_model(&block)),
+                Some("model") => schema.models.push(extract_model(&block, ModelKind::Model)),
+                // A trait is extracted as a model with `kind: Trait` (RFC
+                // 0011) — same field pipeline, composition-only semantics
+                // enforced downstream.
+                Some("trait") => schema.models.push(extract_model(&block, ModelKind::Trait)),
                 Some("enum") => schema.enums.push(extract_enum(&block)),
                 _ => {}
             },
@@ -30,7 +34,7 @@ pub fn extract(root: &Root) -> ExtractedSchema {
     schema
 }
 
-fn extract_model(block: &BlockDecl) -> ModelDef {
+fn extract_model(block: &BlockDecl, kind: ModelKind) -> ModelDef {
     let mut fields = Vec::new();
     if let Some(body) = block.body() {
         for entry in body.entries() {
@@ -70,9 +74,17 @@ fn extract_model(block: &BlockDecl) -> ModelDef {
     }
     ModelDef {
         name: name_text(block),
+        kind,
         extends: block
             .extends()
-            .map(|e| e.parents().map(|t| t.text().to_string()).collect())
+            .map(|e| {
+                e.parents()
+                    .map(|t| MixinRef {
+                        name: t.text().to_string(),
+                        span: token_span(&t),
+                    })
+                    .collect()
+            })
             .unwrap_or_default(),
         fields,
         span: node_span(block.syntax()),
@@ -245,13 +257,30 @@ oneof email by provider as providerKind = \"log\":
     \"postmark\" -> emailPostmark
 ";
         let schema = extract(&Root::cast(parse(src).syntax()).unwrap());
-        // `trait` is not a schema definition, so only `model`/`enum` extract.
-        assert_eq!(schema.models.len(), 2);
+        // `trait` extracts as a model with `kind: Trait` (RFC 0011) — same
+        // field pipeline, composition-only semantics enforced downstream.
+        assert_eq!(schema.models.len(), 3);
         assert_eq!(schema.enums.len(), 1);
         assert_eq!(schema.oneofs.len(), 1);
 
+        let audited = schema.models.iter().find(|m| m.name == "Audited").unwrap();
+        assert_eq!(audited.kind, ModelKind::Trait);
+        assert!(audited.is_trait());
+        assert_eq!(audited.fields.len(), 1);
+
         let plan = schema.models.iter().find(|m| m.name == "Plan").unwrap();
-        assert_eq!(plan.extends, vec!["Base".to_string()]);
+        assert_eq!(plan.kind, ModelKind::Model);
+        // The `is` target carries the span of exactly its token, so
+        // composition diagnostics can point (and quick-fix) at it.
+        let base_ref = &plan.extends[0];
+        assert_eq!(&src[base_ref.span.start..base_ref.span.end], "Base");
+        assert_eq!(
+            plan.extends
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Base"]
+        );
         let field = |n: &str| plan.fields.iter().find(|f| f.name == n).unwrap();
         assert!(field("tier").optional && !field("tier").shorthand);
         // `path path+` → shorthand, required.

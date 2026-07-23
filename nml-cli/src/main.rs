@@ -134,6 +134,14 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
     let mut errors = symbols.find_duplicates();
     errors.extend(symbols.find_unresolved_references(&file));
     errors.extend(symbols.find_const_cycles());
+    // Schema definitions in the file get the full loader pipeline (RFC 0011):
+    // reserved/duplicate definition names, `is` composition, trait usage,
+    // oneof integrity, positional arity, cycles — the same findings loading
+    // the file via `--schema` would report. A file with no definitions
+    // contributes nothing here.
+    let file_name = path.display().to_string();
+    let (_, schema_diags) = nml_validate::loader::load_schema(&[(&file_name, &source)]);
+    errors.extend(schema_diags);
     if errors.is_empty() {
         println!("{}: ok", path.display());
         Ok(())
@@ -144,7 +152,17 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
             first_code = first_code.or(report(&path, &source_map, err));
         }
         explain_hint(first_code);
-        Err(format!("{} validation error(s)", errors.len()))
+        // Warnings (e.g. advisory model-reference cycles) report but do not
+        // fail the file — same posture as `check`.
+        let error_count = errors
+            .iter()
+            .filter(|d| d.severity == nml_core::diagnostic::Severity::Error)
+            .count();
+        if error_count == 0 {
+            println!("{}: ok", path.display());
+            return Ok(());
+        }
+        Err(format!("{error_count} validation error(s)"))
     }
 }
 

@@ -314,6 +314,90 @@ oneof exhaustive by kind as letters:
 
 **Fix:** add the missing arm (or remove the extra one).
 
+## NML2020
+
+**Unknown `is` target.** Every `is` target must resolve to a declared
+model or trait (RFC 0011). A typo'd target carries a machine-applicable
+did-you-mean; in the editor it is a one-click fix.
+
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2020]'
+trait auditable:
+    auditedBy string?
+
+model gadget is auditible:
+    name string?
+```
+
+**Fix:** correct the name (`is auditable`), or declare the missing
+model/trait.
+
+## NML2021
+
+**`is` target is not composable.** Only models and traits compose with
+`is`; an enum or a `oneof` cannot be mixed in.
+
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2021]'
+enum sizes:
+    - "s"
+    - "m"
+
+model sized is sizes:
+    n string?
+```
+
+**Fix:** reference the enum from a field (`size sizes`) instead of
+composing it, or make the target a model/trait.
+
+## NML2022
+
+**A trait used as a field type.** Traits are composition-only (RFC 0011):
+they bundle fields for `is`, and never describe a value — not directly,
+in `[]`/`set<>`, in a union, behind a `|` modifier, or in `(K -> V)` arm
+positions.
+
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2022]'
+trait auditable:
+    auditedBy string?
+
+model holder:
+    audit auditable?
+```
+
+**Fix:** mix the trait into the model (`model holder is auditable:`), or
+declare a `model` if you need a nested value type.
+
+## NML2023
+
+**A `oneof` arm targets a trait.** Union variants are instantiated by
+discriminator dispatch, so every arm must name an instantiable model —
+a trait can never be selected.
+
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2023]'
+trait auditable:
+    auditedBy string?
+
+oneof entry by kind:
+    "a" -> auditable
+```
+
+**Fix:** point the arm at a model (one that may itself mix the trait in
+with `is`).
+
+## NML2024
+
+**A trait instantiated.** A block (or array-declaration item) keyword
+names a trait. Traits declare capability bundles, not block types, so
+this is an error even in lenient mode — the schema *knows* the name, and
+it is never a valid keyword.
+
+```nml check schema=docs/errors/schemas expect-error='[NML2024]'
+notifiable Alerts:
+    channel = "ops"
+```
+
+**Fix:** instantiate a model that mixes the trait in with `is`, or
+promote the trait to a `model` if it really is a standalone block type.
+
 ## NML2013
 
 **Inheritance cycle.** `is` chains must be acyclic.

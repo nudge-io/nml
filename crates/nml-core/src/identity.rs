@@ -410,7 +410,7 @@ fn item_body(item: &ListItem) -> Option<&Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FieldDef, FieldType};
+    use crate::model::{FieldDef, FieldType, ModelKind};
     use crate::types::PrimitiveType;
 
     fn s() -> Span {
@@ -432,6 +432,7 @@ mod tests {
 
     fn model(fields: Vec<FieldDef>) -> ModelDef {
         ModelDef {
+            kind: ModelKind::Model,
             name: "m".into(),
             extends: vec![],
             fields,

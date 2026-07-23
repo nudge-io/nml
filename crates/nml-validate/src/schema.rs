@@ -98,14 +98,43 @@ impl SchemaValidator {
     }
 
     /// Candidate names for an unknown-keyword suggestion: every declared
-    /// model and `oneof` — the two targets a block or array keyword can
-    /// resolve to.
+    /// *instantiable* model and `oneof` — the two targets a block or array
+    /// keyword can resolve to. Traits are excluded (RFC 0011): suggesting
+    /// one would teach the NML2024 error.
     fn keyword_candidates(&self) -> impl Iterator<Item = &str> + '_ {
         self.index
             .models()
             .iter()
+            .filter(|m| !m.is_trait())
             .map(|m| m.name.as_str())
             .chain(self.index.oneofs().iter().map(|o| o.name.as_str()))
+    }
+
+    /// The trait-instantiation gate (RFC 0011): if `keyword` names a trait,
+    /// push NML2024 and report `true`. An error even in lenient mode — the
+    /// schema declared the name, so a block using it is a mistake, never
+    /// another tool's vocabulary (the same reasoning as NML2003).
+    fn check_trait_instantiation(
+        &self,
+        keyword: &str,
+        span: Span,
+        diags: &mut Vec<Diagnostic>,
+    ) -> bool {
+        let Some(model) = self.find_model(keyword) else {
+            return false;
+        };
+        if !model.is_trait() {
+            return false;
+        }
+        diags.push(
+            Diagnostic::error(format!(
+                "trait '{keyword}' cannot be instantiated — traits only compose into \
+                 models with `is {keyword}`"
+            ))
+            .with_code(codes::TRAIT_INSTANTIATED)
+            .with_span(span),
+        );
+        true
     }
 
     /// An "unknown property" diagnostic (warning by default, error under
@@ -169,19 +198,47 @@ impl SchemaValidator {
 
     fn validate_block(&self, block: &BlockDecl, diags: &mut Vec<Diagnostic>) {
         let keyword = &block.keyword.name;
-        let is_schema_def = matches!(keyword.as_str(), "model" | "enum");
+        let is_schema_def = matches!(keyword.as_str(), "model" | "enum" | "trait");
 
-        if keyword == "model" {
+        if matches!(keyword.as_str(), "model" | "trait") {
+            // The in-file twin of `nml_core::schema::find_composition_errors`
+            // (RFC 0011): schema declarations authored in a *checked* file get
+            // the same `is`-target diagnostics, with the same code and a
+            // machine-applicable did-you-mean at the target token.
             for parent in &block.extends {
-                if self.find_model(&parent.name).is_none() {
-                    diags.push(
-                        Diagnostic::error(format!(
-                            "unknown parent model '{}' in extends clause",
-                            parent.name
-                        ))
-                        .with_span(parent.span),
-                    );
+                if self.find_model(&parent.name).is_some() {
+                    continue;
                 }
+                let wrong_kind = if self.find_enum(&parent.name).is_some() {
+                    Some("an enum")
+                } else if self.find_oneof(&parent.name).is_some() {
+                    Some("a oneof")
+                } else {
+                    None
+                };
+                diags.push(match wrong_kind {
+                    Some(kind_name) => Diagnostic::error(format!(
+                        "`is` target '{}' is {} — only models and traits compose",
+                        parent.name, kind_name,
+                    ))
+                    .with_code(codes::INVALID_MIXIN_KIND)
+                    .with_span(parent.span),
+                    None => {
+                        let mut diag = Diagnostic::error(format!(
+                            "unknown `is` target '{}' — no model or trait with that name",
+                            parent.name,
+                        ))
+                        .with_code(codes::UNKNOWN_MIXIN)
+                        .with_span(parent.span);
+                        if let Some(s) = nml_core::suggest::suggest(
+                            &parent.name,
+                            self.index.models().iter().map(|m| m.name.as_str()),
+                        ) {
+                            diag = diag.with_suggestion(s, parent.span);
+                        }
+                        diag
+                    }
+                });
             }
             self.validate_field_defaults(block, diags);
         }
@@ -190,6 +247,11 @@ impl SchemaValidator {
         self.validate_members_builtin_refs(&block.body, keyword, diags);
 
         if !is_schema_def {
+            // Traits are never block types (RFC 0011); the gate also stops the
+            // body from being validated against the trait's fields below.
+            if self.check_trait_instantiation(keyword, block.keyword.span, diags) {
+                return;
+            }
             // A block declaration (`role editor:`) fills its model's `name` field from
             // the block name — lenient: an explicit `name` in the body wins (RFC 0005
             // §5). `oneof`/other targets keep the prior path.
@@ -227,7 +289,13 @@ impl SchemaValidator {
         }
 
         let keyword = &arr.item_keyword.name;
-        let is_schema_def = matches!(keyword.as_str(), "model" | "enum");
+        let is_schema_def = matches!(keyword.as_str(), "model" | "enum" | "trait");
+        // Traits are never element types either (RFC 0011): report once at
+        // the keyword and skip item validation — the declaration is already
+        // in error, and its items have no model to validate against.
+        if !is_schema_def && self.check_trait_instantiation(keyword, arr.item_keyword.span, diags) {
+            return;
+        }
         // An array item keyword may name a model or a `oneof`, mirroring the
         // block-keyword dispatch in `validate_block` — resolved once and reused
         // both for the strict check and to validate each item below.
@@ -2933,7 +3001,8 @@ workflow W:
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("unknown parent model 'nonexistent'")),
+                .any(|d| d.message.contains("unknown `is` target 'nonexistent'")
+                    && d.code.map(|c| c.to_string()).as_deref() == Some("NML2020")),
             "should detect unknown parent model; diags: {:?}",
             diags
         );
@@ -2949,7 +3018,7 @@ workflow W:
         let diags = validator.validate(&file);
         let extends_diags: Vec<_> = diags
             .iter()
-            .filter(|d| d.message.contains("unknown parent"))
+            .filter(|d| d.message.contains("unknown `is` target"))
             .collect();
         assert!(
             extends_diags.is_empty(),
@@ -2969,14 +3038,14 @@ workflow W:
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("unknown parent model 'foo'")),
+                .any(|d| d.message.contains("unknown `is` target 'foo'")),
             "should detect 'foo' as unknown; diags: {:?}",
             diags
         );
         assert!(
             diags
                 .iter()
-                .any(|d| d.message.contains("unknown parent model 'bar'")),
+                .any(|d| d.message.contains("unknown `is` target 'bar'")),
             "should detect 'bar' as unknown; diags: {:?}",
             diags
         );
@@ -4369,5 +4438,95 @@ workflow W:
             "list duplicates are legal: {:?}",
             d.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod trait_instance_tests {
+    //! RFC 0011 instance-side enforcement: traits cannot be instantiated,
+    //! and the editor surface never suggests them as keywords.
+
+    use super::*;
+    use nml_core::diagnostic::Severity;
+
+    fn loaded_validator(schema_source: &str) -> SchemaValidator {
+        // Through the loader, so inheritance is resolved like production.
+        let (schema, diags) = crate::loader::load_schema(&[("t.model.nml", schema_source)]);
+        assert!(diags.is_empty(), "schema must load clean: {diags:?}");
+        SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
+    }
+
+    const SCHEMA: &str = "trait monitored:\n    timeout duration = \"5s\"\n\n\
+                          model endpoint is monitored:\n    url string+\n";
+
+    fn check(source: &str, strict: bool) -> Vec<Diagnostic> {
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
+        let v = loaded_validator(SCHEMA);
+        let v = if strict { v.strict() } else { v };
+        v.validate(&file)
+    }
+
+    #[test]
+    fn instantiating_a_trait_errors_even_in_lenient_mode() {
+        let diags = check("monitored Probe:\n    timeout = \"9s\"\n", false);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        let d = &diags[0];
+        assert_eq!(d.code.map(|c| c.to_string()).as_deref(), Some("NML2024"));
+        assert_eq!(d.severity, Severity::Error);
+        assert!(
+            d.message.contains("cannot be instantiated"),
+            "{}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn trait_as_array_item_keyword_errors() {
+        let diags = check(
+            "[]monitored probes:\n    - A:\n        timeout = \"9s\"\n",
+            false,
+        );
+        assert_eq!(
+            diags[0].code.map(|c| c.to_string()).as_deref(),
+            Some("NML2024"),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn inherited_trait_field_is_validated_on_instances() {
+        // Wrong kind for the trait-declared field: the model merged it, so
+        // the validator types it.
+        let diags = check(
+            "endpoint api:\n    url = \"https://x.dev\"\n    timeout = 9\n",
+            false,
+        );
+        assert!(
+            diags.iter().any(
+                |d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2008")
+                    && d.message.contains("'timeout'")
+            ),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn strict_unknown_keyword_never_suggests_a_trait() {
+        // "monitred" is nearest to trait "monitored" — but a trait is not a
+        // legal keyword, so no suggestion is offered at all.
+        let diags = check("monitred Probe:\n    timeout = \"9s\"\n", true);
+        let d = diags
+            .iter()
+            .find(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2004"))
+            .expect("strict unknown-keyword diagnostic");
+        assert!(d.suggestion.is_none(), "{d:?}");
+    }
+
+    #[test]
+    fn trait_declarations_in_checked_files_are_schema_defs() {
+        // A `trait` block in a checked file is a schema definition, not an
+        // unknown instance keyword — even under strict.
+        let diags = check("trait audited:\n    auditedBy string?\n", true);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 }

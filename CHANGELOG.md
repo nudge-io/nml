@@ -4,6 +4,24 @@
 
 ### Added
 
+- **Traits are real (RFC 0011)**: `trait name:` declares a non-instantiable
+  mixin — same field syntax as a model (defaults, markers, modifiers,
+  directives all travel), composed with `is` by models and other traits,
+  and never a block keyword, field type, or `oneof` arm target. Previously
+  `trait` parsed but was silently ignored by schema extraction. Five new
+  stable codes with error-index entries: `NML2020` unknown `is` target
+  (with a machine-applicable did-you-mean at the target token — `is`
+  targets were previously *silently* unresolved), `NML2021` non-composable
+  `is` target, `NML2022` trait as a field type, `NML2023` trait as a
+  `oneof` arm, `NML2024` trait instantiation (an error even in lenient
+  mode). Strict-mode keyword suggestions and editor keyword completion
+  exclude traits; `trait` joins the language-keyword completions.
+- `nml validate` now runs the full schema-finder pipeline on files that
+  declare models/traits/enums/oneofs (reserved and duplicate names,
+  composition, oneof integrity, positional arity, cycles) — previously
+  these surfaced only through `check --schema`. Warnings report without
+  failing the file, matching `check`.
+
 - **Unified diagnostics model** (`nml-core::diagnostic`, RFC 0008): one
   `Diagnostic` type — severity (now incl. `Info`), span, source, structured
   suggestion, and a **stable error code** (`NML0000`-style, never renumbered
@@ -137,3 +155,11 @@
 - Per-crate READMEs, CONTRIBUTING (docs-required gate), SECURITY policy,
   PR template, RFC status index, and a stability & compatibility policy
   (`docs/stability.md`); workspace `rust-version` declared
+- **Nine-chapter tutorial** (`docs/tutorial/`): one growing status-page
+  config from first parse through schemas, composition, `oneof`, access
+  control, the Rust embedding pipeline, a diff-driven reload classifier,
+  and shipped schema packages. Every chapter's finished config is a
+  CI-validated fixture; chapters 7–9 are workspace crates the docs harness
+  compiles **and runs**, asserting the output printed on the page; full
+  Rust listings on pages are CI-checked to be verbatim excerpts of the
+  compiled programs (```` ```rust source=<file> ```` guard)

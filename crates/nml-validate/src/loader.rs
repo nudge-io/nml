@@ -12,8 +12,8 @@ use std::collections::HashSet;
 // Import the passes by name (not the module) so the bare `schema` identifier stays
 // free for the local `ExtractedSchema` value and our own `crate::schema` module.
 use nml_core::schema::{
-    find_extends_cycles, find_model_cycles, find_oneof_errors, find_shorthand_errors,
-    resolve_model_inheritance, ExtractedSchema,
+    find_composition_errors, find_extends_cycles, find_model_cycles, find_oneof_errors,
+    find_shorthand_errors, resolve_model_inheritance, ExtractedSchema,
 };
 
 use nml_core::diagnostic::Diagnostic;
@@ -55,8 +55,10 @@ pub fn load_schema(sources: &[(&str, &str)]) -> (ExtractedSchema, Vec<Diagnostic
         let (extracted, errors) = nml_core::cst::extract_schema(text);
         diagnostics.extend(errors.into_iter().map(|d| d.with_source(*name)));
         for m in &extracted.models {
+            // Traits share the model namespace (RFC 0011): a trait and a
+            // model with one name would be unresolvable at `is` sites.
             check_definition_name(
-                "model",
+                m.kind.label(),
                 &m.name,
                 m.span,
                 name,
@@ -90,6 +92,12 @@ pub fn load_schema(sources: &[(&str, &str)]) -> (ExtractedSchema, Vec<Diagnostic
     }
 
     diagnostics.extend(find_extends_cycles(&schema));
+
+    // Composition integrity (RFC 0011): every `is` target resolves, traits
+    // never appear in value-type or `oneof`-arm position. Run *before*
+    // inheritance resolution so each violation reports once, at the
+    // definition that wrote it.
+    diagnostics.extend(find_composition_errors(&schema));
 
     resolve_model_inheritance(&mut schema);
 
@@ -338,5 +346,68 @@ mod tests {
         assert!(!schema.is_empty());
         assert_eq!(schema.models.len(), 2);
         assert_eq!(schema.enums.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod trait_tests {
+    //! RFC 0011 end-to-end through `load_schema`: traits merge like models,
+    //! and every misuse carries its code and source attribution.
+
+    use super::*;
+    use nml_core::schema_index::SchemaIndex;
+
+    fn code_strings(diags: &[nml_core::diagnostic::Diagnostic]) -> Vec<String> {
+        diags
+            .iter()
+            .filter_map(|d| d.code.map(|c| c.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn traits_load_merge_and_default_through_the_index() {
+        let src = "trait monitored:\n    timeout duration = \"5s\"\n\n\
+                   model endpoint is monitored:\n    url string+\n";
+        let (schema, diags) = load_schema(&[("t.model.nml", src)]);
+        assert!(diags.is_empty(), "{diags:?}");
+        let index = SchemaIndex::build(schema.models, schema.enums, schema.oneofs);
+        let endpoint = index.model("endpoint").unwrap();
+        assert!(
+            endpoint.fields.iter().any(|f| f.name == "timeout"),
+            "trait field must be merged into the composing model"
+        );
+        // The trait itself stays visible in the index (hover, `is` resolution)
+        // and keeps its kind.
+        assert!(index.model("monitored").unwrap().is_trait());
+    }
+
+    #[test]
+    fn composition_errors_carry_codes_and_sources() {
+        let src = "trait cap:\n    x string?\n\n\
+                   model a is missing:\n    y string?\n\n\
+                   model b:\n    c cap?\n\n\
+                   oneof entry by kind:\n    \"a\" -> cap\n";
+        let (_, diags) = load_schema(&[("bad.model.nml", src)]);
+        let codes = code_strings(&diags);
+        for expected in ["NML2020", "NML2022", "NML2023"] {
+            assert!(
+                codes.iter().any(|c| c == expected),
+                "missing {expected} in {codes:?}"
+            );
+        }
+        // Cross-source structural passes stay unattributed by design (see
+        // the module doc): a finding over the *merged* schema is owned by no
+        // single file. The span still points into the defining source.
+        assert!(diags.iter().all(|d| d.span.is_some()), "{diags:?}");
+    }
+
+    #[test]
+    fn duplicate_trait_and_model_name_is_one_namespace() {
+        let src = "trait cap:\n    x string?\n\nmodel cap:\n    y string?\n";
+        let (_, diags) = load_schema(&[("dup.model.nml", src)]);
+        assert!(
+            code_strings(&diags).contains(&"NML2009".to_string()),
+            "trait/model share one namespace: {diags:?}"
+        );
     }
 }

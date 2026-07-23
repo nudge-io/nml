@@ -2,13 +2,67 @@ use crate::span::Span;
 use crate::types::{PrimitiveType, SpannedValue};
 use serde::Serialize;
 
-/// A model definition parsed from `model name:` or `model name is parent:`.
+/// What a `ModelDef` declares (RFC 0011). A trait is structurally a model —
+/// same fields, defaults, directives, `extends` — distinguished only where
+/// the distinction is real: a trait can compose (`is`) but never be
+/// instantiated as a block, referenced as a field type, or targeted by a
+/// `oneof` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelKind {
+    Model,
+    Trait,
+}
+
+impl ModelKind {
+    /// The declaration keyword, for diagnostics ("model" / "trait").
+    pub fn label(self) -> &'static str {
+        match self {
+            ModelKind::Model => "model",
+            ModelKind::Trait => "trait",
+        }
+    }
+}
+
+/// One `is` target: the mixin's name plus the source span of exactly that
+/// token, so composition diagnostics point — and machine-applicable
+/// did-you-mean fixes rewrite — the target itself, not the whole
+/// declaration (RFC 0011).
+#[derive(Debug, Clone, Serialize)]
+pub struct MixinRef {
+    pub name: String,
+    pub span: Span,
+}
+
+impl MixinRef {
+    /// A span-less reference for synthesized schemas and tests. Extraction
+    /// always builds real spans; only construct span-less refs where no
+    /// source exists to point at.
+    pub fn synthetic(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            span: Span::new(0, 0),
+        }
+    }
+}
+
+/// A model definition parsed from `model name:` / `trait name:` (and their
+/// `… is parent:` forms). `kind` separates instantiable models from
+/// composition-only traits (RFC 0011).
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelDef {
     pub name: String,
-    pub extends: Vec<String>,
+    pub kind: ModelKind,
+    pub extends: Vec<MixinRef>,
     pub fields: Vec<FieldDef>,
     pub span: Span,
+}
+
+impl ModelDef {
+    /// Whether this definition is a composition-only trait (RFC 0011).
+    pub fn is_trait(&self) -> bool {
+        self.kind == ModelKind::Trait
+    }
 }
 
 /// An enum definition parsed from `enum name:`.

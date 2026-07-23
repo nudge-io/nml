@@ -21,11 +21,22 @@ and `fragment` becomes the only escape hatch:
 
     ```nml fragment                     never verified (illustrative excerpt)
 
-Beyond fenced blocks, two more passes run:
+Beyond fenced blocks, more passes run:
 
 - Example files: every `spec/examples/*.nml` is checked with the real CLI —
   `*.model.nml` schema files via `nml validate`, instance files via
   `nml check --schema spec/examples` (models live in the same directory).
+- Tutorial fixtures: every chapter directory under `docs/tutorial/examples/`
+  gets the same treatment — models via `nml validate`, instance files via
+  `nml check`, with `--schema <chapter dir>` once the chapter has a model.
+  Each chapter's final config state is therefore CI-verified.
+- Tutorial programs (`TUTORIAL_APPS`): the chapter app crates are workspace
+  members; this script `cargo run`s each from its chapter directory and
+  asserts the output the tutorial page claims — the pages' "what you'll see"
+  is tested, not trusted.
+- Rust source sync: a ```rust block tagged `source=<repo-rel-file>` must be a
+  verbatim substring of that file, so a page's full-program listing cannot
+  drift from the compiled crate.
 - Banned legacy tokens: syntax the language has removed must not reappear in
   teaching material. Enforced inside nml blocks and example files only (raw
   prose and Rust snippets legitimately contain e.g. `=>`), skipping
@@ -36,9 +47,8 @@ Beyond fenced blocks, two more passes run:
 The `nml` binary is taken from $NML_BIN, else target/debug/nml (build with
 `cargo build -p nml-cli` first — the `just docs-test` recipe does).
 
-Rust snippets are NOT handled here: crate/module doc examples are doc-tests
-(`cargo test`), and tutorial programs live in docs/tutorial/examples/*/ and
-compile in CI.
+Other Rust snippets are NOT handled here: crate/module doc examples are
+doc-tests (`cargo test`).
 """
 
 from __future__ import annotations
@@ -69,6 +79,19 @@ DOC_GLOBS = [
 FENCE_RE = re.compile(r"^```nml\b(.*)$")
 
 EXAMPLE_DIR = "spec/examples"
+TUTORIAL_DIR = "docs/tutorial/examples"
+
+# Tutorial chapter programs: (workspace package, chapter dir, expected output
+# substring). Run from the chapter directory so relative config paths in the
+# teaching code resolve. Entries are added as their chapters land; the crates
+# are workspace members, so `cargo test/clippy/fmt` cover them too.
+TUTORIAL_APPS: list[tuple[str, str, str]] = [
+    ("nml-tutorial-07", "docs/tutorial/examples/07", "4 endpoint(s)"),
+    ("nml-tutorial-08", "docs/tutorial/examples/08", "restart required"),
+    ("nml-tutorial-09", "docs/tutorial/examples/09", "store has: skylight v0.1.0"),
+]
+
+RUST_FENCE_RE = re.compile(r"^```rust\s+(\S.*)$")
 
 # Removed syntax that must never be re-taught. `=>` is banned only inside nml
 # blocks and example files (Rust match arms in prose legitimately use it);
@@ -210,6 +233,24 @@ def banned_tokens_in(text: str) -> list[str]:
     return [tok for tok in BANNED_TOKENS if tok in text]
 
 
+def run_cmd(
+    cmd: list[str], timeout: int = 60, cwd: Path | None = None
+) -> tuple[int | None, str]:
+    """Run a subprocess; returns (returncode, combined output). A timeout
+    yields (None, <message>) so one hanging example fails fast instead of
+    eating the CI job's whole budget."""
+    # CARGO_TARGET_DIR is dropped to match the justfile recipes: everything
+    # this script builds or runs lands in the repo's own target/.
+    env = {k: v for k, v in os.environ.items() if k != "CARGO_TARGET_DIR"}
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"{cmd[0]} did not finish within {timeout}s"
+    return proc.returncode, proc.stdout + proc.stderr
+
+
 def check_example_files() -> tuple[int, int, list[tuple[str, str]]]:
     """Check every spec/examples/*.nml with the real CLI. Returns
     (checked, passed, failures) where failures are (where, detail)."""
@@ -242,6 +283,120 @@ def check_example_files() -> tuple[int, int, list[tuple[str, str]]]:
             (EXAMPLE_DIR, "no example files found — restore them or update EXAMPLE_DIR")
         )
     return checked, passed, failures
+
+
+def check_tutorial_files() -> tuple[int, int, list[tuple[str, str]]]:
+    """Check every docs/tutorial/examples/<chapter>/*.nml with the real CLI.
+    Models are validated; instance files are checked against the chapter's
+    directory once it contains a model (the chapters before schemas exist
+    parse-check only). Returns (checked, passed, failures)."""
+    checked = passed = 0
+    failures: list[tuple[str, str]] = []
+    root = REPO / TUTORIAL_DIR
+    chapters = sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
+    # No silent caps: an empty result means the tutorial moved or was
+    # deleted, not that everything passed.
+    if not chapters:
+        return (
+            0,
+            0,
+            [(TUTORIAL_DIR, "no tutorial chapters found — restore them or update TUTORIAL_DIR")],
+        )
+    for chapter in chapters:
+        files = sorted(chapter.glob("*.nml"))
+        if not files:
+            failures.append(
+                (chapter.relative_to(REPO).as_posix(), "chapter has no .nml fixtures")
+            )
+            continue
+        has_schema = any(f.name.endswith(".model.nml") for f in files)
+        for path in files:
+            checked += 1
+            where = path.relative_to(REPO).as_posix()
+            if bad := banned_tokens_in(path.read_text(encoding="utf-8")):
+                failures.append((where, f"banned legacy token(s): {', '.join(bad)}"))
+                continue
+            if path.name.endswith(".model.nml"):
+                cmd = [str(nml_bin()), "validate", str(path)]
+            elif has_schema:
+                cmd = [str(nml_bin()), "check", "--schema", str(chapter), str(path)]
+            else:
+                cmd = [str(nml_bin()), "check", str(path)]
+            code, output = run_cmd(cmd)
+            if code != 0:
+                failures.append((where, output.strip()))
+            else:
+                passed += 1
+    return checked, passed, failures
+
+
+def run_tutorial_apps() -> tuple[int, int, list[tuple[str, str]]]:
+    """Compile AND run each tutorial chapter program, asserting the output its
+    page claims. Returns (checked, passed, failures)."""
+    checked = passed = 0
+    failures: list[tuple[str, str]] = []
+    for package, chapter, expect in TUTORIAL_APPS:
+        checked += 1
+        # Generous timeout: the first run compiles the crate (CI shares the
+        # workspace target dir with the nml-cli build, so deps are warm).
+        code, output = run_cmd(
+            ["cargo", "run", "--quiet", "-p", package],
+            timeout=300,
+            cwd=REPO / chapter,
+        )
+        if code != 0:
+            failures.append((package, output.strip()))
+        elif expect not in output:
+            failures.append(
+                (package, f"output did not contain {expect!r}; got:\n{output.strip()}")
+            )
+        else:
+            passed += 1
+    return checked, passed, failures
+
+
+def check_rust_source_blocks(path: Path) -> tuple[int, list[tuple[str, str]]]:
+    """```rust source=<repo-rel-file> blocks must be a verbatim substring of
+    that file — the page's program listing cannot drift from the compiled
+    crate. Returns (checked, failures)."""
+    checked = 0
+    failures: list[tuple[str, str]] = []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    i = 0
+    while i < len(lines):
+        m = RUST_FENCE_RE.match(lines[i])
+        if m is None:
+            i += 1
+            continue
+        where = f"{path.relative_to(REPO).as_posix()}:{i + 1}"
+        body: list[str] = []
+        i += 1
+        while i < len(lines) and lines[i].strip() != "```":
+            body.append(lines[i])
+            i += 1
+        i += 1
+        try:
+            tags = shlex.split(m.group(1))
+        except ValueError as e:
+            failures.append((where, f"malformed fence info string: {e}"))
+            continue
+        source = next(
+            (t[len("source="):] for t in tags if t.startswith("source=")), None
+        )
+        if source is None:
+            continue
+        checked += 1
+        source_path = (REPO / source).resolve()
+        if not source_path.is_relative_to(REPO):
+            failures.append((where, f"source path escapes the repository: {source}"))
+        elif not source_path.is_file():
+            failures.append((where, f"source file not found: {source}"))
+        elif "\n".join(body) not in source_path.read_text(encoding="utf-8"):
+            failures.append(
+                (where, f"block is not a verbatim excerpt of {source} — resync them")
+            )
+        continue
+    return checked, failures
 
 
 ERROR_INDEX = "crates/nml-core/assets/error-index.md"
@@ -278,9 +433,13 @@ def main() -> int:
 
     checked = passed = 0
     unverified = 0
+    rust_synced = 0
     failures: list[tuple[str, str]] = []
 
     for path in doc_files():
+        rust_checked, rust_failures = check_rust_source_blocks(path)
+        rust_synced += rust_checked
+        failures.extend(rust_failures)
         # as_posix: ban paths use forward slashes; a Windows checkout must
         # not un-exempt the RFCs (or exempt nothing) via backslash paths.
         rel = path.relative_to(REPO).as_posix()
@@ -318,6 +477,10 @@ def main() -> int:
 
     files_checked, files_passed, file_failures = check_example_files()
     failures.extend(file_failures)
+    tut_checked, tut_passed, tut_failures = check_tutorial_files()
+    failures.extend(tut_failures)
+    apps_checked, apps_passed, app_failures = run_tutorial_apps()
+    failures.extend(app_failures)
     failures.extend(check_error_index())
 
     for where, detail in failures:
@@ -328,6 +491,9 @@ def main() -> int:
     print(
         f"docs-test: {passed}/{checked} verified blocks passed,"
         f" {files_passed}/{files_checked} example files passed,"
+        f" {tut_passed}/{tut_checked} tutorial fixtures passed,"
+        f" {apps_passed}/{apps_checked} tutorial programs passed,"
+        f" {rust_synced} rust listings source-synced,"
         f" {unverified} untagged/fragment blocks not verified"
     )
     return 1 if failures else 0

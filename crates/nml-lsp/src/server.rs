@@ -3099,7 +3099,7 @@ impl LanguageServer for NmlLanguageServer {
             }
         }
 
-        let language_keywords = ["model", "enum", "const", "template"];
+        let language_keywords = ["model", "trait", "enum", "const", "template"];
         for kw in language_keywords {
             items.push(CompletionItem {
                 label: kw.to_string(),

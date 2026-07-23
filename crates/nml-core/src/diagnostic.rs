@@ -149,6 +149,20 @@ pub mod codes {
         /// A `oneof` with an enum-typed discriminator does not cover the
         /// enum exactly (missing arm, or arm outside the enum).
         ONEOF_NOT_EXHAUSTIVE = 2019;
+        /// An `is` target does not resolve to any model or trait (RFC 0011).
+        UNKNOWN_MIXIN = 2020;
+        /// An `is` target names an enum or `oneof` — only models and traits
+        /// compose (RFC 0011).
+        INVALID_MIXIN_KIND = 2021;
+        /// A field's type references a trait — traits are composition-only,
+        /// never value types (RFC 0011).
+        TRAIT_AS_FIELD_TYPE = 2022;
+        /// A `oneof` arm targets a trait — variants must be instantiable
+        /// models (RFC 0011).
+        TRAIT_ONEOF_VARIANT = 2023;
+        /// A block or array keyword names a trait — traits cannot be
+        /// instantiated (RFC 0011).
+        TRAIT_INSTANTIATED = 2024;
         /// Model `extends` chains form a cycle.
         EXTENDS_CYCLE = 2013;
         /// Model references form a cycle (advisory: legal, but often a sign

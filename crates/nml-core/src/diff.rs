@@ -285,9 +285,9 @@ pub fn diff_config(
     };
     diff_model(
         index,
-        ResolvedModel {
+        ModelCtx {
             model,
-            discriminator: None,
+            exempt: None,
         },
         old,
         new,
@@ -387,6 +387,7 @@ pub fn synthesize_config_root(root_name: &str, fields: &[ConfigRootField]) -> Mo
         .collect();
     ModelDef {
         name: root_name.to_string(),
+        kind: crate::model::ModelKind::Model,
         extends: Vec::new(),
         fields,
         span: nospan,
@@ -436,24 +437,56 @@ pub fn wrap_file_as_body(file: &File) -> Body {
     Body { entries }
 }
 
-/// A model an instance body resolved to, plus the oneof discriminator that
-/// selected it (covered content the model's own fields don't list).
+/// What a keyed-body instance's type resolves to: a plain model, or a `oneof`
+/// whose instance diffing (discriminator flip + variant routing) is owned
+/// wholesale by [`diff_oneof_instance`]. One resolver serves BOTH call sites
+/// (field-level bodies and collection elements), so their oneof behavior can
+/// never diverge.
+enum Target<'a> {
+    Model(&'a crate::model::ModelDef),
+    OneOf(&'a crate::model::OneOfDef),
+}
+
+/// Resolve a field type to its instance-diff target: unwrap `Modifier`,
+/// follow `ModelRef` (to a model OR a oneof), and walk `Union` variants to the
+/// first ref that resolves (a union here is already known to be a keyed-body
+/// instance — arms and list shapes were dispatched before this point, so
+/// scalar variants are impossible).
+fn resolve_instance_target<'a>(index: &'a SchemaIndex, ft: &'a FieldType) -> Option<Target<'a>> {
+    match ft {
+        FieldType::Modifier(inner) => resolve_instance_target(index, inner),
+        FieldType::ModelRef(name) => match index.resolve_ref(name) {
+            FieldTarget::Model(m) => Some(Target::Model(m)),
+            FieldTarget::OneOf(o) => Some(Target::OneOf(o)),
+            _ => None,
+        },
+        FieldType::Union(variants) => variants
+            .iter()
+            .find_map(|v| resolve_instance_target(index, v)),
+        _ => None,
+    }
+}
+
+/// The model a body diffs against, plus a property name the remainder walk
+/// must treat as covered — the oneof discriminator when this model is a
+/// variant selected through a oneof (it belongs to the union, not the model's
+/// fields). `None` exempt for plain models.
 #[derive(Clone, Copy)]
-struct ResolvedModel<'a> {
+struct ModelCtx<'a> {
     model: &'a crate::model::ModelDef,
-    discriminator: Option<&'a str>,
+    exempt: Option<&'a str>,
 }
 
 fn diff_model(
     index: &SchemaIndex,
-    resolved: ResolvedModel<'_>,
+    ctx: ModelCtx<'_>,
     old: &[(PathBuf, &Body)],
     new: &[(PathBuf, &Body)],
     prefix: &FieldPath,
     depth: u32,
     out: &mut Vec<FieldChange>,
 ) {
-    let model = resolved.model;
+    let model = ctx.model;
     if depth >= MAX_DEPTH {
         // The resource boundary honors the module invariant: content the walk
         // cannot descend into is structurally compared and surfaces as a
@@ -471,7 +504,152 @@ fn diff_model(
     // and named entries matching no field. Without this, such content is
     // invisible even to the OpaqueChanged fall-through (the model DID
     // resolve) — the tenantGrants silent-diff bug class.
-    diff_unmodeled_remainder(index, resolved, old, new, prefix, depth, out);
+    diff_unmodeled_remainder(index, ctx, old, new, prefix, depth, out);
+}
+
+/// Diff a `oneof` instance — the ONE owner of oneof semantics for both call
+/// sites (field bodies and collection elements). Policy, complete over the
+/// input classes ({absent, content} × {resolvable, unresolvable} × default):
+/// * an ABSENT side (the field/element does not exist — an EMPTY SLICE; a
+///   present-but-empty body is NOT absent, it is real content selecting the
+///   default variant) makes this a pure add/remove: single half-diff, precise
+///   `Added`/`Removed`, and NO discriminator flip (a flip against a side that
+///   does not exist would be a phantom change);
+/// * both sides non-empty with EQUAL effective discriminators (explicit
+///   property | union default): one normal model diff;
+/// * both non-empty, DIFFERENT effective values: emit the flip once
+///   (value-based — two values mapping to the SAME variant still flip), then
+///   same-model → one diff; different models → each side diffs against ITS OWN
+///   variant model vs empty (precise `Removed`/`Added`, no false opacity,
+///   no false drift signal);
+/// * a NON-EMPTY side that cannot resolve (value not in the variants, or the
+///   variant's model missing from the index — both = drift) degrades to the
+///   visible `opaque_if_different` fall-through. Garbage in, deterministic
+///   visible out.
+fn diff_oneof_instance(
+    index: &SchemaIndex,
+    oneof: &crate::model::OneOfDef,
+    old: &[(PathBuf, &Body)],
+    new: &[(PathBuf, &Body)],
+    path: &FieldPath,
+    depth: u32,
+    out: &mut Vec<FieldChange>,
+) {
+    fn effective<'a>(
+        side: &[(PathBuf, &'a Body)],
+        discr_name: &str,
+        default: Option<&'a str>,
+    ) -> Option<&'a str> {
+        lookup_property(side, discr_name).or(default)
+    }
+    let discr_name = oneof.discriminator.as_str();
+    let default = oneof.default_discriminator.as_deref();
+    // ABSENT means the field/element does not exist on that side at all — the
+    // callers pass an EMPTY SLICE for an absent side (diff_field's `_ => &empty`
+    // arm; an element with no body). A side that is PRESENT with an empty body
+    // is REAL content: with a default discriminator, bare presence legitimately
+    // selects the default variant (`e:` ≡ the builtin variant), so a later
+    // explicit `kind = "card"` is a genuine flip — not a phantom.
+    let is_absent = |side: &[(PathBuf, &Body)]| side.is_empty();
+    let variant_model = |val: &str| {
+        let name = oneof
+            .variants
+            .iter()
+            .find(|(v, _)| v == val)
+            .map(|(_, m)| m.as_str())?;
+        match index.resolve_ref(name) {
+            FieldTarget::Model(m) => Some(m),
+            _ => None,
+        }
+    };
+    let empty: Vec<(PathBuf, &Body)> = Vec::new();
+
+    let (old_empty, new_empty) = (is_absent(old), is_absent(new));
+    if old_empty && new_empty {
+        return;
+    }
+    // Pure add/remove: single-sided precise diff, no flip.
+    if old_empty || new_empty {
+        let side = if old_empty { new } else { old };
+        match effective(side, discr_name, default).and_then(&variant_model) {
+            Some(m) => {
+                let ctx = ModelCtx {
+                    model: m,
+                    exempt: Some(discr_name),
+                };
+                if old_empty {
+                    diff_model(index, ctx, &empty, new, path, depth, out);
+                } else {
+                    diff_model(index, ctx, old, &empty, path, depth, out);
+                }
+            }
+            None => opaque_if_different(old, new, path, out),
+        }
+        return;
+    }
+
+    let (Some(old_val), Some(new_val)) = (
+        effective(old, discr_name, default),
+        effective(new, discr_name, default),
+    ) else {
+        // Non-empty but no discriminator and no default: undescribable.
+        opaque_if_different(old, new, path, out);
+        return;
+    };
+    if old_val != new_val {
+        // The flip is the headline change — visible in its own right, once,
+        // value-based. Origin prefers whichever side names the property
+        // explicitly.
+        let flip_path = discriminator_flip_path(path, discr_name);
+        let origin = match discriminator_origin(new, discr_name) {
+            Origin::Default => discriminator_origin(old, discr_name),
+            o => o,
+        };
+        push(
+            &flip_path,
+            ChangeKind::Modified {
+                old: Value::String(old_val.to_string()),
+                new: Value::String(new_val.to_string()),
+            },
+            origin,
+            out,
+        );
+    }
+    match (variant_model(old_val), variant_model(new_val)) {
+        (Some(om), Some(nm)) if std::ptr::eq(om, nm) => {
+            let ctx = ModelCtx {
+                model: nm,
+                exempt: Some(discr_name),
+            };
+            diff_model(index, ctx, old, new, path, depth, out);
+        }
+        (Some(om), Some(nm)) => {
+            // Variant switch: each side against ITS OWN model — precise
+            // Removed/Added, and the old side's fields are fully described
+            // (no false OpaqueChanged, no false drift signal).
+            let nctx = ModelCtx {
+                model: nm,
+                exempt: Some(discr_name),
+            };
+            let octx = ModelCtx {
+                model: om,
+                exempt: Some(discr_name),
+            };
+            diff_model(index, nctx, &empty, new, path, depth, out);
+            diff_model(index, octx, old, &empty, path, depth, out);
+        }
+        _ => {
+            // Unknown variant value or missing variant model on a NON-EMPTY
+            // side — genuine drift, visible.
+            opaque_if_different(old, new, path, out);
+        }
+    }
+}
+
+/// The flip change's path: the oneof field's path plus the discriminator
+/// property hop appended.
+fn discriminator_flip_path(path: &FieldPath, discr: &str) -> FieldPath {
+    path.appended(PathSeg::Field(FieldStep::new(discr, Vec::new(), false)))
 }
 
 /// Diff the parts of a model-instance body the model's fields do not cover.
@@ -483,14 +661,14 @@ fn diff_model(
 /// and surface as one OpaqueChanged at the model's path when they differ.
 fn diff_unmodeled_remainder(
     index: &SchemaIndex,
-    resolved: ResolvedModel<'_>,
+    ctx: ModelCtx<'_>,
     old: &[(PathBuf, &Body)],
     new: &[(PathBuf, &Body)],
     prefix: &FieldPath,
     depth: u32,
     out: &mut Vec<FieldChange>,
 ) {
-    let (model, discriminator) = (resolved.model, resolved.discriminator);
+    let (model, discriminator) = (ctx.model, ctx.exempt);
     // (a) Bare list items. Two cases, one mechanism:
     //  * the model DECLARES a body-positional list field (RFC 0005 `+` on a
     //    list/set — e.g. `plugins []tenantGrantPlugin+`): the items diff
@@ -906,25 +1084,27 @@ fn diff_bodies(
         Effective::Bodies(b) => b,
         _ => &empty,
     };
-    if let Some((model, discr)) = resolve_instance_model(index, &field.field_type, n, o) {
-        diff_model(
+    match resolve_instance_target(index, &field.field_type) {
+        Some(Target::Model(m)) => diff_model(
             index,
-            ResolvedModel {
-                model,
-                discriminator: discr,
+            ModelCtx {
+                model: m,
+                exempt: None,
             },
             o,
             n,
             path,
             depth + 1,
             out,
-        )
-    } else {
-        // Bodies that neither arms, elements, nor a resolvable model consumed:
-        // a shape the schema cannot describe (model↔grammar drift — a renamed/
-        // missing model, an unknown oneof variant, a body under a scalar-typed
-        // field). Visible, never silent (module invariant).
-        opaque_if_different(o, n, path, out);
+        ),
+        Some(Target::OneOf(of)) => diff_oneof_instance(index, of, o, n, path, depth + 1, out),
+        None => {
+            // Bodies that neither arms, elements, nor a resolvable target
+            // consumed: a shape the schema cannot describe (model↔grammar
+            // drift — a renamed/missing model, a body under a scalar-typed
+            // field). Visible, never silent (module invariant).
+            opaque_if_different(o, n, path, out);
+        }
     }
 }
 
@@ -980,62 +1160,23 @@ fn opaque_if_different(
     push(path, ChangeKind::OpaqueChanged, origin, out);
 }
 
-/// Resolve the model a nested instance validates against — following model
-/// refs and, for a `oneof`, the **instance's own discriminator value** (the
-/// new side's, falling back to the old side's), so exactly the variant in use
-/// is walked (RFC 0032 P2: instance-aware, never a pessimistic union).
-/// Returns the resolved model plus, when resolution went through a `oneof`,
-/// the discriminator property name the instance used — the remainder check
-/// must treat that property as covered (it belongs to the oneof, not the
-/// variant model's fields).
-fn resolve_instance_model<'a>(
-    index: &'a SchemaIndex,
-    ft: &'a FieldType,
-    new_bodies: &[(PathBuf, &Body)],
-    old_bodies: &[(PathBuf, &Body)],
-) -> Option<(&'a crate::model::ModelDef, Option<&'a str>)> {
-    match ft {
-        FieldType::Modifier(inner) => resolve_instance_model(index, inner, new_bodies, old_bodies),
-        FieldType::ModelRef(name) => model_from_ref(index, name, new_bodies, old_bodies),
-        // A UNION here is already known to be a keyed-body instance (arms and
-        // list shapes were dispatched before this point), so scalar variants
-        // are impossible: the first model-resolving variant is the one.
-        FieldType::Union(variants) => variants.iter().find_map(|v| match v {
-            FieldType::ModelRef(name) => model_from_ref(index, name, new_bodies, old_bodies),
-            _ => None,
-        }),
-        _ => None,
-    }
-}
-
-/// Resolve a type-reference name to the model a body instance validates
-/// against — directly, or through a `oneof` via the **instance's own
-/// discriminator value** (new side, else old, else the schema default), so
-/// exactly the variant in use is walked.
-fn model_from_ref<'a>(
-    index: &'a SchemaIndex,
-    name: &str,
-    new_bodies: &[(PathBuf, &Body)],
-    old_bodies: &[(PathBuf, &Body)],
-) -> Option<(&'a crate::model::ModelDef, Option<&'a str>)> {
-    match index.resolve_ref(name) {
-        FieldTarget::Model(m) => Some((m, None)),
-        FieldTarget::OneOf(o) => {
-            let discr = lookup_property(new_bodies, &o.discriminator)
-                .or_else(|| lookup_property(old_bodies, &o.discriminator))
-                .or(o.default_discriminator.as_deref())?;
-            let variant = o
-                .variants
-                .iter()
-                .find(|(v, _)| v == discr)
-                .map(|(_, m)| m.as_str())?;
-            match index.resolve_ref(variant) {
-                FieldTarget::Model(m) => Some((m, Some(o.discriminator.as_str()))),
-                _ => None,
+/// The file:line of a discriminator property `name` on one side, for a
+/// discriminator-flip change's origin (the caller prefers whichever side names
+/// the property explicitly). Falls back to `Default` if absent.
+fn discriminator_origin(bodies: &[(PathBuf, &Body)], name: &str) -> Origin {
+    for (file, body) in bodies.iter().rev() {
+        for entry in &body.entries {
+            if let BodyEntryKind::Property(p) = &entry.kind {
+                if p.name.name == name {
+                    return Origin::File {
+                        file: file.clone(),
+                        span: p.value.span,
+                    };
+                }
             }
         }
-        _ => None,
     }
+    Origin::Default
 }
 
 fn lookup_property<'a>(bodies: &[(PathBuf, &'a Body)], name: &str) -> Option<&'a str> {
@@ -1208,38 +1349,42 @@ fn diff_collections(
             .body
             .map(|b| vec![(n.file.map(Path::to_path_buf).unwrap_or_default(), b)])
             .unwrap_or_default();
-        if let Some((model, discr)) =
-            resolve_instance_model(index, elem_type(&field.field_type), &n_files, &o_files)
-        {
-            diff_model(
-                index,
-                ResolvedModel {
-                    model,
-                    discriminator: discr,
-                },
-                &o_files,
-                &n_files,
-                &elem_path,
-                depth + 1,
-                out,
-            );
-        } else {
-            // Scalar-typed elements whose bodies carry config content — e.g.
-            // `|block set<string>` with namespaced `- egress:` entries (the RFC
-            // 0032 |block blind spot): there is no model to recurse into, but
-            // the content is still list items. Complete the recursion: diff the
-            // bodies' own items with the PARENT collection's semantics at the
-            // element path — full per-element fidelity with real origins.
-            let o_items = Effective::Bodies(o_files.clone());
-            let n_items = Effective::Bodies(n_files.clone());
-            let o_items = collect_elems(&o_items);
-            let n_items = collect_elems(&n_items);
-            if !o_items.is_empty() || !n_items.is_empty() {
-                diff_collections(index, field, &o_items, &n_items, &elem_path, depth + 1, out);
-            } else {
-                // No items AND no model: content the schema cannot describe —
-                // visible, never silent (module invariant).
-                opaque_if_different(&o_files, &n_files, &elem_path, out);
+        match resolve_instance_target(index, elem_type(&field.field_type)) {
+            Some(Target::Model(m)) => {
+                diff_model(
+                    index,
+                    ModelCtx {
+                        model: m,
+                        exempt: None,
+                    },
+                    &o_files,
+                    &n_files,
+                    &elem_path,
+                    depth + 1,
+                    out,
+                );
+            }
+            Some(Target::OneOf(of)) => {
+                diff_oneof_instance(index, of, &o_files, &n_files, &elem_path, depth + 1, out);
+            }
+            None => {
+                // Scalar-typed elements whose bodies carry config content — e.g.
+                // `|block set<string>` with namespaced `- egress:` entries (the RFC
+                // 0032 |block blind spot): there is no model to recurse into, but
+                // the content is still list items. Complete the recursion: diff the
+                // bodies' own items with the PARENT collection's semantics at the
+                // element path — full per-element fidelity with real origins.
+                let o_items = Effective::Bodies(o_files.clone());
+                let n_items = Effective::Bodies(n_files.clone());
+                let o_items = collect_elems(&o_items);
+                let n_items = collect_elems(&n_items);
+                if !o_items.is_empty() || !n_items.is_empty() {
+                    diff_collections(index, field, &o_items, &n_items, &elem_path, depth + 1, out);
+                } else {
+                    // No items AND no model: content the schema cannot describe —
+                    // visible, never silent (module invariant).
+                    opaque_if_different(&o_files, &n_files, &elem_path, out);
+                }
             }
         }
     }
@@ -2087,6 +2232,187 @@ mod tests {
         assert!(matches!(d[0].kind, ChangeKind::OpaqueChanged), "{d:?}");
         // Unchanged unmodeled entry ⇒ silent.
         assert!(d2(&with(1), &with(1)).is_empty());
+    }
+
+    /// A oneof DISCRIMINATOR flip is visible in its own right — not merely
+    /// implied by the variant fields that accompany it. `provider "log" →
+    /// "postmark"` must emit a `Modified` at the discriminator path (the
+    /// headline change), independent of the variant-field adds.
+    #[test]
+    fn oneof_discriminator_flip_is_visible() {
+        let schema = "model log:\n\nmodel post:\n    token string?\n\noneof provider by kind:\n    \"log\" -> log\n    \"post\" -> post\n\nmodel server:\n    p provider?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let old = parse_doc("server s:\n    p:\n        kind = \"log\"\n");
+        let new = parse_doc("server s:\n    p:\n        kind = \"post\"\n        token = \"t\"\n");
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        // Both the discriminator flip AND the new variant field are visible.
+        assert!(
+            d.iter().any(|c| p(c) == "p.kind"
+                && matches!(&c.kind, ChangeKind::Modified { old, new }
+                    if matches!(old, Value::String(s) if s == "log")
+                        && matches!(new, Value::String(s) if s == "post"))),
+            "discriminator flip must be visible: {d:?}"
+        );
+        assert!(
+            d.iter().any(|c| p(c) == "p.token"),
+            "variant field too: {d:?}"
+        );
+    }
+
+    /// The discriminator flip is visible even when one side OMITS the property
+    /// and relies on the union default (`by kind = "builtin"`): omitting `kind`
+    /// on the old side then setting it explicitly on the new side is a real
+    /// variant switch, and the effective-value comparison surfaces it — the
+    /// (Some,Some)-only guard would have dropped it silently.
+    #[test]
+    fn oneof_discriminator_flip_visible_across_the_default() {
+        let schema = "model builtin:\n\nmodel card:\n    title string?\n\noneof exp by kind = \"builtin\":\n    \"builtin\" -> builtin\n    \"card\" -> card\n\nmodel server:\n    e exp?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        // old OMITS kind (⇒ default "builtin"); new sets it to "card".
+        let old = parse_doc("server s:\n    e:\n");
+        let new = parse_doc("server s:\n    e:\n        kind = \"card\"\n        title = \"t\"\n");
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        assert!(
+            d.iter().any(|c| p(c) == "e.kind"
+                && matches!(&c.kind, ChangeKind::Modified { old, new }
+                    if matches!(old, Value::String(s) if s == "builtin")
+                        && matches!(new, Value::String(s) if s == "card"))),
+            "default→explicit discriminator flip must be visible: {d:?}"
+        );
+        // And omitting on BOTH sides (both default) stays silent for the discriminator.
+        let same = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+        );
+        assert!(
+            same.iter().all(|c| p(c) != "e.kind"),
+            "no phantom flip: {same:?}"
+        );
+    }
+
+    /// The variant SWITCH that drops fields (`post(fields) → log(empty)`): the
+    /// flip plus PRECISE per-field `Removed`s from the old variant's own model —
+    /// and crucially NO `OpaqueChanged` (the old fields ARE described, by the
+    /// old variant; a coarse/false-drift signal here was the bug this owner
+    /// function exists to fix).
+    #[test]
+    fn oneof_variant_switch_drops_fields_precisely() {
+        let schema = "model log:\n\nmodel post:\n    token string?\n    addr string?\n\noneof provider by kind:\n    \"log\" -> log\n    \"post\" -> post\n\nmodel server:\n    p provider?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let old = parse_doc("server s:\n    p:\n        kind = \"post\"\n        token = \"t\"\n        addr = \"a\"\n");
+        let new = parse_doc("server s:\n    p:\n        kind = \"log\"\n");
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        assert!(
+            d.iter()
+                .all(|c| !matches!(c.kind, ChangeKind::OpaqueChanged)),
+            "a legitimate switch must never read as drift: {d:?}"
+        );
+        assert!(d.iter().any(|c| p(c) == "p.kind"), "flip visible: {d:?}");
+        assert!(
+            d.iter()
+                .any(|c| p(c) == "p.token" && matches!(c.kind, ChangeKind::Removed { .. }))
+                && d.iter()
+                    .any(|c| p(c) == "p.addr" && matches!(c.kind, ChangeKind::Removed { .. })),
+            "old variant's fields removed PRECISELY: {d:?}"
+        );
+    }
+
+    /// ELEMENT-level oneofs (`[]denial`-shaped): a kind-flip on a collection
+    /// element routes through the SAME owner as field-level — both call sites
+    /// converge by construction.
+    #[test]
+    fn oneof_element_level_kind_flip_is_precise() {
+        let schema = "model builtin:\n\nmodel card:\n    title string?\n\noneof denial by kind = \"builtin\":\n    \"builtin\" -> builtin\n    \"card\" -> card\n\nmodel server:\n    denials []denial?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let old = parse_doc(
+            "server s:\n    denials:\n        - NotFound:\n            kind = \"builtin\"\n",
+        );
+        let new = parse_doc("server s:\n    denials:\n        - NotFound:\n            kind = \"card\"\n            title = \"t\"\n");
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        assert!(
+            d.iter()
+                .all(|c| !matches!(c.kind, ChangeKind::OpaqueChanged)),
+            "{d:?}"
+        );
+        assert!(
+            d.iter().any(|c| p(c) == "denials.NotFound.kind"),
+            "element-level flip at the element path: {d:?}"
+        );
+        assert!(d.iter().any(|c| p(c) == "denials.NotFound.title"), "{d:?}");
+    }
+
+    /// A oneof block ADDED whole (old side absent): precise per-field `Added`s
+    /// and NO discriminator flip — even with a default (a flip against a side
+    /// that does not exist would be a phantom change). Mirror for removal.
+    #[test]
+    fn oneof_block_added_or_removed_is_precise_with_no_phantom_flip() {
+        // `port` keeps the absent-side server body non-empty.
+        let schema = "model builtin:\n\nmodel card:\n    title string?\n\noneof exp by kind = \"builtin\":\n    \"builtin\" -> builtin\n    \"card\" -> card\n\nmodel server:\n    port number?\n    e exp?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let absent = parse_doc("server s:\n    port = 1\n");
+        let with_card = parse_doc(
+            "server s:\n    port = 1\n    e:\n        kind = \"card\"\n        title = \"t\"\n",
+        );
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&absent))],
+            &[(PathBuf::from("f.nml"), server_body(&with_card))],
+        );
+        assert!(
+            d.iter().all(|c| p(c) != "e.kind"),
+            "NO phantom flip on a pure add: {d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|c| p(c) == "e.title" && matches!(c.kind, ChangeKind::Added { .. })),
+            "added block's fields precise: {d:?}"
+        );
+        // Removal mirrors.
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&with_card))],
+            &[(PathBuf::from("f.nml"), server_body(&absent))],
+        );
+        assert!(d.iter().all(|c| p(c) != "e.kind"), "{d:?}");
+        assert!(
+            d.iter()
+                .any(|c| p(c) == "e.title" && matches!(c.kind, ChangeKind::Removed { .. })),
+            "removed block's fields precise: {d:?}"
+        );
     }
 
     /// Model↔grammar drift, shape 1 — a `ModelRef` to a model MISSING from the

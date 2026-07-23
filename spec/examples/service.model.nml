@@ -1,8 +1,8 @@
 // === traits ===
 
 trait accessControlled:
-    |allow []role
-    |deny []role
+    |allow []role?
+    |deny []role?
 
 
 // === enums ===

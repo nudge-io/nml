@@ -913,6 +913,28 @@ mod tests {
             run.shorthand && run.optional,
             "`run string?!` is shorthand + optional"
         );
+
+        // The fixture's mixin is a real trait (RFC 0011): extracted, marked,
+        // and composable — its modifier fields reach `resource` via `is`.
+        let ac = schema
+            .models
+            .iter()
+            .find(|m| m.name == "accessControlled")
+            .expect("trait extracted");
+        assert!(ac.is_trait());
+        let mut schema = schema;
+        crate::schema::resolve_model_inheritance(&mut schema);
+        assert!(
+            schema
+                .models
+                .iter()
+                .find(|m| m.name == "resource")
+                .unwrap()
+                .fields
+                .iter()
+                .any(|f| f.name == "allow"),
+            "trait modifier fields merge into composing models"
+        );
     }
 
     #[test]
