@@ -191,6 +191,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Eat an identifier that MUST sit on the same line as the just-consumed
+    /// token (line-significance). If it is absent or on a following line, emit an
+    /// error and consume **nothing** — so the next entry survives recovery rather
+    /// than being swallowed. Used for the RFC 0015 `as <Variant>` variant name,
+    /// mirroring the same-line rule `at_field_type` enforces for a field type.
+    fn expect_kw_same_line_ident(&mut self, desc: &'static str) {
+        if self.at(SyntaxKind::Ident) && !self.newline_before() {
+            self.bump();
+        } else {
+            self.expected(vec![crate::error::ExpectedItem::Desc(desc)], None);
+        }
+    }
+
     /// The `Expected` workhorse (RFC 0009): alternatives + the found token,
     /// captured here so no site ever states "found" by hand.
     fn expected(
@@ -487,7 +500,23 @@ impl<'a> Parser<'a> {
     fn ident_entry(&mut self) {
         let m = self.start();
         self.bump(); // name
-        if self.eat(SyntaxKind::Eq) {
+        if self.at_kw("as") {
+            // RFC 0015 nominal union annotation: `name as <Variant>: body`.
+            // Checked *before* `at_field_type` so `as` is reserved in the type
+            // slot (a field typed literally `as` is not expressible — a
+            // deliberate reservation; `as` is already a keyword in `oneof … as`).
+            // A property/block *named* `as` is unaffected: that `as` is the
+            // bumped name and the next token is `=`/`:`, not this branch.
+            self.bump(); // as
+                         // The variant must follow `as` on the SAME line (line-significance,
+                         // exactly like a field type — see `at_field_type`). Without this
+                         // guard a bare `field as` would swallow the NEXT entry's name as the
+                         // variant, since the offside lexer carries no line-boundary token.
+            self.expect_kw_same_line_ident("a union variant type after `as`");
+            self.expect(SyntaxKind::Colon);
+            self.body();
+            m.complete(self, SyntaxKind::NestedBlock);
+        } else if self.eat(SyntaxKind::Eq) {
             self.value_block();
             m.complete(self, SyntaxKind::Property);
         } else if self.eat(SyntaxKind::Colon) {
@@ -619,7 +648,15 @@ impl<'a> Parser<'a> {
             }
             SyntaxKind::Secret => self.bump(),
             SyntaxKind::Ident => {
-                self.bump();
+                self.bump(); // name
+                if self.at_kw("as") {
+                    // RFC 0015 nominal union annotation on a list element:
+                    // `- Name as <Variant>: body`. Same-line variant (see
+                    // `expect_kw_same_line_ident`) so `- Name as` can't swallow
+                    // the next item.
+                    self.bump(); // as
+                    self.expect_kw_same_line_ident("a union variant type after `as`");
+                }
                 if self.eat(SyntaxKind::Colon) {
                     self.body();
                 }

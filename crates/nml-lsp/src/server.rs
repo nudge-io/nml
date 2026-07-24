@@ -1674,6 +1674,34 @@ fn find_enum_variants_at(
 /// (selected from the body's discriminator). `None` when no schema model applies (unknown
 /// keyword / free-form `object` / a union whose discriminator is unset), or the cursor is on a
 /// header line.
+/// RFC 0015: if the cursor sits in the `as`-type slot of a header line
+/// (`<field> as <partial>`, before any `:` body or `=` value), return the field
+/// name whose union variants should be completed. `None` otherwise. Pure line
+/// analysis so the completion detector is unit-testable in isolation.
+fn as_position_field(line: &str, cursor_byte: usize) -> Option<String> {
+    let before = line.get(..cursor_byte)?;
+    // Still in the header type slot — a `:` (body) or `=` (value) means we have
+    // left it.
+    if before.contains(':') || before.contains('=') {
+        return None;
+    }
+    // Strip an optional list-item marker so `- name as …` is recognized like a
+    // field header.
+    let header = before.trim_start().trim_start_matches("- ");
+    let mut toks = header.split_whitespace();
+    let name = toks.next()?;
+    if toks.next()? != "as" {
+        return None;
+    }
+    // At most one partial variant token may trail the `as`; anything more means
+    // the cursor is past the annotation.
+    match toks.next() {
+        None => Some(name.to_string()),
+        Some(_) if toks.next().is_none() => Some(name.to_string()),
+        _ => None,
+    }
+}
+
 fn find_model_body_at<'i, 'f>(
     file: &'f File,
     pos: Position,
@@ -3086,6 +3114,48 @@ impl LanguageServer for NmlLanguageServer {
                         }
                         return Ok(Some(CompletionResponse::Array(items)));
                     }
+                }
+                // RFC 0015 `as`-position (nominal union): after `<field> as ` on
+                // a header line, the author is choosing a union variant by name.
+                // Offer the field's nameable variants — the SAME candidate set
+                // the validator checks and the did-you-mean draws from, so
+                // completion, diagnostics, and fixes share one source of truth.
+                let as_field = position::line_at(source, pos.line).and_then(|line| {
+                    let end = position::utf16_to_byte(line, pos.character);
+                    as_position_field(line, end)
+                });
+                if let Some(field_name) = as_field {
+                    if let Some((model, _)) = find_model_body_at(&file, pos, index, &line_index) {
+                        if let Some(field) = model.fields.iter().find(|f| f.name == field_name) {
+                            // The union is the field type, or a `[]`/`set<>` element type.
+                            let variants = match &field.field_type {
+                                FieldType::Union(v) => Some(v.as_slice()),
+                                FieldType::List(inner) | FieldType::Set(inner) => {
+                                    match inner.as_ref() {
+                                        FieldType::Union(v) => Some(v.as_slice()),
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if let Some(variants) = variants {
+                                for (i, variant) in index
+                                    .nameable_variant_names(variants)
+                                    .into_iter()
+                                    .enumerate()
+                                {
+                                    items.push(CompletionItem {
+                                        label: variant.to_string(),
+                                        kind: Some(CompletionItemKind::TYPE_PARAMETER),
+                                        detail: Some("union variant".to_string()),
+                                        sort_text: Some(format!("0_{i:03}")),
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    return Ok(Some(CompletionResponse::Array(items)));
                 }
                 if let Some((model, body)) = find_model_body_at(&file, pos, index, &line_index) {
                     let present = present_field_names(body);
@@ -5005,6 +5075,51 @@ workflow VoiceAgent:
             .map(|f| f.name.as_str())
             .collect();
         assert_eq!(offered, vec!["temperature", "baseUrl"]);
+    }
+
+    #[test]
+    fn as_position_detector_recognizes_the_type_slot() {
+        // Field header, cursor right after `as ` (empty partial).
+        assert_eq!(
+            as_position_field("    slot as ", 12).as_deref(),
+            Some("slot")
+        );
+        // With a partial variant typed.
+        assert_eq!(
+            as_position_field("    slot as mod", 15).as_deref(),
+            Some("slot")
+        );
+        // List element header.
+        assert_eq!(
+            as_position_field("        - one as ", 17).as_deref(),
+            Some("one")
+        );
+        // Not `as`-position: a plain nested block, a value, a completed body.
+        assert_eq!(as_position_field("    slot", 8), None);
+        assert_eq!(as_position_field("    port = ", 11), None);
+        assert_eq!(as_position_field("    slot as modelB:", 19), None);
+    }
+
+    #[test]
+    fn as_completion_offers_union_variants() {
+        // A same-class union field; at the `as` slot, the nameable variants are
+        // offered (and disjoint variants — a list/scalar — never are).
+        let index = field_index(
+            "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        let source = "host H:\n    slot as modelA:\n        a = \"x\"\n";
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
+        let line_index = LineIndex::new(source);
+        let (model, _) =
+            find_model_body_at(&file, Position::new(1, 8), &index, &line_index).unwrap();
+        let field = model.fields.iter().find(|f| f.name == "slot").unwrap();
+        let FieldType::Union(variants) = &field.field_type else {
+            panic!("expected union field")
+        };
+        assert_eq!(
+            index.nameable_variant_names(variants),
+            vec!["modelA", "modelB"]
+        );
     }
 
     #[test]

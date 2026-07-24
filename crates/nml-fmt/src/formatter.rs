@@ -306,6 +306,12 @@ impl<'a> Formatter<'a> {
             BodyEntryKind::NestedBlock(nb) => {
                 self.write_indent(depth);
                 self.out.push_str(&nb.name.name);
+                // RFC 0015: re-emit the `as <Variant>` annotation. LOAD-BEARING —
+                // fmt reconstructs from the AST, so dropping it would silently
+                // re-disambiguate a same-class union (typed → anonymous →
+                // structural first-wins), changing the config's meaning. The
+                // round-trip test locks this.
+                self.emit_type_annotation(&nb.body);
                 self.out.push(':');
                 self.emit_trailing_comment(nb.name.span.start);
                 self.out.push('\n');
@@ -422,6 +428,16 @@ impl<'a> Formatter<'a> {
         }
     }
 
+    /// Emit an RFC 0015 nominal type annotation (` as <Variant>`) when the body
+    /// carries one. The single point both the field and list-element headers use,
+    /// so the annotation is never emitted inconsistently or dropped.
+    fn emit_type_annotation(&mut self, body: &Body) {
+        if let Some(ann) = &body.type_annotation {
+            self.out.push_str(" as ");
+            self.out.push_str(&ann.name);
+        }
+    }
+
     fn list_item(&mut self, item: &ListItem, depth: usize) {
         self.write_indent(depth);
         self.out.push_str("- ");
@@ -429,6 +445,9 @@ impl<'a> Formatter<'a> {
         match &item.kind {
             ListItemKind::Named { name, body } => {
                 self.out.push_str(&name.name);
+                // RFC 0015: re-emit `as <Variant>` at the list-element level too
+                // (see `body_entry`). Same data-integrity requirement.
+                self.emit_type_annotation(body);
                 self.out.push(':');
                 self.emit_trailing_comment(item.span.start);
                 self.out.push('\n');
@@ -853,6 +872,66 @@ mod tests {
     #[test]
     fn roundtrip_multiple_blocks() {
         roundtrip("service A:\n    x = 1\n\nservice B:\n    y = 2\n");
+    }
+
+    #[test]
+    fn roundtrip_preserves_nominal_annotation() {
+        use nml_core::ast::{Body, BodyEntryKind, DeclarationKind};
+        // RFC 0015 data-integrity guarantee: fmt reconstructs from the AST, so
+        // it MUST re-emit `as <Variant>`; dropping it would silently change a
+        // same-class union's variant. Assert the text is preserved AND that the
+        // annotation survives a parse→format→parse round-trip semantically.
+        let field = "host H:\n    slot as modelB:\n        b = \"x\"\n";
+        let elem = "host H:\n    slots:\n        - one as modelB:\n            b = \"x\"\n";
+
+        fn slot_annotation(body: &Body, name: &str) -> Option<String> {
+            body.entries.iter().find_map(|e| match &e.kind {
+                BodyEntryKind::NestedBlock(nb) if nb.name.name == name => {
+                    Some(nb.body.type_annotation.as_ref()?.name.clone())
+                }
+                _ => None,
+            })
+        }
+        fn host_body(src: &str) -> Body {
+            let file = parse(src).unwrap();
+            let formatted = format(&file);
+            // Text preserved verbatim (idempotent canonical form).
+            assert_eq!(formatted, src, "annotation must survive formatting");
+            match &parse(&formatted).unwrap().declarations[0].kind {
+                DeclarationKind::Block(b) => b.body.clone(),
+                _ => panic!("expected block"),
+            }
+        }
+
+        assert_eq!(
+            slot_annotation(&host_body(field), "slot").as_deref(),
+            Some("modelB"),
+            "field-level annotation must survive parse→format→parse"
+        );
+        // List-element level: descend into `slots` then find the named item.
+        let elem_body = host_body(elem);
+        let slots = elem_body
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::NestedBlock(nb) if nb.name.name == "slots" => Some(&nb.body),
+                _ => None,
+            })
+            .unwrap();
+        let item_ann = slots.entries.iter().find_map(|e| match &e.kind {
+            BodyEntryKind::ListItem(it) => match &it.kind {
+                nml_core::ast::ListItemKind::Named { body, .. } => {
+                    Some(body.type_annotation.as_ref()?.name.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        assert_eq!(
+            item_ann.as_deref(),
+            Some("modelB"),
+            "list-element annotation must survive parse→format→parse"
+        );
     }
 
     #[test]

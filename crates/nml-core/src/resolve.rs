@@ -154,7 +154,7 @@ impl ValueResolver {
             .iter()
             .map(|entry| self.resolve_body_entry(entry))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Body { entries })
+        Ok(body.with_entries(entries))
     }
 
     /// Resolve all values in an `ArrayBody`.
@@ -335,7 +335,7 @@ pub fn apply_shared_properties(body: &Body) -> Body {
         })
         .collect();
 
-    Body { entries }
+    body.with_entries(entries)
 }
 
 /// Recurse into a (just-merged) item's own body so ITS scopes apply their
@@ -458,7 +458,7 @@ fn merge_shared_into_body(body: &Body, shared: &[&SharedProperty]) -> Body {
         }
     }
 
-    Body { entries }
+    body.with_entries(entries)
 }
 
 /// When the item already has a nested block with the same name as the shared block, shallow-merge

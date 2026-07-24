@@ -273,6 +273,17 @@ pub mod codes {
         /// target is a name or a string, so no arm can be synthesized from
         /// this value (RFC 0005 §10).
         ARM_SHORTHAND_MISMATCH = 2050;
+        /// An `as <Variant>` nominal annotation (RFC 0015) names a type that is
+        /// not one of the union's variants; comes with a did-you-mean.
+        UNKNOWN_UNION_VARIANT = 2051;
+        /// A same-class union instance carries no `as <Variant>` annotation and
+        /// its body shape cannot choose between two or more model variants
+        /// (RFC 0015 D2). Fail-closed: the author must state the type.
+        AMBIGUOUS_UNION_INSTANCE = 2052;
+        /// An `as <Variant>` annotation (RFC 0015) sits on a field that is not a
+        /// union — there is no variant to select, so the annotation has no
+        /// meaning. Flagged rather than silently ignored (visible-never-silent).
+        STRAY_TYPE_ANNOTATION = 2053;
 
         /// A package validator binding is fully shadowed by earlier
         /// bindings — its globs can never match first (RFC 0030).

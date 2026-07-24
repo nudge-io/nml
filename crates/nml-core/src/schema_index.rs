@@ -117,9 +117,27 @@ impl SchemaIndex {
     /// body-dependent variant selection, shared by the validator's walk and the
     /// defaulter's walk so neither re-derives it.
     pub fn resolve_type_in_body<'a>(&'a self, ty: &'a FieldType, body: &Body) -> FieldTarget<'a> {
+        // A modifier field carries its declared inner type; classify by it —
+        // the same unwrap `resolve_type` performs, so a modifier-wrapped union
+        // (`|slot (a | b)`) gets full body-aware + RFC 0015 annotation-aware
+        // variant selection instead of degrading to the bare `Union` target.
+        if let FieldType::Modifier(inner) = ty {
+            return self.resolve_type_in_body(inner, body);
+        }
         let FieldType::Union(variants) = ty else {
             return self.resolve_type(ty);
         };
+        // RFC 0015: an explicit nominal annotation (`field as <Variant>:`) rides
+        // on the body and selects the variant by *declared type name* — exact,
+        // never shape-inferred. A valid annotation wins; an unknown one falls
+        // through to structural (the validator reports it, so no consumer here
+        // needs an error channel and none panics). This is the single point that
+        // makes every union-variant consumer honor `as` — no per-consumer wiring.
+        if let Some(name) = body.type_annotation.as_ref().map(|i| i.name.as_str()) {
+            if let Some(variant) = self.select_variant_by_type_name(variants, name) {
+                return self.resolve_type(variant);
+            }
+        }
         let has_list_items = body
             .entries
             .iter()
@@ -161,6 +179,54 @@ impl SchemaIndex {
             })
             .map(|variant| self.resolve_type(variant))
             .unwrap_or(FieldTarget::Leaf)
+    }
+
+    /// RFC 0015 nominal variant selection: the union variant whose declared
+    /// **type name** equals `name` — the exact counterpart to the shape rule in
+    /// [`resolve_type_in_body`](Self::resolve_type_in_body). Only *nameable*
+    /// variants qualify: a `ModelRef` that resolves to a model or `oneof` (a
+    /// block type an `as <Variant>` can name). Disjoint list/scalar variants are
+    /// structurally unambiguous and intentionally not nameable. `None` when no
+    /// variant matches — an unknown annotation, which the validator reports.
+    /// The single nominal-selection primitive: the resolver selects with it, the
+    /// validator checks membership with it, and completion/did-you-mean draw
+    /// their candidate set from [`nameable_variant_names`](Self::nameable_variant_names).
+    pub fn select_variant_by_type_name<'a>(
+        &self,
+        variants: &'a [FieldType],
+        name: &str,
+    ) -> Option<&'a FieldType> {
+        variants.iter().find(|v| match v {
+            FieldType::ModelRef(n) => {
+                n == name
+                    && matches!(
+                        self.resolve_ref(n),
+                        FieldTarget::Model(_) | FieldTarget::OneOf(_)
+                    )
+            }
+            _ => false,
+        })
+    }
+
+    /// The declared type names of a union's **nameable** variants (model/`oneof`
+    /// refs) — the one candidate set powering `as`-position completion and the
+    /// did-you-mean on an unknown annotation. Source order, so completion and
+    /// diagnostics list variants as authored.
+    pub fn nameable_variant_names<'a>(&self, variants: &'a [FieldType]) -> Vec<&'a str> {
+        variants
+            .iter()
+            .filter_map(|v| match v {
+                FieldType::ModelRef(n)
+                    if matches!(
+                        self.resolve_ref(n),
+                        FieldTarget::Model(_) | FieldTarget::OneOf(_)
+                    ) =>
+                {
+                    Some(n.as_str())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Resolve a named type reference (`someModel`) to its target: a model, a
@@ -364,5 +430,74 @@ mod tests {
             crate::ast::DeclarationKind::Block(b) => b.body.clone(),
             _ => panic!("expected block"),
         }
+    }
+
+    /// The body of the nested block named `name` within `body`.
+    fn nested_body<'a>(body: &'a Body, name: &str) -> &'a Body {
+        body.entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                crate::ast::BodyEntryKind::NestedBlock(nb) if nb.name.name == name => {
+                    Some(&nb.body)
+                }
+                _ => None,
+            })
+            .expect("nested block not found")
+    }
+
+    #[test]
+    fn resolve_type_in_body_honors_nominal_annotation() {
+        // Two same-class models — shape inference cannot disambiguate them.
+        let idx = SchemaIndex::build(
+            vec![model("modelA", vec![]), model("modelB", vec![])],
+            vec![],
+            vec![],
+        );
+        let union = FieldType::Union(vec![
+            FieldType::ModelRef("modelA".into()),
+            FieldType::ModelRef("modelB".into()),
+        ]);
+        let FieldType::Union(variants) = &union else {
+            unreachable!()
+        };
+
+        // `slot as modelB:` — the annotation lowers onto slot's body and selects
+        // the *named* variant, overriding structural first-wins.
+        let outer = body_of("x X:\n    slot as modelB:\n        k = \"v\"\n");
+        let slot = nested_body(&outer, "slot");
+        assert_eq!(
+            slot.type_annotation.as_ref().map(|i| i.name.as_str()),
+            Some("modelB"),
+            "the `as` annotation must lower onto the body"
+        );
+        assert!(
+            matches!(idx.resolve_type_in_body(&union, slot), FieldTarget::Model(m) if m.name == "modelB"),
+            "a valid annotation selects the named variant"
+        );
+
+        // Same shape, no annotation → structural first-wins (modelA).
+        let plain = body_of("x X:\n    slot:\n        k = \"v\"\n");
+        assert!(
+            matches!(idx.resolve_type_in_body(&union, nested_body(&plain, "slot")), FieldTarget::Model(m) if m.name == "modelA"),
+            "no annotation → structural first-declared"
+        );
+
+        // Unknown annotation → falls through to structural (never panics; the
+        // validator reports the unknown variant separately).
+        let bad = body_of("x X:\n    slot as nope:\n        k = \"v\"\n");
+        assert!(
+            matches!(idx.resolve_type_in_body(&union, nested_body(&bad, "slot")), FieldTarget::Model(m) if m.name == "modelA"),
+            "an unknown annotation degrades to structural, does not panic"
+        );
+
+        // `select_variant_by_type_name` is exact and membership-checked.
+        assert!(idx
+            .select_variant_by_type_name(variants, "modelB")
+            .is_some());
+        assert!(idx.select_variant_by_type_name(variants, "nope").is_none());
+        assert_eq!(
+            idx.nameable_variant_names(variants),
+            vec!["modelA", "modelB"]
+        );
     }
 }

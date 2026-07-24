@@ -34,7 +34,10 @@
 
 use std::fmt;
 
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::de::{
+    self, DeserializeSeed, Deserializer as _, EnumAccess, MapAccess, SeqAccess, VariantAccess,
+    Visitor,
+};
 use serde::Deserialize;
 
 use crate::ast::*;
@@ -337,6 +340,31 @@ impl<'de> de::Deserializer<'de> for NestedBlockDeserializer<'de> {
         visitor.visit_some(self)
     }
 
+    /// RFC 0015 — the runtime side of nominal disambiguation. A block-valued
+    /// union deserializes into a Rust enum; without help serde reaches it as an
+    /// unwrapped map whose only native selector is `#[serde(untagged)]`
+    /// (try-first, which cannot honor a header annotation). When the block
+    /// carries `as <Variant>`, we present it as a **synthesized external tag** —
+    /// the single-variant enum access `{ <Variant>: body }` — to a standard,
+    /// externally-tagged enum. The built value is then the *same* variant the
+    /// schema resolved and the validator checked: no try-first, no divergence.
+    /// An un-annotated block keeps today's behavior (forwarded to `any`), so
+    /// disjoint unions and non-enum targets are unaffected.
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match &self.body.type_annotation {
+            Some(variant) => visitor.visit_enum(AnnotatedEnumAccess {
+                variant: &variant.name,
+                body: self.body,
+            }),
+            None => self.deserialize_any(visitor),
+        }
+    }
+
     fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         visitor.visit_unit()
     }
@@ -344,7 +372,68 @@ impl<'de> de::Deserializer<'de> for NestedBlockDeserializer<'de> {
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
         bytes byte_buf unit unit_struct newtype_struct tuple
-        tuple_struct enum identifier
+        tuple_struct identifier
+    }
+}
+
+/// EnumAccess for an `as <Variant>`-annotated block (RFC 0015): yields the
+/// annotation as the external tag, then deserializes the block body as that
+/// variant's content. Serde applies the target enum's own `#[serde(rename…)]`
+/// and reports `unknown variant` for a tag no variant matches — the same
+/// canonical enum handling every other serde format gets.
+struct AnnotatedEnumAccess<'a> {
+    variant: &'a str,
+    body: &'a Body,
+}
+
+impl<'de> EnumAccess<'de> for AnnotatedEnumAccess<'de> {
+    type Error = Error;
+    type Variant = AnnotatedVariantAccess<'de>;
+
+    fn variant_seed<V: DeserializeSeed<'de>>(
+        self,
+        seed: V,
+    ) -> Result<(V::Value, Self::Variant), Self::Error> {
+        let tag = seed.deserialize(de::value::StrDeserializer::<Error>::new(self.variant))?;
+        Ok((tag, AnnotatedVariantAccess { body: self.body }))
+    }
+}
+
+struct AnnotatedVariantAccess<'a> {
+    body: &'a Body,
+}
+
+impl<'de> VariantAccess<'de> for AnnotatedVariantAccess<'de> {
+    type Error = Error;
+
+    /// `field as <Variant>:` with an empty body targets a unit variant.
+    fn unit_variant(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn newtype_variant_seed<T: DeserializeSeed<'de>>(
+        self,
+        seed: T,
+    ) -> Result<T::Value, Self::Error> {
+        seed.deserialize(NestedBlockDeserializer { body: self.body })
+    }
+
+    fn tuple_variant<V: Visitor<'de>>(
+        self,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        NestedBlockDeserializer { body: self.body }.deserialize_seq(visitor)
+    }
+
+    /// The common case: a same-class model variant is a struct — deserialize the
+    /// block body as its fields (a map), never re-entering the enum path.
+    fn struct_variant<V: Visitor<'de>>(
+        self,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        NestedBlockDeserializer { body: self.body }.deserialize_map(visitor)
     }
 }
 
@@ -753,6 +842,58 @@ service MyApp:
         assert_eq!(config.port, 8080.0);
         assert_eq!(config.host, "localhost");
         assert!(config.debug);
+    }
+
+    // Shared RFC 0015 fixture: a same-class model union as an externally-tagged
+    // Rust enum, plus its host struct. Both variants are exercised below so all
+    // fields are genuinely read.
+    #[derive(Deserialize, Debug, PartialEq)]
+    enum Slot {
+        #[serde(rename = "modelA")]
+        ModelA { a: String },
+        #[serde(rename = "modelB")]
+        ModelB { b: String },
+    }
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct Host {
+        slot: Slot,
+    }
+
+    fn host_slot(source: &str) -> Result<Host, Error> {
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("host", "H").body().unwrap();
+        from_block(body)
+    }
+
+    #[test]
+    fn deserialize_honors_nominal_annotation_as_external_tag() {
+        // RFC 0015: `as <Variant>` lowers to a synthesized external tag, so a
+        // block-valued same-class union deserializes to the *annotated* variant
+        // — not serde-untagged try-first. Both variants (and `#[serde(rename)]`)
+        // are exercised.
+        assert_eq!(
+            host_slot("host H:\n    slot as modelB:\n        b = \"hi\"\n").unwrap(),
+            Host {
+                slot: Slot::ModelB { b: "hi".into() }
+            }
+        );
+        assert_eq!(
+            host_slot("host H:\n    slot as modelA:\n        a = \"lo\"\n").unwrap(),
+            Host {
+                slot: Slot::ModelA { a: "lo".into() }
+            }
+        );
+    }
+
+    #[test]
+    fn deserialize_unknown_annotation_variant_errors_at_runtime() {
+        // The annotation names no variant → serde's canonical unknown-variant
+        // error at deserialization (the validator also reports it upstream).
+        assert!(
+            host_slot("host H:\n    slot as modelZ:\n        a = \"x\"\n").is_err(),
+            "unknown annotation variant must error at deserialization"
+        );
     }
 
     #[test]

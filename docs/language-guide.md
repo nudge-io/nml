@@ -240,7 +240,7 @@ references.
 | Syntax | Meaning |
 |--------|---------|
 | `@roleRef` | Role or identity reference |
-| `@a & @b` | Role-conjunction expression (RFC 0011) |
+| `@a & @b` | Role-conjunction expression (RFC 0014) |
 
 Fields accept both inline definitions and references to declarations
 defined elsewhere in the file.
@@ -507,12 +507,9 @@ service AdminReports:
 
 Each list entry is an independent grant (any entry may match); `&`
 composes conditions *within* an entry — the list is the OR, `&` is the
-AND. The language carries the expression opaquely; consumers assign the
-set-intersection semantics. A conjunction lowers to one value in canonical
-`" & "`-joined form regardless of source spacing (`@a&@b` ≡ `@a & @b`),
-and `nml fmt` rewrites tight spacing for you. `&&` and dangling `&` are
-parse errors with targeted guidance (single `&`, as in type-intersection
-languages — there is no `&&` and no `and`).
+AND. Consumers assign the set-intersection semantics. The syntax details
+— canonical `" & "` form, spacing, and the `&&`/dangling-`&` errors —
+live in "Role conjunctions" under Reference Types above.
 
 ### Inheritance
 

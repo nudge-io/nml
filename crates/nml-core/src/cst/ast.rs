@@ -448,6 +448,12 @@ impl NestedBlock {
     pub fn body(&self) -> Option<Body> {
         child(&self.0)
     }
+    /// The RFC 0015 nominal type annotation (`name as <Variant>:`) — the variant
+    /// ident following the `as` keyword. `None` for an un-annotated block. Shares
+    /// the exact `ident_after_kw` accessor `oneof … as <enum>` uses.
+    pub fn type_annotation(&self) -> Option<SyntaxToken> {
+        ident_after_kw(&self.0, "as")
+    }
 }
 
 ast_node!(/// `| name (= value | : list | type)`
@@ -518,6 +524,11 @@ impl ListItem {
     /// The nested body (named form `- Name: …`).
     pub fn body(&self) -> Option<Body> {
         child(&self.0)
+    }
+    /// The RFC 0015 nominal type annotation (`- Name as <Variant>:`) — the variant
+    /// ident following the `as` keyword. `None` for an un-annotated item.
+    pub fn type_annotation(&self) -> Option<SyntaxToken> {
+        ident_after_kw(&self.0, "as")
     }
     /// The shorthand value (`- "string"`).
     pub fn value(&self) -> Option<ValueNode> {

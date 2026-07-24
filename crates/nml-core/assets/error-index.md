@@ -1011,6 +1011,70 @@ model page:
 **Fix:** supply a name or a string (it becomes the `else ->` arm's
 target), or write the item in block form with explicit arms.
 
+## NML2051
+
+**Unknown union variant.** An `as <Variant>` annotation (RFC 0015) must name
+one of the union's variants. This one names a type the union does not include;
+a did-you-mean points at the closest match.
+
+```nml check expect-error='[NML2051]'
+model alpha:
+    a string?
+model beta:
+    b string?
+model host:
+    slot (alpha | beta)?
+
+host H:
+    slot as gamma:
+        a = "x"
+```
+
+**Fix:** annotate with one of the union's variants (`slot as alpha:` /
+`slot as beta:`), or accept the completion / did-you-mean suggestion.
+
+## NML2052
+
+**Ambiguous union instance.** A same-class union instance carries no
+`as <Variant>` annotation and its body shape cannot choose between two or more
+model variants. NML is fail-closed here: rather than silently guessing the
+first variant, it asks you to state the type (RFC 0015 D2).
+
+```nml check expect-error='[NML2052]'
+model alpha:
+    a string?
+model beta:
+    b string?
+model host:
+    slot (alpha | beta)?
+
+host H:
+    slot:
+        a = "x"
+```
+
+**Fix:** state the variant with `as` — e.g. `slot as alpha:`.
+
+## NML2053
+
+**Stray type annotation.** An `as <Variant>` annotation (RFC 0015) selects a
+union variant. This field is not a union, so there is no variant to choose and
+the annotation has no effect — flagged rather than silently ignored.
+
+```nml check expect-error='[NML2053]'
+model inner:
+    x string?
+model host:
+    slot inner?
+
+host H:
+    slot as other:
+        x = "v"
+```
+
+**Fix:** drop the annotation (`slot:`), or change the field's type to a union
+if you meant to choose between variants.
+
 ## NML4000
 
 **Fully shadowed validator.** A package validator binding's globs can

@@ -146,7 +146,7 @@ fn inline_array_references(doc: &crate::query::Document<'_>, body: &Body, depth:
             _ => entry.clone(),
         })
         .collect();
-    Body { entries }
+    body.with_entries(entries)
 }
 
 fn inline_in_item(doc: &crate::query::Document<'_>, item: &ListItem, depth: u32) -> ListItem {
@@ -205,7 +205,7 @@ fn array_declaration_as_body(
             kind: BodyEntryKind::ListItem(inline_in_item(doc, item, depth)),
         });
     }
-    Body { entries }
+    Body::new(entries)
 }
 
 /// [`from_body_defaulted`] keyed by a block's keyword (its root model/oneof), so
@@ -324,7 +324,7 @@ impl<'a> Defaulter<'a> {
             }
         }
 
-        Body { entries }
+        body.with_entries(entries)
     }
 
     /// Recurse into an authored nested block, dispatching on the parent field.
@@ -345,6 +345,16 @@ impl<'a> Defaulter<'a> {
         // instances get their model defaults; uniqueness is validation's job.
         if let FieldType::List(inner) | FieldType::Set(inner) = &field.field_type {
             return self.list_body(inner, nb_body, depth + 1);
+        }
+        // A union field's variant is body-dependent — its structural shape or an
+        // RFC 0015 `as <Variant>` annotation. `resolve_field` (body-less) can only
+        // yield the bare `Union` target, which would default nothing; resolve
+        // WITH the body so the selected variant's defaults are applied — the
+        // field-level analogue of `list_body`, and consistent with how the
+        // validator resolves the same instance.
+        if matches!(&field.field_type, FieldType::Union(_)) {
+            let target = self.index.resolve_type_in_body(&field.field_type, nb_body);
+            return self.default_against(target, nb_body, depth + 1);
         }
         match self.index.resolve_field(field) {
             FieldTarget::Model(m) => self.model_body(m, nb_body, depth + 1),
@@ -525,7 +535,7 @@ fn map_item_bodies(body: &Body, f: impl Fn(&Body) -> Body) -> Body {
             _ => entry.clone(),
         })
         .collect();
-    Body { entries }
+    body.with_entries(entries)
 }
 
 /// Build a synthesized `Property` body entry (a value the instance omitted). The
@@ -551,14 +561,12 @@ fn inject_discriminator(body: &Body, name: &str, value: &str, span: Span) -> Bod
         span,
         SpannedValue::new(Value::String(value.to_string()), span),
     ));
-    Body { entries }
+    body.with_entries(entries)
 }
 
 /// Empty body used as the seed when materializing a fully-defaultable nested
 /// model that the instance omitted entirely.
-const EMPTY_BODY: Body = Body {
-    entries: Vec::new(),
-};
+const EMPTY_BODY: Body = Body::new(Vec::new());
 
 #[cfg(test)]
 mod tests {
@@ -814,6 +822,135 @@ mod tests {
         let listy = item(parallel, "Listy").expect("Listy item");
         let sub = item(listy, "Sub").expect("Sub item under Listy");
         assert_eq!(prop(sub, "retries"), Some(&Value::number(3.0)));
+    }
+
+    /// The RFC 0015 END-TO-END guarantee, through the REAL pipeline
+    /// (`apply_positional → apply_shared_properties → apply_defaults →
+    /// resolve_body → from_block`), not pass-by-pass: the annotation must
+    /// survive every body-rebuilding transform (each must use
+    /// `Body::with_entries`, never `Body::new`), select the named variant's
+    /// DEFAULTS, and reach the deserializer's synthesized tag so the built Rust
+    /// value is the annotated variant. This is the test that catches an
+    /// annotation-stripping rebuild anywhere in the chain — unit tests on the
+    /// individual passes cannot (they run on freshly-parsed bodies).
+    #[test]
+    fn annotated_union_survives_the_full_pipeline() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        enum Slot {
+            #[serde(rename = "modelA")]
+            ModelA { a: String },
+            #[serde(rename = "modelB")]
+            ModelB { b: String, c: String },
+        }
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct Host {
+            slot: Slot,
+        }
+        let idx = index_from(
+            "model modelA:\n    a string = \"da\"\nmodel modelB:\n    b string = \"db\"\n    c string?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        let body = body_of("host H:\n    slot as modelB:\n        c = \"keep\"\n");
+        let host: Host = from_body_defaulted(&idx, "host", &body, &ValueResolver::new(|_| None))
+            .expect("the annotated union must deserialize through the full pipeline");
+        assert_eq!(
+            host.slot,
+            Slot::ModelB {
+                b: "db".into(), // modelB's default — proves the DEFAULTER saw the annotation
+                c: "keep".into(),
+            },
+            "the built value must be the ANNOTATED variant with ITS defaults"
+        );
+    }
+
+    /// The list-element half of the full-pipeline guard: an annotated `[]union`
+    /// ITEM must survive shared-property merging (`.retries`), per-item
+    /// defaulting, and value resolution — the transform sites the field-level
+    /// test does not reach (identity `list_body`/`list_item`, defaults
+    /// `map_item_bodies`, resolve `resolve_list_item` + shared-merge).
+    #[test]
+    fn annotated_union_list_element_survives_the_full_pipeline() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        enum Slot {
+            #[serde(rename = "modelA")]
+            ModelA { a: String },
+            #[serde(rename = "modelB")]
+            ModelB { b: String, c: String, retries: f64 },
+        }
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct Host {
+            slots: Vec<Slot>,
+        }
+        let idx = index_from(
+            "model modelA:\n    a string = \"da\"\n    retries number?\nmodel modelB:\n    b string = \"db\"\n    c string?\n    retries number?\nmodel host:\n    slots [](modelA | modelB)?\n",
+        );
+        let body = body_of(
+            "host H:\n    slots:\n        .retries = 7\n        - one as modelB:\n            c = \"keep\"\n",
+        );
+        let host: Host = from_body_defaulted(&idx, "host", &body, &ValueResolver::new(|_| None))
+            .expect("the annotated list element must deserialize through the full pipeline");
+        assert_eq!(
+            host.slots,
+            vec![Slot::ModelB {
+                b: "db".into(),   // modelB's default — the defaulter saw the annotation
+                c: "keep".into(), // authored value
+                retries: 7.0,     // shared property merged into the annotated item
+            }],
+            "the element must be the ANNOTATED variant with its defaults AND shared props"
+        );
+    }
+
+    #[test]
+    fn union_field_instance_gets_variant_defaults() {
+        // RFC 0015: a field-level `as <Variant>` union instance must get the
+        // NAMED variant's defaults — the field-level analogue of the list case
+        // above (previously the field path resolved body-less to a bare `Union`
+        // and defaulted nothing).
+        let idx = index_from(
+            "model modelA:\n    a string = \"da\"\nmodel modelB:\n    b string = \"db\"\n    c string?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        let out = apply_defaults(
+            &idx,
+            "host",
+            &body_of("host H:\n    slot as modelB:\n        c = \"keep\"\n"),
+        );
+        let slot = nested(&out, "slot").expect("slot block");
+        assert_eq!(
+            prop(slot, "b"),
+            Some(&Value::String("db".into())),
+            "the annotated variant's default must be injected"
+        );
+    }
+
+    #[test]
+    fn union_field_positional_shorthand_materializes_under_annotation() {
+        // RFC 0015: `apply_positional` must recurse into an annotated union field
+        // so a positional shorthand (`- "/api"`) inside the SELECTED variant fills
+        // that variant's `+` field (previously the union field resolved body-less
+        // and was skipped, leaving the scalar un-materialized).
+        let idx = index_from(
+            "model route:\n    path string +\nmodel modelB:\n    routes []route\nmodel modelA:\n    a string?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        let body =
+            body_of("host H:\n    slot as modelB:\n        routes:\n            - \"/api\"\n");
+        let out = crate::identity::apply_positional(&idx, "host", &body);
+        let slot = nested(&out, "slot").expect("slot block");
+        let routes = nested(slot, "routes").expect("routes block");
+        let first = routes
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::ListItem(li) => match &li.kind {
+                    ListItemKind::Shorthand { body: Some(b), .. } => Some(b),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the scalar item must be materialized into a body");
+        assert_eq!(
+            prop(first, "path"),
+            Some(&Value::String("/api".into())),
+            "the positional shorthand must fill the variant's `+` field"
+        );
     }
 
     #[test]

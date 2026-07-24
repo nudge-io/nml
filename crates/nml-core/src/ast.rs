@@ -212,9 +212,55 @@ pub struct ArrayDecl {
 }
 
 /// The body of a block declaration.
+///
+/// `type_annotation` carries an RFC 0015 nominal type annotation (`field as
+/// <Variant>:`) when the body is the content of an explicitly-typed union
+/// instance. It rides on the `Body` — the single input
+/// [`SchemaIndex::resolve_type_in_body`](crate::SchemaIndex::resolve_type_in_body)
+/// already takes — so **variant selection** stays centralized in that one
+/// resolver (the validator, defaulter, identity walk, LSP, and differ all select
+/// through it, with no per-consumer threading). The deserializer and formatter
+/// read this field directly for their own concerns (a synthesized serde tag; the
+/// re-emitted `as` text); they don't resolve variants, so they can't diverge from
+/// the resolver, but the carrier — not a single call — is what keeps every reader
+/// consistent. `None` for every un-annotated body (the overwhelming majority);
+/// only the lowering of an `as`-annotated entry sets it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Body {
     pub entries: Vec<BodyEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_annotation: Option<Identifier>,
+}
+
+impl Body {
+    /// A **fresh** body with no nominal type annotation — for genuinely new
+    /// bodies only (empty seeds, synthesized instances, array-decl inlining).
+    /// `const` so it serves `const` seeds as well as runtime construction.
+    ///
+    /// A body derived FROM an existing body must use
+    /// [`with_entries`](Self::with_entries) instead — `new` would silently strip
+    /// the RFC 0015 annotation, changing which union variant every downstream
+    /// consumer resolves.
+    pub const fn new(entries: Vec<BodyEntry>) -> Self {
+        Self {
+            entries,
+            type_annotation: None,
+        }
+    }
+
+    /// Rebuild this body with transformed entries, **preserving** its nominal
+    /// type annotation (RFC 0015). Every 1:1 body transform — value resolution,
+    /// default injection, identity materialization, shared-property merging,
+    /// reference inlining — must rebuild through this, so `slot as modelB:`
+    /// still names `modelB` when the transformed body reaches the defaulter's
+    /// variant selection and the deserializer's synthesized tag. Guarded by the
+    /// full-pipeline test `annotated_union_survives_the_full_pipeline`.
+    pub fn with_entries(&self, entries: Vec<BodyEntry>) -> Self {
+        Self {
+            entries,
+            type_annotation: self.type_annotation.clone(),
+        }
+    }
 }
 
 /// An entry within a block body.

@@ -268,9 +268,7 @@ impl SchemaValidator {
                 return;
             }
         }
-        let empty = Body {
-            entries: Vec::new(),
-        };
+        let empty = Body::new(Vec::new());
         let elem = self.index.resolve_type_in_body(inner, &empty);
         self.validate_shared_properties(&shared, &elem, depth, diags);
     }
@@ -696,6 +694,11 @@ impl SchemaValidator {
             if let Some(body) = item_body {
                 self.validate_body(body, is_schema_def, keyword, diags);
                 self.validate_members_builtin_refs(body, keyword, diags);
+                // A top-level array element is a single keyword, never a union,
+                // so an `as <Variant>` annotation on an item is always stray.
+                if !is_schema_def {
+                    self.flag_stray_annotation(body, diags);
+                }
             }
             if !is_schema_def
                 && matches!(
@@ -971,6 +974,144 @@ impl SchemaValidator {
     /// inline item (named or scalar) against the element target via
     /// [`Self::validate_inline_item`]. Returns whether the target carried
     /// instance structure (model / oneof / list of those).
+    /// RFC 0015 nominal-union enforcement — the one gate shared by the field and
+    /// list-element union sites, so both behave identically:
+    ///
+    /// * an `as <Variant>` annotation that names no variant is an error with a
+    ///   machine-applicable did-you-mean (drawn from the union's nameable
+    ///   variants — the same candidate set the LSP completes);
+    /// * a same-class instance with **no** annotation whose body shape cannot
+    ///   choose between ≥2 model variants is the D2 hard error — fail-closed, so
+    ///   an ambiguous instance is unrepresentable rather than silently guessed.
+    ///
+    /// Disjoint unions are untouched: a single nameable variant, or a body that
+    /// structurally selects a list/arm-set variant, is never ambiguous.
+    /// Returns whether instance validation should proceed. `false` means a
+    /// union-level error (unknown variant / shape mismatch / D2 ambiguity) was
+    /// already reported — validating the body against a *guessed* variant would
+    /// only pile spurious unknown-property/missing-field noise on top of the
+    /// real finding (the same no-noise rule `materialize_item` applies via
+    /// `validatable`).
+    fn check_union_annotation(
+        &self,
+        variants: &[FieldType],
+        body: &Body,
+        union_span: Span,
+        diags: &mut Vec<Diagnostic>,
+    ) -> bool {
+        if let Some(ann) = &body.type_annotation {
+            if self
+                .index
+                .select_variant_by_type_name(variants, &ann.name)
+                .is_none()
+            {
+                let nameable = self.index.nameable_variant_names(variants);
+                let mut diag =
+                    Diagnostic::error(format!("`{}` is not a variant of this union", ann.name))
+                        .with_code(codes::UNKNOWN_UNION_VARIANT)
+                        .with_span(ann.span);
+                if let Some(s) = nml_core::suggest::suggest(&ann.name, nameable.iter().copied()) {
+                    diag = diag.with_suggestion(s.to_string(), ann.span);
+                }
+                diags.push(diag);
+                return false;
+            }
+            return true;
+        }
+        // No annotation → the body's shape must select a variant.
+        let has_arms = body
+            .entries
+            .iter()
+            .any(|e| matches!(e.kind, BodyEntryKind::Arm(_)));
+        let has_list = body
+            .entries
+            .iter()
+            .any(|e| matches!(e.kind, BodyEntryKind::ListItem(_)));
+        // A list/arm shape only *disambiguates* if the union actually has that
+        // variant. If it does not, the shape matches NO variant: it resolves to
+        // `Leaf` and would be validated as nothing (silently dropped). Flag it as
+        // a shape mismatch — the same fail-loud stance D2 takes for the keyed
+        // case, closing the model-only-union hole.
+        let has_arms_variant = variants.iter().any(|v| matches!(v, FieldType::Arms { .. }));
+        let has_list_variant = variants.iter().any(|v| matches!(v, FieldType::List(_)));
+        if (has_arms && !has_arms_variant) || (has_list && !has_list_variant) {
+            let shape = if has_arms { "routing arms" } else { "a list" };
+            let nameable = self.index.nameable_variant_names(variants);
+            let expected = if nameable.is_empty() {
+                String::new()
+            } else {
+                format!("; expected a block form of one of: {}", nameable.join(", "))
+            };
+            diags.push(
+                Diagnostic::error(format!(
+                    "{shape} is not a valid instance of this union{expected}"
+                ))
+                .with_code(codes::UNION_TYPE_MISMATCH)
+                .with_span(union_span),
+            );
+            return false;
+        }
+        // A keyed / empty body lands among the model variants by first-wins; with
+        // ≥2 nameable variants that is an ambiguous guess → D2.
+        if !has_arms && !has_list {
+            let nameable = self.index.nameable_variant_names(variants);
+            if nameable.len() >= 2 {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "ambiguous union instance: shape cannot choose between {}; \
+                         add an explicit type with `as <variant>`",
+                        nameable.join(" | ")
+                    ))
+                    .with_code(codes::AMBIGUOUS_UNION_INSTANCE)
+                    .with_span(union_span),
+                );
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Resolve a list element's type against its body, first running the RFC
+    /// 0038 union gate when the element type is a union — so every `[](A | B)`
+    /// element enforces `as`/D2 identically to a field-level union, from one
+    /// place.
+    fn resolve_elem_checked<'a>(
+        &'a self,
+        inner: &'a FieldType,
+        item: &ListItem,
+        probe: &Body,
+        diags: &mut Vec<Diagnostic>,
+    ) -> FieldTarget<'a> {
+        if let FieldType::Union(variants) = inner {
+            if !self.check_union_annotation(variants, probe, item.span, diags) {
+                // A union-level error was reported; `Leaf` skips instance
+                // validation quietly instead of validating a guessed variant.
+                return FieldTarget::Leaf;
+            }
+        } else {
+            self.flag_stray_annotation(probe, diags);
+        }
+        self.index.resolve_type_in_body(inner, probe)
+    }
+
+    /// RFC 0015: flag an `as <Variant>` annotation on a non-union field or
+    /// element — there is no variant to select, so it has no effect. The
+    /// complement of [`Self::check_union_annotation`]: together they make every
+    /// annotated body either meaningful (union) or flagged (non-union), never
+    /// silently ignored — the same single-source discipline everywhere.
+    fn flag_stray_annotation(&self, body: &Body, diags: &mut Vec<Diagnostic>) {
+        if let Some(ann) = &body.type_annotation {
+            diags.push(
+                Diagnostic::error(format!(
+                    "`as {}` is only valid on a union-typed field; there is no variant to select here",
+                    ann.name
+                ))
+                .with_code(codes::STRAY_TYPE_ANNOTATION)
+                .with_span(ann.span),
+            );
+        }
+    }
+
     fn validate_target_instance(
         &self,
         target: &FieldTarget,
@@ -1194,6 +1335,13 @@ impl SchemaValidator {
                     seen_fields.push(&nb.name.name);
 
                     if let Some(field_def) = model.fields.iter().find(|f| f.name == nb.name.name) {
+                        // RFC 0015: an `as <Variant>` annotation is meaningful only
+                        // on a union field (including a modifier-wrapped one). On
+                        // anything else there is no variant to select — flag it
+                        // rather than silently ignore it.
+                        if union_variants(&field_def.field_type).is_none() {
+                            self.flag_stray_annotation(&nb.body, diags);
+                        }
                         match &field_def.field_type {
                             FieldType::ModelRef(ref_name) => {
                                 self.validate_ref_instance(
@@ -1212,9 +1360,7 @@ impl SchemaValidator {
                                 // item's identity into the body before validating —
                                 // so a required `name` supplied by the item key
                                 // (`- classify:`) is seen, not reported missing.
-                                let empty = Body {
-                                    entries: Vec::new(),
-                                };
+                                let empty = Body::new(Vec::new());
                                 self.validate_body_shared_properties(&nb.body, inner, depth, diags);
                                 for entry in &nb.body.entries {
                                     let BodyEntryKind::ListItem(item) = &entry.kind else {
@@ -1225,7 +1371,7 @@ impl SchemaValidator {
                                         ListItemKind::Shorthand { body: Some(b), .. } => b,
                                         _ => &empty,
                                     };
-                                    let elem = self.index.resolve_type_in_body(inner, probe);
+                                    let elem = self.resolve_elem_checked(inner, item, probe, diags);
                                     self.validate_inline_item(item, &elem, depth + 1, diags);
                                 }
                             }
@@ -1233,9 +1379,7 @@ impl SchemaValidator {
                                 // Items validate exactly like a list's (same
                                 // per-item variant resolution + identity
                                 // materialization as the `List` arm above)…
-                                let empty = Body {
-                                    entries: Vec::new(),
-                                };
+                                let empty = Body::new(Vec::new());
                                 self.validate_body_shared_properties(&nb.body, inner, depth, diags);
                                 let mut items: Vec<&ListItem> = Vec::new();
                                 for entry in &nb.body.entries {
@@ -1247,7 +1391,7 @@ impl SchemaValidator {
                                         ListItemKind::Shorthand { body: Some(b), .. } => b,
                                         _ => &empty,
                                     };
-                                    let elem = self.index.resolve_type_in_body(inner, probe);
+                                    let elem = self.resolve_elem_checked(inner, item, probe, diags);
                                     self.validate_inline_item(item, &elem, depth + 1, diags);
                                     items.push(item);
                                 }
@@ -1260,21 +1404,30 @@ impl SchemaValidator {
                             FieldType::Arms { key, target } => {
                                 self.validate_instance_against_arms(&nb.body, key, target, diags);
                             }
-                            FieldType::Union(_) => {
-                                // Body shape (arms / list items / neither)
-                                // selects the union variant — e.g. RFC 0007's
-                                // `(string | (role -> denial))` picks the arm
-                                // set when the block holds arms.
-                                let target = self
-                                    .index
-                                    .resolve_type_in_body(&field_def.field_type, &nb.body);
-                                self.validate_target_instance(
-                                    &target,
+                            FieldType::Union(variants) => {
+                                // RFC 0015: an explicit `as <Variant>` selects the
+                                // variant nominally; otherwise body shape (arms /
+                                // list items / neither) selects it — e.g. RFC
+                                // 0007's `(string | (role -> denial))` picks the
+                                // arm set when the block holds arms. The gate
+                                // reports a bad annotation and enforces D2.
+                                if self.check_union_annotation(
+                                    variants,
                                     &nb.body,
-                                    depth + 1,
-                                    Some(nb.name.span),
+                                    nb.name.span,
                                     diags,
-                                );
+                                ) {
+                                    let target = self
+                                        .index
+                                        .resolve_type_in_body(&field_def.field_type, &nb.body);
+                                    self.validate_target_instance(
+                                        &target,
+                                        &nb.body,
+                                        depth + 1,
+                                        Some(nb.name.span),
+                                        diags,
+                                    );
+                                }
                             }
                             FieldType::Primitive(PrimitiveType::Object) => {}
                             _ => {}
@@ -1325,15 +1478,13 @@ impl SchemaValidator {
                             FieldType::List(i) | FieldType::Set(i) => i,
                             _ => unreachable!("guarded by the find predicate"),
                         };
-                        let empty = Body {
-                            entries: Vec::new(),
-                        };
+                        let empty = Body::new(Vec::new());
                         let probe = match &item.kind {
                             ListItemKind::Named { body, .. } => body,
                             ListItemKind::Shorthand { body: Some(b), .. } => b,
                             _ => &empty,
                         };
-                        let elem = self.index.resolve_type_in_body(inner, probe);
+                        let elem = self.resolve_elem_checked(inner, item, probe, diags);
                         self.validate_inline_item(item, &elem, depth + 1, diags);
                     }
                 }
@@ -1477,9 +1628,8 @@ impl SchemaValidator {
         };
 
         // Validate everything except the discriminator against the variant.
-        let variant_body = Body {
-            entries: body
-                .entries
+        let variant_body = Body::new(
+            body.entries
                 .iter()
                 .filter(|entry| {
                     !matches!(
@@ -1489,7 +1639,7 @@ impl SchemaValidator {
                 })
                 .cloned()
                 .collect(),
-        };
+        );
         self.validate_instance_against_model(
             &variant_body,
             variant_model,
@@ -2092,6 +2242,19 @@ impl SchemaValidator {
             }
             diags.push(diag);
         });
+    }
+}
+
+/// The union variants of a field type, transparently unwrapping a modifier
+/// wrapper (`|field (A | B)`). `None` when the field is not — even underneath a
+/// modifier — a union. The single "is this (a modifier around) a union?" test,
+/// so the RFC 0015 stray-annotation guard never false-positives on a
+/// modifier-typed union.
+fn union_variants(ty: &FieldType) -> Option<&[FieldType]> {
+    match ty {
+        FieldType::Union(v) => Some(v),
+        FieldType::Modifier(inner) => union_variants(inner),
+        _ => None,
     }
 }
 
@@ -3250,6 +3413,163 @@ workflow W:
         );
     }
 
+    // ── RFC 0015 nominal union disambiguation ────────────────────────────────
+
+    const SAME_CLASS_SCHEMA: &str = "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slot (modelA | modelB)?\n    slots [](modelA | modelB)?\n";
+
+    fn diags_for(schema: &str, source: &str) -> Vec<Diagnostic> {
+        let validator = make_validator(schema);
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
+        validator.validate(&file)
+    }
+
+    #[test]
+    fn nominal_annotation_selects_variant_and_validates_against_it() {
+        // `as modelB` selects modelB; a modelB-legal body is clean.
+        let diags = diags_for(
+            SAME_CLASS_SCHEMA,
+            "host H:\n    slot as modelB:\n        b = \"x\"\n",
+        );
+        assert!(
+            diags.is_empty(),
+            "valid annotation must be clean: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn nominal_annotation_is_checked_not_a_cast() {
+        // `as modelB` but the body carries modelA's field → validated against
+        // modelB, so `a` is an unknown property. `as` narrows, never bypasses.
+        let diags = diags_for(
+            SAME_CLASS_SCHEMA,
+            "host H:\n    slot as modelB:\n        a = \"x\"\n",
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("unknown property")),
+            "annotation must validate the body against the named variant: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn d2_same_class_anonymous_is_a_hard_error() {
+        // No annotation, keyed body, two model variants → ambiguous → D2.
+        let diags = diags_for(SAME_CLASS_SCHEMA, "host H:\n    slot:\n        a = \"x\"\n");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(codes::AMBIGUOUS_UNION_INSTANCE)),
+            "same-class anonymous must be a hard error: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn list_shape_on_model_only_union_is_flagged_not_dropped() {
+        // A list body under a same-class MODEL union matches no variant — it must
+        // be flagged, never silently resolved to nothing (would otherwise be an
+        // un-validated, un-diagnosed drop).
+        let diags = diags_for(
+            SAME_CLASS_SCHEMA,
+            "host H:\n    slot:\n        - foo:\n            a = \"x\"\n",
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(codes::UNION_TYPE_MISMATCH)),
+            "a list body on a model-only union must be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_variant_annotation_errors_with_did_you_mean() {
+        let diags = diags_for(
+            SAME_CLASS_SCHEMA,
+            "host H:\n    slot as modelC:\n        b = \"x\"\n",
+        );
+        let d = diags
+            .iter()
+            .find(|d| d.code == Some(codes::UNKNOWN_UNION_VARIANT))
+            .expect("unknown-variant error");
+        assert!(
+            d.suggestion.is_some(),
+            "unknown variant must carry a machine-applicable did-you-mean: {d:?}"
+        );
+        // No noise: after the union-level error, the body must NOT be validated
+        // against a guessed variant (no spurious unknown-property pile-on).
+        assert_eq!(
+            diags.len(),
+            1,
+            "exactly the union-level finding, no guessed-variant noise: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn d2_and_annotation_apply_at_list_element_level_too() {
+        // Ambiguous at a `[](A | B)` element → D2.
+        let ambiguous = diags_for(
+            SAME_CLASS_SCHEMA,
+            "host H:\n    slots:\n        - one:\n            a = \"x\"\n",
+        );
+        assert!(
+            ambiguous
+                .iter()
+                .any(|d| d.code == Some(codes::AMBIGUOUS_UNION_INSTANCE)),
+            "list-element same-class anonymous must error: {ambiguous:?}"
+        );
+        // `- one as modelB:` disambiguates the element cleanly.
+        let annotated = diags_for(
+            SAME_CLASS_SCHEMA,
+            "host H:\n    slots:\n        - one as modelB:\n            b = \"x\"\n",
+        );
+        assert!(
+            annotated.is_empty(),
+            "annotated list element must be clean: {annotated:?}"
+        );
+    }
+
+    #[test]
+    fn stray_annotation_on_non_union_field_is_flagged() {
+        // `as` is only meaningful on a union field; on a plain model field it is
+        // flagged, never silently ignored.
+        let schema = "model inner:\n    x string?\nmodel host:\n    slot inner?\n";
+        let diags = diags_for(schema, "host H:\n    slot as other:\n        x = \"v\"\n");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(codes::STRAY_TYPE_ANNOTATION)),
+            "stray annotation on a non-union field must be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn stray_annotation_on_non_union_list_element_is_flagged() {
+        // The stray check covers list elements too, not just field-level blocks.
+        let schema = "model inner:\n    x string?\nmodel host:\n    items []inner?\n";
+        let diags = diags_for(
+            schema,
+            "host H:\n    items:\n        - one as other:\n            x = \"v\"\n",
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(codes::STRAY_TYPE_ANNOTATION)),
+            "stray annotation on a non-union list element must be flagged: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn disjoint_union_never_triggers_d2() {
+        // The shipping `(step | []step)` shape has ONE nameable variant, so a
+        // keyed body is unambiguous — D2 must NOT fire (no regression).
+        let schema = "model step:\n    emit string?\n    parallel (step | []step)?\n";
+        let diags = diags_for(schema, "step Fork:\n    parallel:\n        emit = \"x\"\n");
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.code != Some(codes::AMBIGUOUS_UNION_INSTANCE)),
+            "disjoint union must never trigger D2: {diags:?}"
+        );
+    }
+
     #[test]
     fn test_circular_model_ref_no_infinite_recursion() {
         let schema = "model nodeA:\n    name string\n    child nodeB?\n\nmodel nodeB:\n    name string\n    parent nodeA?\n";
@@ -4335,17 +4655,15 @@ workflow W:
         let validator = make_validator(schema);
 
         let span = Span::empty(0);
-        let mut body = Body { entries: vec![] };
+        let mut body = Body::new(vec![]);
         for _ in 0..(MAX_VALIDATION_DEPTH + 4) {
-            body = Body {
-                entries: vec![BodyEntry {
-                    kind: BodyEntryKind::NestedBlock(NestedBlock {
-                        name: Identifier::new("child", span),
-                        body,
-                    }),
-                    span,
-                }],
-            };
+            body = Body::new(vec![BodyEntry {
+                kind: BodyEntryKind::NestedBlock(NestedBlock {
+                    name: Identifier::new("child", span),
+                    body,
+                }),
+                span,
+            }]);
         }
         let file = File {
             declarations: vec![Declaration {

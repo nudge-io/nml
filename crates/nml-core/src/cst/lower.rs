@@ -130,27 +130,31 @@ impl Lower {
 
     /// Lower a present body's entries.
     fn lower_body(&mut self, body: ast::Body) -> Body {
-        Body {
-            entries: body.entries().map(|e| self.body_entry(e)).collect(),
-        }
+        Body::new(body.entries().map(|e| self.body_entry(e)).collect())
     }
 
     /// Lower an *optional* body — an absent body lowers to an empty one. For callers
     /// that already hold a body, use [`Self::lower_body`] directly.
     fn body_of(&mut self, body: Option<ast::Body>) -> Body {
-        body.map(|b| self.lower_body(b)).unwrap_or_else(|| Body {
-            entries: Vec::new(),
-        })
+        body.map(|b| self.lower_body(b))
+            .unwrap_or_else(|| Body::new(Vec::new()))
     }
 
     fn body_entry(&mut self, entry: ast::Entry) -> BodyEntry {
         let span = content_span(entry.syntax());
         let kind = match entry {
             ast::Entry::Property(p) => BodyEntryKind::Property(self.property(&p)),
-            ast::Entry::NestedBlock(n) => BodyEntryKind::NestedBlock(NestedBlock {
-                name: ident_of(n.name()),
-                body: self.body_of(n.body()),
-            }),
+            ast::Entry::NestedBlock(n) => {
+                // RFC 0015: an `as <Variant>` annotation rides on the block's
+                // `Body`, so the one canonical resolver honors it with no
+                // per-consumer threading.
+                let mut body = self.body_of(n.body());
+                body.type_annotation = n.type_annotation().map(ident);
+                BodyEntryKind::NestedBlock(NestedBlock {
+                    name: ident_of(n.name()),
+                    body,
+                })
+            }
             ast::Entry::Modifier(m) => BodyEntryKind::Modifier(self.modifier(&m)),
             ast::Entry::SharedProperty(s) => BodyEntryKind::SharedProperty(self.shared(&s)),
             ast::Entry::ListItem(l) => BodyEntryKind::ListItem(self.list_item(&l)),
@@ -263,22 +267,29 @@ impl Lower {
                 .join(" & ");
             ListItemKind::Role(joined)
         } else if let Some(name) = l.name() {
+            // RFC 0015: an `as <Variant>` annotation on the item rides on its
+            // `Body`. An annotation is itself a mark of an *instance* (not a bare
+            // reference), so its presence forces the Named form even without an
+            // explicit body — the annotation is never dropped.
+            let annotation = l.type_annotation().map(ident);
             if let Some(body) = l.body() {
+                let mut body = self.lower_body(body);
+                body.type_annotation = annotation;
                 ListItemKind::Named {
                     name: ident(name),
-                    body: self.lower_body(body),
+                    body,
                 }
-            } else if l.has_colon() {
-                // `- Name:` with no entries — the colon marks an inline
-                // instance with an (empty) body, not a reference. Lowering it
-                // as Named keeps it visible to instance validation (its
-                // missing required fields must fail loud), where collapsing
-                // it into `Reference` made it structurally invisible.
+            } else if l.has_colon() || annotation.is_some() {
+                // `- Name:` (or `- Name as V`) with no entries — the colon or the
+                // annotation marks an inline instance with an (empty) body, not a
+                // reference. Lowering it as Named keeps it visible to instance
+                // validation (its missing required fields must fail loud), where
+                // collapsing it into `Reference` made it structurally invisible.
+                let mut body = Body::new(Vec::new());
+                body.type_annotation = annotation;
                 ListItemKind::Named {
                     name: ident(name),
-                    body: Body {
-                        entries: Vec::new(),
-                    },
+                    body,
                 }
             } else {
                 ListItemKind::Reference(ident(name))
@@ -592,6 +603,78 @@ mod tests {
     /// RFC 0007 §3: a BARE `K -> V` at field-type position is a parse error —
     /// the arrow, like the union pipe, is only consumed inside parens. This is
     /// what keeps the field-suffix `?` unambiguous.
+    #[test]
+    fn as_annotation_lowers_onto_the_body() {
+        // RFC 0015: `as <Variant>` at a field entry AND a list element both lower
+        // onto the target `Body`, so the one canonical resolver sees them.
+        let file = cst_ast(
+            "host H:\n    slot as modelB:\n        b = \"x\"\n    items:\n        - one as modelC:\n            c = \"y\"\n",
+        );
+        let DeclarationKind::Block(b) = &file.declarations[0].kind else {
+            panic!("expected block")
+        };
+        let nested = |name: &str| {
+            b.body.entries.iter().find_map(move |e| match &e.kind {
+                BodyEntryKind::NestedBlock(nb) if nb.name.name == name => Some(&nb.body),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            nested("slot")
+                .unwrap()
+                .type_annotation
+                .as_ref()
+                .map(|i| i.name.as_str()),
+            Some("modelB"),
+            "field-level annotation must lower onto the body"
+        );
+        let item_ann = nested("items")
+            .unwrap()
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::ListItem(li) => match &li.kind {
+                    ListItemKind::Named { body, .. } => {
+                        body.type_annotation.as_ref().map(|i| i.name.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            });
+        assert_eq!(
+            item_ann.as_deref(),
+            Some("modelC"),
+            "list-element annotation must lower onto the item body"
+        );
+    }
+
+    #[test]
+    fn malformed_as_recovers_without_panic_or_sibling_capture() {
+        // `field as` (no variant) and `field as X` (no colon) must error, not
+        // panic, and must NOT swallow the following (same-indent) sibling.
+        for src in [
+            "host H:\n    slot as\n    sibling = 1\n",
+            "host H:\n    slot as modelB\n    sibling = 1\n",
+        ] {
+            let parsed = parse(src);
+            assert!(
+                !parsed.errors().is_empty(),
+                "a malformed `as` must be a parse error: {src:?}"
+            );
+            let file = cst_ast(src);
+            let DeclarationKind::Block(b) = &file.declarations[0].kind else {
+                panic!("expected block")
+            };
+            assert!(
+                b.body.entries.iter().any(|e| matches!(
+                    &e.kind,
+                    BodyEntryKind::Property(p) if p.name.name == "sibling"
+                )),
+                "the sibling entry must survive recovery, not be captured: {src:?}"
+            );
+        }
+    }
+
     #[test]
     fn bare_arm_set_type_is_a_parse_error() {
         let parsed = parse("model mount:\n    denial role -> denial\n");

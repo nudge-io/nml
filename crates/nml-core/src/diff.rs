@@ -426,7 +426,7 @@ pub fn wrap_file_as_body(file: &File) -> Body {
                         kind: BodyEntryKind::ListItem(i),
                     })
                     .collect();
-                (a.name.clone(), Body { entries })
+                (a.name.clone(), Body::new(entries))
             }
             _ => continue,
         };
@@ -435,7 +435,7 @@ pub fn wrap_file_as_body(file: &File) -> Body {
             kind: BodyEntryKind::NestedBlock(NestedBlock { name, body }),
         });
     }
-    Body { entries }
+    Body::new(entries)
 }
 
 /// What a keyed-body instance's type resolves to: a plain model, or a `oneof`
@@ -477,7 +477,11 @@ fn resolve_diff_target<'a>(
         .rev()
         .chain(old_bodies.iter().rev())
         .map(|(_, b)| *b)
-        .find(|b| !b.entries.is_empty())
+        // An RFC 0015 `as <Variant>` annotation makes even an entry-less body
+        // meaningful (it names the variant), so it counts as a representative —
+        // else `slot as modelB:` with an empty body would fall through to the
+        // structural first-wins and mis-resolve.
+        .find(|b| !b.entries.is_empty() || b.type_annotation.is_some())
         .unwrap_or(empty);
     index.resolve_type_in_body(ft, body)
 }
@@ -1099,9 +1103,32 @@ fn diff_bodies(
         Effective::Bodies(b) => b,
         _ => &empty,
     };
-    let empty_body = Body {
-        entries: Vec::new(),
-    };
+    let empty_body = Body::new(Vec::new());
+    // RFC 0015 variant SWITCH: resolve each side to its own variant (honoring an
+    // `as <Variant>` annotation on that side). When they select DIFFERENT models
+    // — an annotation switch, or a shape switch — diff each side against its own
+    // model as precise removes+adds, so the switch stays VISIBLE even when the
+    // two bodies are field-identical (which `diff_model` against one shared model
+    // would silently miss). Only reachable for a union with ≥2 model variants
+    // (RFC 0015's same-class case); existing single-model unions never enter here
+    // — their two sides resolve to the same model — so behavior is unchanged.
+    let old_target = resolve_diff_target(index, &field.field_type, o, &empty, &empty_body);
+    let new_target = resolve_diff_target(index, &field.field_type, n, &empty, &empty_body);
+    if let (FieldTarget::Model(om), FieldTarget::Model(nm)) = (&old_target, &new_target) {
+        if om.name != nm.name {
+            let octx = ModelCtx {
+                model: om,
+                exempt: None,
+            };
+            let nctx = ModelCtx {
+                model: nm,
+                exempt: None,
+            };
+            diff_model(index, octx, o, &empty, path, depth + 1, out);
+            diff_model(index, nctx, &empty, n, path, depth + 1, out);
+            return;
+        }
+    }
     match resolve_diff_target(index, &field.field_type, n, o, &empty_body) {
         FieldTarget::Model(m) => diff_model(
             index,
@@ -1371,9 +1398,7 @@ fn diff_collections(
             .body
             .map(|b| vec![(n.file.map(Path::to_path_buf).unwrap_or_default(), b)])
             .unwrap_or_default();
-        let empty_body = Body {
-            entries: Vec::new(),
-        };
+        let empty_body = Body::new(Vec::new());
         match resolve_diff_target(
             index,
             elem_type(&field.field_type),
@@ -1505,11 +1530,21 @@ fn body_eq_bounded(a: &Body, b: &Body, depth: u32) -> bool {
     if depth >= MAX_DEPTH {
         return false;
     }
-    a.entries.len() == b.entries.len()
+    // A nominal type annotation (RFC 0015 `as <Variant>`) is part of the body's
+    // meaning: `slot as modelA:` and `slot as modelB:` with identical entries
+    // are different instances (a variant switch). Comparing it here keeps such
+    // a switch visible to the differ, never silently equal.
+    annotation_name(a) == annotation_name(b)
+        && a.entries.len() == b.entries.len()
         && a.entries
             .iter()
             .zip(&b.entries)
             .all(|(x, y)| entry_structural_eq(x, y, depth))
+}
+
+/// The nominal type-annotation name of a body, if any (RFC 0015).
+fn annotation_name(b: &Body) -> Option<&str> {
+    b.type_annotation.as_ref().map(|i| i.name.as_str())
 }
 
 fn entry_structural_eq(a: &BodyEntry, b: &BodyEntry, depth: u32) -> bool {
@@ -1851,6 +1886,36 @@ mod tests {
         assert_eq!(p(&d[0]), "denial");
     }
 
+    /// RFC 0015 — a nominal variant SWITCH (`as modelA` → `as modelB`) must stay
+    /// VISIBLE even when the two bodies are field-IDENTICAL. Diffing both sides
+    /// against one shared model would silently miss it; per-side resolution +
+    /// precise removes/adds keeps the invariant.
+    #[test]
+    fn nominal_variant_switch_is_visible_even_when_fields_identical() {
+        let schema = "model modelA:\n    shared string?\n    a string?\nmodel modelB:\n    shared string?\n    b string?\nmodel server:\n    slot (modelA | modelB)?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        // Only the annotation changes; `shared = "x"` is byte-identical.
+        let old = parse_doc("server s:\n    slot as modelA:\n        shared = \"x\"\n");
+        let new = parse_doc("server s:\n    slot as modelB:\n        shared = \"x\"\n");
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        assert!(
+            !d.is_empty(),
+            "an annotation-only variant switch must be visible, not silent: {d:?}"
+        );
+        assert!(
+            d.iter()
+                .all(|c| !matches!(c.kind, ChangeKind::OpaqueChanged)),
+            "a legitimate switch must not read as drift: {d:?}"
+        );
+    }
+
     /// ARM blocks diff PER-ARM (RFC 0007): a retargeted arm is one `Modified`
     /// of target values at ITS selector element path; unchanged arms are
     /// silent; a REORDER is honestly a -/+ pair of the full moved arm (arms
@@ -1994,22 +2059,18 @@ mod tests {
     fn over_deep_bodies_fail_visible_not_stack_overflow() {
         use crate::ast::{BodyEntry, Identifier, NestedBlock};
         fn deep_body(levels: u32) -> Body {
-            let mut body = Body {
-                entries: Vec::new(),
-            };
+            let mut body = Body::new(Vec::new());
             for i in 0..levels {
-                body = Body {
-                    entries: vec![BodyEntry {
-                        span: Span { start: 0, end: 0 },
-                        kind: BodyEntryKind::NestedBlock(NestedBlock {
-                            name: Identifier {
-                                name: format!("n{i}"),
-                                span: Span { start: 0, end: 0 },
-                            },
-                            body,
-                        }),
-                    }],
-                };
+                body = Body::new(vec![BodyEntry {
+                    span: Span { start: 0, end: 0 },
+                    kind: BodyEntryKind::NestedBlock(NestedBlock {
+                        name: Identifier {
+                            name: format!("n{i}"),
+                            span: Span { start: 0, end: 0 },
+                        },
+                        body,
+                    }),
+                }]);
             }
             body
         }
@@ -2046,47 +2107,41 @@ mod tests {
         // Hand-build a chain deeper than the walk cap with `v = <leaf>` at the bottom.
         fn chain(levels: u32, leaf: i64) -> Body {
             let nospan = Span { start: 0, end: 0 };
-            let mut body = Body {
-                entries: vec![BodyEntry {
-                    span: nospan,
-                    kind: BodyEntryKind::Property(Property {
-                        name: Identifier {
-                            name: "v".into(),
-                            span: nospan,
-                        },
-                        value: SpannedValue {
-                            value: Value::Number(leaf.into()),
-                            span: nospan,
-                        },
-                    }),
-                }],
-            };
-            for _ in 0..levels {
-                body = Body {
-                    entries: vec![BodyEntry {
+            let mut body = Body::new(vec![BodyEntry {
+                span: nospan,
+                kind: BodyEntryKind::Property(Property {
+                    name: Identifier {
+                        name: "v".into(),
                         span: nospan,
-                        kind: BodyEntryKind::NestedBlock(NestedBlock {
-                            name: Identifier {
-                                name: "child".into(),
-                                span: nospan,
-                            },
-                            body,
-                        }),
-                    }],
-                };
-            }
-            Body {
-                entries: vec![BodyEntry {
+                    },
+                    value: SpannedValue {
+                        value: Value::Number(leaf.into()),
+                        span: nospan,
+                    },
+                }),
+            }]);
+            for _ in 0..levels {
+                body = Body::new(vec![BodyEntry {
                     span: nospan,
                     kind: BodyEntryKind::NestedBlock(NestedBlock {
                         name: Identifier {
-                            name: "root".into(),
+                            name: "child".into(),
                             span: nospan,
                         },
                         body,
                     }),
-                }],
+                }]);
             }
+            Body::new(vec![BodyEntry {
+                span: nospan,
+                kind: BodyEntryKind::NestedBlock(NestedBlock {
+                    name: Identifier {
+                        name: "root".into(),
+                        span: nospan,
+                    },
+                    body,
+                }),
+            }])
         }
         let old = chain(MAX_DEPTH + 8, 1);
         let new = chain(MAX_DEPTH + 8, 2);
