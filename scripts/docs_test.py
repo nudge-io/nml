@@ -463,7 +463,9 @@ def check_index_relative_links(index_path) -> list[tuple[str, str]]:
             if target.startswith(("http://", "https://", "#")):
                 continue
             resolved = (index_path.parent / target.split("#")[0]).resolve()
-            if not resolved.is_file():
+            # Same containment rule as schema= dirs above: a doc link that
+            # escapes the repo is wrong even if the path happens to exist.
+            if not resolved.is_file() or not resolved.is_relative_to(REPO):
                 failures.append(
                     (ERROR_INDEX, f"line {number}: relative link does not resolve: {target}")
                 )

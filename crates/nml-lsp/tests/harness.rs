@@ -1259,6 +1259,26 @@ async fn explain_code_action_is_negotiation_gated() {
         let report = harness.open(&app, bad).await;
         let diags = report["diagnostics"].as_array().expect("diagnostics");
         assert!(!diags.is_empty(), "fixture must produce diagnostics");
+        // The border invariant the Explain filter (and hover explanations)
+        // stand on: every CODED diagnostic is stamped `source: "nml"` with a
+        // STRING code — true today because all coded findings flow through
+        // the one converter (`push_diagnostic`); the direct-construction
+        // sites in `validate_document` are uncoded advisories. A new coded
+        // path that bypasses the converter fails here, not in a user's
+        // editor as a silently missing action.
+        for diag in diags {
+            if let Some(code) = diag.get("code") {
+                assert!(
+                    code.is_string(),
+                    "coded diagnostic with non-string code: {diag}"
+                );
+                assert_eq!(
+                    diag["source"],
+                    json!("nml"),
+                    "coded diagnostic without source stamp: {diag}"
+                );
+            }
+        }
 
         // Exactly what a client does: round-trip the pulled diagnostics as
         // the code-action context.

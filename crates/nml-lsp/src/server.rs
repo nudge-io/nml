@@ -1707,6 +1707,27 @@ fn summarize_body(body: &Body) -> String {
 /// this works inside nested bodies too (completion no longer routes through the top-level-only
 /// `find_enclosing_block_keyword` + flat `models.find` lookup; that helper still serves the
 /// hover/definition paths). Takes the parsed `&File` (parse-once).
+/// The `FieldDef` named `prop_name` governing `pos` — candidates-aware: in an
+/// AMBIGUOUS union body the field resolves across ALL candidates (first
+/// declaring variant wins, declaration order), so a value position on a field
+/// unique to a later variant — e.g. its enum values — still completes. A
+/// oneof candidate declares no fields pre-discriminator and contributes none.
+fn governing_field_at<'i>(
+    file: &File,
+    pos: Position,
+    index: &'i SchemaIndex,
+    line_index: &LineIndex,
+    prop_name: &str,
+) -> Option<&'i FieldDef> {
+    match find_candidates_at(file, pos, index, line_index)? {
+        DescentTarget::One(model, _) => model.fields.iter().find(|f| f.name == prop_name),
+        DescentTarget::Ambiguous { candidates, .. } => candidates.iter().find_map(|c| match c {
+            NameableVariant::Model(m) => m.fields.iter().find(|f| f.name == prop_name),
+            NameableVariant::OneOf(_) => None,
+        }),
+    }
+}
+
 fn find_model_ref_type_at(
     file: &File,
     source: &str,
@@ -1722,8 +1743,7 @@ fn find_model_ref_type_at(
         return None;
     }
 
-    let (model, _body) = find_model_body_at(file, pos, index, line_index)?;
-    let field = model.fields.iter().find(|f| f.name == prop_name)?;
+    let field = governing_field_at(file, pos, index, line_index, prop_name)?;
 
     match &field.field_type {
         FieldType::ModelRef(ref_name) => Some(ref_name.clone()),
@@ -1756,8 +1776,7 @@ fn find_enum_variants_at(
         return None;
     }
 
-    let (model, _body) = find_model_body_at(file, pos, index, line_index)?;
-    let field = model.fields.iter().find(|f| f.name == prop_name)?;
+    let field = governing_field_at(file, pos, index, line_index, prop_name)?;
 
     fn variants_of(ty: &FieldType, index: &SchemaIndex, out: &mut Vec<String>) {
         match ty {
@@ -2457,8 +2476,13 @@ fn union_of_fields_completions(
                     "0_0000".to_string(),
                 ),
             };
+            let (label, filter_text) = match fd {
+                Some((_, field)) => field_label(field),
+                None => (fname.clone(), None),
+            };
             items.push(CompletionItem {
-                label: fname.clone(),
+                label,
+                filter_text,
                 kind: Some(CompletionItemKind::FIELD),
                 label_details: label_details.then(|| CompletionItemLabelDetails {
                     detail: None,
@@ -2501,8 +2525,14 @@ fn union_of_fields_completions(
             } else {
                 provenance.join(" | ")
             };
+            let (label, filter_text) = if agree {
+                field_label(fields[0])
+            } else {
+                (fname.clone(), None)
+            };
             items.push(CompletionItem {
-                label: fname.clone(),
+                label,
+                filter_text,
                 kind: Some(CompletionItemKind::FIELD),
                 detail: Some(detail),
                 sort_text: Some(format!("1_{fname}")),
@@ -2607,6 +2637,17 @@ fn field_sort_key(field: &FieldDef, idx: usize) -> String {
 
 /// `insert_text`: `<field> = ` for a scalar/leaf field, `<field>:` for a model/oneof/list/
 /// object field (which is authored as a block) — a blanket `= ` would be wrong for blocks.
+/// Completion label + filter text for a field: a modifier-declared field
+/// DISPLAYS as authored (`|vis`) so the list is honest about its form, while
+/// filtering stays on the bare name (typing `vis` still matches).
+fn field_label(field: &FieldDef) -> (String, Option<String>) {
+    if matches!(field.field_type, FieldType::Modifier(_)) {
+        (format!("|{}", field.name), Some(field.name.clone()))
+    } else {
+        (field.name.clone(), None)
+    }
+}
+
 fn field_insert_text(index: &SchemaIndex, field: &FieldDef) -> String {
     // A modifier-declared field is AUTHORED with its sigil (`|vis = …`) — a
     // sigil-less insert would author an unknown PROPERTY, not the modifier.
@@ -3940,8 +3981,10 @@ impl LanguageServer for NmlLanguageServer {
                             if present.contains(&field.name) {
                                 continue;
                             }
+                            let (label, filter_text) = field_label(field);
                             items.push(CompletionItem {
-                                label: field.name.clone(),
+                                label,
+                                filter_text,
                                 kind: Some(CompletionItemKind::FIELD),
                                 detail: Some(field_detail(field)),
                                 // The schema author's leading comment block (RFC
@@ -4144,8 +4187,13 @@ impl LanguageServer for NmlLanguageServer {
             // Parse first so the singleton-preferred gate counts only VALID
             // entries (a malformed sibling must not suppress a legitimate
             // singleton did-you-mean's preferred flag).
+            // Defense-in-depth: cap parsed suggestions at the producer's own
+            // alternative cap — a hostile/buggy client cannot mint unbounded
+            // actions from one diagnostic.
+            const MAX_SUGGESTION_ACTIONS: usize = 8;
             let parsed: Vec<(String, usize, usize, String)> = suggestions
                 .iter()
+                .take(MAX_SUGGESTION_ACTIONS)
                 .filter_map(|s| {
                     Some((
                         s.get("replacement")?.as_str()?.to_string(),
@@ -5957,6 +6005,22 @@ workflow VoiceAgent:
         assert_eq!(offered, vec!["temperature", "baseUrl"]);
     }
 
+    /// Round-19: value-position lookups are candidates-aware — an enum field
+    /// UNIQUE to a later variant still resolves its variants inside an
+    /// ambiguous body (previously the first-candidate view missed it).
+    #[test]
+    fn value_completion_resolves_fields_across_ambiguous_candidates() {
+        let idx = field_index(
+            "enum modeKind:\n    - fast\n    - slow\nmodel modelA:\n    a string?\nmodel modelB:\n    mode modeKind?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        let source = "host H:\n    slot:\n        mode = \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        let variants = find_enum_variants_at(&file, source, Position::new(2, 15), &idx, &li)
+            .expect("enum variants for a modelB-unique field");
+        assert_eq!(variants, vec!["fast", "slow"]);
+    }
+
     /// Round-17 border pins: a modifier-declared field completes WITH its
     /// sigil (`|vis = `), and a modifier entry already in the body excludes
     /// its field from re-offering — in both the single-model and
@@ -5982,7 +6046,7 @@ workflow VoiceAgent:
         let items =
             union_of_fields_completions(&idx, &candidates, body, header.as_ref(), &li, false);
         assert!(
-            !items.iter().any(|i| i.label == "vis"),
+            !items.iter().any(|i| i.label == "vis" || i.label == "|vis"),
             "a modifier-set field must not re-offer: {:?}",
             items.iter().map(|i| i.label.clone()).collect::<Vec<_>>()
         );
@@ -6002,12 +6066,17 @@ workflow VoiceAgent:
             union_of_fields_completions(&idx, &candidates, body, header.as_ref(), &li2, false);
         let vis = items
             .iter()
-            .find(|i| i.label == "vis")
+            .find(|i| i.label == "|vis")
             .expect("vis offered");
         assert_eq!(
             vis.insert_text.as_deref(),
             Some("|vis = "),
             "modifier fields author WITH the sigil"
+        );
+        assert_eq!(
+            vis.filter_text.as_deref(),
+            Some("vis"),
+            "filtering stays on the bare name"
         );
     }
 
