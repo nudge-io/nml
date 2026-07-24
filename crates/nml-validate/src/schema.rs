@@ -264,11 +264,11 @@ impl SchemaValidator {
                 })
                 .collect();
             if !models.is_empty() {
-                self.validate_shared_properties_union(&shared, &models, diags);
+                self.validate_shared_properties_union(&shared, &models, depth, diags);
                 return;
             }
         }
-        let empty = Body::new(Vec::new());
+        let empty = Body::fresh(Vec::new());
         let elem = self.index.resolve_type_in_body(inner, &empty);
         self.validate_shared_properties(&shared, &elem, depth, diags);
     }
@@ -277,13 +277,16 @@ impl SchemaValidator {
     /// if ANY model variant defines it, and its value must satisfy at least
     /// one defining variant's field type — checked through the standard
     /// union value check, so the mismatch message and code are the ones
-    /// every union value gets. Block-valued shared properties are covered by
-    /// per-item validation once merged (which knows each item's concrete
-    /// variant).
+    /// every union value gets. Block-valued shared properties follow the same
+    /// subset rule: the block's content must be a valid instance for at least
+    /// one declaring variant's field model (the validator never merges, so this
+    /// is the only pre-merge coverage the content gets — RFC 0015 made
+    /// same-class unions the newly reachable case).
     fn validate_shared_properties_union(
         &self,
         shared: &[&SharedProperty],
         models: &[&ModelDef],
+        depth: u32,
         diags: &mut Vec<Diagnostic>,
     ) {
         for sp in shared {
@@ -320,27 +323,80 @@ impl SchemaValidator {
                 diags.push(diag);
                 continue;
             }
-            if let SharedPropertyKind::Scalar(sv) = &sp.kind {
-                if let [only] = defining.as_slice() {
-                    self.validate_value_against_type(
-                        &sv.value,
-                        &only.field_type,
-                        name,
-                        "for shared property",
-                        sv.span,
-                        diags,
-                    );
-                } else {
-                    let union =
-                        FieldType::Union(defining.iter().map(|f| f.field_type.clone()).collect());
-                    self.validate_value_against_type(
-                        &sv.value,
-                        &union,
-                        name,
-                        "for shared property",
-                        sv.span,
-                        diags,
-                    );
+            match &sp.kind {
+                SharedPropertyKind::Scalar(sv) => {
+                    if let [only] = defining.as_slice() {
+                        self.validate_value_against_type(
+                            &sv.value,
+                            &only.field_type,
+                            name,
+                            "for shared property",
+                            sv.span,
+                            diags,
+                        );
+                    } else {
+                        let union = FieldType::Union(
+                            defining.iter().map(|f| f.field_type.clone()).collect(),
+                        );
+                        self.validate_value_against_type(
+                            &sv.value,
+                            &union,
+                            name,
+                            "for shared property",
+                            sv.span,
+                            diags,
+                        );
+                    }
+                }
+                SharedPropertyKind::Block(body) => {
+                    // Subset semantics, block form: the content must be a valid
+                    // instance for AT LEAST ONE variant declaring the field as
+                    // something block-capable (mirroring the scalar rule).
+                    // Declarers resolve through the canonical body-aware
+                    // resolver, so a union-typed declarer selects its variant by
+                    // the block's shape. A clean pass on any declarer accepts;
+                    // findings from the first block-capable declarer otherwise;
+                    // and if NO declarer can hold a block at all, that is a
+                    // type mismatch — never a silent accept.
+                    let mut first: Option<Vec<Diagnostic>> = None;
+                    let mut ok = false;
+                    let mut block_capable = false;
+                    for field in &defining {
+                        if let FieldTarget::Model(inner) =
+                            self.index.resolve_type_in_body(&field.field_type, body)
+                        {
+                            block_capable = true;
+                            let mut local = Vec::new();
+                            self.validate_instance_against_model(
+                                body,
+                                inner,
+                                depth + 1,
+                                Some(sp.name.span),
+                                &mut local,
+                            );
+                            if local.is_empty() {
+                                ok = true;
+                                break;
+                            }
+                            if first.is_none() {
+                                first = Some(local);
+                            }
+                        }
+                    }
+                    if !block_capable {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "type mismatch for shared property '.{name}': no union \
+                                 variant declares '{name}' as a block-capable type"
+                            ))
+                            .with_code(codes::TYPE_MISMATCH)
+                            .with_span(sp.name.span),
+                        );
+                    } else if !ok {
+                        if let Some(local) = first {
+                            diags.extend(local);
+                        }
+                    }
                 }
             }
         }
@@ -1335,13 +1391,31 @@ impl SchemaValidator {
                     seen_fields.push(&nb.name.name);
 
                     if let Some(field_def) = model.fields.iter().find(|f| f.name == nb.name.name) {
-                        // RFC 0015: an `as <Variant>` annotation is meaningful only
-                        // on a union field (including a modifier-wrapped one). On
-                        // anything else there is no variant to select — flag it
-                        // rather than silently ignore it.
-                        if union_variants(&field_def.field_type).is_none() {
-                            self.flag_stray_annotation(&nb.body, diags);
+                        // RFC 0015: a union field — plain or MODIFIER-WRAPPED
+                        // (`|slot (a | b)`) — takes one gated path: annotation/D2
+                        // enforcement, then validation against the resolved
+                        // variant (`resolve_type_in_body` unwraps the modifier
+                        // the same way). Dispatching via `union_variants` keeps a
+                        // modifier-wrapped union from silently skipping the gate
+                        // the way the raw `match` did. Everything else flags a
+                        // stray annotation and dispatches as before.
+                        if let Some(variants) = field_def.field_type.union_variants() {
+                            if self.check_union_annotation(variants, &nb.body, nb.name.span, diags)
+                            {
+                                let target = self
+                                    .index
+                                    .resolve_type_in_body(&field_def.field_type, &nb.body);
+                                self.validate_target_instance(
+                                    &target,
+                                    &nb.body,
+                                    depth + 1,
+                                    Some(nb.name.span),
+                                    diags,
+                                );
+                            }
+                            continue;
                         }
+                        self.flag_stray_annotation(&nb.body, diags);
                         match &field_def.field_type {
                             FieldType::ModelRef(ref_name) => {
                                 self.validate_ref_instance(
@@ -1360,7 +1434,7 @@ impl SchemaValidator {
                                 // item's identity into the body before validating —
                                 // so a required `name` supplied by the item key
                                 // (`- classify:`) is seen, not reported missing.
-                                let empty = Body::new(Vec::new());
+                                let empty = Body::fresh(Vec::new());
                                 self.validate_body_shared_properties(&nb.body, inner, depth, diags);
                                 for entry in &nb.body.entries {
                                     let BodyEntryKind::ListItem(item) = &entry.kind else {
@@ -1379,7 +1453,7 @@ impl SchemaValidator {
                                 // Items validate exactly like a list's (same
                                 // per-item variant resolution + identity
                                 // materialization as the `List` arm above)…
-                                let empty = Body::new(Vec::new());
+                                let empty = Body::fresh(Vec::new());
                                 self.validate_body_shared_properties(&nb.body, inner, depth, diags);
                                 let mut items: Vec<&ListItem> = Vec::new();
                                 for entry in &nb.body.entries {
@@ -1404,31 +1478,9 @@ impl SchemaValidator {
                             FieldType::Arms { key, target } => {
                                 self.validate_instance_against_arms(&nb.body, key, target, diags);
                             }
-                            FieldType::Union(variants) => {
-                                // RFC 0015: an explicit `as <Variant>` selects the
-                                // variant nominally; otherwise body shape (arms /
-                                // list items / neither) selects it — e.g. RFC
-                                // 0007's `(string | (role -> denial))` picks the
-                                // arm set when the block holds arms. The gate
-                                // reports a bad annotation and enforces D2.
-                                if self.check_union_annotation(
-                                    variants,
-                                    &nb.body,
-                                    nb.name.span,
-                                    diags,
-                                ) {
-                                    let target = self
-                                        .index
-                                        .resolve_type_in_body(&field_def.field_type, &nb.body);
-                                    self.validate_target_instance(
-                                        &target,
-                                        &nb.body,
-                                        depth + 1,
-                                        Some(nb.name.span),
-                                        diags,
-                                    );
-                                }
-                            }
+                            // Union fields — plain or modifier-wrapped — were
+                            // dispatched by `union_variants` above, before this
+                            // match.
                             FieldType::Primitive(PrimitiveType::Object) => {}
                             _ => {}
                         }
@@ -1478,7 +1530,7 @@ impl SchemaValidator {
                             FieldType::List(i) | FieldType::Set(i) => i,
                             _ => unreachable!("guarded by the find predicate"),
                         };
-                        let empty = Body::new(Vec::new());
+                        let empty = Body::fresh(Vec::new());
                         let probe = match &item.kind {
                             ListItemKind::Named { body, .. } => body,
                             ListItemKind::Shorthand { body: Some(b), .. } => b,
@@ -1628,7 +1680,10 @@ impl SchemaValidator {
         };
 
         // Validate everything except the discriminator against the variant.
-        let variant_body = Body::new(
+        // Derived from `body`, so rebuild via `with_entries` (the RFC 0015
+        // convention): the annotation is preserved for any annotation-sensitive
+        // logic below oneof validation, never silently stripped.
+        let variant_body = body.with_entries(
             body.entries
                 .iter()
                 .filter(|entry| {
@@ -1708,7 +1763,20 @@ impl SchemaValidator {
                                 diags,
                             );
                         }
-                        ListItemKind::Reference(_) | ListItemKind::Named { .. } => {}
+                        // RFC 0015: the annotation rules apply in a modifier
+                        // block list like any other list — gate a union element
+                        // type (D2 / unknown-variant), flag a stray annotation
+                        // otherwise — never silently carry one. Body-content
+                        // validation of modifier items stays as-is (pre-existing
+                        // leniency, out of this RFC's scope).
+                        ListItemKind::Named { body, .. } => {
+                            if let Some(variants) = inner.union_variants() {
+                                self.check_union_annotation(variants, body, item.span, diags);
+                            } else {
+                                self.flag_stray_annotation(body, diags);
+                            }
+                        }
+                        ListItemKind::Reference(_) => {}
                     }
                 }
                 if is_set {
@@ -2242,19 +2310,6 @@ impl SchemaValidator {
             }
             diags.push(diag);
         });
-    }
-}
-
-/// The union variants of a field type, transparently unwrapping a modifier
-/// wrapper (`|field (A | B)`). `None` when the field is not — even underneath a
-/// modifier — a union. The single "is this (a modifier around) a union?" test,
-/// so the RFC 0015 stray-annotation guard never false-positives on a
-/// modifier-typed union.
-fn union_variants(ty: &FieldType) -> Option<&[FieldType]> {
-    match ty {
-        FieldType::Union(v) => Some(v),
-        FieldType::Modifier(inner) => union_variants(inner),
-        _ => None,
     }
 }
 
@@ -3557,6 +3612,108 @@ workflow W:
     }
 
     #[test]
+    fn modifier_wrapped_union_is_gated_like_a_plain_union() {
+        // `|slot (modelA | modelB)` written as a nested block takes the SAME
+        // gated path as a plain union: D2 on anonymous same-class, NML2051 on a
+        // bogus annotation, and full body validation on a valid one. Previously
+        // Modifier(Union) fell to the wildcard arm — zero diagnostics.
+        let schema = "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel mhost:\n    |slot (modelA | modelB)?\n";
+        let anonymous = diags_for(schema, "mhost H:\n    slot:\n        a = \"x\"\n");
+        assert!(
+            anonymous
+                .iter()
+                .any(|d| d.code == Some(codes::AMBIGUOUS_UNION_INSTANCE)),
+            "modifier-wrapped same-class anonymous must D2: {anonymous:?}"
+        );
+        let bogus = diags_for(schema, "mhost H:\n    slot as gamma:\n        a = \"x\"\n");
+        assert!(
+            bogus
+                .iter()
+                .any(|d| d.code == Some(codes::UNKNOWN_UNION_VARIANT)),
+            "modifier-wrapped bogus annotation must NML2051: {bogus:?}"
+        );
+        let wrong_body = diags_for(schema, "mhost H:\n    slot as modelB:\n        a = \"x\"\n");
+        assert!(
+            wrong_body
+                .iter()
+                .any(|d| d.message.contains("unknown property")),
+            "modifier-wrapped valid annotation must VALIDATE the body: {wrong_body:?}"
+        );
+    }
+
+    /// F4 (interaction audit): a BLOCK-form shared property under a union
+    /// element type must have its content validated (subset semantics — valid
+    /// for at least one declaring variant). Previously only scalar shared
+    /// props were checked; block content shipped to consumers unvalidated.
+    #[test]
+    fn union_block_shared_property_content_is_validated() {
+        let schema = "model sub:\n    x string?\nmodel modelA:\n    sub sub?\nmodel modelB:\n    sub sub?\n    b string?\nmodel host:\n    slots [](modelA | modelB)?\n";
+        let bad = diags_for(
+            schema,
+            "host H:\n    slots:\n        .sub:\n            bogus = \"v\"\n        - one as modelB:\n            b = \"x\"\n",
+        );
+        assert!(
+            bad.iter().any(|d| d.message.contains("unknown property")),
+            "bogus block shared-prop content under a union must be flagged: {bad:?}"
+        );
+        let good = diags_for(
+            schema,
+            "host H:\n    slots:\n        .sub:\n            x = \"v\"\n        - one as modelB:\n            b = \"x\"\n",
+        );
+        assert!(
+            good.is_empty(),
+            "valid block shared-prop content must stay clean: {good:?}"
+        );
+    }
+
+    /// Round 9: annotation rules reach MODIFIER block lists too — a stray `as`
+    /// on a `|allow:`-style item is flagged, never silently carried (the last
+    /// Body-bearing grammar position in the enumeration).
+    #[test]
+    fn stray_annotation_on_modifier_block_item_is_flagged() {
+        let schema = "model host:\n    |allow []string?\n";
+        let diags = diags_for(
+            schema,
+            "host H:\n    |allow:\n        - one as modelB:\n            x = \"v\"\n",
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(codes::STRAY_TYPE_ANNOTATION)),
+            "a stray annotation on a modifier block item must be flagged: {diags:?}"
+        );
+    }
+
+    /// Round-10 F5: a block shared property with NO block-capable declaring
+    /// variant (all declarers scalar) is a type mismatch — never a silent
+    /// accept; and a UNION-typed declarer resolves body-aware (its model
+    /// variant validates the content).
+    #[test]
+    fn union_block_shared_property_without_block_capable_declarer_errors() {
+        // Both variants declare `sub` as a SCALAR: a block can't fill it.
+        let scalar_only = "model modelA:\n    sub string?\nmodel modelB:\n    sub string?\nmodel host:\n    slots [](modelA | modelB)?\n";
+        let diags = diags_for(
+            scalar_only,
+            "host H:\n    slots:\n        .sub:\n            bogus = \"v\"\n        - one as modelB:\n            sub = \"s\"\n",
+        );
+        assert!(
+            diags.iter().any(|d| d.code == Some(codes::TYPE_MISMATCH)),
+            "a block on scalar-only declarers must be a type mismatch: {diags:?}"
+        );
+        // A union-typed declarer: `(sub | other)` resolves the block's shape to
+        // its model variant, and the content validates against it.
+        let union_declarer = "model sub:\n    x string?\nmodel other:\n    y string?\nmodel modelA:\n    sub (sub | other)?\nmodel modelB:\n    b string?\nmodel host:\n    slots [](modelA | modelB)?\n";
+        let bad = diags_for(
+            union_declarer,
+            "host H:\n    slots:\n        .sub:\n            bogus = \"v\"\n        - one as modelB:\n            b = \"s\"\n",
+        );
+        assert!(
+            bad.iter().any(|d| d.message.contains("unknown property")),
+            "a union-typed declarer must validate block content body-aware: {bad:?}"
+        );
+    }
+
+    #[test]
     fn disjoint_union_never_triggers_d2() {
         // The shipping `(step | []step)` shape has ONE nameable variant, so a
         // keyed body is unambiguous — D2 must NOT fire (no regression).
@@ -4655,9 +4812,9 @@ workflow W:
         let validator = make_validator(schema);
 
         let span = Span::empty(0);
-        let mut body = Body::new(vec![]);
+        let mut body = Body::fresh(vec![]);
         for _ in 0..(MAX_VALIDATION_DEPTH + 4) {
-            body = Body::new(vec![BodyEntry {
+            body = Body::fresh(vec![BodyEntry {
                 kind: BodyEntryKind::NestedBlock(NestedBlock {
                     name: Identifier::new("child", span),
                     body,

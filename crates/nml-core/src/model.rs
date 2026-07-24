@@ -159,6 +159,23 @@ pub enum FieldType {
     Set(Box<FieldType>),
 }
 
+impl FieldType {
+    /// The union variants of this type, transparently unwrapping a modifier
+    /// wrapper (`|field (A | B)`); `None` when the type is not — even beneath a
+    /// modifier — a union. The single "is this (a modifier around) a union?"
+    /// test (RFC 0015): the validator's annotation/D2 gate, the defaulter's and
+    /// identity walk's union branches, and LSP `as`-completion all dispatch
+    /// through it, so a modifier-wrapped union is never second-class in one
+    /// consumer and first-class in another.
+    pub fn union_variants(&self) -> Option<&[FieldType]> {
+        match self {
+            FieldType::Union(v) => Some(v),
+            FieldType::Modifier(inner) => inner.union_variants(),
+            _ => None,
+        }
+    }
+}
+
 /// Renders the type in NML source syntax: `[]string`, `(step | []step)`,
 /// `[](string | number)`.
 ///

@@ -431,6 +431,88 @@ async fn declared_model_file_gets_directive_did_you_mean() {
 
 /// TEST D — `#` completion in a covered model file offers the vocabulary
 /// (label = name, detail = arg kind, documentation = doc), and nothing else.
+/// RFC 0015 end-to-end: `as`-position completion through the REAL completion
+/// handler (didOpen → schema registry → completion), not the unit-tested
+/// detector alone — the union's nameable variants are offered at `slot as ⌖`.
+#[tokio::test]
+async fn as_position_completion_offers_union_variants_end_to_end() {
+    let base = temp_dir("as-completion");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let ws = base.join("ws");
+    fs::create_dir_all(&ws).expect("create workspace");
+    let model = ws.join("union.model.nml");
+    let model_text =
+        "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slot (modelA | modelB)?\n";
+    fs::write(&model, model_text).expect("write model");
+    let config = ws.join("app.nml");
+    let config_text = "host H:\n    slot as \n";
+    fs::write(&config, config_text).expect("write config");
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness.open(&model, model_text).await;
+    harness.open(&config, config_text).await;
+    let result = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": file_uri(&config) },
+                // End of `    slot as ` — the annotation type slot.
+                "position": { "line": 1, "character": 12 },
+            }),
+        )
+        .await;
+    let items = result.as_array().expect("completion item array");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert_eq!(
+        labels,
+        ["modelA", "modelB"],
+        "the union's nameable variants, source order: {result}"
+    );
+}
+
+/// Round-10 F4: the ELEMENT-level twin — `- one as ⌖` inside `slots:` must
+/// offer the enclosing list field's union variants (the item name is not a
+/// field; the union lives on `slots`). Previously returned [] end-to-end.
+#[tokio::test]
+async fn as_position_completion_works_on_list_elements_end_to_end() {
+    let base = temp_dir("as-completion-element");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let ws = base.join("ws");
+    fs::create_dir_all(&ws).expect("create workspace");
+    let model = ws.join("union.model.nml");
+    let model_text =
+        "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slots [](modelA | modelB)?\n";
+    fs::write(&model, model_text).expect("write model");
+    let config = ws.join("app.nml");
+    let config_text = "host H:\n    slots:\n        - one as \n";
+    fs::write(&config, config_text).expect("write config");
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness.open(&model, model_text).await;
+    harness.open(&config, config_text).await;
+    let result = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": file_uri(&config) },
+                // End of `        - one as ` — the item's annotation slot.
+                "position": { "line": 2, "character": 17 },
+            }),
+        )
+        .await;
+    let items = result.as_array().expect("completion item array");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert_eq!(
+        labels,
+        ["modelA", "modelB"],
+        "the enclosing list field's variants: {result}"
+    );
+}
+
 #[tokio::test]
 async fn directive_completion_offers_vocabulary() {
     let base = temp_dir("directive-completion");

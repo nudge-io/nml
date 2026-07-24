@@ -130,14 +130,14 @@ impl Lower {
 
     /// Lower a present body's entries.
     fn lower_body(&mut self, body: ast::Body) -> Body {
-        Body::new(body.entries().map(|e| self.body_entry(e)).collect())
+        Body::fresh(body.entries().map(|e| self.body_entry(e)).collect())
     }
 
     /// Lower an *optional* body — an absent body lowers to an empty one. For callers
     /// that already hold a body, use [`Self::lower_body`] directly.
     fn body_of(&mut self, body: Option<ast::Body>) -> Body {
         body.map(|b| self.lower_body(b))
-            .unwrap_or_else(|| Body::new(Vec::new()))
+            .unwrap_or_else(|| Body::fresh(Vec::new()))
     }
 
     fn body_entry(&mut self, entry: ast::Entry) -> BodyEntry {
@@ -285,7 +285,7 @@ impl Lower {
                 // reference. Lowering it as Named keeps it visible to instance
                 // validation (its missing required fields must fail loud), where
                 // collapsing it into `Reference` made it structurally invisible.
-                let mut body = Body::new(Vec::new());
+                let mut body = Body::fresh(Vec::new());
                 body.type_annotation = annotation;
                 ListItemKind::Named {
                     name: ident(name),
@@ -645,6 +645,87 @@ mod tests {
             item_ann.as_deref(),
             Some("modelC"),
             "list-element annotation must lower onto the item body"
+        );
+    }
+
+    /// F1 (interaction audit): `as` on a ROOT declaration header must be a loud
+    /// parse error that keeps the body attached to the REAL declaration — never
+    /// the silent split into a bodyless block plus a bogus `as`-keyword block
+    /// that swallows the body.
+    #[test]
+    fn as_on_declaration_header_errors_without_swallowing_the_body() {
+        // All three header positions: plain, after an `is` clause, array decl.
+        for src in [
+            "host H as modelB:\n    b = \"x\"\n",
+            "host H is Base as modelB:\n    b = \"x\"\n",
+        ] {
+            let parsed = parse(src);
+            assert!(
+                !parsed.errors().is_empty(),
+                "`as` on a declaration header must be a parse error: {src:?}"
+            );
+            let file = cst_ast(src);
+            assert_eq!(
+                file.declarations.len(),
+                1,
+                "no bogus extra declaration: {src:?}"
+            );
+            let DeclarationKind::Block(b) = &file.declarations[0].kind else {
+                panic!("expected block")
+            };
+            assert_eq!(b.keyword.name, "host");
+            assert!(
+                b.body.entries.iter().any(|e| matches!(
+                    &e.kind,
+                    BodyEntryKind::Property(p) if p.name.name == "b"
+                )),
+                "the body must attach to the real declaration: {src:?}"
+            );
+        }
+        // Round-10 F6/F7: repeated `as` clauses all consumed (body on the real
+        // decl), and `is as` leaves `as` for the annotation rejection.
+        for src in [
+            "host H as x as y as z:\n    b = \"x\"\n",
+            "host H is as modelB:\n    b = \"x\"\n",
+        ] {
+            let parsed = parse(src);
+            assert!(!parsed.errors().is_empty(), "must be loud: {src:?}");
+            let file = cst_ast(src);
+            assert_eq!(
+                file.declarations.len(),
+                1,
+                "no bogus extra declaration: {src:?}"
+            );
+            let DeclarationKind::Block(b) = &file.declarations[0].kind else {
+                panic!("expected block")
+            };
+            assert_eq!(b.keyword.name, "host", "{src:?}");
+            assert!(
+                b.body.entries.iter().any(|e| matches!(
+                    &e.kind,
+                    BodyEntryKind::Property(p) if p.name.name == "b"
+                )),
+                "the body must attach to the real declaration: {src:?}"
+            );
+        }
+
+        // Array decl: same guarantee, item attaches to the real declaration.
+        let src = "[]mount m as modelB:\n    - one:\n        b = \"x\"\n";
+        let parsed = parse(src);
+        assert!(
+            !parsed.errors().is_empty(),
+            "`as` on an array-decl header must be a parse error"
+        );
+        let file = cst_ast(src);
+        assert_eq!(file.declarations.len(), 1, "no bogus extra declaration");
+        let DeclarationKind::Array(a) = &file.declarations[0].kind else {
+            panic!("expected array decl")
+        };
+        assert_eq!(a.item_keyword.name, "mount");
+        assert_eq!(
+            a.body.items.len(),
+            1,
+            "the item must attach to the real declaration"
         );
     }
 

@@ -426,7 +426,7 @@ pub fn wrap_file_as_body(file: &File) -> Body {
                         kind: BodyEntryKind::ListItem(i),
                     })
                     .collect();
-                (a.name.clone(), Body::new(entries))
+                (a.name.clone(), Body::fresh(entries))
             }
             _ => continue,
         };
@@ -435,7 +435,7 @@ pub fn wrap_file_as_body(file: &File) -> Body {
             kind: BodyEntryKind::NestedBlock(NestedBlock { name, body }),
         });
     }
-    Body::new(entries)
+    Body::fresh(entries)
 }
 
 /// What a keyed-body instance's type resolves to: a plain model, or a `oneof`
@@ -1074,7 +1074,39 @@ fn diff_bodies(
     // as per-arm Addeds rather than one blob.
     let old_arms = collect_arm_entries(old);
     let new_arms = collect_arm_entries(new);
+    let old_elems = collect_elems(old);
+    let new_elems = collect_elems(new);
+
+    // ── Shape-transition visibility (RFC 0015) ──────────────────────────────
+    // The arms/collections early returns below render exactly ONE
+    // representation. When the two sides take DIFFERENT paths — a keyed model
+    // body or inline value on one side, an arms/list form on the other (a
+    // union shape switch) — the losing side's content would silently vanish.
+    // Surface the orphaned side FIRST, in its own representation, so a shape
+    // switch keeps the never-silent invariant at the boundary.
+    let old_is_ae = old_arms.is_some() || !old_elems.is_empty();
+    let new_is_ae = new_arms.is_some() || !new_elems.is_empty();
+    if old_is_ae != new_is_ae {
+        if old_is_ae {
+            // Old side renders below (vs empty); the NEW side is the orphan.
+            orphan_side_visibility(index, field, new, false, path, depth, out);
+        } else {
+            orphan_side_visibility(index, field, old, true, path, depth, out);
+        }
+    }
+
     if old_arms.is_some() || new_arms.is_some() {
+        // Arms ↔ ELEMS transition (both "collection-shaped", different kinds —
+        // e.g. `((role -> string) | []step)` switching forms): the non-arms
+        // side's elements have no arm representation and would vanish in the
+        // arm diff below. Surface them as their own collection diff vs empty —
+        // the same orphan rule, arms edition.
+        if old_arms.is_none() && !old_elems.is_empty() {
+            diff_collections(index, field, &old_elems, &[], path, depth, out);
+        }
+        if new_arms.is_none() && !new_elems.is_empty() {
+            diff_collections(index, field, &[], &new_elems, path, depth, out);
+        }
         diff_arms(
             &old_arms.unwrap_or_default(),
             &new_arms.unwrap_or_default(),
@@ -1085,11 +1117,23 @@ fn diff_bodies(
     }
 
     // Collections (either side items, or a list/set-typed field).
-    let old_elems = collect_elems(old);
-    let new_elems = collect_elems(new);
     if !old_elems.is_empty() || !new_elems.is_empty() {
         diff_collections(index, field, &old_elems, &new_elems, path, depth, out);
         return;
+    }
+
+    // Value ↔ body transition with neither side arms/elems (e.g. a union's
+    // scalar variant swapped for its model variant): the body side is rendered
+    // by the model path below against an empty slice; the VALUE side has no
+    // representation there — surface it here.
+    match (old, new) {
+        (Effective::Value(..) | Effective::Default(_), Effective::Bodies(_)) => {
+            orphan_side_visibility(index, field, old, true, path, depth, out);
+        }
+        (Effective::Bodies(_), Effective::Value(..) | Effective::Default(_)) => {
+            orphan_side_visibility(index, field, new, false, path, depth, out);
+        }
+        _ => {}
     }
 
     // Model / oneof instance: resolve the target and recurse with per-file
@@ -1103,7 +1147,7 @@ fn diff_bodies(
         Effective::Bodies(b) => b,
         _ => &empty,
     };
-    let empty_body = Body::new(Vec::new());
+    let empty_body = Body::fresh(Vec::new());
     // RFC 0015 variant SWITCH: resolve each side to its own variant (honoring an
     // `as <Variant>` annotation on that side). When they select DIFFERENT models
     // — an annotation switch, or a shape switch — diff each side against its own
@@ -1116,6 +1160,15 @@ fn diff_bodies(
     let new_target = resolve_diff_target(index, &field.field_type, n, &empty, &empty_body);
     if let (FieldTarget::Model(om), FieldTarget::Model(nm)) = (&old_target, &new_target) {
         if om.name != nm.name {
+            // Both sides must EXIST for a switch witness — an absent side is an
+            // add/remove of the whole field, and a phantom `as A → as B` there
+            // would claim an annotation that never was (the same absent-side
+            // rule diff_oneof_instance applies to discriminator flips). A
+            // present-but-empty annotated body IS a real side and keeps its
+            // witness.
+            if !o.is_empty() && !n.is_empty() {
+                push_variant_switch(&om.name, &nm.name, o, n, path, out);
+            }
             let octx = ModelCtx {
                 model: om,
                 exempt: None,
@@ -1180,6 +1233,118 @@ fn elems_structural_eq(old: &[Elem<'_>], new: &[Elem<'_>]) -> bool {
 /// The comparison is the per-file body SEQUENCE (an undescribable shape has no
 /// merge semantics to apply), so re-splitting identical content across files
 /// conservatively reads as changed — visible, never silent, per the invariant.
+/// One side of a shape transition, rendered in its OWN representation against
+/// emptiness (RFC 0015 shape-switch visibility): a keyed/annotated body diffs
+/// through its per-side-resolved model or oneof (precise per-field
+/// removes/adds), an inline value emits one Removed/Added, and anything
+/// unresolvable degrades to the visible opaque fall-through — never silence.
+/// `removed` = the orphan is the OLD side (its content is going away).
+fn orphan_side_visibility(
+    index: &SchemaIndex,
+    field: &FieldDef,
+    side: &Effective,
+    removed: bool,
+    path: &FieldPath,
+    depth: u32,
+    out: &mut Vec<FieldChange>,
+) {
+    match side {
+        Effective::Bodies(b) => {
+            let empty: Vec<(PathBuf, &Body)> = Vec::new();
+            let empty_body = Body::fresh(Vec::new());
+            let (o, n): (&Vec<_>, &Vec<_>) = if removed { (b, &empty) } else { (&empty, b) };
+            match resolve_diff_target(index, &field.field_type, b, &empty, &empty_body) {
+                FieldTarget::Model(m) => {
+                    let ctx = ModelCtx {
+                        model: m,
+                        exempt: None,
+                    };
+                    diff_model(index, ctx, o, n, path, depth + 1, out);
+                }
+                FieldTarget::OneOf(of) => {
+                    diff_oneof_instance(index, of, o, n, path, depth + 1, out);
+                }
+                _ => opaque_if_different(o, n, path, out),
+            }
+        }
+        Effective::Value(sv, file) => {
+            let kind = if removed {
+                ChangeKind::Removed {
+                    old: sv.value.clone(),
+                }
+            } else {
+                ChangeKind::Added {
+                    new: sv.value.clone(),
+                }
+            };
+            push(
+                path,
+                kind,
+                Origin::File {
+                    file: file.to_path_buf(),
+                    span: sv.span,
+                },
+                out,
+            );
+        }
+        Effective::Default(sv) => {
+            let kind = if removed {
+                ChangeKind::Removed {
+                    old: sv.value.clone(),
+                }
+            } else {
+                ChangeKind::Added {
+                    new: sv.value.clone(),
+                }
+            };
+            push(path, kind, Origin::Default, out);
+        }
+        // Absent: nothing to surface. Items: an arms/elems-shaped side is
+        // rendered by its own dispatch path, never orphaned here.
+        Effective::Absent | Effective::Items(..) => {}
+    }
+}
+
+/// RFC 0015: emit a nominal variant SWITCH itself as an explicit, always-visible
+/// change (`as modelA` → `as modelB`) — the nominal-union analogue of a oneof
+/// discriminator flip. The per-side half-diffs that follow surface field
+/// content; THIS entry guarantees the switch is visible even when both bodies
+/// are entry-less (nothing to half-diff) or the variants differ only in their
+/// schema defaults — the cases where content diffs alone would be silent,
+/// violating the never-silent invariant. Origin prefers the annotation ident's
+/// own span (the token that changed), then the first entry, then Default.
+fn push_variant_switch(
+    old_model: &str,
+    new_model: &str,
+    old: &[(PathBuf, &Body)],
+    new: &[(PathBuf, &Body)],
+    path: &FieldPath,
+    out: &mut Vec<FieldChange>,
+) {
+    let origin = new
+        .first()
+        .or_else(|| old.first())
+        .map(|(f, b)| Origin::File {
+            file: f.clone(),
+            span: b
+                .type_annotation
+                .as_ref()
+                .map(|i| i.span)
+                .or_else(|| b.entries.first().map(|e| e.span))
+                .unwrap_or(Span { start: 0, end: 0 }),
+        })
+        .unwrap_or(Origin::Default);
+    push(
+        path,
+        ChangeKind::Modified {
+            old: Value::String(format!("as {old_model}")),
+            new: Value::String(format!("as {new_model}")),
+        },
+        origin,
+        out,
+    );
+}
+
 fn opaque_if_different(
     old: &[(PathBuf, &Body)],
     new: &[(PathBuf, &Body)],
@@ -1398,7 +1563,64 @@ fn diff_collections(
             .body
             .map(|b| vec![(n.file.map(Path::to_path_buf).unwrap_or_default(), b)])
             .unwrap_or_default();
-        let empty_body = Body::new(Vec::new());
+        let empty_body = Body::fresh(Vec::new());
+        // RFC 0015 variant SWITCH at the ELEMENT level — the exact twin of the
+        // field-level rule in `diff_bodies`: resolve each side against its own
+        // body (honoring its `as <Variant>` annotation); different models diff
+        // as precise per-side removes+adds, so an annotation-only element
+        // switch is never silently equal. Only reachable for `[](A | B)` unions
+        // with ≥2 model variants; single-model elements resolve identically on
+        // both sides and fall through unchanged.
+        let empty_side: Vec<(PathBuf, &Body)> = Vec::new();
+        let o_target = resolve_diff_target(
+            index,
+            elem_type(&field.field_type),
+            &o_files,
+            &empty_side,
+            &empty_body,
+        );
+        let n_target = resolve_diff_target(
+            index,
+            elem_type(&field.field_type),
+            &n_files,
+            &empty_side,
+            &empty_body,
+        );
+        if let (FieldTarget::Model(om), FieldTarget::Model(nm)) = (&o_target, &n_target) {
+            if om.name != nm.name {
+                // Absent-side guard: same phantom rule as the field level.
+                if !o_files.is_empty() && !n_files.is_empty() {
+                    push_variant_switch(&om.name, &nm.name, &o_files, &n_files, &elem_path, out);
+                }
+                let octx = ModelCtx {
+                    model: om,
+                    exempt: None,
+                };
+                let nctx = ModelCtx {
+                    model: nm,
+                    exempt: None,
+                };
+                diff_model(
+                    index,
+                    octx,
+                    &o_files,
+                    &empty_side,
+                    &elem_path,
+                    depth + 1,
+                    out,
+                );
+                diff_model(
+                    index,
+                    nctx,
+                    &empty_side,
+                    &n_files,
+                    &elem_path,
+                    depth + 1,
+                    out,
+                );
+                continue;
+            }
+        }
         match resolve_diff_target(
             index,
             elem_type(&field.field_type),
@@ -1916,6 +2138,186 @@ mod tests {
         );
     }
 
+    /// F3 (interaction audit): the switch must be visible even with EMPTY
+    /// bodies — nothing to half-diff, so the explicit `as A` → `as B` Modified
+    /// entry is the only witness. Covers variants that differ only in schema
+    /// defaults (the effective config changes with zero authored entries).
+    #[test]
+    fn nominal_variant_switch_with_empty_bodies_is_visible() {
+        let schema = "model modelA:\n    cap number = 1\nmodel modelB:\n    cap number = 2\nmodel server:\n    slot (modelA | modelB)?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let old = parse_doc("server s:\n    slot as modelA:\n");
+        let new = parse_doc("server s:\n    slot as modelB:\n");
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        assert!(
+            d.iter().any(|c| matches!(
+                &c.kind,
+                ChangeKind::Modified { old, new }
+                    if old.as_str() == Some("as modelA") && new.as_str() == Some("as modelB")
+            )),
+            "an empty-body variant switch must emit the explicit switch change: {d:?}"
+        );
+    }
+
+    /// Round-11: the ARMS ↔ ELEMS transition (both collection-shaped,
+    /// different kinds) must surface BOTH sides — the arm removed AND the new
+    /// elements added — not just the arm side.
+    #[test]
+    fn shape_switch_arms_to_elems_keeps_both_sides_visible() {
+        let schema =
+            "model step:\n    run string?\nmodel server:\n    slot ((role -> string) | []step)?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let old = parse_doc("server s:\n    slot:\n        @admin -> \"OLDTARGET\"\n");
+        let new = parse_doc("server s:\n    slot:\n        - A:\n            run = \"x\"\n");
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        assert!(
+            d.iter()
+                .any(|c| matches!(c.kind, ChangeKind::Removed { .. })),
+            "the arm side must be visibly removed: {d:?}"
+        );
+        assert!(
+            d.iter().any(|c| matches!(c.kind, ChangeKind::Added { .. })),
+            "the element side must be visibly added: {d:?}"
+        );
+    }
+
+    /// Round-10 F1: a SHAPE switch (keyed model form → list form of
+    /// `(step | []step)`) must surface the keyed side's content — previously
+    /// the collections early-return silently dropped it.
+    #[test]
+    fn shape_switch_keyed_to_list_keeps_old_content_visible() {
+        let schema =
+            "model step:\n    run string?\n    a string?\nmodel server:\n    slot (step | []step)?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let old = parse_doc("server s:\n    slot:\n        run = \"OLDVALUE\"\n");
+        let new = parse_doc("server s:\n    slot:\n        - A:\n            a = \"x\"\n");
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        assert!(
+            d.iter()
+                .any(|c| p(c) == "slot.run" && matches!(c.kind, ChangeKind::Removed { .. })),
+            "the keyed side's content must be visibly removed: {d:?}"
+        );
+        assert!(
+            d.iter().any(|c| matches!(c.kind, ChangeKind::Added { .. })),
+            "the list side's content must be visibly added: {d:?}"
+        );
+    }
+
+    /// Round-10 F2: a model ↔ scalar transition on `(modelA | string)` must
+    /// surface BOTH sides — the body's fields removed AND the new value added.
+    #[test]
+    fn shape_switch_model_to_scalar_keeps_both_sides_visible() {
+        let schema = "model modelA:\n    a string?\nmodel server:\n    slot (modelA | string)?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let old = parse_doc("server s:\n    slot as modelA:\n        a = \"OLDVALUE\"\n");
+        let new = parse_doc("server s:\n    slot = \"NEWSCALAR\"\n");
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        assert!(
+            d.iter()
+                .any(|c| p(c) == "slot.a" && matches!(c.kind, ChangeKind::Removed { .. })),
+            "the model side's field must be visibly removed: {d:?}"
+        );
+        assert!(
+            d.iter().any(|c| matches!(
+                &c.kind,
+                ChangeKind::Added { new } if new.as_str() == Some("NEWSCALAR")
+            )),
+            "the scalar side must be visibly added: {d:?}"
+        );
+    }
+
+    /// Round-10 F3: NO phantom switch witness on an absent side — a pure add
+    /// of `slot as modelB:` is an Add, not an `as modelA → as modelB` Modified
+    /// that claims an annotation which never existed.
+    #[test]
+    fn no_phantom_switch_witness_on_pure_add_or_remove() {
+        let schema = "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel server:\n    slot (modelA | modelB)?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let old = parse_doc("server s:\n    other = 1\n");
+        let new = parse_doc("server s:\n    other = 1\n    slot as modelB:\n        b = \"x\"\n");
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        assert!(
+            !d.iter().any(|c| matches!(
+                &c.kind,
+                ChangeKind::Modified { old, .. } if old.as_str().is_some_and(|s| s.starts_with("as "))
+            )),
+            "a pure add must not fabricate a variant-switch witness: {d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|c| p(c) == "slot.b" && matches!(c.kind, ChangeKind::Added { .. })),
+            "the added body renders as adds: {d:?}"
+        );
+    }
+
+    /// The ELEMENT-level twin: an annotation-only switch on a paired `[]union`
+    /// element (`- one as modelA:` → `- one as modelB:`, identical entries)
+    /// must be visible — the paired-element recursion resolves per side, exactly
+    /// like the field-level rule.
+    #[test]
+    fn nominal_variant_switch_on_list_element_is_visible() {
+        let schema = "model modelA:\n    shared string?\nmodel modelB:\n    shared string?\nmodel server:\n    slots [](modelA | modelB)?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let old = parse_doc(
+            "server s:\n    slots:\n        - one as modelA:\n            shared = \"x\"\n",
+        );
+        let new = parse_doc(
+            "server s:\n    slots:\n        - one as modelB:\n            shared = \"x\"\n",
+        );
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        assert!(
+            !d.is_empty(),
+            "an element-level annotation-only switch must be visible: {d:?}"
+        );
+        assert!(
+            d.iter()
+                .all(|c| !matches!(c.kind, ChangeKind::OpaqueChanged)),
+            "a legitimate element switch must not read as drift: {d:?}"
+        );
+    }
+
     /// ARM blocks diff PER-ARM (RFC 0007): a retargeted arm is one `Modified`
     /// of target values at ITS selector element path; unchanged arms are
     /// silent; a REORDER is honestly a -/+ pair of the full moved arm (arms
@@ -2059,9 +2461,9 @@ mod tests {
     fn over_deep_bodies_fail_visible_not_stack_overflow() {
         use crate::ast::{BodyEntry, Identifier, NestedBlock};
         fn deep_body(levels: u32) -> Body {
-            let mut body = Body::new(Vec::new());
+            let mut body = Body::fresh(Vec::new());
             for i in 0..levels {
-                body = Body::new(vec![BodyEntry {
+                body = Body::fresh(vec![BodyEntry {
                     span: Span { start: 0, end: 0 },
                     kind: BodyEntryKind::NestedBlock(NestedBlock {
                         name: Identifier {
@@ -2107,7 +2509,7 @@ mod tests {
         // Hand-build a chain deeper than the walk cap with `v = <leaf>` at the bottom.
         fn chain(levels: u32, leaf: i64) -> Body {
             let nospan = Span { start: 0, end: 0 };
-            let mut body = Body::new(vec![BodyEntry {
+            let mut body = Body::fresh(vec![BodyEntry {
                 span: nospan,
                 kind: BodyEntryKind::Property(Property {
                     name: Identifier {
@@ -2121,7 +2523,7 @@ mod tests {
                 }),
             }]);
             for _ in 0..levels {
-                body = Body::new(vec![BodyEntry {
+                body = Body::fresh(vec![BodyEntry {
                     span: nospan,
                     kind: BodyEntryKind::NestedBlock(NestedBlock {
                         name: Identifier {
@@ -2132,7 +2534,7 @@ mod tests {
                     }),
                 }]);
             }
-            Body::new(vec![BodyEntry {
+            Body::fresh(vec![BodyEntry {
                 span: nospan,
                 kind: BodyEntryKind::NestedBlock(NestedBlock {
                     name: Identifier {

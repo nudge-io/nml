@@ -205,7 +205,7 @@ fn array_declaration_as_body(
             kind: BodyEntryKind::ListItem(inline_in_item(doc, item, depth)),
         });
     }
-    Body::new(entries)
+    Body::fresh(entries)
 }
 
 /// [`from_body_defaulted`] keyed by a block's keyword (its root model/oneof), so
@@ -351,8 +351,9 @@ impl<'a> Defaulter<'a> {
         // yield the bare `Union` target, which would default nothing; resolve
         // WITH the body so the selected variant's defaults are applied — the
         // field-level analogue of `list_body`, and consistent with how the
-        // validator resolves the same instance.
-        if matches!(&field.field_type, FieldType::Union(_)) {
+        // validator resolves the same instance. `union_variants` unwraps a
+        // modifier wrapper, so `|slot (a | b)` defaults like a plain union.
+        if field.field_type.union_variants().is_some() {
             let target = self.index.resolve_type_in_body(&field.field_type, nb_body);
             return self.default_against(target, nb_body, depth + 1);
         }
@@ -566,7 +567,7 @@ fn inject_discriminator(body: &Body, name: &str, value: &str, span: Span) -> Bod
 
 /// Empty body used as the seed when materializing a fully-defaultable nested
 /// model that the instance omitted entirely.
-const EMPTY_BODY: Body = Body::new(Vec::new());
+const EMPTY_BODY: Body = Body::fresh(Vec::new());
 
 #[cfg(test)]
 mod tests {
@@ -828,7 +829,7 @@ mod tests {
     /// (`apply_positional → apply_shared_properties → apply_defaults →
     /// resolve_body → from_block`), not pass-by-pass: the annotation must
     /// survive every body-rebuilding transform (each must use
-    /// `Body::with_entries`, never `Body::new`), select the named variant's
+    /// `Body::with_entries`, never a fresh construction), select the named variant's
     /// DEFAULTS, and reach the deserializer's synthesized tag so the built Rust
     /// value is the annotated variant. This is the test that catches an
     /// annotation-stripping rebuild anywhere in the chain — unit tests on the

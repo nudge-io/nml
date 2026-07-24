@@ -297,11 +297,48 @@ impl<'a> Parser<'a> {
     }
 
     /// `keyword name (is parent, …)? : body?`
+    /// RFC 0015: `as <Variant>` is a FIELD/ITEM annotation, not a declaration
+    /// one — a top-level declaration's type IS its keyword. Without this
+    /// rejection, `host H as modelB:` (or the `is`-clause and array-decl forms)
+    /// would silently split into a bodyless declaration plus a bogus
+    /// `as modelB:` block that swallows the intended body (the missing-colon
+    /// leniency makes that legal). Error, then consume `as <ident>` so the
+    /// colon and body still attach to the REAL declaration — fail-loud
+    /// recovery, never a silent reinterpretation. Called at EVERY position a
+    /// declaration header can end (after the name and after an `is` clause) —
+    /// one guarded exit, not per-site copies.
+    fn reject_decl_annotation(&mut self) {
+        // A loop, not an `if`: `host H as x as y as z:` must consume EVERY
+        // stray clause, or the body would still split onto a bogus block at
+        // the first unguarded repetition. Each repetition errors — loud per
+        // clause, and the loop always advances (bump `as`), so it terminates.
+        while self.at_kw("as") {
+            self.expected(
+                vec![
+                    crate::error::ExpectedItem::Kind(SyntaxKind::Colon),
+                    crate::error::ExpectedItem::Desc(
+                        "a body — `as <Variant>` annotates union-typed fields and list \
+                         items, not declarations (a declaration's type is its keyword)",
+                    ),
+                ],
+                Some("after a declaration name"),
+            );
+            self.bump(); // as
+            if self.at(SyntaxKind::Ident) && !self.newline_before() {
+                self.bump(); // the stray variant ident
+            }
+        }
+    }
+
     fn block_decl(&mut self) {
         let m = self.start();
         self.bump(); // keyword
         self.name();
+        self.reject_decl_annotation();
         self.extends_clause();
+        // `host H is Base as modelB:` — the annotation can trail the `is`
+        // clause too; both header exits are guarded.
+        self.reject_decl_annotation();
         if self.eat(SyntaxKind::Colon) {
             self.body();
         }
@@ -315,6 +352,7 @@ impl<'a> Parser<'a> {
         self.expect(SyntaxKind::RBracket);
         self.expect_desc(SyntaxKind::Ident, "an item keyword");
         self.name();
+        self.reject_decl_annotation();
         if self.eat(SyntaxKind::Colon) {
             self.body();
         }
@@ -403,11 +441,27 @@ impl<'a> Parser<'a> {
         }
         let m = self.start();
         self.bump(); // is
-        self.expect_desc(SyntaxKind::Ident, "a parent name");
+        self.expect_parent_name();
         while self.eat(SyntaxKind::Comma) {
-            self.expect_desc(SyntaxKind::Ident, "a parent name");
+            self.expect_parent_name();
         }
         m.complete(self, SyntaxKind::Extends);
+    }
+
+    /// A parent name in an `is` clause — but NEVER the contextual keyword `as`:
+    /// `host H is as modelB:` must leave `as` for [`Self::reject_decl_annotation`]
+    /// (which follows the clause) so the error names the real problem and the
+    /// body stays on the real declaration, instead of `as` being swallowed as a
+    /// bogus parent and the diagnostic pointing at the wrong thing.
+    fn expect_parent_name(&mut self) {
+        if self.at_kw("as") {
+            self.expected(
+                vec![crate::error::ExpectedItem::Desc("a parent name")],
+                Some("in an `is` clause"),
+            );
+            return; // leave `as` for the annotation rejection
+        }
+        self.expect_desc(SyntaxKind::Ident, "a parent name");
     }
 
     /// The declaration/property name, wrapped for typed access.

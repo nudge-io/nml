@@ -1678,16 +1678,26 @@ fn find_enum_variants_at(
 /// (`<field> as <partial>`, before any `:` body or `=` value), return the field
 /// name whose union variants should be completed. `None` otherwise. Pure line
 /// analysis so the completion detector is unit-testable in isolation.
-fn as_position_field(line: &str, cursor_byte: usize) -> Option<String> {
+/// What the `as`-type slot under the cursor annotates: a FIELD header
+/// (`slot as ⌖` — the union lives on the named field itself) or a LIST ITEM
+/// (`- one as ⌖` — the name is the *item's*, and the union lives on the
+/// **enclosing list field**, found by span). Conflating the two made
+/// element-level completion silently dead: the item name matched no field.
+enum AsSlot {
+    Field(String),
+    Item,
+}
+
+fn as_position_field(line: &str, cursor_byte: usize) -> Option<AsSlot> {
     let before = line.get(..cursor_byte)?;
     // Still in the header type slot — a `:` (body) or `=` (value) means we have
     // left it.
     if before.contains(':') || before.contains('=') {
         return None;
     }
-    // Strip an optional list-item marker so `- name as …` is recognized like a
-    // field header.
-    let header = before.trim_start().trim_start_matches("- ");
+    let trimmed = before.trim_start();
+    let is_item = trimmed.starts_with("- ");
+    let header = trimmed.trim_start_matches("- ");
     let mut toks = header.split_whitespace();
     let name = toks.next()?;
     if toks.next()? != "as" {
@@ -1695,11 +1705,139 @@ fn as_position_field(line: &str, cursor_byte: usize) -> Option<String> {
     }
     // At most one partial variant token may trail the `as`; anything more means
     // the cursor is past the annotation.
-    match toks.next() {
-        None => Some(name.to_string()),
-        Some(_) if toks.next().is_none() => Some(name.to_string()),
-        _ => None,
+    let in_slot = match toks.next() {
+        None => true,
+        Some(_) => toks.next().is_none(),
+    };
+    if !in_slot {
+        return None;
     }
+    Some(if is_item {
+        AsSlot::Item
+    } else {
+        AsSlot::Field(name.to_string())
+    })
+}
+
+/// The union-elemented list/set FIELD whose block contains `pos` — the
+/// enclosing field of an item annotation slot (`- one as ⌖` sits inside
+/// `slots:`, whose type is `[](modelA | modelB)`). Descends through
+/// model-typed nested blocks like `descend_to_cursor`, but STOPS at the list
+/// field itself (the item under the cursor is mid-typing and need not parse).
+/// Editor-grade containment: last entry starting before the cursor, bounded by
+/// the next sibling's start.
+fn find_union_list_field_at<'i>(
+    model: &'i ModelDef,
+    body: &Body,
+    pos: Position,
+    index: &'i SchemaIndex,
+    line_index: &LineIndex,
+) -> Option<&'i FieldDef> {
+    let mut owner: Option<(&'i FieldDef, &Body)> = None;
+    for (i, entry) in body.entries.iter().enumerate() {
+        let BodyEntryKind::NestedBlock(nb) = &entry.kind else {
+            continue;
+        };
+        let range = span_to_range(entry.span, line_index);
+        if pos.line <= range.start.line {
+            continue;
+        }
+        let next_start = body
+            .entries
+            .get(i + 1)
+            .map(|e| span_to_range(e.span, line_index).start.line);
+        let bounded = match next_start {
+            Some(next) => pos.line < next,
+            None => true,
+        };
+        if bounded {
+            if let Some(field) = model.fields.iter().find(|f| f.name == nb.name.name) {
+                owner = Some((field, &nb.body));
+            }
+        }
+    }
+    let (field, nested_body) = owner?;
+    let base = match &field.field_type {
+        FieldType::Modifier(inner) => inner.as_ref(),
+        t => t,
+    };
+    if let FieldType::List(inner) | FieldType::Set(inner) = base {
+        // An item body the cursor sits strictly INSIDE (below its header):
+        // descend through the item's body-aware resolved variant, so a union
+        // list nested in a `[]model` item — or in another union's item — is
+        // reachable. The item under the cursor uses the same editor-grade rule.
+        let mut item_owner: Option<&Body> = None;
+        for (i, entry) in nested_body.entries.iter().enumerate() {
+            let BodyEntryKind::ListItem(item) = &entry.kind else {
+                continue;
+            };
+            let range = span_to_range(entry.span, line_index);
+            if pos.line <= range.start.line {
+                continue; // the item's own header line (the annotation slot)
+            }
+            let next_start = nested_body
+                .entries
+                .get(i + 1)
+                .map(|e| span_to_range(e.span, line_index).start.line);
+            let bounded = match next_start {
+                Some(next) => pos.line < next,
+                None => true,
+            };
+            if bounded {
+                if let ListItemKind::Named { body, .. } = &item.kind {
+                    item_owner = Some(body);
+                }
+            }
+        }
+        if let Some(item_body) = item_owner {
+            if let FieldTarget::Model(m) = index.resolve_type_in_body(inner, item_body) {
+                return find_union_list_field_at(m, item_body, pos, index, line_index);
+            }
+            return None;
+        }
+        // Cursor on an item header: a union-elemented list IS the slot's field.
+        return inner.union_variants().is_some().then_some(field);
+    }
+    // Otherwise descend into a model-typed block and keep looking.
+    if let FieldTarget::Model(child) = index.resolve_field(field) {
+        return find_union_list_field_at(child, nested_body, pos, index, line_index);
+    }
+    None
+}
+
+/// The top-level block declaration owning `pos`, with editor-grade
+/// containment: a line the author is MID-TYPING (e.g. the `- one as ` of an
+/// in-progress annotation) is often malformed, and resilient parsing trims it
+/// from the declaration's content span — strict span containment would orphan
+/// exactly the lines completion serves. Rule: the last declaration starting
+/// before the cursor owns it, bounded by the NEXT declaration's start (span
+/// end alone is not trusted upward).
+fn enclosing_top_block<'f>(
+    file: &'f File,
+    pos: Position,
+    line_index: &LineIndex,
+) -> Option<&'f BlockDecl> {
+    let mut owner: Option<&BlockDecl> = None;
+    for (i, decl) in file.declarations.iter().enumerate() {
+        let range = span_to_range(decl.span, line_index);
+        if pos.line <= range.start.line {
+            continue; // header line or before this declaration
+        }
+        let next_start = file
+            .declarations
+            .get(i + 1)
+            .map(|d| span_to_range(d.span, line_index).start.line);
+        let bounded = match next_start {
+            Some(next) => pos.line < next,
+            None => true,
+        };
+        if bounded {
+            if let DeclarationKind::Block(b) = &decl.kind {
+                owner = Some(b);
+            }
+        }
+    }
+    owner
 }
 
 fn find_model_body_at<'i, 'f>(
@@ -1708,16 +1846,7 @@ fn find_model_body_at<'i, 'f>(
     index: &'i SchemaIndex,
     line_index: &LineIndex,
 ) -> Option<(&'i ModelDef, &'f Body)> {
-    let block = file.declarations.iter().find_map(|decl| {
-        let range = span_to_range(decl.span, line_index);
-        // Strictly inside the body — `pos.line > start` excludes the `keyword Name:` header.
-        if pos.line > range.start.line && pos.line <= range.end.line {
-            if let DeclarationKind::Block(b) = &decl.kind {
-                return Some(b);
-            }
-        }
-        None
-    })?;
+    let block = enclosing_top_block(file, pos, line_index)?;
     let FieldTarget::Model(model) = index.resolve_ref(&block.keyword.name) else {
         return None;
     };
@@ -1817,22 +1946,48 @@ fn descend_to_cursor<'i, 'f>(
             FieldTarget::Model(child) => {
                 descend_to_cursor(child, &nested.body, pos, index, line_index)
             }
-            // A list-of-model field: the nested body holds list items — descend into the one
-            // containing the cursor, as the item model.
-            FieldTarget::ListOf(inner) => {
-                let FieldTarget::Model(item_model) = inner.as_ref() else {
+            // A list/set field: the nested body holds list items — descend into
+            // the one owning the cursor, resolving the item's model PER ITEM
+            // through the canonical body-aware resolver, so `[](modelA |
+            // modelB)` items (annotated or shape-selected) complete their
+            // variant's fields exactly like `[]model` items. Editor-grade
+            // containment: a mid-typing line under the item is often trimmed
+            // from its span, so ownership is start-before-cursor bounded by
+            // the next sibling's start.
+            FieldTarget::ListOf(_) | FieldTarget::SetOf(_) => {
+                let base = match &field.field_type {
+                    FieldType::Modifier(inner) => inner.as_ref(),
+                    t => t,
+                };
+                let (FieldType::List(elem_ty) | FieldType::Set(elem_ty)) = base else {
                     return None;
                 };
-                let item = nested.body.entries.iter().find_map(|e| match &e.kind {
-                    BodyEntryKind::ListItem(item) => {
-                        let r = span_to_range(item.span, line_index);
-                        (pos.line > r.start.line && pos.line <= r.end.line).then_some(item)
+                let mut item_owner: Option<&Body> = None;
+                for (i, e) in nested.body.entries.iter().enumerate() {
+                    let BodyEntryKind::ListItem(item) = &e.kind else {
+                        continue;
+                    };
+                    let r = span_to_range(e.span, line_index);
+                    if pos.line <= r.start.line {
+                        continue;
                     }
-                    _ => None,
-                })?;
-                let ListItemKind::Named {
-                    body: item_body, ..
-                } = &item.kind
+                    let next_start = nested
+                        .body
+                        .entries
+                        .get(i + 1)
+                        .map(|e| span_to_range(e.span, line_index).start.line);
+                    let bounded = match next_start {
+                        Some(next) => pos.line < next,
+                        None => true,
+                    };
+                    if bounded {
+                        if let ListItemKind::Named { body, .. } = &item.kind {
+                            item_owner = Some(body);
+                        }
+                    }
+                }
+                let item_body = item_owner?;
+                let FieldTarget::Model(item_model) = index.resolve_type_in_body(elem_ty, item_body)
                 else {
                     return None;
                 };
@@ -1844,7 +1999,18 @@ fn descend_to_cursor<'i, 'f>(
                 let variant = resolve_oneof_variant(oneof, &nested.body, index)?;
                 descend_to_cursor(variant, &nested.body, pos, index, line_index)
             }
-            // union / object / leaf → no concrete model to complete here.
+            // A union FIELD (`slot as modelB:` / shape-selected): resolve the
+            // variant body-aware and complete ITS fields — the field-level twin
+            // of the per-item rule above.
+            FieldTarget::Union => {
+                let FieldTarget::Model(child) =
+                    index.resolve_type_in_body(&field.field_type, &nested.body)
+                else {
+                    return None;
+                };
+                descend_to_cursor(child, &nested.body, pos, index, line_index)
+            }
+            // object / leaf → no concrete model to complete here.
             _ => None,
         };
     }
@@ -3124,20 +3290,48 @@ impl LanguageServer for NmlLanguageServer {
                     let end = position::utf16_to_byte(line, pos.character);
                     as_position_field(line, end)
                 });
-                if let Some(field_name) = as_field {
-                    if let Some((model, _)) = find_model_body_at(&file, pos, index, &line_index) {
-                        if let Some(field) = model.fields.iter().find(|f| f.name == field_name) {
-                            // The union is the field type, or a `[]`/`set<>` element type.
-                            let variants = match &field.field_type {
-                                FieldType::Union(v) => Some(v.as_slice()),
+                if let Some(slot) = as_field {
+                    // Field form: the union is on the NAMED field of the
+                    // enclosing (descended) model. Item form (`- one as ⌖`):
+                    // the name is the item's — the union lives on the ENCLOSING
+                    // list/set field, found by its own descent that stops AT the
+                    // list field (the mid-typing item need not parse, and the
+                    // full descent would fail on a list-of-union).
+                    let field = match &slot {
+                        AsSlot::Field(name) => find_model_body_at(&file, pos, index, &line_index)
+                            .and_then(|(model, _)| model.fields.iter().find(|f| f.name == *name)),
+                        AsSlot::Item => {
+                            enclosing_top_block(&file, pos, &line_index).and_then(|block| {
+                                let FieldTarget::Model(model) =
+                                    index.resolve_ref(&block.keyword.name)
+                                else {
+                                    return None;
+                                };
+                                find_union_list_field_at(
+                                    model,
+                                    &block.body,
+                                    pos,
+                                    index,
+                                    &line_index,
+                                )
+                            })
+                        }
+                    };
+                    {
+                        if let Some(field) = field {
+                            // The union is the field type (plain or modifier-
+                            // wrapped — `union_variants` unwraps `|`), or a
+                            // `[]`/`set<>` element type.
+                            let base = match &field.field_type {
+                                FieldType::Modifier(inner) => inner.as_ref(),
+                                t => t,
+                            };
+                            let variants = base.union_variants().or_else(|| match base {
                                 FieldType::List(inner) | FieldType::Set(inner) => {
-                                    match inner.as_ref() {
-                                        FieldType::Union(v) => Some(v.as_slice()),
-                                        _ => None,
-                                    }
+                                    inner.union_variants()
                                 }
                                 _ => None,
-                            };
+                            });
                             if let Some(variants) = variants {
                                 for (i, variant) in index
                                     .nameable_variant_names(variants)
@@ -5077,27 +5271,68 @@ workflow VoiceAgent:
         assert_eq!(offered, vec!["temperature", "baseUrl"]);
     }
 
+    /// Round-11: the item-slot finder reaches a union list NESTED inside a
+    /// `[]model` item (descending through items via per-item body-aware
+    /// resolution), and in-item field completion resolves the ANNOTATED
+    /// variant's model.
+    #[test]
+    fn union_list_finder_descends_through_items_and_annotated_variants() {
+        let schema = "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel outer:\n    inner [](modelA | modelB)?\nmodel host:\n    items []outer?\n";
+        let idx = field_index(schema);
+        let source =
+            "host H:\n    items:\n        - x:\n            inner:\n                - one as \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let line_index = LineIndex::new(source);
+        let pos = Position::new(4, 26);
+        let field = enclosing_top_block(&file, pos, &line_index).and_then(|block| {
+            let FieldTarget::Model(model) = idx.resolve_ref(&block.keyword.name) else {
+                return None;
+            };
+            find_union_list_field_at(model, &block.body, pos, &idx, &line_index)
+        });
+        assert_eq!(
+            field.map(|f| f.name.as_str()),
+            Some("inner"),
+            "the nested union list field must be reachable through items"
+        );
+
+        // In-item field completion: the cursor inside `- one as modelB:` must
+        // resolve modelB (the annotated variant), not fail or offer the parent.
+        let schema2 = "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host2:\n    slots [](modelA | modelB)?\n";
+        let idx2 = field_index(schema2);
+        let source2 = "host2 H:\n    slots:\n        - one as modelB:\n            \n";
+        let file2 = nml_core::cst::parse_best_effort(source2);
+        let li2 = LineIndex::new(source2);
+        let resolved = find_model_body_at(&file2, Position::new(3, 12), &idx2, &li2);
+        assert_eq!(
+            resolved.map(|(m, _)| m.name.as_str()),
+            Some("modelB"),
+            "field completion inside an annotated item must resolve its variant"
+        );
+    }
+
     #[test]
     fn as_position_detector_recognizes_the_type_slot() {
         // Field header, cursor right after `as ` (empty partial).
-        assert_eq!(
-            as_position_field("    slot as ", 12).as_deref(),
-            Some("slot")
-        );
+        assert!(matches!(
+            as_position_field("    slot as ", 12),
+            Some(AsSlot::Field(n)) if n == "slot"
+        ));
         // With a partial variant typed.
-        assert_eq!(
-            as_position_field("    slot as mod", 15).as_deref(),
-            Some("slot")
-        );
-        // List element header.
-        assert_eq!(
-            as_position_field("        - one as ", 17).as_deref(),
-            Some("one")
-        );
+        assert!(matches!(
+            as_position_field("    slot as mod", 15),
+            Some(AsSlot::Field(n)) if n == "slot"
+        ));
+        // List element header — an ITEM slot: the name is the item's, so the
+        // union must come from the ENCLOSING list field, not a field lookup.
+        assert!(matches!(
+            as_position_field("        - one as ", 17),
+            Some(AsSlot::Item)
+        ));
         // Not `as`-position: a plain nested block, a value, a completed body.
-        assert_eq!(as_position_field("    slot", 8), None);
-        assert_eq!(as_position_field("    port = ", 11), None);
-        assert_eq!(as_position_field("    slot as modelB:", 19), None);
+        assert!(as_position_field("    slot", 8).is_none());
+        assert!(as_position_field("    port = ", 11).is_none());
+        assert!(as_position_field("    slot as modelB:", 19).is_none());
     }
 
     #[test]

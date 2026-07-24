@@ -32,7 +32,7 @@ const NAME_FIELD: &str = "name";
 
 /// Seed for a bodyless scalar item (`- "/api"`): the shorthand value is injected into
 /// this empty body, producing a one-property instance.
-const EMPTY_BODY: Body = Body::new(Vec::new());
+const EMPTY_BODY: Body = Body::fresh(Vec::new());
 
 /// Bounds recursion into nested structure, mirroring the defaulter's
 /// `MAX_DEFAULT_DEPTH`. The pass runs on untrusted instance bodies.
@@ -106,7 +106,7 @@ pub fn materialize_item(item: &ListItem, model: &ModelDef) -> Materialized {
                             validatable: true,
                         },
                         None => Materialized {
-                            body: Body::new(Vec::new()),
+                            body: Body::fresh(Vec::new()),
                             diagnostics: vec![error(
                                 crate::diagnostic::codes::ARM_SHORTHAND_MISMATCH,
                                 format!(
@@ -132,7 +132,7 @@ pub fn materialize_item(item: &ListItem, model: &ModelDef) -> Materialized {
                     validatable: true,
                 },
                 None => Materialized {
-                    body: Body::new(Vec::new()),
+                    body: Body::fresh(Vec::new()),
                     diagnostics: vec![error(
                         crate::diagnostic::codes::DROPPED_ITEM_KEY,
                         format!(
@@ -147,7 +147,7 @@ pub fn materialize_item(item: &ListItem, model: &ModelDef) -> Materialized {
         }
         // Links — never materialized, never validated as inline instances.
         ListItemKind::Reference(_) | ListItemKind::Role(_) => Materialized {
-            body: Body::new(Vec::new()),
+            body: Body::fresh(Vec::new()),
             diagnostics: Vec::new(),
             validatable: false,
         },
@@ -229,7 +229,7 @@ fn inject_arm(body: &Body, field: &str, target: ArmTarget, span: Span) -> Body {
         span,
         kind: BodyEntryKind::NestedBlock(NestedBlock {
             name: Identifier::new(field.to_string(), span),
-            body: Body::new(vec![arm]),
+            body: Body::fresh(vec![arm]),
         }),
     };
     let mut entries = body.entries.clone();
@@ -308,12 +308,13 @@ impl Positionalizer<'_> {
             return self.list_body(inner, body, depth + 1);
         }
         // A union field's variant is body-dependent (structural shape or an RFC
-        // 0038 `as <Variant>` annotation). `resolve_field` (body-less) yields only
+        // 0015 `as <Variant>` annotation). `resolve_field` (body-less) yields only
         // the bare `Union` target and would skip recursion, so nested positional
         // shorthands under the selected variant would never materialize. Resolve
         // WITH the body and recurse into the chosen variant — consistent with the
-        // validator and defaulter.
-        if let FieldType::Union(variants) = &field.field_type {
+        // validator and defaulter. `union_variants` unwraps a modifier wrapper,
+        // so `|slot (a | b)` materializes like a plain union.
+        if let Some(variants) = field.field_type.union_variants() {
             return match self.index.resolve_type_in_body(&field.field_type, body) {
                 FieldTarget::Model(m) => self.model_body(m, body, depth + 1),
                 FieldTarget::OneOf(o) => self.oneof_body(o, body, depth + 1),
@@ -378,7 +379,7 @@ impl Positionalizer<'_> {
         // Resolve the element model. For a union list this is body-dependent; a
         // bodyless scalar can't select a variant, so it falls through unchanged
         // (scalar-on-union is out of scope, flagged by the validator — §10).
-        let empty = Body::new(Vec::new());
+        let empty = Body::fresh(Vec::new());
         let probe = item_body(item).unwrap_or(&empty);
         let FieldTarget::Model(m) = self.index.resolve_type_in_body(inner, probe) else {
             return item.clone();
@@ -491,7 +492,7 @@ mod tests {
     #[test]
     fn named_item_injects_name_when_declared() {
         let m = model(vec![fd("name", false), fd("description", false)]);
-        let r = materialize_item(&named("editor", Body::new(vec![])), &m);
+        let r = materialize_item(&named("editor", Body::fresh(vec![])), &m);
         assert!(r.diagnostics.is_empty() && r.validatable);
         assert_eq!(name_value(&r.body), Some("editor"));
     }
@@ -501,7 +502,7 @@ mod tests {
         // The runtime-fallback case (e.g. `model step`): not injected, not flagged,
         // but the authored body is still validatable.
         let m = model(vec![fd("run", false)]);
-        let r = materialize_item(&named("classify", Body::new(vec![])), &m);
+        let r = materialize_item(&named("classify", Body::fresh(vec![])), &m);
         assert!(r.diagnostics.is_empty() && r.validatable);
         assert_eq!(name_value(&r.body), None);
     }
@@ -511,7 +512,7 @@ mod tests {
         // Lenient: an explicit `name` overrides the key — no diagnostic, explicit value
         // retained (matching `de`'s `has_explicit_name`).
         let m = model(vec![fd("name", false)]);
-        let item = named("editor", Body::new(vec![prop("name", "other")]));
+        let item = named("editor", Body::fresh(vec![prop("name", "other")]));
         let r = materialize_item(&item, &m);
         assert!(r.diagnostics.is_empty() && r.validatable);
         assert_eq!(name_value(&r.body), Some("other"));
@@ -597,11 +598,11 @@ mod tests {
             span: s(),
             kind: ListItemKind::Shorthand {
                 value: SpannedValue::new(Value::String("ignored".into()), s()),
-                body: Some(Body::new(vec![BodyEntry {
+                body: Some(Body::fresh(vec![BodyEntry {
                     span: s(),
                     kind: BodyEntryKind::NestedBlock(NestedBlock {
                         name: Identifier::new("dispatch", s()),
-                        body: Body::new(vec![BodyEntry {
+                        body: Body::fresh(vec![BodyEntry {
                             span: s(),
                             kind: BodyEntryKind::Arm(Arm {
                                 selector: ArmSelector::Else,
@@ -652,7 +653,7 @@ mod tests {
             span: s(),
             kind: ListItemKind::Shorthand {
                 value: SpannedValue::new(Value::String("ignored".into()), s()),
-                body: Some(Body::new(vec![prop("dispatch", "explicit")])),
+                body: Some(Body::fresh(vec![prop("dispatch", "explicit")])),
             },
         };
         let r = materialize_item(&with_prop, &m);

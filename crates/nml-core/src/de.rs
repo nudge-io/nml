@@ -187,10 +187,30 @@ impl<'de> de::Deserializer<'de> for BodyDeserializer<'de> {
         self.deserialize_map(visitor)
     }
 
+    /// RFC 0015 at the ROOT: `from_block` called directly on an annotated body
+    /// deserializing into a Rust enum takes the same synthesized-external-tag
+    /// path as every nested level — full symmetry, no "works one level down but
+    /// not at the top" asymmetry. Un-annotated bodies are unchanged.
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match &self.body.type_annotation {
+            Some(variant) => visitor.visit_enum(AnnotatedEnumAccess {
+                variant: &variant.name,
+                body: self.body,
+                label: None,
+            }),
+            None => self.deserialize_any(visitor),
+        }
+    }
+
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
         bytes byte_buf option unit unit_struct newtype_struct seq tuple
-        tuple_struct enum identifier ignored_any
+        tuple_struct identifier ignored_any
     }
 }
 
@@ -360,6 +380,7 @@ impl<'de> de::Deserializer<'de> for NestedBlockDeserializer<'de> {
             Some(variant) => visitor.visit_enum(AnnotatedEnumAccess {
                 variant: &variant.name,
                 body: self.body,
+                label: None,
             }),
             None => self.deserialize_any(visitor),
         }
@@ -381,9 +402,15 @@ impl<'de> de::Deserializer<'de> for NestedBlockDeserializer<'de> {
 /// variant's content. Serde applies the target enum's own `#[serde(rename…)]`
 /// and reports `unknown variant` for a tag no variant matches — the same
 /// canonical enum handling every other serde format gets.
+///
+/// `label` carries a named list item's key (`- one as modelB:` → `"one"`) so the
+/// variant's content deserializes with the SAME name-injection semantics an
+/// un-annotated named item gets (`NamedItemDeserializer`); a field-level block
+/// has no label.
 struct AnnotatedEnumAccess<'a> {
     variant: &'a str,
     body: &'a Body,
+    label: Option<&'a str>,
 }
 
 impl<'de> EnumAccess<'de> for AnnotatedEnumAccess<'de> {
@@ -395,12 +422,19 @@ impl<'de> EnumAccess<'de> for AnnotatedEnumAccess<'de> {
         seed: V,
     ) -> Result<(V::Value, Self::Variant), Self::Error> {
         let tag = seed.deserialize(de::value::StrDeserializer::<Error>::new(self.variant))?;
-        Ok((tag, AnnotatedVariantAccess { body: self.body }))
+        Ok((
+            tag,
+            AnnotatedVariantAccess {
+                body: self.body,
+                label: self.label,
+            },
+        ))
     }
 }
 
 struct AnnotatedVariantAccess<'a> {
     body: &'a Body,
+    label: Option<&'a str>,
 }
 
 impl<'de> VariantAccess<'de> for AnnotatedVariantAccess<'de> {
@@ -415,7 +449,13 @@ impl<'de> VariantAccess<'de> for AnnotatedVariantAccess<'de> {
         self,
         seed: T,
     ) -> Result<T::Value, Self::Error> {
-        seed.deserialize(NestedBlockDeserializer { body: self.body })
+        match self.label {
+            Some(label) => seed.deserialize(NamedItemDeserializer {
+                label,
+                body: self.body,
+            }),
+            None => seed.deserialize(NestedBlockDeserializer { body: self.body }),
+        }
     }
 
     fn tuple_variant<V: Visitor<'de>>(
@@ -427,13 +467,21 @@ impl<'de> VariantAccess<'de> for AnnotatedVariantAccess<'de> {
     }
 
     /// The common case: a same-class model variant is a struct — deserialize the
-    /// block body as its fields (a map), never re-entering the enum path.
+    /// content as its fields (a map), never re-entering the enum path. A named
+    /// item's label injects as `name` exactly as it would un-annotated.
     fn struct_variant<V: Visitor<'de>>(
         self,
         _fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
-        NestedBlockDeserializer { body: self.body }.deserialize_map(visitor)
+        match self.label {
+            Some(label) => NamedItemDeserializer {
+                label,
+                body: self.body,
+            }
+            .deserialize_map(visitor),
+            None => NestedBlockDeserializer { body: self.body }.deserialize_map(visitor),
+        }
     }
 }
 
@@ -536,6 +584,27 @@ impl<'de> de::Deserializer<'de> for NamedItemDeserializer<'de> {
         visitor.visit_some(self)
     }
 
+    /// RFC 0015 at the LIST-ELEMENT level: `- one as modelB:` deserializing into
+    /// a Rust enum takes the same synthesized-external-tag path as a field-level
+    /// block (see `NestedBlockDeserializer::deserialize_enum`), carrying the item
+    /// label so the variant's content keeps named-item `name` injection.
+    /// Un-annotated items are unchanged (forwarded to `any`).
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match &self.body.type_annotation {
+            Some(variant) => visitor.visit_enum(AnnotatedEnumAccess {
+                variant: &variant.name,
+                body: self.body,
+                label: Some(self.label),
+            }),
+            None => self.deserialize_any(visitor),
+        }
+    }
+
     fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         visitor.visit_unit()
     }
@@ -543,7 +612,7 @@ impl<'de> de::Deserializer<'de> for NamedItemDeserializer<'de> {
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string
         bytes byte_buf unit unit_struct newtype_struct seq tuple
-        tuple_struct enum identifier
+        tuple_struct identifier
     }
 }
 

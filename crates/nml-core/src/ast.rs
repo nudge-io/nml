@@ -237,11 +237,14 @@ impl Body {
     /// bodies only (empty seeds, synthesized instances, array-decl inlining).
     /// `const` so it serves `const` seeds as well as runtime construction.
     ///
-    /// A body derived FROM an existing body must use
-    /// [`with_entries`](Self::with_entries) instead — `new` would silently strip
-    /// the RFC 0015 annotation, changing which union variant every downstream
-    /// consumer resolves.
-    pub const fn new(entries: Vec<BodyEntry>) -> Self {
+    /// Deliberately NOT named `new`: a body derived FROM an existing body must
+    /// use [`with_entries`](Self::with_entries) instead — a fresh construction
+    /// there would silently strip the RFC 0015 annotation, changing which union
+    /// variant every downstream consumer resolves (a real found-in-review bug).
+    /// The name makes the intent — "this body is new, not derived" — explicit
+    /// at every call site, so the attractive-default footgun (`new`) does not
+    /// exist.
+    pub const fn fresh(entries: Vec<BodyEntry>) -> Self {
         Self {
             entries,
             type_annotation: None,
