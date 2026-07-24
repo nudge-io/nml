@@ -47,7 +47,7 @@
           {
             "id": "server",
             "title": "Install the language server",
-            "description": "The neutral server is `nml-lsp`. Install it on your PATH (e.g. `cargo install nml-lsp`, or copy it to `~/.cargo/bin/nml-lsp`), or point `nml.server.path` at it.\n[Open NML settings](command:workbench.action.openSettings?%22nml.server%22)",
+            "description": "The neutral server is `nml-lsp`. Install it on your PATH (e.g. `cargo install --locked nml-lsp`, or copy it to `~/.cargo/bin/nml-lsp`), or point `nml.server.path` at it.\n[Open NML settings](command:workbench.action.openSettings?%22nml.server%22)",
             "media": {
               "markdown": "walkthroughs/server.md"
             },

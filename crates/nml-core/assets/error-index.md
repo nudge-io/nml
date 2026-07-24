@@ -1075,6 +1075,24 @@ host H:
 **Fix:** drop the annotation (`slot:`), or change the field's type to a union
 if you meant to choose between variants.
 
+## NML2054
+
+**Shadowed discriminator (advisory).** A `oneof` arm's model declares a
+field named like the union's discriminator. An instance's property of that
+name is always read as the discriminator, so the field itself can never be
+set — almost always an authoring mistake, so it warns.
+
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2054]'
+model logEntry:
+    kind string?
+oneof record by kind:
+    "log" -> logEntry
+```
+
+**Fix:** rename the model field (or the discriminator) so the two don't
+collide; a modifier-form field (`|kind`) is distinct authoring and does not
+shadow.
+
 ## NML4000
 
 **Fully shadowed validator.** A package validator binding's globs can

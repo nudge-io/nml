@@ -661,6 +661,168 @@ async fn d2_offers_two_annotate_actions_neither_preferred() {
     }
 }
 
+/// RFC 0015 round 21, end-to-end through the real handler: a PLAIN
+/// oneof-typed field's fresh body is a discovery moment — the discriminator
+/// is offered honestly (no `as` announcement, no edit: an annotation on a
+/// non-union field is a stray) — and the discriminator's VALUE position
+/// completes the arm keys.
+#[tokio::test]
+async fn oneof_discovery_moment_end_to_end() {
+    let base = temp_dir("oneof-discovery");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let ws = base.join("ws");
+    fs::create_dir_all(&ws).expect("create workspace");
+    let model = ws.join("mail.model.nml");
+    let model_text = "model logM:\n    level string?\nmodel postM:\n    server string?\n\noneof mail by kind:\n    \"log\" -> logM\n    \"post\" -> postM\n\nmodel host:\n    slot mail?\n";
+    fs::write(&model, model_text).expect("write model");
+    let config = ws.join("app.nml");
+    // The discovery moment: `slot:` just typed, no discriminator yet.
+    let config_text = "host H:\n    slot:\n        \n";
+    fs::write(&config, config_text).expect("write config");
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness.open(&model, model_text).await;
+    harness.open(&config, config_text).await;
+    let result = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": file_uri(&config) },
+                "position": { "line": 2, "character": 8 },
+            }),
+        )
+        .await;
+    let items = result.as_array().expect("completion item array");
+    let kind = items
+        .iter()
+        .find(|i| i["label"] == json!("kind"))
+        .unwrap_or_else(|| panic!("the discriminator must be offered: {result}"));
+    assert_eq!(kind["insertText"], json!("kind = "), "{kind}");
+    assert!(
+        kind["additionalTextEdits"].is_null(),
+        "no annotation may attach on a non-union field: {kind}"
+    );
+    assert!(
+        !kind["detail"].as_str().unwrap_or_default().contains("adds"),
+        "the label must not announce an edit it does not attach: {kind}"
+    );
+
+    // The value position the scaffold creates: arm keys complete.
+    harness
+        .notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": file_uri(&config), "version": 2 },
+                "contentChanges": [{ "text": "host H:\n    slot:\n        kind = \n" }],
+            }),
+        )
+        .await;
+    let result = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": file_uri(&config) },
+                "position": { "line": 2, "character": 15 },
+            }),
+        )
+        .await;
+    let items = result.as_array().expect("completion item array");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(
+        labels.contains(&"\"log\"") && labels.contains(&"\"post\""),
+        "arm keys must complete at the discriminator value: {labels:?}"
+    );
+
+    // The SWITCHING state (round 24): a VALID authored discriminator still
+    // completes every arm — the author is changing variants, not setting one.
+    harness
+        .notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": file_uri(&config), "version": 3 },
+                "contentChanges": [{ "text": "host H:\n    slot:\n        kind = \"log\"\n" }],
+            }),
+        )
+        .await;
+    let result = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": file_uri(&config) },
+                "position": { "line": 2, "character": 16 },
+            }),
+        )
+        .await;
+    let items = result.as_array().expect("completion item array");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(
+        labels.contains(&"\"log\"") && labels.contains(&"\"post\""),
+        "the switching state must complete every arm: {labels:?}"
+    );
+}
+
+/// Round 23, end-to-end: a body resolved through a oneof's DEFAULT
+/// discriminator offers BOTH the default variant's fields and the
+/// discriminator itself as a defaulted knob — field parity (a defaulted
+/// field is shown with its default; so is the defaulted discriminator).
+#[tokio::test]
+async fn defaulted_discriminator_stays_discoverable_end_to_end() {
+    let base = temp_dir("oneof-defaulted-knob");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let ws = base.join("ws");
+    fs::create_dir_all(&ws).expect("create workspace");
+    let model = ws.join("mail.model.nml");
+    let model_text = "model logM:\n    level string?\nmodel postM:\n    server string?\n\noneof mail by kind = \"log\":\n    \"log\" -> logM\n    \"post\" -> postM\n\nmodel host:\n    slot mail?\n";
+    fs::write(&model, model_text).expect("write model");
+    let config = ws.join("app.nml");
+    let config_text = "host H:\n    slot:\n        \n";
+    fs::write(&config, config_text).expect("write config");
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness.open(&model, model_text).await;
+    harness.open(&config, config_text).await;
+    let result = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": file_uri(&config) },
+                "position": { "line": 2, "character": 8 },
+            }),
+        )
+        .await;
+    let items = result.as_array().expect("completion item array");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(
+        labels.contains(&"level"),
+        "the default variant's fields complete: {labels:?}"
+    );
+    let kind = items
+        .iter()
+        .find(|i| i["label"] == json!("kind"))
+        .unwrap_or_else(|| panic!("the defaulted discriminator must stay discoverable: {result}"));
+    assert_eq!(kind["insertText"], json!("kind = "), "{kind}");
+    let detail = kind["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("(default)") && detail.contains("\"log\""),
+        "the knob states its default: {kind}"
+    );
+    // Sorted after the variant's declared fields (it is optional-with-default).
+    let kind_sort = kind["sortText"].as_str().unwrap();
+    let level_sort = items
+        .iter()
+        .find(|i| i["label"] == json!("level"))
+        .and_then(|i| i["sortText"].as_str())
+        .unwrap();
+    assert!(
+        kind_sort > level_sort,
+        "the defaulted knob ranks after declared fields: {kind_sort} vs {level_sort}"
+    );
+}
+
 #[tokio::test]
 async fn directive_completion_offers_vocabulary() {
     let base = temp_dir("directive-completion");

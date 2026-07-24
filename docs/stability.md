@@ -27,9 +27,21 @@ commitment, demonstrated by the two renames already shipped:
 
 ## Minimum supported Rust version (MSRV)
 
-- The workspace declares `rust-version` in [Cargo.toml](../Cargo.toml); that
-  is the toolchain we build and test with. It may be relaxed downward after a
-  `cargo-msrv` audit, and it is never raised in a patch release.
+- **The MSRV is 1.86**, declared as `rust-version` in
+  [Cargo.toml](../Cargo.toml) — the single source of truth: the CI `msrv`
+  job and the `just msrv` recipe both read the number from that line.
+- It is a **measured** floor, not a guess: the audited bisect (2026-07)
+  found the workspace — every build target, the `wasm32-wasip1` server, and
+  doctests — compiles on exactly 1.86, and that the floor is set by the
+  `icu_*` dependency family (via `url`/`idna` under `tower-lsp`), not by
+  nml's own code.
+- It is **enforced**, not aspirational: CI builds every target on exactly
+  this toolchain, on Linux/macOS/Windows, against the committed
+  `Cargo.lock`. A dependency raising its own floor surfaces as a reviewed
+  lockfile-update failure — never as a downstream user's broken build.
+- **Raising the MSRV is a minor-version event**, never a patch, and always
+  CHANGELOG-noted with the reason. It is never raised beyond what a change
+  actually needs.
 
 ## What is and isn't a stable interface
 

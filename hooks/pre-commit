@@ -42,10 +42,13 @@ fi
 
 # ── 2. the workspace compiles ───────────────────────────────────────────────
 if [ "${NML_PRECOMMIT_SKIP_CHECK:-0}" != "1" ]; then
-    if ! cargo check --workspace --quiet >/dev/null 2>&1; then
-        echo "pre-commit: cargo check failed — a sync point must build." >&2
+    # --locked: Cargo.lock is committed — a manifest change without its lock
+    # update must fail HERE, not as a red `--locked` CI job after push.
+    if ! cargo check --workspace --quiet --locked >/dev/null 2>&1; then
+        echo "pre-commit: cargo check --locked failed — a sync point must build." >&2
+        echo "  (lock drift? run 'cargo update <crate>' and stage Cargo.lock)" >&2
         echo "  (emergency escape: NML_PRECOMMIT_SKIP_CHECK=1 git commit …)" >&2
-        cargo check --workspace --quiet 2>&1 | grep '^error' | head -5 >&2
+        cargo check --workspace --quiet --locked 2>&1 | grep '^error' | head -5 >&2
         exit 1
     fi
 fi

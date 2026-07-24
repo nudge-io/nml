@@ -1,0 +1,9 @@
+// NML2054: a oneof arm's model declaring a field named like the
+// discriminator — unreachable (the property is always read as the
+// discriminator), so it warns.
+
+model logEntry:
+    kind string?
+
+oneof record by kind:
+    "log" -> logEntry

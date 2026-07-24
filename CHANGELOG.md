@@ -4,6 +4,25 @@
 
 ### Added
 
+- **MSRV: measured, declared, and enforced — Rust 1.86.** The floor was
+  established by an audited bisect (every build target, the
+  `wasm32-wasip1` server, and doctests, each candidate resolved with the
+  MSRV-aware resolver): nml's own code compiles below 1.86, but the
+  `icu_*` dependency family (via `url`/`idna` under `tower-lsp`) sets
+  1.86 as the honest floor of the resolvable dependency set. CI now
+  builds on exactly that toolchain across Linux/macOS/Windows (the job
+  reads the version from `Cargo.toml` — one line to bump, and bumps are
+  minor-version events per `docs/stability.md`), `Cargo.lock` is now
+  committed (current cargo-team guidance; CI runs `--locked`, so a
+  dependency release can never break `main` silently), and three more
+  gates joined the reusable pipeline: rustdoc with warnings denied,
+  `cargo package` publish-readiness for every publishable crate, and a
+  nightly-resolver minimal-versions check proving the declared dependency
+  bounds are real. Running the supply-chain gate locally also surfaced a
+  latent failure: the unpublished tutorial apps tripped cargo-deny's
+  license check — now exempted via `private = { ignore = true }`
+  (licensing applies to what ships). Locally: `just msrv`.
+
 - **Full error explanations in-editor (RFC 0010 tier 2)**: every coded
   diagnostic offers an **Explain NML0000** code action that renders the
   complete error-index entry — meaning, runnable examples, the fix — as

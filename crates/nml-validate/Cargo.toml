@@ -32,4 +32,6 @@ serde = { workspace = true }
 # Cross-platform mtime setting for the GC aging tests: `std` cannot open a
 # directory handle to retime it on Windows (needs FILE_FLAG_BACKUP_SEMANTICS);
 # `filetime::set_file_mtime` does this correctly on every platform.
-filetime = "0.2"
+# ≥0.2.9: `set_file_mtime` first appears there (honest floor, verified by
+# the CI minimal-versions job).
+filetime = "0.2.9"

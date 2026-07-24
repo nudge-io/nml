@@ -121,14 +121,19 @@ serde = { version = "1", features = ["derive"] }
 
 ```bash
 # installs the `nml` binary (until the crates.io release, use:
-#   cargo install --git https://github.com/nudge-io/nml nml-cli)
-cargo install nml-cli
+#   cargo install --locked --git https://github.com/nudge-io/nml nml-cli)
+# --locked: build with the exact dependency set CI verified
+cargo install --locked nml-cli
 
 nml parse <file>                  # dump the AST as JSON (reports ALL errors)
 nml validate <file>               # duplicates + unresolved references
 nml fmt <file>                    # canonical formatting, comment-preserving
 nml check --schema <dir> <file>   # full validation; non-zero exit for CI
+nml explain NML2007               # the full error-index entry, offline
 ```
+
+**MSRV: Rust 1.86** — measured, CI-enforced on all three platforms, and
+raised only in minor releases ([policy](docs/stability.md#minimum-supported-rust-version-msrv)).
 
 ## How it compares
 

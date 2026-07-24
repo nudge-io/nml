@@ -25,7 +25,9 @@ jobs:
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Build the WASM neutral server
-        run: cargo build -p nml-lsp --target wasm32-wasip1 --release
+        # --locked: this wasm ships inside the VSIX — the release artifact
+        # must be built from exactly the dependency set the gates verified.
+        run: cargo build -p nml-lsp --target wasm32-wasip1 --release --locked
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:

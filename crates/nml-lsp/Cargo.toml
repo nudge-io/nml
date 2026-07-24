@@ -43,7 +43,9 @@ dunce = "1"
 tokio = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { version = "1", default-features = false, features = [
+# Same honest floor as the workspace tokio (see workspace Cargo.toml); kept
+# non-workspace because the FEATURE SET is the wasm subset, not "full".
+tokio = { version = "1.17", default-features = false, features = [
     "rt",
     "macros",
     "sync",
@@ -53,9 +55,9 @@ tokio = { version = "1", default-features = false, features = [
 # `tower` for the Service/ready/call surface, `futures` for stream draining, and
 # `serde` for framing the JSON-RPC wire. (Native drives via tower-lsp's own
 # `Server::serve`, so these are wasm-only.)
-tower = { version = "0.4", default-features = false, features = ["util"] }
+tower = { version = "0.4.6", default-features = false, features = ["util"] }
 futures = { version = "0.3", default-features = false }
-serde = "1"
+serde = { workspace = true }
 
 [dev-dependencies]
 nml-validate = { workspace = true, features = ["test-support"] }
@@ -65,4 +67,4 @@ nml-validate = { workspace = true, features = ["test-support"] }
 # Sink half. Both are already in the tree as tower-lsp dependencies (same
 # versions), so this adds no new compiles to a full build.
 futures = "0.3"
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.4.6", features = ["util"] }

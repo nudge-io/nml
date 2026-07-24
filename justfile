@@ -37,17 +37,17 @@ install-ext: package-ext
 install: install-bin install-ext
     @echo "Done. Reload Cursor (Cmd+Shift+P → Developer: Reload Window)"
 
-# Run all workspace tests
+# Run all workspace tests (matches CI: --locked against the committed lock)
 test:
-    cargo test --workspace
+    cargo test --workspace --locked
 
 # Run only the LSP tests
 test-lsp:
     cargo test -p nml-lsp
 
-# Run clippy on the workspace (matches CI: --all-targets covers tests/examples)
+# Run clippy on the workspace (matches CI: --all-targets + --locked)
 lint:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --locked -- -D warnings
 
 # Format all Rust code
 fmt:
@@ -60,8 +60,24 @@ fmt-check:
 # Verify the tagged ```nml blocks in the Markdown docs against the real CLI
 # (see scripts/docs_test.py for the tag grammar). Matches the CI docs job.
 docs-test:
-    unset CARGO_TARGET_DIR && cargo build -p nml-cli
+    unset CARGO_TARGET_DIR && cargo build -p nml-cli --locked
     python3 scripts/docs_test.py
+
+# The declared floor toolchain (read from Cargo.toml, the single source of
+# truth) builds every target, the wasm server, and the doctests, against
+# the committed lock — see docs/stability.md.
+# Verify the MSRV contract locally (matches the CI msrv job)
+msrv:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version="$(grep -m1 '^rust-version' Cargo.toml | cut -d '"' -f 2)"
+    [ -n "$version" ] || { echo "no rust-version in Cargo.toml" >&2; exit 1; }
+    echo "MSRV from Cargo.toml: $version"
+    rustup toolchain install "$version" --profile minimal --target wasm32-wasip1
+    unset CARGO_TARGET_DIR
+    RUSTUP_TOOLCHAIN="$version" cargo check --workspace --all-targets --locked
+    RUSTUP_TOOLCHAIN="$version" cargo check -p nml-lsp --target wasm32-wasip1 --locked
+    RUSTUP_TOOLCHAIN="$version" cargo test --doc --workspace --locked
 
 # Clean build artifacts
 clean:

@@ -17,9 +17,12 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# Declared as the toolchain we build and test with; may be relaxed after a
-# cargo-msrv pass establishes the true floor.
-rust-version = "1.97"
+# The MSRV contract (docs/stability.md): measured floor, enforced by the CI
+# `msrv` job on exactly this toolchain (which reads the number from this
+# line — this is the single source of truth). Set by the icu_* dependency
+# family (via url/idna under tower-lsp), not by our code. Raising it is a
+# minor-version event, always CHANGELOG-noted.
+rust-version = "1.86"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nicknudge/nml"
 homepage = "https://github.com/nicknudge/nml"
@@ -33,8 +36,16 @@ nml-core = { path = "crates/nml-core", version = "0.1.0" }
 nml-validate = { path = "crates/nml-validate", version = "0.1.0" }
 nml-fmt = { path = "crates/nml-fmt", version = "0.1.0" }
 thiserror = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# ≥1.0.220: the serde/serde_core split — older serde cannot compile the
+# resolved graph (url 2.5+ and modern derive output reference the split-era
+# markers). The workspace's honest floor (verified by the CI
+# minimal-versions job).
+serde = { version = "1.0.220", features = ["derive"] }
+# ≥1.0.50: tower-lsp's requirement; the workspace's honest floor (verified
+# by the CI minimal-versions job).
+serde_json = "1.0.50"
 tower-lsp = "0.20"
-tokio = { version = "1", features = ["full"] }
+# ≥1.17: tower-lsp's own requirement; the workspace's honest floor (verified
+# by the CI minimal-versions job).
+tokio = { version = "1.17", features = ["full"] }
 rowan = "0.15"

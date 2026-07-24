@@ -97,6 +97,30 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
                     ),
                 ));
             }
+            // A variant model declaring a PLAIN field named like the
+            // discriminator can never have it set: an instance's property of
+            // that name is always claimed AS the discriminator (validation
+            // strips it before variant checks; completion suppresses the
+            // field's values, RFC 0015). Advisory (RFC 0008
+            // severity-at-source): legal, always suspicious. Modifier-form
+            // fields (`|kind`) are distinct authoring and do not shadow.
+            if let Some(m) = schema.models.iter().find(|m| &m.name == model) {
+                if m.fields.iter().any(|f| {
+                    f.name == oneof.discriminator && !matches!(f.field_type, FieldType::Modifier(_))
+                }) {
+                    errors.push(at_def(
+                        Diagnostic::warning(format!(
+                            "oneof '{}' arm \"{}\": model '{}' declares a field '{}' named \
+                             like the discriminator — an instance's '{}' property is always \
+                             read as the discriminator, so the field can never be set",
+                            oneof.name, value, model, oneof.discriminator, oneof.discriminator
+                        ))
+                        .with_code(codes::SHADOWED_DISCRIMINATOR)
+                        .with_span(oneof.span),
+                        &oneof.source,
+                    ));
+                }
+            }
         }
 
         // A declared default discriminator must name one of the arms.
@@ -924,6 +948,35 @@ mod tests {
             errs.iter()
                 .any(|e| e.message.contains("duplicate discriminator value")),
             "expected duplicate-value error; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn oneof_shadowed_discriminator_warns_plain_field_only() {
+        // A PLAIN variant field named like the discriminator: advisory.
+        let schema = extract_src(
+            "model logM:\n    kind string?\n\noneof mail by kind:\n    \"log\" -> logM\n",
+        );
+        let errs = find_oneof_errors(&schema);
+        let shadow: Vec<_> = errs
+            .iter()
+            .filter(|e| e.code == Some(crate::diagnostic::codes::SHADOWED_DISCRIMINATOR))
+            .collect();
+        assert_eq!(shadow.len(), 1, "exactly one advisory: {errs:?}");
+        assert!(
+            matches!(shadow[0].severity, crate::diagnostic::Severity::Warning),
+            "advisory, not an error: {:?}",
+            shadow[0]
+        );
+        // The modifier form (`|kind`) is distinct authoring — no shadow.
+        let schema2 = extract_src(
+            "model logM:\n    |kind string?\n\noneof mail by kind:\n    \"log\" -> logM\n",
+        );
+        assert!(
+            find_oneof_errors(&schema2)
+                .iter()
+                .all(|e| e.code != Some(crate::diagnostic::codes::SHADOWED_DISCRIMINATOR)),
+            "modifier-form fields do not shadow"
         );
     }
 

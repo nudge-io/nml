@@ -7,7 +7,7 @@ Schema-aware editing (diagnostics, completions, hovers) is powered by the
   anything else. Declare it in the next step and the editor uses the tool's own
   server.
 - **Generic NML project?** Install the neutral server:
-  - `cargo install nml-lsp`, or
+  - `cargo install --locked nml-lsp`, or
   - copy the `nml-lsp` binary to `~/.cargo/bin/nml-lsp`, or
   - set **`nml.server.path`** to its location.
 

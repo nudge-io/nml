@@ -9,7 +9,7 @@ use tower_lsp::{Client, LanguageServer};
 
 use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
-use nml_core::schema_index::NameableVariant;
+use nml_core::schema_index::{BodyShape, NameableVariant};
 use nml_core::span::Span;
 use nml_core::types::Value;
 use nml_core::{FieldTarget, SchemaIndex};
@@ -1699,84 +1699,180 @@ fn summarize_body(body: &Body) -> String {
     format!("```nml\n{}\n```", lines.join("\n"))
 }
 
-/// Determine if the cursor is in a value position for a ModelRef field.
-/// Returns the target model name (e.g. "step", "tool") if applicable.
-/// At a value position (`<prop> = <here>`), the model-ref name the field's type expects, so
-/// declarations of that model can be offered. Built on the shared cursor-context walk
-/// ([`find_model_body_at`]) — which resolves the enclosing model at **any** nesting depth — so
-/// this works inside nested bodies too (completion no longer routes through the top-level-only
-/// `find_enclosing_block_keyword` + flat `models.find` lookup; that helper still serves the
-/// hover/definition paths). Takes the parsed `&File` (parse-once).
-/// The `FieldDef` named `prop_name` governing `pos` — candidates-aware: in an
-/// AMBIGUOUS union body the field resolves across ALL candidates (first
-/// declaring variant wins, declaration order), so a value position on a field
-/// unique to a later variant — e.g. its enum values — still completes. A
-/// oneof candidate declares no fields pre-discriminator and contributes none.
-fn governing_field_at<'i>(
+/// The `<prop> = ⌖` prefix of a value position: the property name to the left
+/// of `=` on the cursor's line, or `None` when the line has no `=` before the
+/// cursor. The one line-parse every value-position lookup shares.
+fn value_position_prop_name(source: &str, pos: Position) -> Option<&str> {
+    let line = position::line_at(source, pos.line)?;
+    let end = position::utf16_to_byte(line, pos.character);
+    let eq_pos = line[..end].find('=')?;
+    let prop_name = line[..eq_pos].trim();
+    (!prop_name.is_empty()).then_some(prop_name)
+}
+
+/// Everything declared to govern a value position (`<name> = ⌖`).
+///
+/// Candidates-aware and MERGING: in an ambiguous union body a name shared
+/// across variants contributes EVERY declaring variant's field — first-wins
+/// would let one variant's `string` silently suppress another's enum values.
+/// A oneof candidate declares no fields pre-discriminator, but when the name
+/// IS its discriminator the arm keys govern the value (tier-0 scaffolds
+/// `kind = ` from exactly this pseudo-field; the value position must then
+/// actually complete).
+struct ValueGovernors<'i> {
+    fields: Vec<&'i FieldDef>,
+    discriminator_arms: Vec<String>,
+}
+
+fn value_governors_at<'i>(
     file: &File,
     pos: Position,
     index: &'i SchemaIndex,
     line_index: &LineIndex,
     prop_name: &str,
-) -> Option<&'i FieldDef> {
-    match find_candidates_at(file, pos, index, line_index)? {
-        DescentTarget::One(model, _) => model.fields.iter().find(|f| f.name == prop_name),
-        DescentTarget::Ambiguous { candidates, .. } => candidates.iter().find_map(|c| match c {
-            NameableVariant::Model(m) => m.fields.iter().find(|f| f.name == prop_name),
-            NameableVariant::OneOf(_) => None,
-        }),
+) -> ValueGovernors<'i> {
+    // `|vis = …` authors the MODIFIER form of a field: the sigil is syntax,
+    // not part of the declared name, so strip it for the lookup — and require
+    // the authored form to match the declaration (sigil ⟺ modifier-typed).
+    // A sigil on a plain field, or a bare name on a modifier field, authors a
+    // *different* entry than the declaration, so no field governs it.
+    let (name, sigiled) = match prop_name.strip_prefix('|') {
+        Some(bare) => (bare.trim_start(), true),
+        None => (prop_name, false),
+    };
+    let form_matches = |f: &FieldDef| f.name == name && is_modifier_form(f) == sigiled;
+    let mut governors = ValueGovernors {
+        fields: Vec::new(),
+        discriminator_arms: Vec::new(),
+    };
+    match find_candidates_at(file, pos, index, line_index) {
+        Some(DescentTarget::One {
+            model, via_oneof, ..
+        }) => {
+            // The discriminator STRIP, mirrored from the validator: in a
+            // via-resolved body a property named like the discriminator IS
+            // the discriminator — the validator claims it before variant
+            // validation — so a shadowing variant field's values would all
+            // be rejected there. Arm keys only (the variant-switching
+            // moment: `kind = "log"` at the value completes every arm).
+            // The sigiled form (`|kind`) is never the discriminator and
+            // keeps the field channel.
+            match via_oneof.filter(|o| o.discriminator == name && !sigiled) {
+                Some(o) => governors
+                    .discriminator_arms
+                    .extend(o.variants.iter().map(|(value, _)| value.clone())),
+                None => governors
+                    .fields
+                    .extend(model.fields.iter().find(|f| form_matches(f))),
+            }
+        }
+        Some(DescentTarget::Ambiguous { candidates, .. }) => {
+            for candidate in &candidates {
+                match candidate {
+                    NameableVariant::Model(m) => governors
+                        .fields
+                        .extend(m.fields.iter().find(|f| form_matches(f))),
+                    NameableVariant::OneOf(o) if o.discriminator == name && !sigiled => {
+                        governors
+                            .discriminator_arms
+                            .extend(o.variants.iter().map(|(value, _)| value.clone()));
+                    }
+                    NameableVariant::OneOf(_) => {}
+                }
+            }
+        }
+        None => {}
     }
+    governors
 }
 
-fn find_model_ref_type_at(
+/// At a value position (`<prop> = ⌖`), the model-ref type names whose
+/// declarations are legal reference values there — through the Modifier form
+/// wrapper, list/set element types, and every model-ref member of a union
+/// (`slot (modelA | modelB)` admits declarations of either). Enum refs are
+/// excluded (their values are VARIANTS, [`find_value_completions_at`]'s job).
+/// Governor-merged across ambiguous candidates; deduplicated, declaration
+/// order. Built on the shared cursor-context walk, so it works at any
+/// nesting depth. Takes the parsed `&File` (parse-once).
+fn find_model_ref_types_at(
     file: &File,
     source: &str,
     pos: Position,
     index: &SchemaIndex,
     line_index: &LineIndex,
-) -> Option<String> {
-    let line = position::line_at(source, pos.line)?;
-    let end = position::utf16_to_byte(line, pos.character);
-    let eq_pos = line[..end].find('=')?;
-    let prop_name = line[..eq_pos].trim();
-    if prop_name.is_empty() {
-        return None;
+) -> Vec<String> {
+    fn ref_names_of(ty: &FieldType, index: &SchemaIndex, out: &mut Vec<String>) {
+        match ty {
+            FieldType::ModelRef(name) => {
+                if index.enum_def(name).is_none() {
+                    out.push(name.clone());
+                }
+            }
+            FieldType::List(inner) | FieldType::Set(inner) | FieldType::Modifier(inner) => {
+                ref_names_of(inner, index, out)
+            }
+            FieldType::Union(members) => {
+                for m in members {
+                    ref_names_of(m, index, out);
+                }
+            }
+            // NO `Arms` recursion (asymmetry with `variants_of` is deliberate):
+            // an arms member's target governs `@key -> ⌖` positions, never the
+            // `= ⌖` scalar form this lookup serves.
+            _ => {}
+        }
     }
+    let Some(prop_name) = value_position_prop_name(source, pos) else {
+        return Vec::new();
+    };
+    let governors = value_governors_at(file, pos, index, line_index, prop_name);
+    let mut names = Vec::new();
+    for field in &governors.fields {
+        ref_names_of(&field.field_type, index, &mut names);
+    }
+    let mut seen = HashSet::new();
+    names.retain(|n| seen.insert(n.clone()));
+    names
+}
 
-    let field = governing_field_at(file, pos, index, line_index, prop_name)?;
+/// The two kinds of declared value valid at a value position, kept separate
+/// so completion labels each for what it is: `variants` from enum-typed
+/// governing fields ("enum variant"), `arms` from a oneof discriminator
+/// ("discriminator value" — the same label the top-level oneof path uses).
+/// Both in schema-declaration order, deduplicated (variants win overlaps).
+struct ValueCompletions {
+    variants: Vec<String>,
+    arms: Vec<String>,
+}
 
-    match &field.field_type {
-        FieldType::ModelRef(ref_name) => Some(ref_name.clone()),
-        FieldType::List(inner) => match inner.as_ref() {
-            FieldType::ModelRef(ref_name) => Some(ref_name.clone()),
-            _ => None,
-        },
-        _ => None,
+#[cfg(test)]
+impl ValueCompletions {
+    /// The single merged list most pins assert — variants then arms.
+    fn merged(self) -> Vec<String> {
+        let mut all = self.variants;
+        all.extend(self.arms);
+        all
     }
 }
 
-/// Enum variants valid in the value position at the cursor (RFC 0030): for a
-/// field typed as an enum ref, a list of enum refs, or a union whose members
-/// include enum refs, return the declared variants in schema-declaration
-/// order (canonical spelling — the whole point of surfacing them). This is
-/// the plain-enum completion the LSP never had: `ENUM_MEMBER` previously
-/// existed only for oneof discriminator arms and membership refs.
-fn find_enum_variants_at(
+/// Declared values valid in the value position at the cursor (RFC 0030): for
+/// a field typed as an enum ref, a list of enum refs, or a union whose
+/// members include enum refs, the declared variants in schema-declaration
+/// order (canonical spelling — the whole point of surfacing them); plus a
+/// governing oneof discriminator's arm keys. This is the plain-enum
+/// completion the LSP never had: `ENUM_MEMBER` previously existed only for
+/// oneof discriminator arms and membership refs. Governor-merged: every
+/// declaring candidate's field contributes (candidate order); `None` when
+/// nothing completes.
+fn find_value_completions_at(
     file: &File,
     source: &str,
     pos: Position,
     index: &SchemaIndex,
     line_index: &LineIndex,
-) -> Option<Vec<String>> {
-    let line = position::line_at(source, pos.line)?;
-    let end = position::utf16_to_byte(line, pos.character);
-    let eq_pos = line[..end].find('=')?;
-    let prop_name = line[..eq_pos].trim();
-    if prop_name.is_empty() {
-        return None;
-    }
-
-    let field = governing_field_at(file, pos, index, line_index, prop_name)?;
+) -> Option<ValueCompletions> {
+    let prop_name = value_position_prop_name(source, pos)?;
+    let governors = value_governors_at(file, pos, index, line_index, prop_name);
 
     fn variants_of(ty: &FieldType, index: &SchemaIndex, out: &mut Vec<String>) {
         match ty {
@@ -1785,7 +1881,9 @@ fn find_enum_variants_at(
                     out.extend(e.variants.iter().cloned());
                 }
             }
-            FieldType::List(inner) | FieldType::Set(inner) => variants_of(inner, index, out),
+            FieldType::List(inner) | FieldType::Set(inner) | FieldType::Modifier(inner) => {
+                variants_of(inner, index, out)
+            }
             FieldType::Union(members) => {
                 for m in members {
                     variants_of(m, index, out);
@@ -1798,15 +1896,21 @@ fn find_enum_variants_at(
         }
     }
     let mut variants = Vec::new();
-    variants_of(&field.field_type, index, &mut variants);
-    (!variants.is_empty()).then_some(variants)
+    for field in &governors.fields {
+        variants_of(&field.field_type, index, &mut variants);
+    }
+    let mut seen = HashSet::new();
+    variants.retain(|v| seen.insert(v.clone()));
+    let mut arms = governors.discriminator_arms;
+    arms.retain(|a| seen.insert(a.clone()));
+    (!variants.is_empty() || !arms.is_empty()).then_some(ValueCompletions { variants, arms })
 }
 
 // ── Schema-driven field completion (RFC 0003) ─────────────────────────────────
 
 /// Resolve the model whose fields are valid at the cursor's body, **and that body** (so the
 /// caller excludes already-present fields without re-walking). The schema-driven dual of
-/// [`find_model_ref_type_at`]: that resolves a *field's value type*; this resolves the
+/// [`find_model_ref_types_at`]: that resolves a *field's value types*; this resolves the
 /// *enclosing body's model* so its fields can be completed.
 ///
 /// Resolves the **top-level** block the cursor sits in (`resolve_ref(keyword)`), then
@@ -2081,11 +2185,11 @@ fn find_candidates_at<'i, 'f>(
     let FieldTarget::Model(model) = index.resolve_ref(&block.keyword.name) else {
         return None;
     };
-    descend_to_cursor(model, &block.body, pos, index, line_index)
+    descend_to_cursor(model, &block.body, pos, index, line_index, None)
 }
 
 /// Single-model view of the descent, for consumers that need exactly one
-/// governing model (value-position lookups, tests). For an ambiguous body it
+/// governing model (the `as`-slot path, tests). For an ambiguous body it
 /// yields the FIRST model candidate — the same deterministic first-declared
 /// order structural resolution uses, so legacy behavior is unchanged.
 fn find_model_body_at<'i, 'f>(
@@ -2095,7 +2199,7 @@ fn find_model_body_at<'i, 'f>(
     line_index: &LineIndex,
 ) -> Option<(&'i ModelDef, &'f Body)> {
     match find_candidates_at(file, pos, index, line_index)? {
-        DescentTarget::One(model, body) => Some((model, body)),
+        DescentTarget::One { model, body, .. } => Some((model, body)),
         DescentTarget::Ambiguous {
             candidates, body, ..
         } => candidates
@@ -2179,22 +2283,48 @@ fn named_type_names(ty: &FieldType) -> Vec<String> {
     }
 }
 
-/// From a `(model, body)` known to contain the cursor, descend to the innermost body the
-/// cursor is in and the model whose fields are valid there. Recurses through nested
-/// model-typed fields and list-of-model items. Returns `None` (no field suggestions) if the
-/// cursor is inside a sub-body that resolves to no concrete model.
 /// What the completion descent lands on: ONE governing model (the common
-/// case), or the candidate set of an AMBIGUOUS union body (RFC 0015 F4) —
-/// un-annotated same-class, or annotated with an unknown name (the limbo
-/// state) — plus the header ident (name + span) the auto-annotation edit
-/// targets.
+/// case), or an UNRESOLVED body's candidate set — an ambiguous union (RFC
+/// 0015 F4: un-annotated same-class, or annotated with an unknown name, the
+/// limbo state) or a pre-discriminator `oneof` (single candidate) — plus the
+/// header ident (name + span) the auto-annotation edit targets, where an
+/// annotation is legal.
 enum DescentTarget<'i, 'f> {
-    One(&'i ModelDef, &'f Body),
+    One {
+        model: &'i ModelDef,
+        body: &'f Body,
+        /// The `oneof` the landing body resolved through, when it did — the
+        /// raw fact; consumers apply their own policy. The field-completion
+        /// knob filters it through [`defaulted_knob`]; the value governors
+        /// use it as-is so the discriminator's arm keys complete even at a
+        /// VALID authored value (the variant-switching moment).
+        via_oneof: Option<&'i OneOfDef>,
+    },
     Ambiguous {
         candidates: Vec<NameableVariant<'i>>,
         body: &'f Body,
         header: Option<(String, Span)>,
     },
+}
+
+/// A body whose type resolves to a `oneof` with NO discriminator set (or one
+/// naming no arm) is a DISCOVERY moment, not a dead end: surface the oneof as
+/// the candidate set, so completion offers its discriminator field and the
+/// arm keys complete at its value position — the union-of-fields machinery
+/// already renders exactly this for oneof candidates. `header` only where the
+/// position may legally carry `as` (a union-typed field); on a plain
+/// oneof-typed field or element an annotation is a stray (NML2053), so no
+/// anchor — and therefore no auto-annotation edit — may attach.
+fn unresolved_oneof_target<'i, 'f>(
+    oneof: &'i OneOfDef,
+    body: &'f Body,
+    header: Option<(String, Span)>,
+) -> DescentTarget<'i, 'f> {
+    DescentTarget::Ambiguous {
+        candidates: vec![NameableVariant::OneOf(oneof)],
+        body,
+        header,
+    }
 }
 
 /// The union candidate set for an ambiguous body — the shared ORACLE for the
@@ -2210,9 +2340,18 @@ fn ambiguous_candidates<'i>(
         return Some(c);
     }
     if let Some(ann) = &body.type_annotation {
-        if index
-            .select_variant_by_type_name(variants, &ann.name)
-            .is_none()
+        // The LIMBO state honors the oracle's SHAPE gate too: a list-shaped
+        // body (bare items) is structurally resolvable regardless of its bad
+        // annotation — field discovery there would offer names whose
+        // acceptance duplicates the items already filling the shorthand
+        // field. Only keyed/empty bodies are FIELD-discovery moments. (The
+        // pre-discriminator oneof path bypasses this gate safely: a oneof
+        // candidate contributes only its discriminator, never a shorthand
+        // list field, so that hazard cannot arise there.)
+        if BodyShape::of(body).keyed_or_bare()
+            && index
+                .select_variant_by_type_name(variants, &ann.name)
+                .is_none()
         {
             let all: Vec<NameableVariant<'i>> = variants
                 .iter()
@@ -2233,12 +2372,20 @@ fn ambiguous_candidates<'i>(
     None
 }
 
+/// From a `(model, body)` known to contain the cursor, descend to the
+/// innermost body the cursor is in and the target governing it. Recurses
+/// through nested model-typed fields, list/set items, oneof variants, and
+/// unions. `None` (no suggestions) when the cursor's sub-body resolves to no
+/// concrete target.
 fn descend_to_cursor<'i, 'f>(
     model: &'i ModelDef,
     body: &'f Body,
     pos: Position,
     index: &'i SchemaIndex,
     line_index: &LineIndex,
+    // The oneof `body` was resolved through, when it was — consumed only if
+    // THIS body is the landing body (deeper recursion passes its own).
+    via_oneof: Option<&'i OneOfDef>,
 ) -> Option<DescentTarget<'i, 'f>> {
     // Editor-grade containment (the same rule as top blocks and list items):
     // a mid-typing line under a nested block — INCLUDING the just-typed EMPTY
@@ -2271,7 +2418,7 @@ fn descend_to_cursor<'i, 'f>(
         let field = model.fields.iter().find(|f| f.name == nested.name.name)?;
         return match index.resolve_field(field) {
             FieldTarget::Model(child) => {
-                descend_to_cursor(child, &nested.body, pos, index, line_index)
+                descend_to_cursor(child, &nested.body, pos, index, line_index, None)
             }
             // A list/set field: the nested body holds list items — descend into
             // the one owning the cursor, resolving the item's model PER ITEM
@@ -2327,15 +2474,36 @@ fn descend_to_cursor<'i, 'f>(
                         });
                     }
                 }
-                let item_model = variant_model_for_body(index, elem_ty, item_body)?;
-                descend_to_cursor(item_model, item_body, pos, index, line_index)
+                let (item_model, item_via) = match index.resolve_type_in_body(elem_ty, item_body) {
+                    FieldTarget::Model(m) => (m, None),
+                    // A `[]mail` element pre-discriminator: same discovery
+                    // moment as the field-level oneof, element twin.
+                    FieldTarget::OneOf(o) => match resolve_oneof_variant(o, item_body, index) {
+                        Some(m) => (m, Some(o)),
+                        None => {
+                            // Anchor at the ITEM name only when the element
+                            // type is a UNION (where `as` is legal on the
+                            // item, same rule as the field-level twin);
+                            // plain `[]oneof` elements get none.
+                            let header = matches!(elem_ty.as_ref(), FieldType::Union(_))
+                                .then(|| (item_name.name.clone(), item_name.span));
+                            return Some(unresolved_oneof_target(o, item_body, header));
+                        }
+                    },
+                    _ => return None,
+                };
+                descend_to_cursor(item_model, item_body, pos, index, line_index, item_via)
             }
             // A `oneof` field: select the variant from the body's discriminator and descend
             // into the same body as that variant model. This is variant-field completion.
-            FieldTarget::OneOf(oneof) => {
-                let variant = resolve_oneof_variant(oneof, &nested.body, index)?;
-                descend_to_cursor(variant, &nested.body, pos, index, line_index)
-            }
+            // Pre-discriminator (unset, or set to no arm — the typo state),
+            // the body surfaces the oneof itself instead of dying.
+            FieldTarget::OneOf(oneof) => match resolve_oneof_variant(oneof, &nested.body, index) {
+                Some(variant) => {
+                    descend_to_cursor(variant, &nested.body, pos, index, line_index, Some(oneof))
+                }
+                None => Some(unresolved_oneof_target(oneof, &nested.body, None)),
+            },
             // A union FIELD: an AMBIGUOUS body (un-annotated same-class, or
             // unknown-annotation limbo) surfaces its candidate set for the
             // union-of-fields completion, anchored at the field header name;
@@ -2350,21 +2518,66 @@ fn descend_to_cursor<'i, 'f>(
                         });
                     }
                 }
-                let child = variant_model_for_body(index, &field.field_type, &nested.body)?;
-                descend_to_cursor(child, &nested.body, pos, index, line_index)
+                match index.resolve_type_in_body(&field.field_type, &nested.body) {
+                    FieldTarget::Model(child) => {
+                        descend_to_cursor(child, &nested.body, pos, index, line_index, None)
+                    }
+                    // The union resolved to a ONEOF variant (`as mail:`, or the
+                    // sole nameable member) whose discriminator is still unset:
+                    // discovery again — and here the field IS union-typed, so
+                    // the header anchor is legal and the discriminator pick may
+                    // auto-annotate.
+                    FieldTarget::OneOf(o) => match resolve_oneof_variant(o, &nested.body, index) {
+                        Some(m) => {
+                            descend_to_cursor(m, &nested.body, pos, index, line_index, Some(o))
+                        }
+                        None => Some(unresolved_oneof_target(
+                            o,
+                            &nested.body,
+                            Some((nested.name.name.clone(), nested.name.span)),
+                        )),
+                    },
+                    _ => None,
+                }
             }
             // object / leaf → no concrete model to complete here.
             _ => None,
         };
     }
-    Some(DescentTarget::One(model, body))
+    Some(DescentTarget::One {
+        model,
+        body,
+        via_oneof,
+    })
 }
 
-/// Resolve a `oneof` instance body to its variant model: read the discriminator value the
-/// body sets (or the schema default), match it to an arm, and resolve that variant. `None`
-/// when no discriminator is set/defaulted or it names no arm — an unresolved union, so no
-/// fields to offer.
-/// RFC 0015 F4 — the union-of-fields completion for an AMBIGUOUS union body
+/// The defaulted-discriminator KNOB for a landing body: `Some` iff the body
+/// resolved through the oneof's DEFAULT and completion should surface the
+/// discriminator as a settable knob (field parity — defaulted knobs show
+/// like defaulted fields). Withheld when the name is authored in ANY entry
+/// form — the base present-name rule (a Property resolves; a block or
+/// modifier form is already invalid, but offering the knob beside it would
+/// invite a duplicate name; the shorthand-list extension cannot apply to a
+/// discriminator) — or when the variant model SHADOWS the discriminator
+/// with a field of its own (the field item covers it).
+fn defaulted_knob<'i>(
+    model: &ModelDef,
+    body: &Body,
+    via_oneof: Option<&'i OneOfDef>,
+) -> Option<&'i OneOfDef> {
+    via_oneof.filter(|o| {
+        !present_field_names(body).contains(&o.discriminator)
+            && !model.fields.iter().any(|f| f.name == o.discriminator)
+    })
+}
+
+/// One declaration of a field name across the candidate set: the candidate's
+/// index, and its `FieldDef` with its declaration index — `None` for a
+/// oneof's discriminator pseudo-field (which sorts first: it is the most
+/// discriminating pick a oneof candidate has).
+type FieldDecl<'a> = (usize, Option<(usize, &'a FieldDef)>);
+
+/// RFC 0015 F4 — the union-of-fields completion for an UNRESOLVED body
 /// (TypeScript-style discovery, plus one step further): every candidate
 /// variant's fields are offered with provenance; **tier 0** = fields unique to
 /// one variant (the discriminating picks, grouped by variant, required-first
@@ -2380,12 +2593,6 @@ fn descend_to_cursor<'i, 'f>(
 /// ABOVE the cursor — typing at the cursor never shifts earlier offsets, so a
 /// cached completion list stays applicable (the invariant a resolve-based lazy
 /// scheme would otherwise exist for; asserted by test).
-/// One declaration of a field name across the candidate set: the candidate's
-/// index, and its `FieldDef` with its declaration index — `None` for a
-/// oneof's discriminator pseudo-field (which sorts first: it is the most
-/// discriminating pick a oneof candidate has).
-type FieldDecl<'a> = (usize, Option<(usize, &'a FieldDef)>);
-
 fn union_of_fields_completions(
     index: &SchemaIndex,
     candidates: &[NameableVariant<'_>],
@@ -2437,14 +2644,17 @@ fn union_of_fields_completions(
     }
     let annotation_edit = |variant: &str| -> Option<Vec<TextEdit>> {
         let (name, span) = header?;
-        // LIMBO: if the body already carries a (necessarily unknown, or we
-        // would not be ambiguous) annotation, the edit must REPLACE it — a
-        // name-token-only edit would produce `slot as modelA as nope:`.
-        let end = body
-            .type_annotation
-            .as_ref()
-            .map(|a| a.span.end.max(span.end))
-            .unwrap_or(span.end);
+        // An annotation may already be present: unknown (the LIMBO state) —
+        // the edit must REPLACE it, a name-token-only edit would produce
+        // `slot as modelA as nope:` — or already naming THIS variant (a
+        // pre-discriminator oneof under an annotated union field): then the
+        // edit would be a byte-identical no-op, and announcing "adds `as X`"
+        // for it would be false — attach nothing.
+        let end = match &body.type_annotation {
+            Some(a) if a.name == variant => return None,
+            Some(a) => a.span.end.max(span.end),
+            None => span.end,
+        };
         Some(vec![TextEdit {
             range: line_index.range(Span::new(span.start, end)),
             new_text: format!("{name} as {variant}"),
@@ -2459,7 +2669,11 @@ fn union_of_fields_completions(
         if unique {
             let (ci, fd) = decls[0];
             let variant = candidates[ci].name();
-            let announce = format!("adds `as {variant}`");
+            let annotation = annotation_edit(variant);
+            // The announcement is HONEST: it appears exactly when the edit is
+            // attached (no header anchor — e.g. a pre-discriminator plain
+            // oneof field, where `as` would be a stray — announces nothing).
+            let announce = annotation.is_some().then(|| format!("adds `as {variant}`"));
             let (detail, docs, insert, in_group) = match fd {
                 Some((fi, field)) => (
                     field_detail(field),
@@ -2486,12 +2700,15 @@ fn union_of_fields_completions(
                 kind: Some(CompletionItemKind::FIELD),
                 label_details: label_details.then(|| CompletionItemLabelDetails {
                     detail: None,
-                    description: Some(format!("{variant} — {announce}")),
+                    description: Some(match &announce {
+                        Some(a) => format!("{variant} — {a}"),
+                        None => variant.to_string(),
+                    }),
                 }),
-                detail: Some(if label_details {
-                    detail
-                } else {
-                    format!("{detail} — {variant} ({announce})")
+                detail: Some(match (&announce, label_details) {
+                    (_, true) => detail,
+                    (Some(a), false) => format!("{detail} — {variant} ({a})"),
+                    (None, false) => format!("{detail} — {variant}"),
                 }),
                 documentation: docs.map(Documentation::String),
                 // Tier 0: grouped by variant, required-first + declaration
@@ -2499,36 +2716,55 @@ fn union_of_fields_completions(
                 // completion uses).
                 sort_text: Some(format!("0_{ci:03}_{in_group}")),
                 insert_text: Some(insert),
-                additional_text_edits: annotation_edit(variant),
+                additional_text_edits: annotation,
                 ..Default::default()
             });
         } else {
             let provenance: Vec<&str> =
                 decls.iter().map(|(ci, _)| candidates[*ci].name()).collect();
             // Scaffolding only when every declaring variant agrees on the
-            // field's declared type; bare name otherwise (types may differ).
+            // field's declared type AND its form — `FieldType`'s Display
+            // erases the `|` wrapper, so modifier-ness must be compared
+            // explicitly or `|vis string` vs `vis string` would false-agree.
             let fields: Vec<&FieldDef> = decls
                 .iter()
                 .filter_map(|(_, fd)| fd.map(|(_, f)| f))
                 .collect();
-            let agree = fields.len() == decls.len()
+            let all_decls_are_fields = fields.len() == decls.len();
+            let uniform_modifier =
+                all_decls_are_fields && fields.iter().all(|f| is_modifier_form(f));
+            let uniform_plain = fields.iter().all(|f| !is_modifier_form(f));
+            let agree = all_decls_are_fields
+                && (uniform_modifier || uniform_plain)
                 && fields
                     .windows(2)
                     .all(|w| w[0].field_type.to_string() == w[1].field_type.to_string());
-            let insert = if agree {
-                field_insert_text(index, fields[0])
+            // A name that is a DISCRIMINATOR in every candidate (two oneofs
+            // sharing `by kind`): the property form is safe for all, so
+            // scaffold it — the merged arm keys then complete at the value.
+            let all_discriminators = decls.iter().all(|(_, fd)| fd.is_none());
+            // The no-scaffold fallback still honors a uniform authored form:
+            // when every declarer is a modifier, a sigil-less insert would
+            // author an unknown PROPERTY, not the field. Mixed forms get the
+            // bare name — the author's pick of form decides the variant.
+            let (label, filter_text, insert) = if agree {
+                let (label, filter) = field_label(fields[0]);
+                (label, filter, field_insert_text(index, fields[0]))
+            } else if uniform_modifier {
+                (
+                    format!("|{fname}"),
+                    Some(fname.clone()),
+                    format!("|{fname}"),
+                )
+            } else if all_discriminators {
+                (fname.clone(), None, format!("{fname} = "))
             } else {
-                fname.clone()
+                (fname.clone(), None, fname.clone())
             };
             let detail = if agree {
                 format!("{} — {}", field_detail(fields[0]), provenance.join(" | "))
             } else {
                 provenance.join(" | ")
-            };
-            let (label, filter_text) = if agree {
-                field_label(fields[0])
-            } else {
-                (fname.clone(), None)
             };
             items.push(CompletionItem {
                 label,
@@ -2546,9 +2782,10 @@ fn union_of_fields_completions(
 
 /// The concrete MODEL a body resolves to under `ty` — through the canonical
 /// body-aware resolver, then through a `oneof` variant's discriminator when the
-/// resolution lands on a oneof. The one lookup all completion descents share,
-/// so a union whose variant is a ONEOF (`(modelA | mail)`, `as mail:` +
-/// `kind = …`) completes exactly like a model variant.
+/// resolution lands on a oneof. Serves the `as`-slot descent
+/// ([`find_union_list_field_at`]); the completion descent inlines the same
+/// two-step so an UNRESOLVED oneof can surface its discovery target instead
+/// of `None`.
 fn variant_model_for_body<'i>(
     index: &'i SchemaIndex,
     ty: &'i FieldType,
@@ -2561,6 +2798,12 @@ fn variant_model_for_body<'i>(
     }
 }
 
+/// Resolve a `oneof` instance body to its variant model: read the
+/// discriminator value the body sets (or the schema default), match it to an
+/// arm, and resolve that variant. `None` when no discriminator is
+/// set/defaulted or it names no arm — the completion descent turns exactly
+/// that `None` into the pre-discriminator DISCOVERY moment
+/// ([`unresolved_oneof_target`]).
 fn resolve_oneof_variant<'i>(
     oneof: &OneOfDef,
     body: &Body,
@@ -2581,6 +2824,34 @@ fn resolve_oneof_variant<'i>(
         FieldTarget::Model(m) => Some(m),
         _ => None,
     }
+}
+
+/// Field names already SET in `body` for `model`: [`present_field_names`]
+/// plus the body-positional shorthand field when bare list items fill it
+/// (RFC 0005 `+` on a list/set) — the validator's seen-scan counts those
+/// items as setting that field, so completion must not re-offer it (accepting
+/// the re-offer would author a duplicate named block beside the bare items).
+/// The candidate-set paths need no counterpart: the D2 oracle and the limbo
+/// gate never classify a list-shaped body as ambiguous, and the one producer
+/// that CAN carry list-shaped bodies (the pre-discriminator oneof) offers
+/// only its discriminator — never a shorthand list field — so the
+/// duplicate-authoring hazard cannot arise there.
+fn present_field_names_in(model: &ModelDef, body: &Body) -> HashSet<String> {
+    let mut present = present_field_names(body);
+    if body
+        .entries
+        .iter()
+        .any(|e| matches!(e.kind, BodyEntryKind::ListItem(_)))
+    {
+        if let Some(field) = model
+            .fields
+            .iter()
+            .find(|f| f.shorthand && matches!(f.field_type, FieldType::List(_) | FieldType::Set(_)))
+        {
+            present.insert(field.name.clone());
+        }
+    }
+    present
 }
 
 /// Property/block names already present in `body` — excluded from field suggestions so a
@@ -2635,13 +2906,21 @@ fn field_sort_key(field: &FieldDef, idx: usize) -> String {
     format!("{}_{idx:04}", u8::from(field.optional))
 }
 
+/// The authored FORM of a field: modifier-declared fields are written with
+/// the `|` sigil (`|vis = …`), plain fields without. The one predicate behind
+/// form matching (value governors), tier-1 form agreement, labels, and
+/// insert-text sigils — the round-20 layer's central concept, named once.
+fn is_modifier_form(field: &FieldDef) -> bool {
+    matches!(field.field_type, FieldType::Modifier(_))
+}
+
 /// `insert_text`: `<field> = ` for a scalar/leaf field, `<field>:` for a model/oneof/list/
 /// object field (which is authored as a block) — a blanket `= ` would be wrong for blocks.
 /// Completion label + filter text for a field: a modifier-declared field
 /// DISPLAYS as authored (`|vis`) so the list is honest about its form, while
 /// filtering stays on the bare name (typing `vis` still matches).
 fn field_label(field: &FieldDef) -> (String, Option<String>) {
-    if matches!(field.field_type, FieldType::Modifier(_)) {
+    if is_modifier_form(field) {
         (format!("|{}", field.name), Some(field.name.clone()))
     } else {
         (field.name.clone(), None)
@@ -2651,15 +2930,42 @@ fn field_label(field: &FieldDef) -> (String, Option<String>) {
 fn field_insert_text(index: &SchemaIndex, field: &FieldDef) -> String {
     // A modifier-declared field is AUTHORED with its sigil (`|vis = …`) — a
     // sigil-less insert would author an unknown PROPERTY, not the modifier.
-    let sigil = if matches!(field.field_type, FieldType::Modifier(_)) {
-        "|"
-    } else {
-        ""
-    };
+    let sigil = if is_modifier_form(field) { "|" } else { "" };
     match index.resolve_field(field) {
         FieldTarget::Leaf => format!("{sigil}{} = ", field.name),
         _ => format!("{sigil}{}:", field.name),
     }
+}
+
+/// Parse the wire `suggestions` payload of a diagnostic's `data` (see the
+/// diagnostics.rs producer): every valid `{replacement, start, end, kind}`
+/// entry, capped at the producer's own alternative bound
+/// (`MAX_FIX_ALTERNATIVES` in nml-validate). Parse-then-cap, in that order:
+/// the cap counts VALID entries — so a hostile/buggy client can neither mint
+/// unbounded actions from one diagnostic nor bury a legitimate entry behind
+/// malformed padding — and the singleton-preferred gate downstream counts
+/// only real suggestions.
+fn parse_suggestion_entries(
+    suggestions: &[serde_json::Value],
+) -> Vec<(String, usize, usize, String)> {
+    const MAX_SUGGESTION_ACTIONS: usize = 8;
+    suggestions
+        .iter()
+        .filter_map(|s| {
+            let start = s.get("start")?.as_u64()? as usize;
+            let end = s.get("end")?.as_u64()? as usize;
+            // An inverted span would round-trip as a spec-invalid LSP Range;
+            // fail closed like every other malformed entry.
+            (start <= end).then_some(())?;
+            Some((
+                s.get("replacement")?.as_str()?.to_string(),
+                start,
+                end,
+                s.get("kind")?.as_str()?.to_string(),
+            ))
+        })
+        .take(MAX_SUGGESTION_ACTIONS)
+        .collect()
 }
 
 /// When the cursor is at the value position of a `oneof` instance's discriminator
@@ -2672,14 +2978,7 @@ fn find_oneof_discriminator_at<'i>(
     index: &'i SchemaIndex,
     line_index: &LineIndex,
 ) -> Option<&'i OneOfDef> {
-    let line = position::line_at(source, pos.line)?;
-    let end = position::utf16_to_byte(line, pos.character);
-    let eq_pos = line[..end].find('=')?;
-    let prop_name = line[..eq_pos].trim();
-    if prop_name.is_empty() {
-        return None;
-    }
-
+    let prop_name = value_position_prop_name(source, pos)?;
     let keyword = find_enclosing_block_keyword(file, pos, line_index)?;
     match index.resolve_ref(&keyword) {
         FieldTarget::OneOf(oneof) if oneof.discriminator == prop_name => Some(oneof),
@@ -2738,7 +3037,7 @@ fn collect_declarations_by_keyword(
 fn find_declaration_hover(
     docs: &HashMap<Url, String>,
     word: &str,
-    model_ref_type: Option<&str>,
+    model_ref_types: &[String],
 ) -> Option<String> {
     let mut item_hover: Option<String> = None;
     for (doc_uri, source) in docs.iter() {
@@ -2771,7 +3070,7 @@ fn find_declaration_hover(
                                 &arr.item_keyword.name,
                                 word,
                                 &summarize_body(item_body),
-                                model_ref_type,
+                                model_ref_types,
                                 source,
                                 doc_uri,
                             ));
@@ -2793,7 +3092,7 @@ fn find_declaration_hover(
                 &kw,
                 &decl_name,
                 &body_summary,
-                model_ref_type,
+                model_ref_types,
                 source,
                 doc_uri,
             ));
@@ -2811,13 +3110,18 @@ fn render_declaration_hover(
     kw: &str,
     decl_name: &str,
     body_summary: &str,
-    model_ref_type: Option<&str>,
+    model_ref_types: &[String],
     source: &str,
     doc_uri: &Url,
 ) -> String {
     let mut text = format!("**{kw}** `{decl_name}`");
-    if let Some(ref_type) = model_ref_type {
-        text.push_str(&format!(" *(referenced as {ref_type})*"));
+    // Multiple governing types (a union-typed or candidate-merged value
+    // position) are all stated — the position honestly admits any of them.
+    if !model_ref_types.is_empty() {
+        text.push_str(&format!(
+            " *(referenced as {})*",
+            model_ref_types.join(" | ")
+        ));
     }
     if let Some(doc) = nml_core::cst::doc_comment_for(source, decl_name) {
         text.push_str("\n\n");
@@ -3763,10 +4067,10 @@ impl LanguageServer for NmlLanguageServer {
             // than re-cloning it per detector. A package-bound document (RFC
             // 0030) completes against its package's exclusive definitions —
             // the same exclusivity rule diagnostics apply.
-            let (model_ref_type, discriminator_values, enum_variants): (
-                Option<String>,
+            let (model_ref_types, discriminator_values, value_completions): (
+                Vec<String>,
                 Option<Vec<String>>,
-                Option<Vec<String>>,
+                Option<ValueCompletions>,
             ) = {
                 let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
                 match docs
@@ -3777,32 +4081,34 @@ impl LanguageServer for NmlLanguageServer {
                     Some((source, file)) => {
                         let index: &SchemaIndex = handle.index();
                         let line_index = LineIndex::new(source);
-                        let model_ref =
-                            find_model_ref_type_at(&file, source, pos, index, &line_index);
+                        let model_refs =
+                            find_model_ref_types_at(&file, source, pos, index, &line_index);
                         let discriminator =
                             find_oneof_discriminator_at(&file, source, pos, index, &line_index)
                                 .map(|o| {
                                     o.variants.iter().map(|(value, _)| value.clone()).collect()
                                 });
-                        let variants =
-                            find_enum_variants_at(&file, source, pos, index, &line_index);
-                        (model_ref, discriminator, variants)
+                        let values =
+                            find_value_completions_at(&file, source, pos, index, &line_index);
+                        (model_refs, discriminator, values)
                     }
-                    None => (None, None, None),
+                    None => (Vec::new(), None, None),
                 }
             };
 
-            if let Some(ref ref_type) = model_ref_type {
+            if !model_ref_types.is_empty() {
                 let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-                let matches = collect_declarations_by_keyword(&docs, ref_type);
-                for (name, kw, file_name) in matches {
-                    items.push(CompletionItem {
-                        label: name.clone(),
-                        kind: Some(CompletionItemKind::REFERENCE),
-                        detail: Some(format!("{kw} (from {file_name})")),
-                        sort_text: Some(format!("0_{name}")),
-                        ..Default::default()
-                    });
+                for ref_type in &model_ref_types {
+                    let matches = collect_declarations_by_keyword(&docs, ref_type);
+                    for (name, kw, file_name) in matches {
+                        items.push(CompletionItem {
+                            label: name.clone(),
+                            kind: Some(CompletionItemKind::REFERENCE),
+                            detail: Some(format!("{kw} (from {file_name})")),
+                            sort_text: Some(format!("0_{name}")),
+                            ..Default::default()
+                        });
+                    }
                 }
             }
 
@@ -3819,24 +4125,30 @@ impl LanguageServer for NmlLanguageServer {
 
             // Inside a `oneof` block, offer the arm keys as discriminator values.
             if let Some(values) = discriminator_values {
-                for value in values {
+                for (i, value) in values.iter().enumerate() {
                     items.push(quoted_value_item(
-                        &value,
+                        value,
                         "discriminator value",
-                        format!("0_{value}"),
+                        format!("0_{i:03}"),
                         edit_ranges,
                         insert_replace,
                     ));
                 }
             }
 
-            // Plain enum-typed field (RFC 0030): offer the declared variants,
-            // canonical spelling, schema-declaration order.
-            if let Some(variants) = enum_variants {
-                for (i, variant) in variants.iter().enumerate() {
+            // Governed values (RFC 0030 + RFC 0015): enum variants and
+            // discriminator arm keys, each labeled for what it is, one
+            // schema-declaration-order sequence.
+            if let Some(values) = value_completions {
+                let labeled = values
+                    .variants
+                    .iter()
+                    .map(|v| (v, "enum variant"))
+                    .chain(values.arms.iter().map(|a| (a, "discriminator value")));
+                for (i, (value, label)) in labeled.enumerate() {
                     items.push(quoted_value_item(
-                        variant,
-                        "enum variant",
+                        value,
+                        label,
                         format!("0_{i:03}"),
                         edit_ranges,
                         insert_replace,
@@ -3975,8 +4287,12 @@ impl LanguageServer for NmlLanguageServer {
                     return Ok(Some(CompletionResponse::Array(items)));
                 }
                 match find_candidates_at(&file, pos, index, &line_index) {
-                    Some(DescentTarget::One(model, body)) => {
-                        let present = present_field_names(body);
+                    Some(DescentTarget::One {
+                        model,
+                        body,
+                        via_oneof,
+                    }) => {
+                        let present = present_field_names_in(model, body);
                         for (idx, field) in model.fields.iter().enumerate() {
                             if present.contains(&field.name) {
                                 continue;
@@ -3992,6 +4308,25 @@ impl LanguageServer for NmlLanguageServer {
                                 documentation: field.doc.clone().map(Documentation::String),
                                 sort_text: Some(field_sort_key(field, idx)),
                                 insert_text: Some(field_insert_text(index, field)),
+                                ..Default::default()
+                            });
+                        }
+                        // Field parity: a body resolved through a oneof's
+                        // DEFAULT still shows the discriminator — a settable
+                        // knob with a default, exactly like a defaulted field
+                        // (which completion shows with its `= default`).
+                        // Sorted after declared optional fields.
+                        if let Some(o) = defaulted_knob(model, body, via_oneof) {
+                            items.push(CompletionItem {
+                                label: o.discriminator.clone(),
+                                kind: Some(CompletionItemKind::FIELD),
+                                detail: Some(format!(
+                                    "discriminator of `{}` = {:?} (default)",
+                                    o.name,
+                                    o.default_discriminator.as_deref().unwrap_or_default()
+                                )),
+                                sort_text: Some(format!("1_9999_{}", o.discriminator)),
+                                insert_text: Some(format!("{} = ", o.discriminator)),
                                 ..Default::default()
                             });
                         }
@@ -4184,25 +4519,7 @@ impl LanguageServer for NmlLanguageServer {
             else {
                 continue;
             };
-            // Parse first so the singleton-preferred gate counts only VALID
-            // entries (a malformed sibling must not suppress a legitimate
-            // singleton did-you-mean's preferred flag).
-            // Defense-in-depth: cap parsed suggestions at the producer's own
-            // alternative cap — a hostile/buggy client cannot mint unbounded
-            // actions from one diagnostic.
-            const MAX_SUGGESTION_ACTIONS: usize = 8;
-            let parsed: Vec<(String, usize, usize, String)> = suggestions
-                .iter()
-                .take(MAX_SUGGESTION_ACTIONS)
-                .filter_map(|s| {
-                    Some((
-                        s.get("replacement")?.as_str()?.to_string(),
-                        s.get("start")?.as_u64()? as usize,
-                        s.get("end")?.as_u64()? as usize,
-                        s.get("kind")?.as_str()?.to_string(),
-                    ))
-                })
-                .collect();
+            let parsed = parse_suggestion_entries(suggestions);
             let total = parsed.len();
             for (replacement, start, end, kind) in parsed {
                 let edit = TextEdit {
@@ -4440,11 +4757,7 @@ impl LanguageServer for NmlLanguageServer {
                         if let Some(field) = model.fields.iter().find(|f| f.name == word) {
                             // In source syntax the `|` sigil belongs to the
                             // field name (`|allow []string`), not the type.
-                            let sigil = if matches!(field.field_type, FieldType::Modifier(_)) {
-                                "|"
-                            } else {
-                                ""
-                            };
+                            let sigil = if is_modifier_form(field) { "|" } else { "" };
                             let opt = if field.optional { "?" } else { "" };
                             let mut text = format!(
                                 "**{keyword}** field\n\n```nml\n  {sigil}{} {}{opt}\n```",
@@ -4502,18 +4815,17 @@ impl LanguageServer for NmlLanguageServer {
             }
 
             if !word.is_empty() {
-                let model_ref_type = if !is_prop {
+                let model_ref_types = if !is_prop {
                     let file = nml_core::cst::parse_best_effort(&source_clone);
                     let handle = self.schema_index_for(&uri);
                     let line_index = LineIndex::new(&source_clone);
-                    find_model_ref_type_at(&file, &source_clone, pos, handle.index(), &line_index)
+                    find_model_ref_types_at(&file, &source_clone, pos, handle.index(), &line_index)
                 } else {
-                    None
+                    Vec::new()
                 };
 
                 let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(text) = find_declaration_hover(&docs, &word, model_ref_type.as_deref())
-                {
+                if let Some(text) = find_declaration_hover(&docs, &word, &model_ref_types) {
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
                             kind: MarkupKind::Markdown,
@@ -5898,12 +6210,21 @@ workflow VoiceAgent:
 
     // ── ModelRef + discriminator helpers (share the parse-once / index walk) ──────
 
-    /// Resolve the model-ref type at the cursor via the shared walk (parse-once + index).
+    /// Resolve the FIRST model-ref type at the cursor via the shared walk
+    /// (parse-once + index) — the single-type view most pins assert;
+    /// multi-type merging has its own tests.
     fn ref_type_at(schema_source: &str, source: &str, pos: Position) -> Option<String> {
+        ref_types_at(schema_source, source, pos).into_iter().next()
+    }
+
+    /// All model-ref types at the cursor (union members, merged candidates).
+    /// Best-effort parse, as production: value positions are often mid-typing
+    /// (`slot = ⌖` with no value yet).
+    fn ref_types_at(schema_source: &str, source: &str, pos: Position) -> Vec<String> {
         let index = field_index(schema_source);
-        let file = nml_core::cst::parse_to_ast(source).unwrap();
+        let file = nml_core::cst::parse_best_effort(source);
         let line_index = LineIndex::new(source);
-        find_model_ref_type_at(&file, source, pos, &index, &line_index)
+        find_model_ref_types_at(&file, source, pos, &index, &line_index)
     }
 
     /// The `oneof` arm keys offered at the cursor, or `None` if not a discriminator position.
@@ -6016,7 +6337,8 @@ workflow VoiceAgent:
         let source = "host H:\n    slot:\n        mode = \n";
         let file = nml_core::cst::parse_best_effort(source);
         let li = LineIndex::new(source);
-        let variants = find_enum_variants_at(&file, source, Position::new(2, 15), &idx, &li)
+        let variants = find_value_completions_at(&file, source, Position::new(2, 15), &idx, &li)
+            .map(ValueCompletions::merged)
             .expect("enum variants for a modelB-unique field");
         assert_eq!(variants, vec!["fast", "slow"]);
     }
@@ -6078,6 +6400,606 @@ workflow VoiceAgent:
             Some("vis"),
             "filtering stays on the bare name"
         );
+    }
+
+    /// Round-20: modifier VALUE positions. `|mode = ⌖` strips the sigil for
+    /// the field lookup (candidates-aware) and unwraps the Modifier type for
+    /// enum variants; the authored form must MATCH the declaration — a bare
+    /// name on a modifier field (or a sigil on a plain field) governs nothing.
+    #[test]
+    fn modifier_value_position_completes_enum_variants_form_matched() {
+        let idx = field_index(
+            "enum modeKind:\n    - fast\n    - slow\nmodel modelA:\n    plain modeKind?\nmodel modelB:\n    |mode modeKind?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        let li_at = |source: &str, line: u32, character: u32| {
+            let file = nml_core::cst::parse_best_effort(source);
+            let li = LineIndex::new(source);
+            find_value_completions_at(&file, source, Position::new(line, character), &idx, &li)
+                .map(ValueCompletions::merged)
+        };
+        // Sigiled form on the modifier field (unique to the SECOND candidate).
+        assert_eq!(
+            li_at("host H:\n    slot:\n        |mode = \n", 2, 16),
+            Some(vec!["fast".into(), "slow".into()]),
+            "modifier value position must complete the inner enum"
+        );
+        // Bare form on a modifier-declared field: authors a property, not the
+        // modifier — nothing governs, fail closed.
+        assert_eq!(li_at("host H:\n    slot:\n        mode = \n", 2, 15), None);
+        // Sigiled form on a PLAIN field: same mismatch, same fail-closed.
+        assert_eq!(
+            li_at("host H:\n    slot:\n        |plain = \n", 2, 17),
+            None
+        );
+        // The plain path is unaffected.
+        assert_eq!(
+            li_at("host H:\n    slot:\n        plain = \n", 2, 16),
+            Some(vec!["fast".into(), "slow".into()])
+        );
+    }
+
+    /// Round-20: tier-1 (shared-name) agreement compares the authored FORM,
+    /// not just the type Display (which erases the `|` wrapper): mixed
+    /// modifier/property never scaffolds; an all-modifier name keeps its
+    /// sigil in label and insert even when the inner types disagree.
+    #[test]
+    fn tier1_shared_name_agreement_is_modifierness_aware() {
+        let shared_item = |schema: &str| {
+            let idx = field_index(schema);
+            let source = "host H:\n    slot:\n        \n";
+            let file = nml_core::cst::parse_best_effort(source);
+            let li = LineIndex::new(source);
+            let Some(DescentTarget::Ambiguous {
+                candidates,
+                body,
+                header,
+            }) = find_candidates_at(&file, Position::new(2, 8), &idx, &li)
+            else {
+                panic!("ambiguous")
+            };
+            let items =
+                union_of_fields_completions(&idx, &candidates, body, header.as_ref(), &li, false);
+            items
+                .into_iter()
+                .find(|i| i.filter_text.as_deref() == Some("vis") || i.label == "vis")
+                .expect("shared field offered")
+        };
+        // Mixed form, same inner type: Display alone would false-agree.
+        let mixed = shared_item(
+            "model modelA:\n    |vis role?\nmodel modelB:\n    vis role?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        assert_eq!(mixed.label, "vis");
+        assert_eq!(
+            mixed.insert_text.as_deref(),
+            Some("vis"),
+            "mixed forms must not scaffold either form"
+        );
+        // Uniformly modifier, disagreeing inner types: no scaffold, but the
+        // name-only insert must keep the sigil or it authors a property.
+        let all_mod = shared_item(
+            "model modelA:\n    |vis role?\nmodel modelB:\n    |vis string?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        assert_eq!(all_mod.label, "|vis");
+        assert_eq!(all_mod.insert_text.as_deref(), Some("|vis"));
+        assert_eq!(all_mod.filter_text.as_deref(), Some("vis"));
+        // Uniformly modifier, agreeing types: full scaffold with sigil.
+        let agree = shared_item(
+            "model modelA:\n    |vis role?\nmodel modelB:\n    |vis role?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        assert_eq!(agree.label, "|vis");
+        assert_eq!(agree.insert_text.as_deref(), Some("|vis = "));
+    }
+
+    /// Round-20 audit F1: value-position governors MERGE across candidates —
+    /// a name shared between variants contributes every declaration, so one
+    /// variant's `string` cannot suppress another's enum values, and two
+    /// enum declarations union their variants.
+    #[test]
+    fn value_completion_merges_shared_names_across_candidates() {
+        let at = |schema: &str| {
+            let idx = field_index(schema);
+            let source = "host H:\n    slot:\n        mode = \n";
+            let file = nml_core::cst::parse_best_effort(source);
+            let li = LineIndex::new(source);
+            find_value_completions_at(&file, source, Position::new(2, 15), &idx, &li)
+                .map(ValueCompletions::merged)
+        };
+        // The suppression case: modelA's `string` declaration comes first.
+        assert_eq!(
+            at("enum modeKind:\n    - fast\n    - slow\nmodel modelA:\n    mode string?\nmodel modelB:\n    mode modeKind?\nmodel host:\n    slot (modelA | modelB)?\n"),
+            Some(vec!["fast".into(), "slow".into()]),
+            "a string declaration in an earlier variant must not suppress a later variant's enum"
+        );
+        // Two enum declarations: variants union in candidate order.
+        assert_eq!(
+            at("enum kindA:\n    - a1\n    - a2\nenum kindB:\n    - b1\n    - b2\nmodel modelA:\n    mode kindA?\nmodel modelB:\n    mode kindB?\nmodel host:\n    slot (modelA | modelB)?\n"),
+            Some(vec!["a1".into(), "a2".into(), "b1".into(), "b2".into()])
+        );
+    }
+
+    /// Round-20 audit F5: tier-0 scaffolds a oneof candidate's discriminator
+    /// (`kind = `) — the value position it creates must then complete the
+    /// arm keys, not abandon the author.
+    #[test]
+    fn ambiguous_discriminator_value_position_offers_arm_keys() {
+        let idx = field_index(
+            "model modelA:\n    a string?\nmodel logM:\n    level string?\n\noneof mail by kind:\n    \"log\" -> logM\n\nmodel host:\n    slot (modelA | mail)?\n",
+        );
+        let source = "host H:\n    slot:\n        kind = \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        assert_eq!(
+            find_value_completions_at(&file, source, Position::new(2, 15), &idx, &li)
+                .map(ValueCompletions::merged),
+            Some(vec!["log".into()]),
+            "the discriminator's arm keys govern its value position"
+        );
+    }
+
+    /// Round-20 audit F6 + enum exclusion: a union-typed field's own value
+    /// position admits declarations of EVERY model-ref member; enum refs are
+    /// excluded from the ref-type channel (their values are variants).
+    #[test]
+    fn union_typed_field_value_admits_all_member_declarations() {
+        let schema = "enum modeKind:\n    - fast\nmodel modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slot (modelA | modelB)?\n    mode modeKind?\n";
+        assert_eq!(
+            ref_types_at(schema, "host H:\n    slot = \n", Position::new(1, 11)),
+            vec!["modelA".to_string(), "modelB".to_string()]
+        );
+        assert!(
+            ref_types_at(schema, "host H:\n    mode = \n", Position::new(1, 11)).is_empty(),
+            "enum refs complete as variants, never as reference declarations"
+        );
+    }
+
+    /// Round-20 audit F2: bare list items fill the body-positional shorthand
+    /// field (RFC 0005 `+`) — the validator's seen-scan counts it as SET, so
+    /// completion must not re-offer it beside the items.
+    #[test]
+    fn bare_list_items_mark_the_positional_field_present() {
+        let idx = field_index("model host:\n    plugins []string+\n    other string?\n");
+        let source = "host H:\n    - alpha\n    \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        let (model, body) = find_model_body_at(&file, Position::new(2, 4), &idx, &li).unwrap();
+        let present = present_field_names_in(model, body);
+        assert!(
+            present.contains("plugins"),
+            "bare items set the shorthand field"
+        );
+        assert!(
+            !present.contains("other"),
+            "unrelated fields stay offerable"
+        );
+    }
+
+    /// Round-21: a PRE-DISCRIMINATOR oneof body is a discovery moment, not a
+    /// dead end — at a plain oneof field, a `[]oneof` element, and a union
+    /// body resolved to a oneof variant. The discriminator field is offered
+    /// (honestly: no `as` announcement where no annotation may attach), and
+    /// its arm keys complete at the value position — including the typo
+    /// state (`kind = lgo`), which previously killed the whole descent.
+    #[test]
+    fn unresolved_oneof_body_is_a_discovery_moment_at_all_three_sites() {
+        let idx = field_index(
+            "model modelA:\n    a string?\nmodel logM:\n    level string?\n\noneof mail by kind:\n    \"log\" -> logM\n\nmodel host:\n    slot mail?\n    slots []mail?\n    or (modelA | mail)?\n",
+        );
+        let candidates_at = |source: &str, line: u32, ch: u32| {
+            let file = nml_core::cst::parse_best_effort(source);
+            let li = LineIndex::new(source);
+            match find_candidates_at(&file, Position::new(line, ch), &idx, &li) {
+                Some(DescentTarget::Ambiguous {
+                    candidates, header, ..
+                }) => Some((candidates.len(), header)),
+                _ => None,
+            }
+        };
+        // Site 1 — plain oneof field, fresh body: single-candidate discovery,
+        // NO header anchor (`as` on a non-union field is a stray, NML2053).
+        let (n, header) = candidates_at("host H:\n    slot:\n        \n", 2, 8)
+            .expect("fresh oneof body must surface the oneof");
+        assert_eq!(n, 1);
+        assert!(header.is_none(), "no anchor where `as` is illegal");
+        // The offered discriminator is honest: no edit, no announcement.
+        {
+            let source = "host H:\n    slot:\n        \n";
+            let file = nml_core::cst::parse_best_effort(source);
+            let li = LineIndex::new(source);
+            let Some(DescentTarget::Ambiguous {
+                candidates,
+                body,
+                header,
+            }) = find_candidates_at(&file, Position::new(2, 8), &idx, &li)
+            else {
+                panic!("ambiguous")
+            };
+            let items =
+                union_of_fields_completions(&idx, &candidates, body, header.as_ref(), &li, true);
+            let kind = items.iter().find(|i| i.label == "kind").expect("kind");
+            assert_eq!(kind.insert_text.as_deref(), Some("kind = "));
+            assert!(kind.additional_text_edits.is_none());
+            let desc = kind
+                .label_details
+                .as_ref()
+                .and_then(|d| d.description.as_deref())
+                .unwrap();
+            assert!(
+                !desc.contains("adds"),
+                "must not announce an edit it does not attach: {desc}"
+            );
+        }
+        // Site 1 value position — arm keys, including the TYPO state.
+        let arms_at = |source: &str, line: u32, ch: u32| {
+            let file = nml_core::cst::parse_best_effort(source);
+            let li = LineIndex::new(source);
+            find_value_completions_at(&file, source, Position::new(line, ch), &idx, &li)
+                .map(ValueCompletions::merged)
+        };
+        assert_eq!(
+            arms_at("host H:\n    slot:\n        kind = \n", 2, 15),
+            Some(vec!["log".into()])
+        );
+        assert_eq!(
+            arms_at("host H:\n    slot:\n        kind = lgo\n", 2, 15),
+            Some(vec!["log".into()]),
+            "the typo state must still offer the repair"
+        );
+        // Site 2 — `[]mail` element body (element twin).
+        let (n, header) =
+            candidates_at("host H:\n    slots:\n        - one:\n            \n", 3, 12)
+                .expect("fresh oneof ELEMENT body must surface the oneof");
+        assert_eq!((n, header.is_none()), (1, true));
+        // Site 3 — union body annotated to the oneof variant: header IS legal
+        // (union-typed field), so the anchor is present — but the annotation
+        // already names the variant, so the discriminator item must attach NO
+        // edit (it would be a byte-identical no-op) and announce nothing.
+        {
+            let source = "host H:\n    or as mail:\n        \n";
+            let file = nml_core::cst::parse_best_effort(source);
+            let li = LineIndex::new(source);
+            let Some(DescentTarget::Ambiguous {
+                candidates,
+                body,
+                header,
+            }) = find_candidates_at(&file, Position::new(2, 8), &idx, &li)
+            else {
+                panic!("annotated-to-oneof body pre-discriminator must surface the oneof")
+            };
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(
+                header.as_ref().map(|(name, _)| name.as_str()),
+                Some("or"),
+                "union-typed field keeps the annotation anchor"
+            );
+            let items =
+                union_of_fields_completions(&idx, &candidates, body, header.as_ref(), &li, false);
+            let kind = items.iter().find(|i| i.label == "kind").expect("kind");
+            assert!(
+                kind.additional_text_edits.is_none(),
+                "an already-matching annotation gets no no-op edit"
+            );
+            assert!(
+                !kind.detail.as_deref().unwrap_or_default().contains("adds"),
+                "and no announcement: {:?}",
+                kind.detail
+            );
+        }
+        // Site 3 counterpoint — STRUCTURALLY resolved to the oneof (no
+        // annotation, disjoint union): the pick may make the resolution
+        // explicit, so the edit attaches and is announced.
+        {
+            let idx2 = field_index(
+                "model logM:\n    level string?\n\noneof mail by kind:\n    \"log\" -> logM\n\nmodel host:\n    or (mail | []logM)?\n",
+            );
+            let source = "host H:\n    or:\n        \n";
+            let file = nml_core::cst::parse_best_effort(source);
+            let li = LineIndex::new(source);
+            let Some(DescentTarget::Ambiguous {
+                candidates,
+                body,
+                header,
+            }) = find_candidates_at(&file, Position::new(2, 8), &idx2, &li)
+            else {
+                panic!("structurally-resolved oneof pre-discriminator must surface the oneof")
+            };
+            let items =
+                union_of_fields_completions(&idx2, &candidates, body, header.as_ref(), &li, false);
+            let kind = items.iter().find(|i| i.label == "kind").expect("kind");
+            assert!(
+                kind.additional_text_edits.is_some(),
+                "a structural resolution may be made explicit"
+            );
+            assert!(
+                kind.detail.as_deref().unwrap_or_default().contains("adds"),
+                "and says so: {:?}",
+                kind.detail
+            );
+        }
+        // Resolution unchanged once the discriminator is set.
+        let source = "host H:\n    slot:\n        kind = \"log\"\n        \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        let (model, _) = find_model_body_at(&file, Position::new(3, 8), &idx, &li)
+            .expect("resolved oneof still descends");
+        assert_eq!(model.name, "logM");
+    }
+
+    /// Round-23/24: FIELD PARITY for defaulted discriminators — a body
+    /// resolved through a oneof's DEFAULT keeps the oneof visible
+    /// (`via_oneof`), and the KNOB policy ([`defaulted_knob`]) offers the
+    /// discriminator exactly like a defaulted field. Authored discriminators
+    /// clear the knob; deeper nesting resets the context.
+    #[test]
+    fn defaulted_discriminator_stays_visible_to_completion() {
+        let idx = field_index(
+            "model logM:\n    level string?\n    sub logM?\nmodel postM:\n    server string?\n\noneof mail by kind = \"log\":\n    \"log\" -> logM\n    \"post\" -> postM\n\nmodel host:\n    slot mail?\n    slots []mail?\n",
+        );
+        let oneof_at = |source: &str, line: u32, ch: u32| {
+            let file = nml_core::cst::parse_best_effort(source);
+            let li = LineIndex::new(source);
+            match find_candidates_at(&file, Position::new(line, ch), &idx, &li) {
+                Some(DescentTarget::One {
+                    model,
+                    body,
+                    via_oneof,
+                }) => Some((
+                    model.name.clone(),
+                    defaulted_knob(model, body, via_oneof).map(|o| o.name.clone()),
+                )),
+                _ => None,
+            }
+        };
+        // Defaulted: the body resolves to the default variant AND keeps the
+        // oneof visible.
+        assert_eq!(
+            oneof_at("host H:\n    slot:\n        \n", 2, 8),
+            Some(("logM".into(), Some("mail".into())))
+        );
+        // Element twin.
+        assert_eq!(
+            oneof_at("host H:\n    slots:\n        - one:\n            \n", 3, 12),
+            Some(("logM".into(), Some("mail".into())))
+        );
+        // Authored discriminator: the knob is set, nothing to surface.
+        assert_eq!(
+            oneof_at(
+                "host H:\n    slot:\n        kind = \"log\"\n        \n",
+                3,
+                8
+            ),
+            Some(("logM".into(), None))
+        );
+        // Deeper nesting resets the context: inside `sub:` the landing body
+        // is a plain model body, not the oneof's.
+        assert_eq!(
+            oneof_at("host H:\n    slot:\n        sub:\n            \n", 3, 12),
+            Some(("logM".into(), None))
+        );
+        // ANY authored entry form clears the knob — the same present-name
+        // rule field completion uses, not just the Property shape.
+        assert_eq!(
+            oneof_at("host H:\n    slot:\n        \n        kind:\n", 2, 8),
+            Some(("logM".into(), None)),
+            "a block-authored discriminator withholds the knob"
+        );
+        assert_eq!(
+            oneof_at(
+                "host H:\n    slot:\n        \n        |kind = \"post\"\n",
+                2,
+                8
+            ),
+            Some(("logM".into(), None)),
+            "a modifier-authored discriminator withholds the knob"
+        );
+        // A variant field SHADOWING the discriminator name: the field item
+        // covers the name — no double-offer.
+        let shadow_idx = field_index(
+            "model logM:\n    kind string?\n    level string?\n\noneof mail by kind = \"log\":\n    \"log\" -> logM\n\nmodel host:\n    slot mail?\n",
+        );
+        let source = "host H:\n    slot:\n        \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        match find_candidates_at(&file, Position::new(2, 8), &shadow_idx, &li) {
+            Some(DescentTarget::One {
+                model,
+                body,
+                via_oneof,
+            }) => assert!(
+                defaulted_knob(model, body, via_oneof).is_none(),
+                "a shadowing variant field suppresses the knob"
+            ),
+            other => panic!(
+                "expected One for the shadowed case, got {}",
+                other.map(|_| "Ambiguous").unwrap_or("None")
+            ),
+        }
+    }
+
+    /// Round-24 (whole-unit audit): the three seams it found, closed.
+    /// (B1) The VARIANT-SWITCHING moment — a resolved oneof body's
+    /// discriminator value still completes its arm keys. (A1) The element
+    /// twin of the union-site anchor — a union ELEMENT resolving to a
+    /// pre-discriminator oneof anchors at the item name; plain `[]oneof`
+    /// stays anchor-less. (B3) A name that is a discriminator in EVERY
+    /// candidate scaffolds the property form.
+    #[test]
+    fn whole_unit_seams_switching_element_anchor_shared_discriminator() {
+        // B1: `kind = "log"` (VALID, resolved) — cursor at the value still
+        // offers both arms: the author is switching, not setting.
+        let idx = field_index(
+            "model logM:\n    level string?\nmodel postM:\n    server string?\n\noneof mail by kind:\n    \"log\" -> logM\n    \"post\" -> postM\n\nmodel host:\n    slot mail?\n",
+        );
+        let source = "host H:\n    slot:\n        kind = \"log\"\n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        assert_eq!(
+            find_value_completions_at(&file, source, Position::new(2, 16), &idx, &li)
+                .map(ValueCompletions::merged),
+            Some(vec!["log".into(), "post".into()]),
+            "the variant-switching quadrant must complete"
+        );
+        // A1: a UNION element resolving structurally to a oneof anchors the
+        // discovery at the ITEM name (as is legal there)…
+        let idx2 = field_index(
+            "model logM:\n    level string?\n\noneof mail by kind:\n    \"log\" -> logM\n\nmodel host:\n    ors [](mail | []string)?\n",
+        );
+        let source2 = "host H:\n    ors:\n        - one:\n            \n";
+        let file2 = nml_core::cst::parse_best_effort(source2);
+        let li2 = LineIndex::new(source2);
+        match find_candidates_at(&file2, Position::new(3, 12), &idx2, &li2) {
+            Some(DescentTarget::Ambiguous { header, .. }) => assert_eq!(
+                header.map(|(name, _)| name),
+                Some("one".into()),
+                "a union element's oneof discovery keeps the item anchor"
+            ),
+            _ => panic!("union element pre-discriminator must surface the oneof"),
+        }
+        // …while the plain `[]mail` element stays anchor-less (pinned in the
+        // three-site test; re-asserted here as the contrast).
+        let idx3 = field_index(
+            "model logM:\n    level string?\n\noneof mail by kind:\n    \"log\" -> logM\n\nmodel host:\n    slots []mail?\n",
+        );
+        let source3 = "host H:\n    slots:\n        - one:\n            \n";
+        let file3 = nml_core::cst::parse_best_effort(source3);
+        let li3 = LineIndex::new(source3);
+        match find_candidates_at(&file3, Position::new(3, 12), &idx3, &li3) {
+            Some(DescentTarget::Ambiguous { header, .. }) => {
+                assert!(header.is_none(), "plain []oneof keeps no anchor")
+            }
+            _ => panic!("plain []oneof pre-discriminator must surface the oneof"),
+        }
+        // B3: `kind` is a discriminator in BOTH candidates → property-form
+        // scaffold (safe for all), merged arms complete at the value.
+        let idx4 = field_index(
+            "model logM:\n    level string?\nmodel postM:\n    server string?\n\noneof mailA by kind:\n    \"log\" -> logM\n\noneof mailB by kind:\n    \"post\" -> postM\n\nmodel host:\n    slot (mailA | mailB)?\n",
+        );
+        let source4 = "host H:\n    slot:\n        \n";
+        let file4 = nml_core::cst::parse_best_effort(source4);
+        let li4 = LineIndex::new(source4);
+        let Some(DescentTarget::Ambiguous {
+            candidates,
+            body,
+            header,
+        }) = find_candidates_at(&file4, Position::new(2, 8), &idx4, &li4)
+        else {
+            panic!("two oneofs sharing a keyed-or-bare body are ambiguous")
+        };
+        let items =
+            union_of_fields_completions(&idx4, &candidates, body, header.as_ref(), &li4, false);
+        let kind = items.iter().find(|i| i.label == "kind").expect("kind");
+        assert_eq!(
+            kind.insert_text.as_deref(),
+            Some("kind = "),
+            "an all-discriminator shared name scaffolds the property form"
+        );
+        assert_eq!(
+            find_value_completions_at(&file4, source4, Position::new(2, 15), &idx4, &li4)
+                .map(ValueCompletions::merged),
+            None,
+            "sanity: no value position on the blank line"
+        );
+        let source5 = "host H:\n    slot:\n        kind = \n";
+        let file5 = nml_core::cst::parse_best_effort(source5);
+        let li5 = LineIndex::new(source5);
+        assert_eq!(
+            find_value_completions_at(&file5, source5, Position::new(2, 15), &idx4, &li5)
+                .map(ValueCompletions::merged),
+            Some(vec!["log".into(), "post".into()]),
+            "both oneofs' arms merge at the shared discriminator's value"
+        );
+    }
+
+    /// Round-25: the discriminator STRIP mirrors the validator — in a
+    /// via-resolved body, `kind = ⌖` completes ARM KEYS ONLY even when the
+    /// variant model shadows the name with an enum field (the validator
+    /// claims the property before variant validation, so the shadow enum's
+    /// values would all be rejected). The sigiled form keeps the field
+    /// channel; the channels stay split so each renders its honest label.
+    #[test]
+    fn discriminator_strip_mirrors_the_validator_and_channels_stay_split() {
+        let idx = field_index(
+            "enum modeKind:\n    - fast\n    - slow\nmodel logM:\n    kind modeKind?\n    |kind modeKind?\nmodel postM:\n    server string?\n\noneof mail by kind:\n    \"log\" -> logM\n    \"post\" -> postM\n\nmodel host:\n    slot mail?\n",
+        );
+        // Property form: the discriminator — arms only, in the arms channel.
+        let source = "host H:\n    slot:\n        kind = \"log\"\n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        let values = find_value_completions_at(&file, source, Position::new(2, 16), &idx, &li)
+            .expect("arms complete");
+        assert!(
+            values.variants.is_empty(),
+            "shadow-enum values are validator-rejected and must not offer: {:?}",
+            values.variants
+        );
+        assert_eq!(values.arms, vec!["log", "post"]);
+        // Sigiled form: never the discriminator — field channel only. (The
+        // body carries an authored discriminator so it RESOLVES: a
+        // modifier-only body is unresolved and routes to discovery instead.)
+        let source2 = "host H:\n    slot:\n        kind = \"log\"\n        |kind = \n";
+        let file2 = nml_core::cst::parse_best_effort(source2);
+        let li2 = LineIndex::new(source2);
+        let values2 = find_value_completions_at(&file2, source2, Position::new(3, 16), &idx, &li2)
+            .expect("modifier field completes");
+        assert_eq!(values2.variants, vec!["fast", "slow"]);
+        assert!(values2.arms.is_empty());
+    }
+
+    /// Round-20 audit F4: the code-action consumer cap counts VALID entries —
+    /// malformed padding can neither bury a legitimate suggestion nor loosen
+    /// the bound (9 valid still cap at 8, order preserved).
+    #[test]
+    fn suggestion_parse_caps_valid_entries_not_raw() {
+        let valid =
+            |r: &str| serde_json::json!({"replacement": r, "start": 0, "end": 1, "kind": "fix"});
+        let malformed = serde_json::json!({"replacement": 42});
+        let mut padded: Vec<serde_json::Value> = vec![malformed; 8];
+        padded.push(valid("real"));
+        let parsed = parse_suggestion_entries(&padded);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "the ninth (valid) entry must survive malformed padding"
+        );
+        assert_eq!(parsed[0].0, "real");
+        let nine: Vec<serde_json::Value> = (0..9).map(|i| valid(&format!("s{i}"))).collect();
+        let capped = parse_suggestion_entries(&nine);
+        assert_eq!(capped.len(), 8);
+        assert_eq!(capped[0].0, "s0");
+        assert_eq!(capped[7].0, "s7");
+        // An inverted span fails closed like any other malformed entry — it
+        // would otherwise round-trip as a spec-invalid LSP Range.
+        let inverted =
+            serde_json::json!({"replacement": "bad", "start": 5, "end": 2, "kind": "fix"});
+        assert!(parse_suggestion_entries(&[inverted]).is_empty());
+    }
+
+    /// Round-21 audit: the LIMBO branch honors the oracle's SHAPE gate — a
+    /// list-shaped body under a typo'd annotation gets NO field discovery
+    /// (offering `plugins` there would rewrite the annotation AND author a
+    /// named block duplicating the bare items already filling it).
+    #[test]
+    fn limbo_field_discovery_is_gated_to_keyed_or_bare_shapes() {
+        let idx = field_index(
+            "model modelA:\n    plugins []string+\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        let source = "host H:\n    slot as nope:\n        - alpha\n        \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        assert!(
+            !matches!(
+                find_candidates_at(&file, Position::new(3, 8), &idx, &li),
+                Some(DescentTarget::Ambiguous { .. })
+            ),
+            "a list-shaped limbo body is not a discovery moment"
+        );
+        // The KEYED limbo body keeps its discovery (the round-15 behavior).
+        let source2 = "host H:\n    slot as nope:\n        \n";
+        let file2 = nml_core::cst::parse_best_effort(source2);
+        let li2 = LineIndex::new(source2);
+        assert!(matches!(
+            find_candidates_at(&file2, Position::new(2, 8), &idx, &li2),
+            Some(DescentTarget::Ambiguous { .. })
+        ));
     }
 
     /// Round-16 pins (element twins of the round-15 fixes): the ELEMENT-level
@@ -6206,7 +7128,7 @@ workflow VoiceAgent:
             other => panic!(
                 "limbo must surface candidates, got {}",
                 match other {
-                    Some(DescentTarget::One(m, _)) => format!("One({})", m.name),
+                    Some(DescentTarget::One { model: m, .. }) => format!("One({})", m.name),
                     None => "None".into(),
                     _ => unreachable!(),
                 }
@@ -6521,7 +7443,7 @@ workflow VoiceAgent:
             )
             .to_string(),
         );
-        let text = find_declaration_hover(&docs, "ProUpsell", None).expect("item hover present");
+        let text = find_declaration_hover(&docs, "ProUpsell", &[]).expect("item hover present");
         assert!(
             text.contains("**denial** `ProUpsell`"),
             "hovers as the array's item keyword: {text}"
@@ -6537,7 +7459,7 @@ workflow VoiceAgent:
         // A MID-LIST item's comment reaches it through the other attachment
         // path (deferred past the previous item's dedent, INTO this item —
         // the in-node walk), and the previous item's content never bleeds in.
-        let second = find_declaration_hover(&docs, "Generic", None).expect("mid-list item hovers");
+        let second = find_declaration_hover(&docs, "Generic", &[]).expect("mid-list item hovers");
         assert!(
             second.contains("The neutral fallback."),
             "a mid-list item surfaces its own leading comment: {second}"
@@ -6547,10 +7469,10 @@ workflow VoiceAgent:
             "the previous item's docs/content never bleed in: {second}"
         );
         // The array declaration itself still hovers as before.
-        let arr = find_declaration_hover(&docs, "denials", None).expect("array hover present");
+        let arr = find_declaration_hover(&docs, "denials", &[]).expect("array hover present");
         assert!(arr.contains("**[]denial** `denials`"), "{arr}");
         // An unknown name hovers nothing.
-        assert!(find_declaration_hover(&docs, "Ghost", None).is_none());
+        assert!(find_declaration_hover(&docs, "Ghost", &[]).is_none());
     }
 
     #[test]
@@ -6570,7 +7492,7 @@ workflow VoiceAgent:
             )
             .to_string(),
         );
-        let text = find_declaration_hover(&docs, "Shared", None).expect("hover present");
+        let text = find_declaration_hover(&docs, "Shared", &[]).expect("hover present");
         assert!(
             text.contains("**workflow** `Shared`"),
             "the declaration outranks the item: {text}"
@@ -6594,7 +7516,7 @@ workflow VoiceAgent:
             // order: a.nml always has the item, b.nml always the declaration.
             docs.insert(make_uri("a.nml"), item_doc.to_string());
             docs.insert(make_uri("b.nml"), decl_doc.to_string());
-            let text = find_declaration_hover(&docs, "Shared", None).expect("hover present");
+            let text = find_declaration_hover(&docs, "Shared", &[]).expect("hover present");
             assert!(
                 text.contains("**workflow** `Shared`") && text.contains("*Source: b.nml*"),
                 "the declaration wins across documents (insertion order {first}/{second}): {text}"

@@ -16,6 +16,9 @@
 # MIT OR Apache-2.0. Strong copyleft (GPL/AGPL/LGPL/SSPL) is deliberately absent
 # and therefore denied. Dual-licensed crates pass by electing a permissive side.
 # NML's own crates are `MIT OR Apache-2.0`, covered by the entries below.
+# `publish = false` members (the tutorial apps) are teaching artifacts, never
+# distributed — licensing applies to what ships, so they are exempt.
+private = { ignore = true }
 allow = [
     "MIT",
     "MIT-0",

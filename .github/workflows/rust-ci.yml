@@ -22,7 +22,12 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Rustdoc is a build product (docs.rs renders it at publish): broken
+      # intra-doc links and bad doc syntax fail here, not on docs.rs.
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # Supply-chain & license gate (see deny.toml): permissive-only dep licenses +
   # RustSec security advisories + a crates.io-only source policy. Reads the
@@ -51,4 +56,84 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
+
+  # The MSRV contract (docs/stability.md): the workspace compiles — every
+  # target, every platform the test matrix covers, doctests included — on
+  # exactly the `rust-version` floor declared in Cargo.toml, which this job
+  # READS so the manifest stays the single source of truth (an MSRV bump is
+  # a one-line change; this job follows). `--locked` pins the committed,
+  # MSRV-compatible dependency set: a dependency raising its own floor
+  # surfaces as a reviewed lockfile-update failure here, never as a
+  # downstream user's broken build. Check-only by design — the MSRV promise
+  # is "it builds"; behavior stays the stable matrix's job.
+  msrv:
+    name: msrv (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Read the declared MSRV from Cargo.toml
+        id: msrv
+        shell: bash
+        run: |
+          version="$(grep -m1 '^rust-version' Cargo.toml | cut -d '"' -f 2)"
+          if [ -z "$version" ]; then
+            echo "::error::no rust-version found in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo check --workspace --all-targets --locked
+      # Cross-compilation is host-independent — once is enough.
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo check -p nml-lsp --target wasm32-wasip1 --locked
+      - run: cargo test --doc --workspace --locked
+
+  # Publish-readiness, continuously: `cargo package` validates metadata,
+  # file sets, and (via its verify build) that each publishable crate
+  # compiles from its own tarball — so publish day is a decision, not a
+  # debugging session. The tutorial apps are excluded explicitly:
+  # `publish = false` blocks *uploading*, but `cargo package` still
+  # packages such members (measured), and they are not publish surface.
+  package:
+    name: cargo package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo package --workspace --exclude 'nml-tutorial-*' --locked
+
+  # Declared version bounds are promises (`serde = "1"` claims we build
+  # against serde 1.0.0). Resolve every DIRECT dependency to its declared
+  # minimum (nightly resolver flag), then prove the workspace still
+  # compiles on stable. Catches under-declared bounds before a downstream
+  # user's cold lockfile does. Deliberately unlocked: this job's whole
+  # point is a different resolution.
+  minimal-versions:
+    name: minimal versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
+        with:
+          toolchain: nightly
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo +nightly update -Zdirect-minimal-versions
+      - run: cargo +stable check --workspace --all-targets

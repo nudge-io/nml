@@ -304,6 +304,10 @@ pub mod codes {
         /// union — there is no variant to select, so the annotation has no
         /// meaning. Flagged rather than silently ignored (visible-never-silent).
         STRAY_TYPE_ANNOTATION = 2053;
+        /// A oneof variant model declares a field named like the
+        /// discriminator — unreachable, the property is always claimed as
+        /// the discriminator (advisory).
+        SHADOWED_DISCRIMINATOR = 2054;
 
         /// A package validator binding is fully shadowed by earlier
         /// bindings — its globs can never match first (RFC 0030).
