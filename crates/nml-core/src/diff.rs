@@ -1158,29 +1158,8 @@ fn diff_bodies(
     // — their two sides resolve to the same model — so behavior is unchanged.
     let old_target = resolve_diff_target(index, &field.field_type, o, &empty, &empty_body);
     let new_target = resolve_diff_target(index, &field.field_type, n, &empty, &empty_body);
-    if let (FieldTarget::Model(om), FieldTarget::Model(nm)) = (&old_target, &new_target) {
-        if om.name != nm.name {
-            // Both sides must EXIST for a switch witness — an absent side is an
-            // add/remove of the whole field, and a phantom `as A → as B` there
-            // would claim an annotation that never was (the same absent-side
-            // rule diff_oneof_instance applies to discriminator flips). A
-            // present-but-empty annotated body IS a real side and keeps its
-            // witness.
-            if !o.is_empty() && !n.is_empty() {
-                push_variant_switch(&om.name, &nm.name, o, n, path, out);
-            }
-            let octx = ModelCtx {
-                model: om,
-                exempt: None,
-            };
-            let nctx = ModelCtx {
-                model: nm,
-                exempt: None,
-            };
-            diff_model(index, octx, o, &empty, path, depth + 1, out);
-            diff_model(index, nctx, &empty, n, path, depth + 1, out);
-            return;
-        }
+    if diff_variant_switch(index, (&old_target, &new_target), o, n, path, depth, out) {
+        return;
     }
     match resolve_diff_target(index, &field.field_type, n, o, &empty_body) {
         FieldTarget::Model(m) => diff_model(
@@ -1233,6 +1212,80 @@ fn elems_structural_eq(old: &[Elem<'_>], new: &[Elem<'_>]) -> bool {
 /// The comparison is the per-file body SEQUENCE (an undescribable shape has no
 /// merge semantics to apply), so re-splitting identical content across files
 /// conservatively reads as changed — visible, never silent, per the invariant.
+/// The nominal name a per-side resolution can switch between — a model or a
+/// `oneof` (both nameable via `as`, and globally name-disjoint by
+/// `ONEOF_NAME_COLLISION`, so equal names imply equal kinds).
+fn switch_name<'a>(t: &FieldTarget<'a>) -> Option<&'a str> {
+    match t {
+        FieldTarget::Model(m) => Some(m.name.as_str()),
+        FieldTarget::OneOf(o) => Some(o.name.as_str()),
+        _ => None,
+    }
+}
+
+/// One side of a variant switch, diffed against emptiness through its OWN
+/// resolved target — the model walk for a model variant, the oneof machinery
+/// (discriminator-aware) for a `oneof` variant.
+fn half_diff_target(
+    index: &SchemaIndex,
+    target: &FieldTarget,
+    side: &[(PathBuf, &Body)],
+    removed: bool,
+    path: &FieldPath,
+    depth: u32,
+    out: &mut Vec<FieldChange>,
+) {
+    let empty: Vec<(PathBuf, &Body)> = Vec::new();
+    let (o, n) = if removed {
+        (side, empty.as_slice())
+    } else {
+        (empty.as_slice(), side)
+    };
+    match target {
+        FieldTarget::Model(m) => {
+            let ctx = ModelCtx {
+                model: m,
+                exempt: None,
+            };
+            diff_model(index, ctx, o, n, path, depth, out);
+        }
+        FieldTarget::OneOf(of) => diff_oneof_instance(index, of, o, n, path, depth, out),
+        _ => {}
+    }
+}
+
+/// RFC 0015 variant SWITCH, the ONE owner for both the field and element
+/// levels: when the two sides resolve (per side, annotation-aware) to
+/// DIFFERENT nameable variants — model↔model, model↔oneof, oneof↔oneof —
+/// emit the explicit `as A → as B` witness (both sides present; an absent
+/// side is a whole-field add/remove and gets no phantom witness, the same
+/// rule `diff_oneof_instance` applies to discriminator flips) and diff each
+/// side against emptiness through its OWN target. Returns whether the switch
+/// path handled the diff; same-variant or non-nameable sides fall through to
+/// the shared single-target path.
+fn diff_variant_switch(
+    index: &SchemaIndex,
+    (old_target, new_target): (&FieldTarget, &FieldTarget),
+    o: &[(PathBuf, &Body)],
+    n: &[(PathBuf, &Body)],
+    path: &FieldPath,
+    depth: u32,
+    out: &mut Vec<FieldChange>,
+) -> bool {
+    let (Some(on), Some(nn)) = (switch_name(old_target), switch_name(new_target)) else {
+        return false;
+    };
+    if on == nn {
+        return false;
+    }
+    if !o.is_empty() && !n.is_empty() {
+        push_variant_switch(on, nn, o, n, path, out);
+    }
+    half_diff_target(index, old_target, o, true, path, depth + 1, out);
+    half_diff_target(index, new_target, n, false, path, depth + 1, out);
+    true
+}
+
 /// One side of a shape transition, rendered in its OWN representation against
 /// emptiness (RFC 0015 shape-switch visibility): a keyed/annotated body diffs
 /// through its per-side-resolved model or oneof (precise per-field
@@ -1586,40 +1639,16 @@ fn diff_collections(
             &empty_side,
             &empty_body,
         );
-        if let (FieldTarget::Model(om), FieldTarget::Model(nm)) = (&o_target, &n_target) {
-            if om.name != nm.name {
-                // Absent-side guard: same phantom rule as the field level.
-                if !o_files.is_empty() && !n_files.is_empty() {
-                    push_variant_switch(&om.name, &nm.name, &o_files, &n_files, &elem_path, out);
-                }
-                let octx = ModelCtx {
-                    model: om,
-                    exempt: None,
-                };
-                let nctx = ModelCtx {
-                    model: nm,
-                    exempt: None,
-                };
-                diff_model(
-                    index,
-                    octx,
-                    &o_files,
-                    &empty_side,
-                    &elem_path,
-                    depth + 1,
-                    out,
-                );
-                diff_model(
-                    index,
-                    nctx,
-                    &empty_side,
-                    &n_files,
-                    &elem_path,
-                    depth + 1,
-                    out,
-                );
-                continue;
-            }
+        if diff_variant_switch(
+            index,
+            (&o_target, &n_target),
+            &o_files,
+            &n_files,
+            &elem_path,
+            depth,
+            out,
+        ) {
+            continue;
         }
         match resolve_diff_target(
             index,
@@ -2163,6 +2192,45 @@ mod tests {
                     if old.as_str() == Some("as modelA") && new.as_str() == Some("as modelB")
             )),
             "an empty-body variant switch must emit the explicit switch change: {d:?}"
+        );
+    }
+
+    /// Round-12: a MODEL ↔ ONEOF variant switch (`(modelA | mail)` where
+    /// `mail` is a oneof) gets the explicit witness + precise per-side diffs —
+    /// previously it degraded to a single `OpaqueChanged`.
+    #[test]
+    fn nominal_switch_between_model_and_oneof_is_precise() {
+        let schema = "model modelA:\n    a string?\nmodel mailLog:\n    level string?\n\noneof mail by kind:\n    \"log\" -> mailLog\n\nmodel server:\n    slot (modelA | mail)?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let old = parse_doc("server s:\n    slot as modelA:\n        a = \"x\"\n");
+        let new = parse_doc(
+            "server s:\n    slot as mail:\n        kind = \"log\"\n        level = \"info\"\n",
+        );
+        let d = diff_config(
+            &idx,
+            "server",
+            &[(PathBuf::from("f.nml"), server_body(&old))],
+            &[(PathBuf::from("f.nml"), server_body(&new))],
+        );
+        assert!(
+            d.iter().any(|c| matches!(
+                &c.kind,
+                ChangeKind::Modified { old, new }
+                    if old.as_str() == Some("as modelA") && new.as_str() == Some("as mail")
+            )),
+            "the model↔oneof switch must emit the explicit witness: {d:?}"
+        );
+        assert!(
+            d.iter()
+                .all(|c| !matches!(c.kind, ChangeKind::OpaqueChanged)),
+            "a legitimate switch must not read as drift: {d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|c| p(c) == "slot.a" && matches!(c.kind, ChangeKind::Removed { .. })),
+            "the model side's fields removed precisely: {d:?}"
         );
     }
 

@@ -1790,7 +1790,7 @@ fn find_union_list_field_at<'i>(
             }
         }
         if let Some(item_body) = item_owner {
-            if let FieldTarget::Model(m) = index.resolve_type_in_body(inner, item_body) {
+            if let Some(m) = variant_model_for_body(index, inner, item_body) {
                 return find_union_list_field_at(m, item_body, pos, index, line_index);
             }
             return None;
@@ -1987,10 +1987,7 @@ fn descend_to_cursor<'i, 'f>(
                     }
                 }
                 let item_body = item_owner?;
-                let FieldTarget::Model(item_model) = index.resolve_type_in_body(elem_ty, item_body)
-                else {
-                    return None;
-                };
+                let item_model = variant_model_for_body(index, elem_ty, item_body)?;
                 descend_to_cursor(item_model, item_body, pos, index, line_index)
             }
             // A `oneof` field: select the variant from the body's discriminator and descend
@@ -2003,11 +2000,7 @@ fn descend_to_cursor<'i, 'f>(
             // variant body-aware and complete ITS fields — the field-level twin
             // of the per-item rule above.
             FieldTarget::Union => {
-                let FieldTarget::Model(child) =
-                    index.resolve_type_in_body(&field.field_type, &nested.body)
-                else {
-                    return None;
-                };
+                let child = variant_model_for_body(index, &field.field_type, &nested.body)?;
                 descend_to_cursor(child, &nested.body, pos, index, line_index)
             }
             // object / leaf → no concrete model to complete here.
@@ -2021,6 +2014,23 @@ fn descend_to_cursor<'i, 'f>(
 /// body sets (or the schema default), match it to an arm, and resolve that variant. `None`
 /// when no discriminator is set/defaulted or it names no arm — an unresolved union, so no
 /// fields to offer.
+/// The concrete MODEL a body resolves to under `ty` — through the canonical
+/// body-aware resolver, then through a `oneof` variant's discriminator when the
+/// resolution lands on a oneof. The one lookup all completion descents share,
+/// so a union whose variant is a ONEOF (`(modelA | mail)`, `as mail:` +
+/// `kind = …`) completes exactly like a model variant.
+fn variant_model_for_body<'i>(
+    index: &'i SchemaIndex,
+    ty: &'i FieldType,
+    body: &Body,
+) -> Option<&'i ModelDef> {
+    match index.resolve_type_in_body(ty, body) {
+        FieldTarget::Model(m) => Some(m),
+        FieldTarget::OneOf(o) => resolve_oneof_variant(o, body, index),
+        _ => None,
+    }
+}
+
 fn resolve_oneof_variant<'i>(
     oneof: &OneOfDef,
     body: &Body,

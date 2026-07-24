@@ -362,18 +362,22 @@ impl SchemaValidator {
                     let mut ok = false;
                     let mut block_capable = false;
                     for field in &defining {
-                        if let FieldTarget::Model(inner) =
-                            self.index.resolve_type_in_body(&field.field_type, body)
-                        {
+                        // Block-capable = anything `validate_target_instance`
+                        // can validate a body against: a model, a `oneof`
+                        // (discriminator-aware), or a list/set (per-item) —
+                        // NOT Model-only, which false-errored on `[]sub` and
+                        // oneof declarers and on a union's list variant
+                        // legitimately selected by an item-shaped block.
+                        let target = self.index.resolve_type_in_body(&field.field_type, body);
+                        let mut local = Vec::new();
+                        if self.validate_target_instance(
+                            &target,
+                            body,
+                            depth + 1,
+                            Some(sp.name.span),
+                            &mut local,
+                        ) {
                             block_capable = true;
-                            let mut local = Vec::new();
-                            self.validate_instance_against_model(
-                                body,
-                                inner,
-                                depth + 1,
-                                Some(sp.name.span),
-                                &mut local,
-                            );
                             if local.is_empty() {
                                 ok = true;
                                 break;
@@ -3710,6 +3714,44 @@ workflow W:
         assert!(
             bad.iter().any(|d| d.message.contains("unknown property")),
             "a union-typed declarer must validate block content body-aware: {bad:?}"
+        );
+    }
+
+    /// Round-13 F1: "block-capable" means anything a body can validate against
+    /// — a list variant selected by item-shaped content, a plain `[]sub`
+    /// declarer, and a oneof declarer are ALL legal (previously Model-only,
+    /// which false-errored TYPE_MISMATCH on each).
+    #[test]
+    fn union_block_shared_property_accepts_list_and_oneof_declarers() {
+        // (a) union declarer whose LIST variant matches the item-shaped block.
+        let list_variant = "model sub:\n    x string?\nmodel modelA:\n    sub (sub | []sub)?\nmodel modelB:\n    b string?\nmodel host:\n    slots [](modelA | modelB)?\n";
+        let d = diags_for(
+            list_variant,
+            "host H:\n    slots:\n        .sub:\n            - i:\n                x = \"v\"\n        - one as modelB:\n            b = \"s\"\n",
+        );
+        assert!(
+            d.is_empty(),
+            "an item-shaped block matching the list variant is legal: {d:?}"
+        );
+        // (b) plain `[]sub` declarers.
+        let list_only = "model sub:\n    x string?\nmodel modelA:\n    sub []sub?\nmodel modelB:\n    sub []sub?\nmodel host:\n    slots [](modelA | modelB)?\n";
+        let d2 = diags_for(
+            list_only,
+            "host H:\n    slots:\n        .sub:\n            - i:\n                x = \"v\"\n        - one as modelB:\n            sub:\n                - j:\n                    x = \"w\"\n",
+        );
+        assert!(
+            d2.iter().all(|x| x.code != Some(codes::TYPE_MISMATCH)),
+            "[]sub declarers are block-capable: {d2:?}"
+        );
+        // (c) oneof declarers with a keyed discriminated block.
+        let oneof_decl = "model logM:\n    level string?\n\noneof mail by kind:\n    \"log\" -> logM\n\nmodel modelA:\n    sub mail?\nmodel modelB:\n    sub mail?\nmodel host:\n    slots [](modelA | modelB)?\n";
+        let d3 = diags_for(
+            oneof_decl,
+            "host H:\n    slots:\n        .sub:\n            kind = \"log\"\n            level = \"info\"\n        - one as modelB:\n            sub:\n                kind = \"log\"\n",
+        );
+        assert!(
+            d3.iter().all(|x| x.code != Some(codes::TYPE_MISMATCH)),
+            "oneof declarers are block-capable: {d3:?}"
         );
     }
 
