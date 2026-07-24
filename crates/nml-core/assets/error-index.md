@@ -3,7 +3,7 @@
 Every diagnostic with a stable code has a section here, keyed `## NML0000`.
 Codes are **stable from the first published release**: never renumbered,
 never reused; a retired code keeps its section as a tombstone (see the
-[stability policy](../stability.md)). This index is bidirectionally guarded
+[stability policy](../../../docs/stability.md)). This index is bidirectionally guarded
 by `just docs-test`: a code without a section — or a section without a code —
 fails CI, and most examples below run through the real CLI.
 
@@ -353,7 +353,7 @@ or `oneof`, and its items carry bodies that would go unvalidated.
 
 **Literal in a `secret` field.** `secret` fields hold *references*
 (`$ENV.NAME`), never literal credential material — the file must never
-contain the secret value (see the [stability policy](../stability.md)'s
+contain the secret value (see the [stability policy](../../../docs/stability.md)'s
 security notes and the README's secrets section).
 
 ```nml check schema=docs/examples/readme expect-error='[NML2006]'

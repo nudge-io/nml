@@ -104,6 +104,11 @@ pub fn build_service(
         // RFC 0030 introspection: which schema package validates a document,
         // from where, at which hash — callable by any LSP client.
         .custom_method("nml/schemaInfo", NmlLanguageServer::schema_info)
+        // RFC 0010 tier 2: full error-index entries from the running binary
+        // (`nml/explain`), and the code list behind the explain-a-code
+        // palette (`nml/explainIndex`).
+        .custom_method("nml/explain", NmlLanguageServer::explain)
+        .custom_method("nml/explainIndex", NmlLanguageServer::explain_index)
         .finish()
 }
 

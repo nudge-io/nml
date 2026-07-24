@@ -259,7 +259,11 @@ mod tests {
         assert_eq!((code_span.start, code_span.end), (16, 19));
         let diag = err.to_diagnostic();
         assert_eq!(diag.code, Some(crate::diagnostic::codes::UNKNOWN_CURRENCY));
-        let sug = diag.suggestion.expect("ISO-4217 did-you-mean");
+        let sug = diag
+            .suggestions
+            .first()
+            .cloned()
+            .expect("ISO-4217 did-you-mean");
         assert_eq!(sug.replacement, "USD");
         assert_eq!((sug.span.start, sug.span.end), (16, 19));
     }

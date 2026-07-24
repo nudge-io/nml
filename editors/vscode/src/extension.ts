@@ -24,6 +24,7 @@ import {
   resolveNeutralServer,
   wasmUriConverters,
 } from "./serverAcquisition";
+import { registerExplain } from "./explain";
 
 // ─────────────────────────────────────────────────────────────────────────
 // RFC 0035 — default-safe discovery + Workspace-Trust gate + status surface.
@@ -288,6 +289,11 @@ async function startClient(context: ExtensionContext): Promise<void> {
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "nml" }],
     outputChannel: channel,
+    // RFC 0010 tier 2 negotiation: declare the command this extension
+    // registered for opening full error explanations. The server only emits
+    // its "Explain NML0000" code action to clients that declared one, so
+    // editors without the command never see an unexecutable action.
+    initializationOptions: { explainCommand: "nml.explain" },
     // The WASM neutral server runs a synchronous pump and cannot issue the
     // server→client request that registers file watchers (RFC 0035), so the
     // client watches on its behalf; the native server self-registers, so adding
@@ -335,6 +341,10 @@ export async function activate(context: ExtensionContext): Promise<void> {
   status = window.createStatusBarItem(StatusBarAlignment.Right, 100);
   status.command = "nml.restartServer";
   context.subscriptions.push(status);
+
+  // RFC 0010 tier 2: the `nml.explain` command (code action + palette) and
+  // the `nml-explain:` virtual-document provider behind it.
+  registerExplain(context, () => client);
 
   context.subscriptions.push(
     commands.registerCommand("nml.restartServer", () =>

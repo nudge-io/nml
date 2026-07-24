@@ -48,7 +48,25 @@ impl fmt::Display for Severity {
     }
 }
 
-/// A machine-applicable fix carried alongside a diagnostic (RFC 0030): the
+/// What a [`Suggestion`] *is* — the axis is exclusivity/applicability, not
+/// rendering prose (though rendering derives from it):
+///
+/// * [`DidYouMean`](SuggestionKind::DidYouMean) — a **singular** correction
+///   for a near-miss (typo'd enum value, directive, variant). Machine-
+///   applicable; an editor may mark it preferred / auto-apply it when it is
+///   the only suggestion.
+/// * [`Fix`](SuggestionKind::Fix) — **one of N mutually exclusive
+///   alternatives** (e.g. RFC 0015 D2's "annotate as `modelA`" / "…`modelB`").
+///   NEVER auto-applied or preferred when siblings exist: the editor silently
+///   picking one would resurrect exactly the guess the diagnostic exists to
+///   forbid. A future `nml fix --apply` applies `Fix`es only when singular.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuggestionKind {
+    DidYouMean,
+    Fix,
+}
+
+/// A machine-applicable edit carried alongside a diagnostic (RFC 0030): the
 /// exact replacement text and the exact span it replaces. Produced wherever
 /// a correction is *derivable* (e.g. a did-you-mean), so editors can offer a
 /// one-keystroke quick-fix instead of leaving the suggestion trapped in
@@ -60,6 +78,8 @@ pub struct Suggestion {
     pub replacement: String,
     /// The exact range the replacement substitutes.
     pub span: Span,
+    /// The exclusivity semantics — see [`SuggestionKind`].
+    pub kind: SuggestionKind,
 }
 
 /// A stable diagnostic code (`NML0042`).
@@ -323,15 +343,25 @@ pub mod codes {
 /// The docs-test guard keeps it bidirectionally complete against [`codes`].
 const ERROR_INDEX: &str = include_str!("../assets/error-index.md");
 
+/// The `(code, body)` pairs of the index's `## NML0000` sections, in index
+/// order — the one place that knows the index's section shape. Every public
+/// derivation ([`explain`], [`explain_summary`], [`explain_document`],
+/// [`explain_index`]) rides this iterator, so the shape is parsed in exactly
+/// one spot and the derivations can never disagree about it. The leading
+/// element of the split is the preamble (title, stability notes) — skipped:
+/// it is browsing context, never explanation content.
+fn sections() -> impl Iterator<Item = (&'static str, &'static str)> {
+    ERROR_INDEX.split("\n## ").skip(1).filter_map(|s| {
+        let (head, body) = s.split_once('\n')?;
+        Some((head.trim(), body.trim()))
+    })
+}
+
 /// The error-index section for `code` (e.g. `"NML2007"`), without its
 /// heading line — the offline body behind `nml explain`. `None` when the
 /// code has no section (unknown or unreleased code strings).
 pub fn explain(code: &str) -> Option<&'static str> {
-    let mut sections = ERROR_INDEX.split("\n## ");
-    sections.find_map(|s| {
-        let (head, body) = s.split_once('\n')?;
-        (head.trim() == code).then(|| body.trim())
-    })
+    sections().find_map(|(head, body)| (head == code).then_some(body))
 }
 
 /// The first paragraph of a code's index section — the bounded hover summary
@@ -341,9 +371,58 @@ pub fn explain(code: &str) -> Option<&'static str> {
 /// dangle in hover context); absolute `http(s)` links are kept — they become
 /// useful the day the index is published.
 pub fn explain_summary(code: &str) -> Option<String> {
-    let body = explain(code)?;
+    summary_of(explain(code)?)
+}
+
+/// First paragraph → one line → links policy. Shared by [`explain_summary`]
+/// (one code) and [`explain_index`] (all codes).
+fn summary_of(body: &str) -> Option<String> {
     let para = body.split("\n\n").next()?.trim().replace('\n', " ");
     Some(strip_relative_links(&para))
+}
+
+/// The full standalone document for a code — a `# NML2007` heading plus the
+/// complete index section (RFC 0010 tier 2). One composer for every full-
+/// entry surface: the CLI's `nml explain` and the editor's `nml/explain`
+/// virtual document render this byte-for-byte, so "the full entry" has
+/// exactly one shape. The heading interpolates the **matched section head**,
+/// never the caller's string — only the vetted code strings can ever appear
+/// in output, by construction. The link policy matches [`explain_summary`],
+/// applied line-wise *outside* code fences: a fenced example is content,
+/// never rewritten.
+pub fn explain_document(code: &str) -> Option<String> {
+    sections().find_map(|(head, body)| (head == code).then(|| compose_document(head, body)))
+}
+
+/// `# {head}` + the body with the link policy applied outside fences — the
+/// one place a full-entry document is shaped (see [`explain_document`]).
+fn compose_document(head: &str, body: &str) -> String {
+    let mut doc = format!("# {head}\n\n");
+    let mut in_fence = false;
+    for line in body.split_inclusive('\n') {
+        let is_fence_delimiter = line.trim_start().starts_with("```");
+        if is_fence_delimiter {
+            in_fence = !in_fence;
+        }
+        if in_fence || is_fence_delimiter {
+            doc.push_str(line);
+        } else {
+            doc.push_str(&strip_relative_links(line));
+        }
+    }
+    doc
+}
+
+/// Every `(code, summary)` pair in the index, in index order — the
+/// discoverability surface behind the editor's `nml/explainIndex` (the
+/// explain-a-code palette) and the CLI's `nml explain --list`. Derived from
+/// the index itself rather than [`codes`], so it needs no runtime code
+/// enumeration and can never disagree with what [`explain`] serves; the
+/// docs-test guard keeps index↔codes bidirectionally complete.
+pub fn explain_index() -> Vec<(&'static str, String)> {
+    sections()
+        .filter_map(|(head, body)| Some((head, summary_of(body)?)))
+        .collect()
 }
 
 /// Rewrite `[text](target)` to `text` for non-absolute targets, keeping
@@ -393,8 +472,10 @@ pub struct Diagnostic {
     /// numerically ambiguous without it. `None` for single-source contexts
     /// and for cross-source findings that no one file owns.
     pub source: Option<String>,
-    /// A machine-applicable fix, when one is derivable.
-    pub suggestion: Option<Suggestion>,
+    /// Machine-applicable edits, when derivable. One `DidYouMean` for a
+    /// near-miss; N mutually exclusive `Fix` alternatives for diagnostics
+    /// with several valid resolutions (RFC 0015 D2). Empty = none.
+    pub suggestions: Vec<Suggestion>,
     /// Secondary locations that explain the primary one (RFC 0009) — e.g.
     /// an unterminated string's opening quote, far from where the failure
     /// surfaces. The LSP maps these to spec-native
@@ -417,7 +498,7 @@ impl Diagnostic {
             message: message.into(),
             span: None,
             source: None,
-            suggestion: None,
+            suggestions: Vec::new(),
             related: Vec::new(),
         }
     }
@@ -457,10 +538,23 @@ impl Diagnostic {
         self
     }
 
+    /// Attach a singular near-miss correction ([`SuggestionKind::DidYouMean`]).
     pub fn with_suggestion(mut self, replacement: impl Into<String>, span: Span) -> Self {
-        self.suggestion = Some(Suggestion {
+        self.suggestions.push(Suggestion {
             replacement: replacement.into(),
             span,
+            kind: SuggestionKind::DidYouMean,
+        });
+        self
+    }
+
+    /// Attach one of N mutually exclusive fix alternatives
+    /// ([`SuggestionKind::Fix`]) — call once per alternative.
+    pub fn with_fix(mut self, replacement: impl Into<String>, span: Span) -> Self {
+        self.suggestions.push(Suggestion {
+            replacement: replacement.into(),
+            span,
+            kind: SuggestionKind::Fix,
         });
         self
     }
@@ -506,10 +600,63 @@ fn write_sanitized(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
 impl fmt::Display for Rendered<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_sanitized(f, &self.0.message)?;
-        if let Some(s) = &self.0.suggestion {
-            f.write_str(" (did you mean \"")?;
-            write_sanitized(f, &s.replacement)?;
-            f.write_str("\"?)")?;
+        let dym: Vec<&Suggestion> = self
+            .0
+            .suggestions
+            .iter()
+            .filter(|s| s.kind == SuggestionKind::DidYouMean)
+            .collect();
+        let fixes: Vec<&Suggestion> = self
+            .0
+            .suggestions
+            .iter()
+            .filter(|s| s.kind == SuggestionKind::Fix)
+            .collect();
+        match dym.as_slice() {
+            [] => {}
+            [one] => {
+                f.write_str(" (did you mean \"")?;
+                write_sanitized(f, &one.replacement)?;
+                f.write_str("\"?)")?;
+            }
+            many => {
+                f.write_str(" (did you mean one of ")?;
+                for (i, s) in many.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str("\"")?;
+                    write_sanitized(f, &s.replacement)?;
+                    f.write_str("\"")?;
+                }
+                f.write_str("?)")?;
+            }
+        }
+        // Fix alternatives render capped — the message already states the
+        // resolution space; this is a preview, not a re-enumeration.
+        const RENDERED_FIXES: usize = 3;
+        match fixes.as_slice() {
+            [] => {}
+            [one] => {
+                f.write_str(" (fix: `")?;
+                write_sanitized(f, &one.replacement)?;
+                f.write_str("`)")?;
+            }
+            many => {
+                f.write_str(" (fixes: ")?;
+                for (i, s) in many.iter().take(RENDERED_FIXES).enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str("`")?;
+                    write_sanitized(f, &s.replacement)?;
+                    f.write_str("`")?;
+                }
+                if many.len() > RENDERED_FIXES {
+                    write!(f, ", … and {} more", many.len() - RENDERED_FIXES)?;
+                }
+                f.write_str(")")?;
+            }
         }
         Ok(())
     }
@@ -576,6 +723,23 @@ mod tests {
         assert_eq!(diag.to_string(), "warning[NML2001]: looks odd [4..17]");
     }
 
+    /// Kind-aware rendering: N mutually exclusive fixes render capped, and a
+    /// singular did-you-mean stays byte-identical to the historical form.
+    #[test]
+    fn rendered_message_renders_fix_alternatives_capped() {
+        let mut d = Diagnostic::error("ambiguous").with_span(Span::new(0, 4));
+        for v in ["a", "b", "c", "d"] {
+            d = d.with_fix(format!("slot as {v}"), Span::new(0, 4));
+        }
+        let out = d.rendered_message();
+        assert!(
+            out.contains("(fixes: `slot as a`, `slot as b`, `slot as c`, … and 1 more)"),
+            "{out}"
+        );
+        let single = Diagnostic::error("x").with_fix("slot as a", Span::new(0, 4));
+        assert!(single.rendered_message().contains("(fix: `slot as a`)"));
+    }
+
     #[test]
     fn rendered_message_derives_hint_from_suggestion() {
         let diag =
@@ -624,6 +788,88 @@ mod tests {
         // Unmatched shapes pass through verbatim, never mangled.
         assert_eq!(strip_relative_links("a [lone bracket"), "a [lone bracket");
         assert_eq!(strip_relative_links("no links at all"), "no links at all");
+    }
+
+    #[test]
+    fn explain_document_composes_canonical_head_and_full_body() {
+        // The heading is the MATCHED section head — canonical, never the
+        // caller's string (injection-proof by construction).
+        let doc = explain_document("NML0001").expect("known code");
+        assert!(doc.starts_with("# NML0001\n\n"), "{doc}");
+        // Full entry: the example fences that summaries exclude are here.
+        assert!(doc.contains("```"), "full body includes examples: {doc}");
+        // Relative links are stripped outside fences (NML0001's stability-
+        // policy link), same policy as hover summaries.
+        assert!(doc.contains("stability policy"), "{doc}");
+        assert!(!doc.contains("](../"), "relative links stripped: {doc}");
+
+        // Unknown and hostile inputs are None — nothing the caller sends can
+        // reach output (exact-match lookup against vetted heads only).
+        assert!(explain_document("NML9999").is_none());
+        assert!(explain_document("../../etc/passwd").is_none());
+        assert!(explain_document("NML0001\n\n# forged heading").is_none());
+
+        // Total over the code space, like `explain` itself.
+        for (_, code) in codes::ALL {
+            assert!(explain_document(&code.to_string()).is_some(), "{code}");
+        }
+    }
+
+    #[test]
+    fn explain_document_never_rewrites_fenced_content() {
+        // A fenced line shaped like a relative link must pass through
+        // verbatim — fences are content, not prose. (Synthetic: today's
+        // index has no fenced links; this pins the composer's behavior,
+        // and `index_sections_are_fence_safe` pins the content invariant.)
+        let body = "prose [x](./rel.md)\n\n```\ncode [y](./rel.md)\n```\n";
+        let composed = compose_document("NML0000", body);
+        assert!(composed.starts_with("# NML0000\n\n"), "{composed}");
+        assert!(composed.contains("prose x\n"), "{composed}");
+        assert!(composed.contains("code [y](./rel.md)\n"), "{composed}");
+    }
+
+    #[test]
+    fn explain_index_lists_every_code_with_its_summary() {
+        let index = explain_index();
+        // Bidirectional over the code space: every code appears exactly once,
+        // every entry is a real code with a non-empty summary, order is the
+        // index's own (band-ascending) order.
+        assert_eq!(index.len(), codes::ALL.len(), "index ↔ codes drift");
+        for (head, summary) in &index {
+            assert!(
+                head.len() == 7
+                    && head.starts_with("NML")
+                    && head[3..].bytes().all(|b| b.is_ascii_digit()),
+                "malformed head {head:?}"
+            );
+            assert!(!summary.is_empty(), "{head} has an empty summary");
+            assert_eq!(explain_summary(head).as_deref(), Some(summary.as_str()));
+        }
+        let mut heads: Vec<_> = index.iter().map(|(h, _)| *h).collect();
+        heads.dedup();
+        assert_eq!(heads.len(), index.len(), "duplicate section heads");
+    }
+
+    #[test]
+    fn index_sections_are_fence_safe() {
+        // A fenced line starting `## ` would silently truncate a section for
+        // EVERY consumer (the splitter is not fence-aware by design — this
+        // tripwire is the cheaper structural guarantee). Fences must also
+        // balance, or the composer's fence tracking would invert.
+        let mut in_fence = false;
+        for line in ERROR_INDEX.lines() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                assert!(
+                    !line.starts_with("## "),
+                    "fenced heading would truncate a section: {line:?}"
+                );
+            }
+        }
+        assert!(!in_fence, "unbalanced code fence in the error index");
     }
 
     #[test]

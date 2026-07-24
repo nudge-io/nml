@@ -73,3 +73,60 @@ suite("nml pull diagnostics (E2E, WASM neutral server)", () => {
     );
   });
 });
+
+// RFC 0010 tier 2, end-to-end in the real editor: the `nml-explain:` content
+// provider fetches the full entry from the running WASM server, and a real
+// diagnostic surfaces the negotiated "Explain …" code action wired to
+// `nml.explain`. (The suite above restores the committed schema in its
+// teardown, so `app.nml`'s type mismatch is live again here.)
+suite("nml explanations (E2E, WASM neutral server)", () => {
+  /** Open app.nml and wait for its diagnostic — activates the extension and
+   *  guarantees a coded diagnostic to hang assertions on. */
+  async function openAppWithDiagnostic(): Promise<{
+    app: vscode.Uri;
+    diags: readonly vscode.Diagnostic[];
+  }> {
+    const app = vscode.Uri.joinPath(workspaceUri(), "app.nml");
+    await vscode.window.showTextDocument(
+      await vscode.workspace.openTextDocument(app)
+    );
+    const diags = await waitForDiagnostics(app, (d) => d.length > 0);
+    return { app, diags };
+  }
+
+  test("the nml-explain provider serves the full entry from the running server", async () => {
+    await openAppWithDiagnostic();
+    const doc = await vscode.workspace.openTextDocument(
+      vscode.Uri.parse("nml-explain:NML0013.md")
+    );
+    const text = doc.getText();
+    assert.ok(
+      text.startsWith("# NML0013"),
+      `canonical heading expected, got: ${text.slice(0, 120)}`
+    );
+    assert.ok(
+      text.includes("Invalid number"),
+      `full entry body expected, got: ${text.slice(0, 200)}`
+    );
+  });
+
+  test("a diagnostic offers the negotiated Explain code action", async () => {
+    const { app, diags } = await openAppWithDiagnostic();
+    const actions = await vscode.commands.executeCommand<vscode.CodeAction[]>(
+      "vscode.executeCodeActionProvider",
+      app,
+      diags[0].range
+    );
+    const explain = (actions ?? []).find((a) => a.title.startsWith("Explain NML"));
+    assert.ok(
+      explain,
+      `Explain action expected, got: ${JSON.stringify((actions ?? []).map((a) => a.title))}`
+    );
+    assert.strictEqual(explain.command?.command, "nml.explain");
+    const code = explain.command?.arguments?.[0];
+    assert.ok(
+      typeof code === "string" && /^NML\d{4}$/.test(code),
+      `canonical code argument expected, got: ${JSON.stringify(code)}`
+    );
+  });
+});

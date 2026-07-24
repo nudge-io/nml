@@ -224,13 +224,23 @@ fn push_diagnostic(
         Some(id) if is_error => format!("{} (schema: {id})", diag.rendered_message()),
         _ => diag.rendered_message(),
     };
-    let data = diag.suggestion.as_ref().map(|s| {
+    let data = (!diag.suggestions.is_empty()).then(|| {
         serde_json::json!({
-            "suggestion": {
-                "replacement": s.replacement,
-                "start": s.span.start,
-                "end": s.span.end,
-            }
+            "suggestions": diag
+                .suggestions
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "replacement": s.replacement,
+                        "start": s.span.start,
+                        "end": s.span.end,
+                        "kind": match s.kind {
+                            nml_core::diagnostic::SuggestionKind::DidYouMean => "didYouMean",
+                            nml_core::diagnostic::SuggestionKind::Fix => "fix",
+                        },
+                    })
+                })
+                .collect::<Vec<_>>(),
         })
     });
     out.push(Diagnostic {
@@ -651,9 +661,12 @@ package demo:
         let suggestion = dym
             .data
             .as_ref()
-            .and_then(|d| d.get("suggestion"))
+            .and_then(|d| d.get("suggestions"))
+            .and_then(|v| v.as_array())
+            .and_then(|v| v.first())
             .expect("data");
         assert_eq!(suggestion.get("replacement").unwrap().as_str(), Some("Lax"));
+        assert_eq!(suggestion.get("kind").unwrap().as_str(), Some("didYouMean"));
         assert!(
             diags.iter().any(|d| d.message.contains("unknownKey")
                 && d.severity == Some(DiagnosticSeverity::ERROR)),
@@ -693,7 +706,9 @@ package demo:
         let s = diag
             .data
             .as_ref()
-            .and_then(|d| d.get("suggestion"))
+            .and_then(|d| d.get("suggestions"))
+            .and_then(|v| v.as_array())
+            .and_then(|v| v.first())
             .expect("structured suggestion");
         let (replacement, start, end) = (
             s.get("replacement").unwrap().as_str().unwrap(),

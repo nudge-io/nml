@@ -9,6 +9,8 @@ use tower_lsp::{Client, LanguageServer};
 
 use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
+use nml_core::schema_index::NameableVariant;
+use nml_core::span::Span;
 use nml_core::types::Value;
 use nml_core::{FieldTarget, SchemaIndex};
 use nml_validate::schema::MembershipSemantics;
@@ -74,6 +76,16 @@ pub struct Inner {
     /// Client capability: `completionItem.insertReplaceSupport` (LSP 3.16) —
     /// gates `InsertReplaceEdit` vs plain `TextEdit` value completions.
     insert_replace_support: std::sync::atomic::AtomicBool,
+    /// Client capability: `completionItem.labelDetailsSupport` (LSP 3.17) —
+    /// gates the RFC 0015 union-of-fields "adds `as X`" label detail; older
+    /// clients get it folded into `detail`.
+    label_details_support: std::sync::atomic::AtomicBool,
+    /// The client-declared command id behind "Explain NML0000" code actions
+    /// (RFC 0010 tier 2), from `initializationOptions.explainCommand`. The
+    /// action is emitted only when a client declared one — an editor that
+    /// registered no such command must never receive an unexecutable action
+    /// (negotiation, not assumption). `None` = no client support declared.
+    explain_command: Mutex<Option<String>>,
 }
 
 pub struct NmlLanguageServer {
@@ -193,6 +205,8 @@ impl NmlLanguageServer {
                     injected,
                 ),
                 insert_replace_support: std::sync::atomic::AtomicBool::new(false),
+                label_details_support: std::sync::atomic::AtomicBool::new(false),
+                explain_command: Mutex::new(None),
             }),
             store_events: Mutex::new(store_events_rx),
         }
@@ -1869,15 +1883,12 @@ fn merge_hover(base: Option<Hover>, aug: Option<(String, Range)>) -> Option<Hove
             range: Some(range),
         }),
         (Some(mut h), Some((md, _))) => {
-            match &mut h.contents {
-                HoverContents::Markup(mc) => {
-                    mc.value.push_str("\n\n---\n\n");
-                    mc.value.push_str(&md);
-                }
-                // Every base hover today is Markup; a future non-markup base
-                // keeps itself and drops the augmentation rather than
-                // mangling either.
-                _ => {}
+            // Every base hover today is Markup; a future non-markup base
+            // keeps itself and drops the augmentation rather than mangling
+            // either.
+            if let HoverContents::Markup(mc) = &mut h.contents {
+                mc.value.push_str("\n\n---\n\n");
+                mc.value.push_str(&md);
             }
             Some(h)
         }
@@ -2038,17 +2049,47 @@ fn enclosing_top_block<'f>(
     owner
 }
 
+/// The full descent result — ONE governing model or an AMBIGUOUS union's
+/// candidate set (RFC 0015 F4). The union-of-fields completion consumes this;
+/// everything else uses the single-model view below.
+fn find_candidates_at<'i, 'f>(
+    file: &'f File,
+    pos: Position,
+    index: &'i SchemaIndex,
+    line_index: &LineIndex,
+) -> Option<DescentTarget<'i, 'f>> {
+    let block = enclosing_top_block(file, pos, line_index)?;
+    let FieldTarget::Model(model) = index.resolve_ref(&block.keyword.name) else {
+        return None;
+    };
+    descend_to_cursor(model, &block.body, pos, index, line_index)
+}
+
+/// Single-model view of the descent, for consumers that need exactly one
+/// governing model (value-position lookups, tests). For an ambiguous body it
+/// yields the FIRST model candidate — the same deterministic first-declared
+/// order structural resolution uses, so legacy behavior is unchanged.
 fn find_model_body_at<'i, 'f>(
     file: &'f File,
     pos: Position,
     index: &'i SchemaIndex,
     line_index: &LineIndex,
 ) -> Option<(&'i ModelDef, &'f Body)> {
-    let block = enclosing_top_block(file, pos, line_index)?;
-    let FieldTarget::Model(model) = index.resolve_ref(&block.keyword.name) else {
-        return None;
-    };
-    descend_to_cursor(model, &block.body, pos, index, line_index)
+    match find_candidates_at(file, pos, index, line_index)? {
+        DescentTarget::One(model, body) => Some((model, body)),
+        DescentTarget::Ambiguous {
+            candidates, body, ..
+        } => candidates
+            .iter()
+            .find_map(|c| match c {
+                NameableVariant::Model(m) => Some(*m),
+                // Structural first-wins parity: a LEADING oneof candidate
+                // resolves through its discriminator (may be absent → try the
+                // next candidate), instead of being skipped entirely.
+                NameableVariant::OneOf(o) => resolve_oneof_variant(o, body, index),
+            })
+            .map(|m| (m, body)),
+    }
 }
 
 /// RFC 0007 arm-target completion: when `pos` sits inside a nested block whose
@@ -2123,22 +2164,91 @@ fn named_type_names(ty: &FieldType) -> Vec<String> {
 /// cursor is in and the model whose fields are valid there. Recurses through nested
 /// model-typed fields and list-of-model items. Returns `None` (no field suggestions) if the
 /// cursor is inside a sub-body that resolves to no concrete model.
+/// What the completion descent lands on: ONE governing model (the common
+/// case), or the candidate set of an AMBIGUOUS union body (RFC 0015 F4) —
+/// un-annotated same-class, or annotated with an unknown name (the limbo
+/// state) — plus the header ident (name + span) the auto-annotation edit
+/// targets.
+enum DescentTarget<'i, 'f> {
+    One(&'i ModelDef, &'f Body),
+    Ambiguous {
+        candidates: Vec<NameableVariant<'i>>,
+        body: &'f Body,
+        header: Option<(String, Span)>,
+    },
+}
+
+/// The union candidate set for an ambiguous body — the shared ORACLE for the
+/// D2 case, plus the LIMBO state (an annotation naming no variant: the
+/// validator rejects it with NML2051, so completion must not quietly resolve
+/// first-wins either — that is F4's shape surviving a typo).
+fn ambiguous_candidates<'i>(
+    index: &'i SchemaIndex,
+    variants: &[FieldType],
+    body: &Body,
+) -> Option<Vec<NameableVariant<'i>>> {
+    if let Some(c) = index.ambiguous_union_variants(variants, body) {
+        return Some(c);
+    }
+    if let Some(ann) = &body.type_annotation {
+        if index
+            .select_variant_by_type_name(variants, &ann.name)
+            .is_none()
+        {
+            let all: Vec<NameableVariant<'i>> = variants
+                .iter()
+                .filter_map(|v| match v {
+                    FieldType::ModelRef(name) => match index.resolve_ref(name) {
+                        FieldTarget::Model(m) => Some(NameableVariant::Model(m)),
+                        FieldTarget::OneOf(o) => Some(NameableVariant::OneOf(o)),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            if all.len() >= 2 {
+                return Some(all);
+            }
+        }
+    }
+    None
+}
+
 fn descend_to_cursor<'i, 'f>(
     model: &'i ModelDef,
     body: &'f Body,
     pos: Position,
     index: &'i SchemaIndex,
     line_index: &LineIndex,
-) -> Option<(&'i ModelDef, &'f Body)> {
-    for entry in &body.entries {
+) -> Option<DescentTarget<'i, 'f>> {
+    // Editor-grade containment (the same rule as top blocks and list items):
+    // a mid-typing line under a nested block — INCLUDING the just-typed EMPTY
+    // body, the union discovery moment — is often trimmed from the block's
+    // content span, so strict span containment would resolve to the parent
+    // exactly where completion matters most. Ownership: the last nested block
+    // starting before the cursor, bounded by the next sibling's start.
+    let mut owned: Option<&nml_core::ast::NestedBlock> = None;
+    for (i, entry) in body.entries.iter().enumerate() {
         let BodyEntryKind::NestedBlock(nested) = &entry.kind else {
             continue;
         };
         let range = span_to_range(entry.span, line_index);
-        // Cursor strictly inside this nested block's body (not on its `name:` header).
-        if pos.line <= range.start.line || pos.line > range.end.line {
+        if pos.line <= range.start.line {
             continue;
         }
+        let next_start = body
+            .entries
+            .get(i + 1)
+            .map(|e| span_to_range(e.span, line_index).start.line);
+        let bounded = match next_start {
+            Some(next) => pos.line < next,
+            None => true,
+        };
+        if bounded {
+            owned = Some(nested);
+        }
+    }
+    if let Some(nested) = owned {
         let field = model.fields.iter().find(|f| f.name == nested.name.name)?;
         return match index.resolve_field(field) {
             FieldTarget::Model(child) => {
@@ -2148,10 +2258,7 @@ fn descend_to_cursor<'i, 'f>(
             // the one owning the cursor, resolving the item's model PER ITEM
             // through the canonical body-aware resolver, so `[](modelA |
             // modelB)` items (annotated or shape-selected) complete their
-            // variant's fields exactly like `[]model` items. Editor-grade
-            // containment: a mid-typing line under the item is often trimmed
-            // from its span, so ownership is start-before-cursor bounded by
-            // the next sibling's start.
+            // variant's fields exactly like `[]model` items.
             FieldTarget::ListOf(_) | FieldTarget::SetOf(_) => {
                 let base = match &field.field_type {
                     FieldType::Modifier(inner) => inner.as_ref(),
@@ -2160,7 +2267,7 @@ fn descend_to_cursor<'i, 'f>(
                 let (FieldType::List(elem_ty) | FieldType::Set(elem_ty)) = base else {
                     return None;
                 };
-                let mut item_owner: Option<&Body> = None;
+                let mut item_owner: Option<&ListItem> = None;
                 for (i, e) in nested.body.entries.iter().enumerate() {
                     let BodyEntryKind::ListItem(item) = &e.kind else {
                         continue;
@@ -2179,12 +2286,28 @@ fn descend_to_cursor<'i, 'f>(
                         None => true,
                     };
                     if bounded {
-                        if let ListItemKind::Named { body, .. } = &item.kind {
-                            item_owner = Some(body);
-                        }
+                        item_owner = Some(item);
                     }
                 }
-                let item_body = item_owner?;
+                let item = item_owner?;
+                let ListItemKind::Named {
+                    name: item_name,
+                    body: item_body,
+                } = &item.kind
+                else {
+                    return None;
+                };
+                // The ELEMENT-level twin: an ambiguous item body gets the
+                // union-of-fields treatment, anchored at the ITEM name.
+                if let FieldType::Union(variants) = elem_ty.as_ref() {
+                    if let Some(candidates) = ambiguous_candidates(index, variants, item_body) {
+                        return Some(DescentTarget::Ambiguous {
+                            candidates,
+                            body: item_body,
+                            header: Some((item_name.name.clone(), item_name.span)),
+                        });
+                    }
+                }
                 let item_model = variant_model_for_body(index, elem_ty, item_body)?;
                 descend_to_cursor(item_model, item_body, pos, index, line_index)
             }
@@ -2194,10 +2317,20 @@ fn descend_to_cursor<'i, 'f>(
                 let variant = resolve_oneof_variant(oneof, &nested.body, index)?;
                 descend_to_cursor(variant, &nested.body, pos, index, line_index)
             }
-            // A union FIELD (`slot as modelB:` / shape-selected): resolve the
-            // variant body-aware and complete ITS fields — the field-level twin
-            // of the per-item rule above.
+            // A union FIELD: an AMBIGUOUS body (un-annotated same-class, or
+            // unknown-annotation limbo) surfaces its candidate set for the
+            // union-of-fields completion, anchored at the field header name;
+            // a resolved one descends into its variant.
             FieldTarget::Union => {
+                if let Some(variants) = field.field_type.union_variants() {
+                    if let Some(candidates) = ambiguous_candidates(index, variants, &nested.body) {
+                        return Some(DescentTarget::Ambiguous {
+                            candidates,
+                            body: &nested.body,
+                            header: Some((nested.name.name.clone(), nested.name.span)),
+                        });
+                    }
+                }
                 let child = variant_model_for_body(index, &field.field_type, &nested.body)?;
                 descend_to_cursor(child, &nested.body, pos, index, line_index)
             }
@@ -2205,13 +2338,182 @@ fn descend_to_cursor<'i, 'f>(
             _ => None,
         };
     }
-    Some((model, body))
+    Some(DescentTarget::One(model, body))
 }
 
 /// Resolve a `oneof` instance body to its variant model: read the discriminator value the
 /// body sets (or the schema default), match it to an arm, and resolve that variant. `None`
 /// when no discriminator is set/defaulted or it names no arm — an unresolved union, so no
 /// fields to offer.
+/// RFC 0015 F4 — the union-of-fields completion for an AMBIGUOUS union body
+/// (TypeScript-style discovery, plus one step further): every candidate
+/// variant's fields are offered with provenance; **tier 0** = fields unique to
+/// one variant (the discriminating picks, grouped by variant, required-first
+/// within it) — each carries an `additionalTextEdits` that inserts
+/// ` as <Variant>` at the header name, so choosing a discriminating field
+/// RESOLVES the ambiguity in the same gesture (the auto-import pattern); a
+/// `oneof` candidate contributes its discriminator (its fields are unknowable
+/// pre-discriminator). **Tier 1** = fields shared by several variants — merged
+/// provenance, NO auto-edit (not discriminating), and type scaffolding only
+/// when every declaring variant agrees on it.
+///
+/// EAGER-edit safety: the auto-annotation targets the header line, strictly
+/// ABOVE the cursor — typing at the cursor never shifts earlier offsets, so a
+/// cached completion list stays applicable (the invariant a resolve-based lazy
+/// scheme would otherwise exist for; asserted by test).
+/// One declaration of a field name across the candidate set: the candidate's
+/// index, and its `FieldDef` with its declaration index — `None` for a
+/// oneof's discriminator pseudo-field (which sorts first: it is the most
+/// discriminating pick a oneof candidate has).
+type FieldDecl<'a> = (usize, Option<(usize, &'a FieldDef)>);
+
+fn union_of_fields_completions(
+    index: &SchemaIndex,
+    candidates: &[NameableVariant<'_>],
+    body: &Body,
+    header: Option<&(String, Span)>,
+    line_index: &LineIndex,
+    label_details: bool,
+) -> Vec<CompletionItem> {
+    let present = present_field_names(body);
+    // (field name) -> its declarations across candidates. Insertion-ordered
+    // Vec for deterministic output + a HashMap index so recording stays
+    // linear in total field count (a Vec-scan per field would be quadratic).
+    let mut occurrences: Vec<(String, Vec<FieldDecl>)> = Vec::new();
+    let mut occ_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    fn record<'a>(
+        occurrences: &mut Vec<(String, Vec<FieldDecl<'a>>)>,
+        occ_index: &mut std::collections::HashMap<String, usize>,
+        name: &str,
+        decl: FieldDecl<'a>,
+    ) {
+        if let Some(&i) = occ_index.get(name) {
+            occurrences[i].1.push(decl);
+        } else {
+            occ_index.insert(name.to_string(), occurrences.len());
+            occurrences.push((name.to_string(), vec![decl]));
+        }
+    }
+    for (ci, cand) in candidates.iter().enumerate() {
+        match cand {
+            NameableVariant::Model(m) => {
+                for (fi, field) in m.fields.iter().enumerate() {
+                    record(
+                        &mut occurrences,
+                        &mut occ_index,
+                        &field.name,
+                        (ci, Some((fi, field))),
+                    );
+                }
+            }
+            NameableVariant::OneOf(o) => {
+                record(
+                    &mut occurrences,
+                    &mut occ_index,
+                    &o.discriminator,
+                    (ci, None),
+                );
+            }
+        }
+    }
+    let annotation_edit = |variant: &str| -> Option<Vec<TextEdit>> {
+        let (name, span) = header?;
+        // LIMBO: if the body already carries a (necessarily unknown, or we
+        // would not be ambiguous) annotation, the edit must REPLACE it — a
+        // name-token-only edit would produce `slot as modelA as nope:`.
+        let end = body
+            .type_annotation
+            .as_ref()
+            .map(|a| a.span.end.max(span.end))
+            .unwrap_or(span.end);
+        Some(vec![TextEdit {
+            range: line_index.range(Span::new(span.start, end)),
+            new_text: format!("{name} as {variant}"),
+        }])
+    };
+    let mut items = Vec::new();
+    for (fname, decls) in &occurrences {
+        if present.contains(fname) {
+            continue;
+        }
+        let unique = decls.len() == 1;
+        if unique {
+            let (ci, fd) = decls[0];
+            let variant = candidates[ci].name();
+            let announce = format!("adds `as {variant}`");
+            let (detail, docs, insert, in_group) = match fd {
+                Some((fi, field)) => (
+                    field_detail(field),
+                    field.doc.clone(),
+                    field_insert_text(index, field),
+                    field_sort_key(field, fi),
+                ),
+                // A oneof discriminator: scaffold the property form; it sorts
+                // FIRST in its group (the most discriminating pick).
+                None => (
+                    format!("discriminator of `{variant}`"),
+                    None,
+                    format!("{fname} = "),
+                    "0_0000".to_string(),
+                ),
+            };
+            items.push(CompletionItem {
+                label: fname.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                label_details: label_details.then(|| CompletionItemLabelDetails {
+                    detail: None,
+                    description: Some(format!("{variant} — {announce}")),
+                }),
+                detail: Some(if label_details {
+                    detail
+                } else {
+                    format!("{detail} — {variant} ({announce})")
+                }),
+                documentation: docs.map(Documentation::String),
+                // Tier 0: grouped by variant, required-first + declaration
+                // order WITHIN the group (the same key single-model field
+                // completion uses).
+                sort_text: Some(format!("0_{ci:03}_{in_group}")),
+                insert_text: Some(insert),
+                additional_text_edits: annotation_edit(variant),
+                ..Default::default()
+            });
+        } else {
+            let provenance: Vec<&str> =
+                decls.iter().map(|(ci, _)| candidates[*ci].name()).collect();
+            // Scaffolding only when every declaring variant agrees on the
+            // field's declared type; bare name otherwise (types may differ).
+            let fields: Vec<&FieldDef> = decls
+                .iter()
+                .filter_map(|(_, fd)| fd.map(|(_, f)| f))
+                .collect();
+            let agree = fields.len() == decls.len()
+                && fields
+                    .windows(2)
+                    .all(|w| w[0].field_type.to_string() == w[1].field_type.to_string());
+            let insert = if agree {
+                field_insert_text(index, fields[0])
+            } else {
+                fname.clone()
+            };
+            let detail = if agree {
+                format!("{} — {}", field_detail(fields[0]), provenance.join(" | "))
+            } else {
+                provenance.join(" | ")
+            };
+            items.push(CompletionItem {
+                label: fname.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some(detail),
+                sort_text: Some(format!("1_{fname}")),
+                insert_text: Some(insert),
+                ..Default::default()
+            });
+        }
+    }
+    items
+}
+
 /// The concrete MODEL a body resolves to under `ty` — through the canonical
 /// body-aware resolver, then through a `oneof` variant's discriminator when the
 /// resolution lands on a oneof. The one lookup all completion descents share,
@@ -2259,6 +2561,9 @@ fn present_field_names(body: &Body) -> HashSet<String> {
         .filter_map(|entry| match &entry.kind {
             BodyEntryKind::Property(prop) => Some(prop.name.name.clone()),
             BodyEntryKind::NestedBlock(nested) => Some(nested.name.name.clone()),
+            // A modifier entry SETS its field (`|vis = @admin`): without this,
+            // completion re-offers `vis` on a body that already authored it.
+            BodyEntryKind::Modifier(m) => Some(m.name.name.clone()),
             _ => None,
         })
         .collect()
@@ -2303,9 +2608,16 @@ fn field_sort_key(field: &FieldDef, idx: usize) -> String {
 /// `insert_text`: `<field> = ` for a scalar/leaf field, `<field>:` for a model/oneof/list/
 /// object field (which is authored as a block) — a blanket `= ` would be wrong for blocks.
 fn field_insert_text(index: &SchemaIndex, field: &FieldDef) -> String {
+    // A modifier-declared field is AUTHORED with its sigil (`|vis = …`) — a
+    // sigil-less insert would author an unknown PROPERTY, not the modifier.
+    let sigil = if matches!(field.field_type, FieldType::Modifier(_)) {
+        "|"
+    } else {
+        ""
+    };
     match index.resolve_field(field) {
-        FieldTarget::Leaf => format!("{} = ", field.name),
-        _ => format!("{}:", field.name),
+        FieldTarget::Leaf => format!("{sigil}{} = ", field.name),
+        _ => format!("{sigil}{}:", field.name),
     }
 }
 
@@ -2899,6 +3211,41 @@ impl NmlLanguageServer {
             Resolution::Unbound => serde_json::json!({ "bound": false, "notes": notes }),
         })
     }
+
+    /// `nml/explain { code } → { markdown } | null` (RFC 0010 tier 2): the
+    /// full error-index entry as a standalone markdown document, from the
+    /// same embedded index the CLI's `nml explain` renders — so the entry
+    /// always comes from the exact binary that emitted the diagnostic (no
+    /// version skew, offline always). Same wire conventions as
+    /// [`Self::schema_info`]: malformed params answer as data, an unknown
+    /// code is `null` (a lookup miss, not a fault). Case-normalized at this
+    /// boundary, like the CLI's.
+    pub async fn explain(&self, params: serde_json::Value) -> Result<serde_json::Value> {
+        let Some(code) = params.get("code").and_then(|c| c.as_str()) else {
+            return Ok(serde_json::json!({ "error": "missing or invalid 'code'" }));
+        };
+        Ok(
+            match nml_core::diagnostic::explain_document(&code.to_ascii_uppercase()) {
+                Some(markdown) => serde_json::json!({ "markdown": markdown }),
+                None => serde_json::Value::Null,
+            },
+        )
+    }
+
+    /// `nml/explainIndex {} → [{ code, summary }]` (RFC 0010 tier 2): every
+    /// diagnostic code with its one-line summary, in index order — the
+    /// discoverability surface behind the editor's explain-a-code palette.
+    /// Deliberately flat: band grouping would promote the allocation bands
+    /// into wire API, which they are documented not to be. Params are
+    /// accepted and ignored (tolerant of `{}`, `null`, or absent).
+    pub async fn explain_index(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+        Ok(serde_json::Value::Array(
+            nml_core::diagnostic::explain_index()
+                .into_iter()
+                .map(|(code, summary)| serde_json::json!({ "code": code, "summary": summary }))
+                .collect(),
+        ))
+    }
 }
 
 /// Compute the full new text of an **existing** `nml-project.nml` for a
@@ -2974,6 +3321,30 @@ impl LanguageServer for NmlLanguageServer {
             .unwrap_or(false);
         self.insert_replace_support
             .store(insert_replace, std::sync::atomic::Ordering::Relaxed);
+        let label_details = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|t| t.completion.as_ref())
+            .and_then(|c| c.completion_item.as_ref())
+            .and_then(|ci| ci.label_details_support)
+            .unwrap_or(false);
+        self.label_details_support
+            .store(label_details, std::sync::atomic::Ordering::Relaxed);
+        // RFC 0010 tier 2: the client may declare the command id it registered
+        // for opening full error explanations. Declared ⇒ diagnostics grow an
+        // "Explain NML0000" code action carrying that command; undeclared ⇒
+        // the action is never emitted (hover summaries and the CLI remain).
+        *self
+            .explain_command
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.get("explainCommand"))
+            .and_then(|c| c.as_str())
+            .filter(|c| !c.is_empty())
+            .map(str::to_string);
         let roots: Vec<Url> = params
             .workspace_folders
             .as_ref()
@@ -3562,24 +3933,49 @@ impl LanguageServer for NmlLanguageServer {
                     }
                     return Ok(Some(CompletionResponse::Array(items)));
                 }
-                if let Some((model, body)) = find_model_body_at(&file, pos, index, &line_index) {
-                    let present = present_field_names(body);
-                    for (idx, field) in model.fields.iter().enumerate() {
-                        if present.contains(&field.name) {
-                            continue;
+                match find_candidates_at(&file, pos, index, &line_index) {
+                    Some(DescentTarget::One(model, body)) => {
+                        let present = present_field_names(body);
+                        for (idx, field) in model.fields.iter().enumerate() {
+                            if present.contains(&field.name) {
+                                continue;
+                            }
+                            items.push(CompletionItem {
+                                label: field.name.clone(),
+                                kind: Some(CompletionItemKind::FIELD),
+                                detail: Some(field_detail(field)),
+                                // The schema author's leading comment block (RFC
+                                // 0004 §4.3) documents the field in the menu too.
+                                documentation: field.doc.clone().map(Documentation::String),
+                                sort_text: Some(field_sort_key(field, idx)),
+                                insert_text: Some(field_insert_text(index, field)),
+                                ..Default::default()
+                            });
                         }
-                        items.push(CompletionItem {
-                            label: field.name.clone(),
-                            kind: Some(CompletionItemKind::FIELD),
-                            detail: Some(field_detail(field)),
-                            // The schema author's leading comment block (RFC
-                            // 0004 §4.3) documents the field in the menu too.
-                            documentation: field.doc.clone().map(Documentation::String),
-                            sort_text: Some(field_sort_key(field, idx)),
-                            insert_text: Some(field_insert_text(index, field)),
-                            ..Default::default()
-                        });
                     }
+                    // RFC 0015 F4: an AMBIGUOUS union body — offer the UNION of
+                    // all candidates' fields (discover), and let a
+                    // variant-unique pick auto-annotate the header (resolve by
+                    // choice). The D2 quick-fixes remain the repair tier; the
+                    // validator stays the sole authority.
+                    Some(DescentTarget::Ambiguous {
+                        candidates,
+                        body,
+                        header,
+                    }) => {
+                        let label_details = self
+                            .label_details_support
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        items.extend(union_of_fields_completions(
+                            index,
+                            &candidates,
+                            body,
+                            header.as_ref(),
+                            &line_index,
+                            label_details,
+                        ));
+                    }
+                    None => {}
                 }
             }
         }
@@ -3737,38 +4133,58 @@ impl LanguageServer for NmlLanguageServer {
         // 1. Machine-applicable suggestions the validator derived — never
         //    re-derived, never parsed out of message text.
         for diag in &params.context.diagnostics {
-            let Some(suggestion) = diag
+            let Some(suggestions) = diag
                 .data
                 .as_ref()
-                .and_then(|d| d.get("suggestion"))
-                .and_then(|s| {
+                .and_then(|d| d.get("suggestions"))
+                .and_then(|s| s.as_array())
+            else {
+                continue;
+            };
+            // Parse first so the singleton-preferred gate counts only VALID
+            // entries (a malformed sibling must not suppress a legitimate
+            // singleton did-you-mean's preferred flag).
+            let parsed: Vec<(String, usize, usize, String)> = suggestions
+                .iter()
+                .filter_map(|s| {
                     Some((
                         s.get("replacement")?.as_str()?.to_string(),
                         s.get("start")?.as_u64()? as usize,
                         s.get("end")?.as_u64()? as usize,
+                        s.get("kind")?.as_str()?.to_string(),
                     ))
                 })
-            else {
-                continue;
-            };
-            let (replacement, start, end) = suggestion;
-            let edit = TextEdit {
-                range: line_index.range(nml_core::span::Span::new(start, end)),
-                new_text: replacement.clone(),
-            };
-            let mut changes = std::collections::HashMap::new();
-            changes.insert(uri.clone(), vec![edit]);
-            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                title: format!("Replace with \"{replacement}\""),
-                kind: Some(CodeActionKind::QUICKFIX),
-                diagnostics: Some(vec![diag.clone()]),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(changes),
+                .collect();
+            let total = parsed.len();
+            for (replacement, start, end, kind) in parsed {
+                let edit = TextEdit {
+                    range: line_index.range(nml_core::span::Span::new(start, end)),
+                    new_text: replacement.clone(),
+                };
+                let mut changes = std::collections::HashMap::new();
+                changes.insert(uri.clone(), vec![edit]);
+                // Titles derive from the suggestion KIND; `is_preferred` only
+                // for a SINGLETON did-you-mean — N mutually exclusive fixes
+                // must never let the editor auto-apply a guess (the exact
+                // ambiguity RFC 0015 D2 exists to forbid).
+                let title = if kind == "fix" {
+                    format!("Apply fix: `{replacement}`")
+                } else {
+                    format!("Replace with \"{replacement}\"")
+                };
+                let preferred = kind == "didYouMean" && total == 1;
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title,
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diag.clone()]),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
+                    is_preferred: preferred.then_some(true),
                     ..Default::default()
-                }),
-                is_preferred: Some(true),
-                ..Default::default()
-            }));
+                }));
+            }
         }
 
         // 2. Pin / opt-out on auto-associated documents. Structural CST
@@ -3802,6 +4218,46 @@ impl LanguageServer for NmlLanguageServer {
                         }
                     }
                 }
+            }
+        }
+
+        // 3. "Explain NML0000" (RFC 0010 tier 2) — negotiation-gated: emitted
+        //    only when the client declared its command id at initialize, so no
+        //    editor ever receives an action it cannot execute. Derived purely
+        //    from the round-tripped `context.diagnostics`: only OUR coded
+        //    diagnostics (`source == "nml"` — other extensions' diagnostics
+        //    share ranges and must never mint our actions), deduped by code,
+        //    after the real fixes (explanation is recourse, not resolution).
+        //    Kind stays empty: this fixes nothing, and a client filtering
+        //    `only: [quickfix]` must not receive it.
+        let explain_command = self
+            .explain_command
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(command) = explain_command {
+            let mut seen = std::collections::HashSet::new();
+            for diag in &params.context.diagnostics {
+                if diag.source.as_deref() != Some("nml") {
+                    continue;
+                }
+                let Some(NumberOrString::String(code)) = &diag.code else {
+                    continue;
+                };
+                if !seen.insert(code.clone()) {
+                    continue;
+                }
+                let title = format!("Explain {code}");
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: title.clone(),
+                    diagnostics: Some(vec![diag.clone()]),
+                    command: Some(Command {
+                        title,
+                        command: command.clone(),
+                        arguments: Some(vec![serde_json::Value::String(code.clone())]),
+                    }),
+                    ..Default::default()
+                }));
             }
         }
 
@@ -5499,6 +5955,194 @@ workflow VoiceAgent:
             .map(|f| f.name.as_str())
             .collect();
         assert_eq!(offered, vec!["temperature", "baseUrl"]);
+    }
+
+    /// Round-17 border pins: a modifier-declared field completes WITH its
+    /// sigil (`|vis = `), and a modifier entry already in the body excludes
+    /// its field from re-offering — in both the single-model and
+    /// union-of-fields paths.
+    #[test]
+    fn modifier_fields_complete_with_sigil_and_exclude_when_present() {
+        let idx = field_index(
+            "model modelA:\n    a string?\n    |vis role?\nmodel modelB:\n    b string?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        // Union path: body already sets |vis → excluded; a (unique) keeps
+        // sigil-less insert; vis would carry the sigil if offered elsewhere.
+        let source = "host H:\n    slot:\n        |vis = @admin\n        \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        let Some(DescentTarget::Ambiguous {
+            candidates,
+            body,
+            header,
+        }) = find_candidates_at(&file, Position::new(3, 8), &idx, &li)
+        else {
+            panic!("ambiguous")
+        };
+        let items =
+            union_of_fields_completions(&idx, &candidates, body, header.as_ref(), &li, false);
+        assert!(
+            !items.iter().any(|i| i.label == "vis"),
+            "a modifier-set field must not re-offer: {:?}",
+            items.iter().map(|i| i.label.clone()).collect::<Vec<_>>()
+        );
+        // Empty body: vis IS offered, with the sigil in its insert text.
+        let source2 = "host H:\n    slot:\n        \n";
+        let file2 = nml_core::cst::parse_best_effort(source2);
+        let li2 = LineIndex::new(source2);
+        let Some(DescentTarget::Ambiguous {
+            candidates,
+            body,
+            header,
+        }) = find_candidates_at(&file2, Position::new(2, 8), &idx, &li2)
+        else {
+            panic!("ambiguous")
+        };
+        let items =
+            union_of_fields_completions(&idx, &candidates, body, header.as_ref(), &li2, false);
+        let vis = items
+            .iter()
+            .find(|i| i.label == "vis")
+            .expect("vis offered");
+        assert_eq!(
+            vis.insert_text.as_deref(),
+            Some("|vis = "),
+            "modifier fields author WITH the sigil"
+        );
+    }
+
+    /// Round-16 pins (element twins of the round-15 fixes): the ELEMENT-level
+    /// limbo edit replaces the bad annotation, and the `label_details=true`
+    /// path announces the pending edit while `detail` stays the plain type.
+    #[test]
+    fn element_limbo_edit_and_label_details_path() {
+        let idx = field_index(
+            "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slots [](modelA | modelB)?\n",
+        );
+        let source = "host H:\n    slots:\n        - one as nope:\n            \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        let Some(DescentTarget::Ambiguous {
+            candidates,
+            body,
+            header,
+        }) = find_candidates_at(&file, Position::new(3, 12), &idx, &li)
+        else {
+            panic!("element limbo must be ambiguous")
+        };
+        let items =
+            union_of_fields_completions(&idx, &candidates, body, header.as_ref(), &li, false);
+        let a = items.iter().find(|i| i.label == "a").expect("a");
+        let edit = &a.additional_text_edits.as_ref().expect("edit")[0];
+        let line2 = "        - one as nope:";
+        let applied = format!(
+            "{}{}{}",
+            &line2[..edit.range.start.character as usize],
+            edit.new_text,
+            &line2[edit.range.end.character as usize..]
+        );
+        assert_eq!(applied, "        - one as modelA:");
+
+        let source2 = "host H:\n    slots:\n        - one:\n            \n";
+        let file2 = nml_core::cst::parse_best_effort(source2);
+        let li2 = LineIndex::new(source2);
+        let Some(DescentTarget::Ambiguous {
+            candidates,
+            body,
+            header,
+        }) = find_candidates_at(&file2, Position::new(3, 12), &idx, &li2)
+        else {
+            panic!("element body must be ambiguous")
+        };
+        let items =
+            union_of_fields_completions(&idx, &candidates, body, header.as_ref(), &li2, true);
+        let a = items.iter().find(|i| i.label == "a").expect("a");
+        assert_eq!(
+            a.label_details
+                .as_ref()
+                .and_then(|l| l.description.as_deref()),
+            Some("modelA — adds `as modelA`"),
+            "the pending edit is announced via labelDetails"
+        );
+        assert_eq!(
+            a.detail.as_deref(),
+            Some("string?"),
+            "detail stays the plain type when labelDetails carries the announcement"
+        );
+    }
+
+    /// Round-15 pins: (1) the LIMBO auto-annotation edit REPLACES the bad
+    /// annotation (name-token-only would yield `slot as modelA as nope:`);
+    /// (2) tier-0 sorts required-first within a variant group.
+    #[test]
+    fn limbo_auto_annotation_replaces_and_tier0_is_required_first() {
+        let idx = field_index(
+            "model modelA:\n    aopt string?\n    zreq string\nmodel modelB:\n    b string?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        let source = "host H:\n    slot as nope:\n        \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        let Some(DescentTarget::Ambiguous {
+            candidates,
+            body,
+            header,
+        }) = find_candidates_at(&file, Position::new(2, 8), &idx, &li)
+        else {
+            panic!("limbo must be ambiguous")
+        };
+        let items =
+            union_of_fields_completions(&idx, &candidates, body, header.as_ref(), &li, false);
+        // (1) the edit swallows ` as nope`: applying it to the header line
+        // yields exactly `    slot as modelA:`.
+        let a = items.iter().find(|i| i.label == "aopt").expect("aopt");
+        let edit = &a.additional_text_edits.as_ref().expect("edit")[0];
+        let line1 = "    slot as nope:";
+        let sc = edit.range.start.character as usize;
+        let ec = edit.range.end.character as usize;
+        assert_eq!(edit.range.start.line, 1);
+        let applied = format!("{}{}{}", &line1[..sc], edit.new_text, &line1[ec..]);
+        assert_eq!(
+            applied, "    slot as modelA:",
+            "the limbo edit must REPLACE the bad annotation"
+        );
+        // (2) required `zreq` sorts before optional `aopt` within modelA's group.
+        let z = items.iter().find(|i| i.label == "zreq").expect("zreq");
+        assert!(
+            z.sort_text.as_ref().unwrap() < a.sort_text.as_ref().unwrap(),
+            "required-first within the variant group: {:?} vs {:?}",
+            z.sort_text,
+            a.sort_text
+        );
+    }
+
+    /// F4 limbo: an UNKNOWN annotation (`as nope`) must not quietly resolve
+    /// first-wins for completion — the candidate set surfaces, same as the
+    /// un-annotated ambiguous case (the validator rejects with NML2051).
+    #[test]
+    fn unknown_annotation_body_surfaces_candidates_not_first_wins() {
+        let idx = field_index(
+            "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slot (modelA | modelB)?\n",
+        );
+        let source = "host H:\n    slot as nope:\n        \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        match find_candidates_at(&file, Position::new(2, 8), &idx, &li) {
+            Some(DescentTarget::Ambiguous {
+                candidates, header, ..
+            }) => {
+                let names: Vec<&str> = candidates.iter().map(|c| c.name()).collect();
+                assert_eq!(names, vec!["modelA", "modelB"]);
+                assert_eq!(header.map(|(n, _)| n), Some("slot".to_string()));
+            }
+            other => panic!(
+                "limbo must surface candidates, got {}",
+                match other {
+                    Some(DescentTarget::One(m, _)) => format!("One({})", m.name),
+                    None => "None".into(),
+                    _ => unreachable!(),
+                }
+            ),
+        }
     }
 
     /// Round-13 F2: a union variant that is a ONEOF (`(modelA | mail)`,

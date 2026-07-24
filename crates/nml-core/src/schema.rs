@@ -1482,7 +1482,7 @@ mod composition_tests {
         assert_eq!(codes_of(&errs), vec!["NML2020"]);
         let d = &errs[0];
         // The did-you-mean is machine-applicable at exactly the target token.
-        let s = d.suggestion.as_ref().expect("suggestion");
+        let s = d.suggestions.first().expect("suggestion");
         assert_eq!(s.replacement, "monitored");
         let span = d.span.expect("span");
         assert_eq!(&src[span.start..span.end], "monitred");

@@ -2,7 +2,7 @@
   "name": "nml-lang",
   "displayName": "NML Language Support",
   "description": "Syntax highlighting and language support for the NML configuration language",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publisher": "nudge",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -30,6 +30,11 @@
       {
         "command": "nml.restartServer",
         "title": "Restart Language Server",
+        "category": "NML"
+      },
+      {
+        "command": "nml.explain",
+        "title": "Explain a Diagnostic Code",
         "category": "NML"
       }
     ],

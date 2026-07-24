@@ -948,7 +948,7 @@ model denial:
             diags
                 .iter()
                 .any(|d| d.rendered_message().contains("did you mean \"Lax\"")
-                    && d.suggestion.is_some()),
+                    && !d.suggestions.is_empty()),
             "{diags:?}"
         );
         assert!(

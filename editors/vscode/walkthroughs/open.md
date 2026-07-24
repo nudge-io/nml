@@ -9,3 +9,9 @@ Open any `.nml` file. Look at the **status bar** (bottom-right):
 
 Diagnostics, completions, and hovers all come from that schema. Click the status
 item to restart the server.
+
+**When something is red:** hover the squiggle for the error's meaning, or use
+the 💡 code action **Explain NML0000** to open the full entry — examples and
+fix — beside your code. For a code you can't hover (CI output, a log), run
+**NML: Explain a Diagnostic Code** from the command palette and search by code
+or summary.

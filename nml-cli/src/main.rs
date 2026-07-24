@@ -117,6 +117,7 @@ COMMANDS:
                                     Parse + validate + schema check (CI-friendly);
                                     --strict makes unknown properties/keywords errors
     explain <code>                  Explain a diagnostic code (e.g. nml explain NML2007)
+    explain --list                  List every diagnostic code with its summary
     help                            Show this help message
     version                         Show version information"
     );
@@ -188,20 +189,32 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
 }
 
 /// `nml explain NML2007` — the embedded error index (offline; the same
-/// source the docs render). Coverage over every code is guaranteed by the
-/// index's bidirectional CI guard plus a unit test in `nml-core`.
+/// source the docs render, via the same `explain_document` composer the
+/// editor's `nml/explain` serves, so "the full entry" has exactly one shape).
+/// `--list` prints every code with its one-line summary (grep-able).
+/// Coverage over every code is guaranteed by the index's bidirectional CI
+/// guard plus a unit test in `nml-core`.
 fn cmd_explain(args: &[String]) -> Result<(), String> {
+    if let [flag] = args {
+        if flag == "--list" {
+            for (code, summary) in nml_core::diagnostic::explain_index() {
+                println!("{code}  {summary}");
+            }
+            return Ok(());
+        }
+    }
     let [code] = args else {
-        return Err("usage: nml explain <code>   (e.g. nml explain NML2007)".to_string());
+        return Err("usage: nml explain <code> | --list   (e.g. nml explain NML2007)".to_string());
     };
-    let normalized = code.to_ascii_uppercase();
-    match nml_core::diagnostic::explain(&normalized) {
-        Some(body) => {
-            println!("{normalized}\n\n{body}");
+    match nml_core::diagnostic::explain_document(&code.to_ascii_uppercase()) {
+        Some(document) => {
+            // The composed document is trim-ended (the sections are trimmed at
+            // the splitter); terminate the terminal line explicitly.
+            println!("{document}");
             Ok(())
         }
         None => Err(format!(
-            "no such diagnostic code: {code} (codes look like NML2007; see the error index)"
+            "no such diagnostic code: {code} (codes look like NML2007; see the error index, or `nml explain --list`)"
         )),
     }
 }

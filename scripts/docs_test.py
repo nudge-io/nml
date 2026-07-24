@@ -441,6 +441,32 @@ def check_error_index() -> list[tuple[str, str]]:
         failures.append((ERROR_INDEX, f"codes missing a section: {', '.join(undocumented)}"))
     if orphaned := sorted(documented - declared):
         failures.append((ERROR_INDEX, f"sections for undeclared codes: {', '.join(orphaned)}"))
+    failures.extend(check_index_relative_links(index_path))
+    return failures
+
+
+def check_index_relative_links(index_path) -> list[tuple[str, str]]:
+    """Every relative link in the error index must resolve from the index's
+    own directory. The index has already moved home once (docs/errors/ →
+    crates/nml-core/assets/), stranding links written for the old home; this
+    guard makes that class of rot a visible failure. Fenced lines are code
+    content, not prose — skipped, matching the `explain_document` composer."""
+    failures = []
+    in_fence = False
+    for number, line in enumerate(index_path.read_text(encoding="utf-8").splitlines(), 1):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        for target in re.findall(r"\]\(([^)]+)\)", line):
+            if target.startswith(("http://", "https://", "#")):
+                continue
+            resolved = (index_path.parent / target.split("#")[0]).resolve()
+            if not resolved.is_file():
+                failures.append(
+                    (ERROR_INDEX, f"line {number}: relative link does not resolve: {target}")
+                )
     return failures
 
 

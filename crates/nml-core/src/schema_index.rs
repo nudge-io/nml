@@ -537,25 +537,26 @@ mod tests {
     /// model-only candidate type would silently drop.
     #[test]
     fn ambiguity_oracle_matches_the_d2_rule() {
-        let mut oneofs = Vec::new();
-        oneofs.push(crate::model::OneOfDef {
-            name: "mailA".into(),
-            discriminator: "kind".into(),
-            discriminator_type: None,
-            default_discriminator: None,
-            variants: vec![("log".into(), "modelA".into())],
-            source: None,
-            span: crate::span::Span { start: 0, end: 0 },
-        });
-        oneofs.push(crate::model::OneOfDef {
-            name: "mailB".into(),
-            discriminator: "kind2".into(),
-            discriminator_type: None,
-            default_discriminator: None,
-            variants: vec![("log".into(), "modelB".into())],
-            source: None,
-            span: crate::span::Span { start: 0, end: 0 },
-        });
+        let oneofs = vec![
+            crate::model::OneOfDef {
+                name: "mailA".into(),
+                discriminator: "kind".into(),
+                discriminator_type: None,
+                default_discriminator: None,
+                variants: vec![("log".into(), "modelA".into())],
+                source: None,
+                span: crate::span::Span { start: 0, end: 0 },
+            },
+            crate::model::OneOfDef {
+                name: "mailB".into(),
+                discriminator: "kind2".into(),
+                discriminator_type: None,
+                default_discriminator: None,
+                variants: vec![("log".into(), "modelB".into())],
+                source: None,
+                span: crate::span::Span { start: 0, end: 0 },
+            },
+        ];
         let idx = SchemaIndex::build(
             vec![model("modelA", vec![]), model("modelB", vec![])],
             vec![],

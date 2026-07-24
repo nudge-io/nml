@@ -142,11 +142,18 @@ impl Harness {
 
     /// `initialize` (rootUri = `root`) followed by `initialized`.
     async fn initialize(&mut self, root: &Path) {
-        self.request(
-            "initialize",
-            json!({ "capabilities": {}, "rootUri": file_uri(root) }),
-        )
-        .await;
+        self.initialize_with_options(root, Value::Null).await;
+    }
+
+    /// [`Self::initialize`] with client `initializationOptions` — how a test
+    /// declares client-side registrations (e.g. RFC 0010 tier 2's
+    /// `explainCommand`) exactly as a real client would.
+    async fn initialize_with_options(&mut self, root: &Path, options: Value) {
+        let mut params = json!({ "capabilities": {}, "rootUri": file_uri(root) });
+        if !options.is_null() {
+            params["initializationOptions"] = options;
+        }
+        self.request("initialize", params).await;
         self.notify("initialized", json!({})).await;
     }
 
@@ -423,7 +430,7 @@ async fn declared_model_file_gets_directive_did_you_mean() {
     let message = dym["message"].as_str().expect("message");
     assert!(message.contains("did you mean \"#live\""), "{message}");
     assert_eq!(
-        dym["data"]["suggestion"]["replacement"],
+        dym["data"]["suggestions"][0]["replacement"],
         json!("#live"),
         "structured suggestion must ride Diagnostic.data: {dym}"
     );
@@ -511,6 +518,147 @@ async fn as_position_completion_works_on_list_elements_end_to_end() {
         ["modelA", "modelB"],
         "the enclosing list field's variants: {result}"
     );
+}
+
+/// RFC 0015 F4 — the union-of-fields completion at the EMPTY ambiguous body
+/// (the just-typed discovery moment, previously resolving to the parent):
+/// both variants' unique fields offered with provenance, each carrying the
+/// auto-annotation `additionalTextEdits` on the header (strictly ABOVE the
+/// cursor — the eager-safety invariant), shared fields merged with no edit.
+#[tokio::test]
+async fn ambiguous_union_body_offers_union_of_fields_with_auto_annotation() {
+    let base = temp_dir("f4-union-of-fields");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let ws = base.join("ws");
+    fs::create_dir_all(&ws).expect("create workspace");
+    let model = ws.join("union.model.nml");
+    let model_text = "model modelA:\n    a string?\n    shared string?\nmodel modelB:\n    b string?\n    shared string?\nmodel host:\n    slot (modelA | modelB)?\n";
+    fs::write(&model, model_text).expect("write model");
+    let config = ws.join("app.nml");
+    // The discovery moment: `slot:` just typed, cursor on the fresh blank line.
+    let config_text = "host H:\n    slot:\n        \n";
+    fs::write(&config, config_text).expect("write config");
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness.open(&model, model_text).await;
+    harness.open(&config, config_text).await;
+    let result = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": file_uri(&config) },
+                "position": { "line": 2, "character": 8 },
+            }),
+        )
+        .await;
+    let items = result.as_array().expect("completion item array");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(
+        labels.contains(&"a") && labels.contains(&"b") && labels.contains(&"shared"),
+        "the UNION of both variants' fields: {labels:?}"
+    );
+    // Tier 0: `a` is unique to modelA → provenance + the header auto-edit.
+    let a = items.iter().find(|i| i["label"] == json!("a")).unwrap();
+    assert!(
+        a["detail"].as_str().unwrap().contains("modelA"),
+        "provenance: {a}"
+    );
+    assert!(
+        a["sortText"].as_str().unwrap().starts_with("0_"),
+        "discriminating fields rank first: {a}"
+    );
+    let edit = &a["additionalTextEdits"][0];
+    assert_eq!(
+        edit["newText"],
+        json!("slot as modelA"),
+        "picking a discriminating field auto-annotates: {a}"
+    );
+    // Eager-safety invariant: the edit is strictly ABOVE the cursor line.
+    assert!(
+        edit["range"]["end"]["line"].as_u64().unwrap() < 2,
+        "the auto-edit must lie above the cursor: {a}"
+    );
+    // Tier 1: `shared` is in both → merged provenance, NO auto-edit.
+    let shared = items
+        .iter()
+        .find(|i| i["label"] == json!("shared"))
+        .unwrap();
+    assert!(
+        shared["sortText"].as_str().unwrap().starts_with("1_"),
+        "shared fields rank after: {shared}"
+    );
+    assert!(
+        shared["additionalTextEdits"].is_null(),
+        "a shared field must not auto-annotate: {shared}"
+    );
+    assert!(
+        shared["detail"]
+            .as_str()
+            .unwrap()
+            .contains("modelA | modelB"),
+        "merged provenance: {shared}"
+    );
+}
+
+/// RFC 0015 F4 — D2's repair tier: the code-action request surfaces one
+/// "Apply fix" action per candidate, and NEITHER is preferred (an editor
+/// auto-applying one would resurrect the guess D2 forbids).
+#[tokio::test]
+async fn d2_offers_two_annotate_actions_neither_preferred() {
+    let base = temp_dir("f4-d2-actions");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let ws = base.join("ws");
+    fs::create_dir_all(&ws).expect("create workspace");
+    let model = ws.join("union.model.nml");
+    let model_text = "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slot (modelA | modelB)?\n";
+    fs::write(&model, model_text).expect("write model");
+    let config = ws.join("app.nml");
+    let config_text = "host H:\n    slot:\n        a = \"x\"\n";
+    fs::write(&config, config_text).expect("write config");
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness.open(&model, model_text).await;
+    let report = harness.open(&config, config_text).await;
+    let diags = report["diagnostics"].as_array().expect("diagnostics");
+    let d2 = diags
+        .iter()
+        .find(|d| d["code"] == json!("NML2052"))
+        .expect("D2 diagnostic");
+    let actions = harness
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": file_uri(&config) },
+                "range": d2["range"],
+                "context": { "diagnostics": [d2] },
+            }),
+        )
+        .await;
+    let actions = actions.as_array().expect("actions");
+    let titles: Vec<&str> = actions
+        .iter()
+        .filter_map(|a| a["title"].as_str())
+        .filter(|t| t.starts_with("Apply fix"))
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["Apply fix: `slot as modelA`", "Apply fix: `slot as modelB`"],
+        "one mutually exclusive fix per candidate: {actions:?}"
+    );
+    for a in actions.iter().filter(|a| {
+        a["title"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("Apply fix"))
+    }) {
+        assert!(
+            a["isPreferred"].is_null(),
+            "alternatives must never be preferred: {a}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1032,4 +1180,127 @@ async fn keyword_completion_offers_schema_models() {
         .find(|i| i["label"] == json!("cache"))
         .unwrap_or_else(|| panic!("schema keyword offered: {result}"));
     assert_eq!(cache["detail"], json!("schema"), "{cache}");
+}
+
+/// RFC 0010 tier 2: `nml/explain` serves the full index entry from the
+/// running binary — canonical heading, case-normalized lookup, `null` for
+/// unknowns, error-as-data for malformed params — and `nml/explainIndex`
+/// lists every code with its summary. The wire shapes are never-migrate;
+/// this test IS the contract.
+#[tokio::test]
+async fn explain_methods_serve_entries_and_index_over_the_wire() {
+    let base = temp_dir("explain-methods");
+    let ws = demo_workspace(&base);
+    let mut harness = Harness::new(Store::at(base.join("store")));
+    harness.initialize(&ws).await;
+
+    // Case-normalized full entry, heading from the MATCHED head.
+    let entry = harness
+        .request("nml/explain", json!({ "code": "nml0013" }))
+        .await;
+    let markdown = entry["markdown"].as_str().expect("markdown field");
+    assert!(markdown.starts_with("# NML0013\n\n"), "{markdown}");
+    assert!(markdown.contains("Invalid number"), "{markdown}");
+
+    // Unknown and hostile codes are null — a lookup miss, not a fault.
+    for bogus in ["NML9999", "../../etc/passwd", "NML0013 OR 1=1"] {
+        let miss = harness
+            .request("nml/explain", json!({ "code": bogus }))
+            .await;
+        assert_eq!(miss, Value::Null, "{bogus}");
+    }
+    // Malformed params answer as data (schemaInfo's convention).
+    let bad = harness.request("nml/explain", json!({})).await;
+    assert!(bad["error"].as_str().is_some(), "{bad}");
+
+    // The index: every entry has a code and a non-empty summary; NML0013 is
+    // present; tolerant of empty params.
+    let index = harness.request("nml/explainIndex", json!({})).await;
+    let entries = index.as_array().expect("index array");
+    assert!(
+        entries.len() > 50,
+        "expected the full code space, got {}",
+        entries.len()
+    );
+    let invalid_number = entries
+        .iter()
+        .find(|e| e["code"] == json!("NML0013"))
+        .unwrap_or_else(|| panic!("NML0013 missing from index: {index}"));
+    assert!(
+        invalid_number["summary"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "{invalid_number}"
+    );
+}
+
+/// RFC 0010 tier 2: the "Explain NML0000" code action is NEGOTIATION-GATED —
+/// emitted (deduped, command id echoed, code as argument) only when the
+/// client declared `initializationOptions.explainCommand`; a client that
+/// declared nothing never receives an action it cannot execute.
+#[tokio::test]
+async fn explain_code_action_is_negotiation_gated() {
+    let base = temp_dir("explain-action");
+    let ws = demo_workspace(&base);
+    let app = ws.join("app.nml");
+    // Two NML0013 diagnostics — the action must dedup to one.
+    let bad = "service Api:\n    x = 1.2.3\n    y = 4.5.6\n";
+    fs::write(&app, bad).expect("write app");
+
+    for declared in [true, false] {
+        let mut harness = Harness::new(Store::at(base.join(format!("store-{declared}"))));
+        if declared {
+            harness
+                .initialize_with_options(&ws, json!({ "explainCommand": "nml.explain" }))
+                .await;
+        } else {
+            harness.initialize(&ws).await;
+        }
+        let report = harness.open(&app, bad).await;
+        let diags = report["diagnostics"].as_array().expect("diagnostics");
+        assert!(!diags.is_empty(), "fixture must produce diagnostics");
+
+        // Exactly what a client does: round-trip the pulled diagnostics as
+        // the code-action context.
+        let result = harness
+            .request(
+                "textDocument/codeAction",
+                json!({
+                    "textDocument": { "uri": file_uri(&app) },
+                    "range": diags[0]["range"],
+                    "context": { "diagnostics": diags },
+                }),
+            )
+            .await;
+        let actions: Vec<Value> = result.as_array().cloned().unwrap_or_default();
+        let explains: Vec<&Value> = actions
+            .iter()
+            .filter(|a| {
+                a["title"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("Explain "))
+            })
+            .collect();
+        if declared {
+            assert_eq!(explains.len(), 1, "deduped by code: {result}");
+            let action = explains[0];
+            assert_eq!(action["title"], json!("Explain NML0013"), "{action}");
+            assert_eq!(
+                action["command"]["command"],
+                json!("nml.explain"),
+                "{action}"
+            );
+            assert_eq!(
+                action["command"]["arguments"],
+                json!(["NML0013"]),
+                "{action}"
+            );
+            assert!(action.get("kind").is_none(), "kind stays empty: {action}");
+        } else {
+            assert!(
+                explains.is_empty(),
+                "undeclared client got an action: {result}"
+            );
+        }
+    }
 }

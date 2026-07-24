@@ -4,6 +4,26 @@
 
 ### Added
 
+- **Full error explanations in-editor (RFC 0010 tier 2)**: every coded
+  diagnostic offers an **Explain NML0000** code action that renders the
+  complete error-index entry — meaning, runnable examples, the fix — as
+  a markdown preview beside the code, and the **NML: Explain a
+  Diagnostic Code** palette command opens the same entries for codes you
+  can't hover (CI output, a teammate's log), listing all of them
+  searchable by code or summary. One composer
+  (`nml_core::diagnostic::explain_document`) shapes the entry for both
+  the editor and `nml explain`; explanations always come from the exact
+  server binary that produced the diagnostic, so error and explanation
+  can never version-skew. The action is negotiation-gated
+  (`initializationOptions.explainCommand`) — LSP clients that registered
+  no command never receive an unexecutable action; the content rides two
+  new custom methods, `nml/explain` and `nml/explainIndex`. Also:
+  `nml explain --list` (every code with its summary, grep-able), the
+  index's own relative links repaired after its move to
+  `crates/nml-core/assets/` (now guarded by a docs-test link resolver),
+  and a tripwire guaranteeing no fenced line can truncate an index
+  section.
+
 - **In-editor error explanations (RFC 0010 tier 1)**: hovering a
   diagnostic shows its error-index **summary** — the meaning paragraph,
   never the examples — after any regular hover content (or alone, on the

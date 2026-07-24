@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
 use nml_core::schema::{report_graph_cycles, ExtractedSchema};
-use nml_core::schema_index::{FieldTarget, SchemaIndex};
+use nml_core::schema_index::{BodyShape, FieldTarget, SchemaIndex};
 use nml_core::span::Span;
 use nml_core::types::{PrimitiveType, Value};
 
@@ -1064,6 +1064,7 @@ impl SchemaValidator {
         variants: &[FieldType],
         body: &Body,
         union_span: Span,
+        fix_anchor: Option<(&str, Span)>,
         diags: &mut Vec<Diagnostic>,
     ) -> bool {
         if let Some(ann) = &body.type_annotation {
@@ -1086,14 +1087,7 @@ impl SchemaValidator {
             return true;
         }
         // No annotation → the body's shape must select a variant.
-        let has_arms = body
-            .entries
-            .iter()
-            .any(|e| matches!(e.kind, BodyEntryKind::Arm(_)));
-        let has_list = body
-            .entries
-            .iter()
-            .any(|e| matches!(e.kind, BodyEntryKind::ListItem(_)));
+        let shape = BodyShape::of(body);
         // A list/arm shape only *disambiguates* if the union actually has that
         // variant. If it does not, the shape matches NO variant: it resolves to
         // `Leaf` and would be validated as nothing (silently dropped). Flag it as
@@ -1101,8 +1095,12 @@ impl SchemaValidator {
         // case, closing the model-only-union hole.
         let has_arms_variant = variants.iter().any(|v| matches!(v, FieldType::Arms { .. }));
         let has_list_variant = variants.iter().any(|v| matches!(v, FieldType::List(_)));
-        if (has_arms && !has_arms_variant) || (has_list && !has_list_variant) {
-            let shape = if has_arms { "routing arms" } else { "a list" };
+        if (shape.has_arms && !has_arms_variant) || (shape.has_list_items && !has_list_variant) {
+            let shape_name = if shape.has_arms {
+                "routing arms"
+            } else {
+                "a list"
+            };
             let nameable = self.index.nameable_variant_names(variants);
             let expected = if nameable.is_empty() {
                 String::new()
@@ -1111,29 +1109,47 @@ impl SchemaValidator {
             };
             diags.push(
                 Diagnostic::error(format!(
-                    "{shape} is not a valid instance of this union{expected}"
+                    "{shape_name} is not a valid instance of this union{expected}"
                 ))
                 .with_code(codes::UNION_TYPE_MISMATCH)
                 .with_span(union_span),
             );
             return false;
         }
-        // A keyed / empty body lands among the model variants by first-wins; with
-        // ≥2 nameable variants that is an ambiguous guess → D2.
-        if !has_arms && !has_list {
-            let nameable = self.index.nameable_variant_names(variants);
-            if nameable.len() >= 2 {
-                diags.push(
-                    Diagnostic::error(format!(
-                        "ambiguous union instance: shape cannot choose between {}; \
-                         add an explicit type with `as <variant>`",
-                        nameable.join(" | ")
-                    ))
-                    .with_code(codes::AMBIGUOUS_UNION_INSTANCE)
-                    .with_span(union_span),
-                );
-                return false;
+        // D2, via the shared AMBIGUITY ORACLE — the same rule the LSP's
+        // union-of-fields completion consumes, so editor and validator can
+        // never disagree about what is ambiguous.
+        if let Some(candidates) = self.index.ambiguous_union_variants(variants, body) {
+            let names: Vec<&str> = candidates.iter().map(|c| c.name()).collect();
+            let mut diag = Diagnostic::error(if fix_anchor.is_some() {
+                format!(
+                    "ambiguous union instance: shape cannot choose between {}; \
+                     add an explicit type with `as <variant>`",
+                    names.join(" | ")
+                )
+            } else {
+                // Reference / scalar-shorthand / role items cannot carry `as`
+                // in place — the fix is the block form.
+                format!(
+                    "ambiguous union instance: shape cannot choose between {}; \
+                     write the item in block form `- <name> as <variant>:`",
+                    names.join(" | ")
+                )
+            })
+            .with_code(codes::AMBIGUOUS_UNION_INSTANCE)
+            .with_span(union_span);
+            // One mutually exclusive Fix per candidate, ONLY where the
+            // annotation is grammatical and meaning-preserving (a field header
+            // or a Named item — an anchored name token to extend). Capped: an
+            // adversarial 1000-variant union must not mint 1000 actions.
+            const MAX_FIX_ALTERNATIVES: usize = 8;
+            if let Some((anchor_name, anchor_span)) = fix_anchor {
+                for c in candidates.iter().take(MAX_FIX_ALTERNATIVES) {
+                    diag = diag.with_fix(format!("{anchor_name} as {}", c.name()), anchor_span);
+                }
             }
+            diags.push(diag);
+            return false;
         }
         true
     }
@@ -1150,7 +1166,16 @@ impl SchemaValidator {
         diags: &mut Vec<Diagnostic>,
     ) -> FieldTarget<'a> {
         if let FieldType::Union(variants) = inner {
-            if !self.check_union_annotation(variants, probe, item.span, diags) {
+            // A Named item anchors the diagnostic AND the fix at its NAME token
+            // (`- one` of `- one as modelB:`); reference/shorthand/role items
+            // cannot carry `as` in place, so they get no fix anchor and the
+            // message steers to the block form.
+            let anchor = match &item.kind {
+                ListItemKind::Named { name, .. } => Some((name.name.as_str(), name.span)),
+                _ => None,
+            };
+            let span = anchor.map(|(_, s)| s).unwrap_or(item.span);
+            if !self.check_union_annotation(variants, probe, span, anchor, diags) {
                 // A union-level error was reported; `Leaf` skips instance
                 // validation quietly instead of validating a guessed variant.
                 return FieldTarget::Leaf;
@@ -1411,8 +1436,13 @@ impl SchemaValidator {
                         // the way the raw `match` did. Everything else flags a
                         // stray annotation and dispatches as before.
                         if let Some(variants) = field_def.field_type.union_variants() {
-                            if self.check_union_annotation(variants, &nb.body, nb.name.span, diags)
-                            {
+                            if self.check_union_annotation(
+                                variants,
+                                &nb.body,
+                                nb.name.span,
+                                Some((nb.name.name.as_str(), nb.name.span)),
+                                diags,
+                            ) {
                                 let target = self
                                     .index
                                     .resolve_type_in_body(&field_def.field_type, &nb.body);
@@ -1780,9 +1810,15 @@ impl SchemaValidator {
                         // otherwise — never silently carry one. Body-content
                         // validation of modifier items stays as-is (pre-existing
                         // leniency, out of this RFC's scope).
-                        ListItemKind::Named { body, .. } => {
+                        ListItemKind::Named { name, body } => {
                             if let Some(variants) = inner.union_variants() {
-                                self.check_union_annotation(variants, body, item.span, diags);
+                                self.check_union_annotation(
+                                    variants,
+                                    body,
+                                    name.span,
+                                    Some((name.name.as_str(), name.span)),
+                                    diags,
+                                );
                             } else {
                                 self.flag_stray_annotation(body, diags);
                             }
@@ -2575,7 +2611,7 @@ mod tests {
             .iter()
             .find(|x| x.rendered_message().contains("did you mean \"Lax\""))
             .expect("did-you-mean diagnostic");
-        let sug = diag.suggestion.as_ref().expect("structured suggestion");
+        let sug = diag.suggestions.first().expect("structured suggestion");
         assert_eq!(sug.replacement, "Lax");
         let mut fixed = source.to_string();
         fixed.replace_range(sug.span.start..sug.span.end, &sug.replacement);
@@ -2963,7 +2999,7 @@ mod tests {
             .iter()
             .find(|d| d.message.contains("unknown property 'provder'"))
             .expect("unknown property flagged");
-        let sug = diag.suggestion.as_ref().expect("field suggestion");
+        let sug = diag.suggestions.first().expect("field suggestion");
         assert_eq!(sug.replacement, "provider");
         // Applying the fix must produce the declared field name exactly.
         let fixed = format!(
@@ -2991,7 +3027,7 @@ mod tests {
             .find(|d| d.message.contains("unknown modifier '|alow'"))
             .expect("unknown modifier flagged");
         assert_eq!(
-            diag.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            diag.suggestions.first().map(|s| s.replacement.as_str()),
             Some("allow")
         );
     }
@@ -3007,7 +3043,7 @@ mod tests {
             .find(|d| d.message.contains("unknown kind \"postmrak\""))
             .expect("unknown discriminator flagged");
         // Transposition → suggested; span excludes the quotes.
-        let sug = diag.suggestion.as_ref().expect("discriminator suggestion");
+        let sug = diag.suggestions.first().expect("discriminator suggestion");
         assert_eq!(sug.replacement, "postmark");
         assert_eq!(sug.span.end - sug.span.start, "postmrak".len());
     }
@@ -3022,7 +3058,7 @@ mod tests {
             .find(|d| d.message.contains("block keyword 'servce'"))
             .expect("strict unknown keyword flagged");
         assert_eq!(
-            diag.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            diag.suggestions.first().map(|s| s.replacement.as_str()),
             Some("service")
         );
     }
@@ -3041,7 +3077,7 @@ mod tests {
             .find(|d| d.message.contains("block keyword 'emial'"))
             .expect("strict unknown keyword flagged");
         assert_eq!(
-            diag.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            diag.suggestions.first().map(|s| s.replacement.as_str()),
             Some("email")
         );
     }
@@ -3057,7 +3093,7 @@ mod tests {
             .find(|d| d.message.contains("array item keyword 'resorce'"))
             .expect("strict unknown array keyword flagged");
         assert_eq!(
-            diag.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            diag.suggestions.first().map(|s| s.replacement.as_str()),
             Some("resource")
         );
     }
@@ -3556,7 +3592,7 @@ workflow W:
             .find(|d| d.code == Some(codes::UNKNOWN_UNION_VARIANT))
             .expect("unknown-variant error");
         assert!(
-            d.suggestion.is_some(),
+            !d.suggestions.is_empty(),
             "unknown variant must carry a machine-applicable did-you-mean: {d:?}"
         );
         // No noise: after the union-level error, the body must NOT be validated
@@ -3777,6 +3813,68 @@ workflow W:
         );
     }
 
+    /// F4: D2 carries one mutually exclusive `Fix` per candidate — anchored at
+    /// the NAME token (field header / Named item) — and NO fixes where `as`
+    /// cannot be written in place (reference items steer to the block form).
+    #[test]
+    fn d2_carries_anchored_fix_alternatives() {
+        use nml_core::diagnostic::SuggestionKind;
+        // Field header: two fixes replacing the name token.
+        let diags = diags_for(SAME_CLASS_SCHEMA, "host H:\n    slot:\n        a = \"x\"\n");
+        let d2 = diags
+            .iter()
+            .find(|d| d.code == Some(codes::AMBIGUOUS_UNION_INSTANCE))
+            .expect("D2");
+        let fixes: Vec<&str> = d2
+            .suggestions
+            .iter()
+            .filter(|s| s.kind == SuggestionKind::Fix)
+            .map(|s| s.replacement.as_str())
+            .collect();
+        assert_eq!(
+            fixes,
+            vec!["slot as modelA", "slot as modelB"],
+            "one fix per candidate, name-anchored: {d2:?}"
+        );
+
+        // Named element: fixes anchored at the ITEM name token.
+        let diags = diags_for(
+            SAME_CLASS_SCHEMA,
+            "host H:\n    slots:\n        - one:\n            a = \"x\"\n",
+        );
+        let d2 = diags
+            .iter()
+            .find(|d| d.code == Some(codes::AMBIGUOUS_UNION_INSTANCE))
+            .expect("element D2");
+        let fixes: Vec<&str> = d2
+            .suggestions
+            .iter()
+            .filter(|s| s.kind == SuggestionKind::Fix)
+            .map(|s| s.replacement.as_str())
+            .collect();
+        assert_eq!(fixes, vec!["one as modelA", "one as modelB"]);
+
+        // Reference item: D2 still fires, but NO fixes (unwritable in place)
+        // and the message steers to the block form.
+        let diags = diags_for(
+            SAME_CLASS_SCHEMA,
+            "host H:\n    slots:\n        - SomeRef\n",
+        );
+        let d2 = diags
+            .iter()
+            .find(|d| d.code == Some(codes::AMBIGUOUS_UNION_INSTANCE))
+            .expect("reference-item D2");
+        assert!(
+            d2.suggestions.is_empty(),
+            "no in-place fix is expressible for a reference item: {d2:?}"
+        );
+        assert!(
+            d2.message.contains("block form"),
+            "the message steers to the block form: {}",
+            d2.message
+        );
+    }
+
     #[test]
     fn disjoint_union_never_triggers_d2() {
         // The shipping `(step | []step)` shape has ONE nameable variant, so a
@@ -3928,7 +4026,7 @@ workflow W:
             diags
                 .iter()
                 .any(|d| d.message.contains("roles are references, not strings")
-                    && d.suggestion.as_ref().map(|s| s.replacement.as_str()) == Some("@public")),
+                    && d.suggestions.first().map(|s| s.replacement.as_str()) == Some("@public")),
             "should suggest removing quotes for role field; diags: {:?}",
             diags
         );
@@ -3946,7 +4044,7 @@ workflow W:
             diags
                 .iter()
                 .any(|d| d.message.contains("roles are references, not strings")
-                    && d.suggestion.as_ref().map(|s| s.replacement.as_str()) == Some("@admin")),
+                    && d.suggestions.first().map(|s| s.replacement.as_str()) == Some("@admin")),
             "should suggest adding @ prefix for role field; diags: {:?}",
             diags
         );
@@ -3983,7 +4081,7 @@ workflow W:
             diags
                 .iter()
                 .any(|d| d.message.contains("roles are references, not strings")
-                    && d.suggestion.as_ref().map(|s| s.replacement.as_str()) == Some("@admin")),
+                    && d.suggestions.first().map(|s| s.replacement.as_str()) == Some("@admin")),
             "should warn about quoted string in role array; diags: {:?}",
             diags
         );
@@ -5519,7 +5617,7 @@ mod trait_instance_tests {
             .iter()
             .find(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2004"))
             .expect("strict unknown-keyword diagnostic");
-        assert!(d.suggestion.is_none(), "{d:?}");
+        assert!(d.suggestions.is_empty(), "{d:?}");
     }
 
     #[test]
@@ -5715,7 +5813,7 @@ mod shared_property_validation_tests {
             .expect("flagged at the shared token");
         assert_eq!(hit.severity, Severity::Warning);
         assert_eq!(
-            hit.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            hit.suggestions.first().map(|s| s.replacement.as_str()),
             Some("timeout")
         );
         assert!(check(src, true).iter().any(
@@ -5759,7 +5857,7 @@ mod shared_property_validation_tests {
             .expect("unknown modifier flagged from model vocabulary");
         assert!(hit.message.contains("model 'endpoint' declares"), "{hit:?}");
         assert_eq!(
-            hit.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            hit.suggestions.first().map(|s| s.replacement.as_str()),
             Some("allow")
         );
         // A correct modifier stays silent.
@@ -5821,7 +5919,7 @@ mod union_shared_property_tests {
             "{hit:?}"
         );
         assert_eq!(
-            hit.suggestion.as_ref().map(|s| s.replacement.as_str()),
+            hit.suggestions.first().map(|s| s.replacement.as_str()),
             Some("label")
         );
         assert!(check(src, true)
