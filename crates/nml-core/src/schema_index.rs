@@ -46,6 +46,77 @@ pub enum FieldTarget<'a> {
     Leaf,
 }
 
+/// The shape facts of an instance body — the ONE classification every
+/// body-shape consumer reads (RFC 0015 F4 consolidation). Previously the
+/// resolver and the validator's union gate each recomputed these booleans
+/// independently, a divergence-in-waiting between "which variant does shape
+/// select" and "when is shape ambiguous". Facts, not an enum: consumers
+/// legitimately dispatch differently (the resolver is arms > list > keyed
+/// positive-match; the ambiguity rule is negative-space `keyed_or_bare`), so
+/// one enum cannot serve both without re-deriving — the shared truth is the
+/// facts themselves.
+#[derive(Debug, Clone, Copy)]
+pub struct BodyShape {
+    /// Routing arms (`@sel -> target` / `else -> target`) present.
+    pub has_arms: bool,
+    /// List items (`- …`) present.
+    pub has_list_items: bool,
+    /// Keyed entries (properties / nested blocks / modifiers) present.
+    /// Deliberately excludes shared properties: a `.key` scopes ITEMS, it does
+    /// not make the body a keyed block instance.
+    pub has_keyed: bool,
+}
+
+impl BodyShape {
+    /// Classify `body` — the single constructor.
+    pub fn of(body: &Body) -> Self {
+        let mut shape = Self {
+            has_arms: false,
+            has_list_items: false,
+            has_keyed: false,
+        };
+        for entry in &body.entries {
+            match entry.kind {
+                BodyEntryKind::Arm(_) => shape.has_arms = true,
+                BodyEntryKind::ListItem(_) => shape.has_list_items = true,
+                BodyEntryKind::Property(_)
+                | BodyEntryKind::NestedBlock(_)
+                | BodyEntryKind::Modifier(_) => shape.has_keyed = true,
+                _ => {}
+            }
+        }
+        shape
+    }
+
+    /// Neither arms nor list items: the body is a keyed block or bare/empty —
+    /// the shapes that land among a union's MODEL variants by first-wins, i.e.
+    /// the ambiguity precondition (RFC 0015 D2).
+    pub fn keyed_or_bare(&self) -> bool {
+        !self.has_arms && !self.has_list_items
+    }
+}
+
+/// One nameable variant of a union — a model or a `oneof`, the two things an
+/// `as <Variant>` can name (globally name-disjoint, so the name is unambiguous).
+/// The ambiguity oracle returns these so no consumer of the candidate set can
+/// drop the oneof case (a `Vec<&ModelDef>` could not represent `(mailA | mailB)`
+/// and would silently change the D2 rule).
+#[derive(Debug, Clone, Copy)]
+pub enum NameableVariant<'a> {
+    Model(&'a ModelDef),
+    OneOf(&'a OneOfDef),
+}
+
+impl<'a> NameableVariant<'a> {
+    /// The declared type name — what `as <name>` writes.
+    pub fn name(&self) -> &'a str {
+        match self {
+            NameableVariant::Model(m) => &m.name,
+            NameableVariant::OneOf(o) => &o.name,
+        }
+    }
+}
+
 /// Owns schema definitions with `O(1)`, order-preserving, first-wins lookup.
 #[derive(Debug, Default)]
 pub struct SchemaIndex {
@@ -138,25 +209,7 @@ impl SchemaIndex {
                 return self.resolve_type(variant);
             }
         }
-        let has_list_items = body
-            .entries
-            .iter()
-            .any(|e| matches!(e.kind, BodyEntryKind::ListItem(_)));
-        let has_arms = body
-            .entries
-            .iter()
-            .any(|e| matches!(e.kind, BodyEntryKind::Arm(_)));
-        // A KEYED body (properties / nested blocks / modifiers) is a block
-        // instance — a scalar variant cannot represent it, so it must select a
-        // model/oneof-ref variant.
-        let has_keyed = body.entries.iter().any(|e| {
-            matches!(
-                e.kind,
-                BodyEntryKind::Property(_)
-                    | BodyEntryKind::NestedBlock(_)
-                    | BodyEntryKind::Modifier(_)
-            )
-        });
+        let shape = BodyShape::of(body);
         // Body shape selects the variant (first matching wins, source order):
         // arms → the arm-set variant (RFC 0007); list items → the list variant;
         // a keyed block → the first model/oneof-ref variant (never a scalar —
@@ -165,17 +218,17 @@ impl SchemaIndex {
         variants
             .iter()
             .find(|variant| match variant {
-                FieldType::Arms { .. } => has_arms,
-                FieldType::List(_) => !has_arms && has_list_items,
-                FieldType::ModelRef(name) if has_keyed => {
-                    !has_arms
-                        && !has_list_items
+                FieldType::Arms { .. } => shape.has_arms,
+                FieldType::List(_) => !shape.has_arms && shape.has_list_items,
+                FieldType::ModelRef(name) if shape.has_keyed => {
+                    !shape.has_arms
+                        && !shape.has_list_items
                         && matches!(
                             self.resolve_ref(name),
                             FieldTarget::Model(_) | FieldTarget::OneOf(_)
                         )
                 }
-                _ => !has_arms && !has_list_items && !has_keyed,
+                _ => !shape.has_arms && !shape.has_list_items && !shape.has_keyed,
             })
             .map(|variant| self.resolve_type(variant))
             .unwrap_or(FieldTarget::Leaf)
@@ -206,6 +259,40 @@ impl SchemaIndex {
             }
             _ => false,
         })
+    }
+
+    /// The RFC 0015 AMBIGUITY ORACLE — the single source of truth for "is this
+    /// union instance ambiguous?", shared by the validator's D2 hard error and
+    /// the LSP's union-of-fields completion so the two can never disagree
+    /// (previously the editor completed first-wins against instances the
+    /// validator rejected — the F4 incoherence).
+    ///
+    /// `Some(candidates)` iff the body carries NO annotation, its shape is
+    /// keyed-or-bare (arms/list shapes are structurally unambiguous), and the
+    /// union has ≥2 nameable variants — the exact D2 precondition. Candidates
+    /// come back as [`NameableVariant`]s in source order: models AND oneofs
+    /// (both are `as`-nameable; a model-only return type would silently drop
+    /// the oneof case and change the rule).
+    pub fn ambiguous_union_variants<'a>(
+        &'a self,
+        variants: &[FieldType],
+        body: &Body,
+    ) -> Option<Vec<NameableVariant<'a>>> {
+        if body.type_annotation.is_some() || !BodyShape::of(body).keyed_or_bare() {
+            return None;
+        }
+        let candidates: Vec<NameableVariant<'a>> = variants
+            .iter()
+            .filter_map(|v| match v {
+                FieldType::ModelRef(name) => match self.resolve_ref(name) {
+                    FieldTarget::Model(m) => Some(NameableVariant::Model(m)),
+                    FieldTarget::OneOf(o) => Some(NameableVariant::OneOf(o)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        (candidates.len() >= 2).then_some(candidates)
     }
 
     /// The declared type names of a union's **nameable** variants (model/`oneof`
@@ -443,6 +530,97 @@ mod tests {
                 _ => None,
             })
             .expect("nested block not found")
+    }
+
+    /// F4: the ambiguity oracle — the ONE rule the validator's D2 and the
+    /// LSP's union-of-fields both consume. Covers the oneof-variant case a
+    /// model-only candidate type would silently drop.
+    #[test]
+    fn ambiguity_oracle_matches_the_d2_rule() {
+        let mut oneofs = Vec::new();
+        oneofs.push(crate::model::OneOfDef {
+            name: "mailA".into(),
+            discriminator: "kind".into(),
+            discriminator_type: None,
+            default_discriminator: None,
+            variants: vec![("log".into(), "modelA".into())],
+            source: None,
+            span: crate::span::Span { start: 0, end: 0 },
+        });
+        oneofs.push(crate::model::OneOfDef {
+            name: "mailB".into(),
+            discriminator: "kind2".into(),
+            discriminator_type: None,
+            default_discriminator: None,
+            variants: vec![("log".into(), "modelB".into())],
+            source: None,
+            span: crate::span::Span { start: 0, end: 0 },
+        });
+        let idx = SchemaIndex::build(
+            vec![model("modelA", vec![]), model("modelB", vec![])],
+            vec![],
+            oneofs,
+        );
+        let same_class = FieldType::Union(vec![
+            FieldType::ModelRef("modelA".into()),
+            FieldType::ModelRef("modelB".into()),
+        ]);
+        let oneof_union = FieldType::Union(vec![
+            FieldType::ModelRef("mailA".into()),
+            FieldType::ModelRef("mailB".into()),
+        ]);
+        let disjoint = FieldType::Union(vec![
+            FieldType::Primitive(PrimitiveType::String),
+            FieldType::ModelRef("modelA".into()),
+        ]);
+        let variants_of = |ty: &FieldType| -> Vec<FieldType> {
+            let FieldType::Union(v) = ty else {
+                unreachable!()
+            };
+            v.clone()
+        };
+
+        // Un-annotated keyed body → ambiguous for same-class AND oneof unions.
+        let keyed = body_of("x X:\n    k = \"v\"\n");
+        let names: Vec<&str> = idx
+            .ambiguous_union_variants(&variants_of(&same_class), &keyed)
+            .expect("same-class keyed is ambiguous")
+            .iter()
+            .map(|c| c.name())
+            .collect();
+        assert_eq!(names, vec!["modelA", "modelB"]);
+        let names: Vec<&str> = idx
+            .ambiguous_union_variants(&variants_of(&oneof_union), &keyed)
+            .expect("a union of two oneofs is ambiguous too — the D2 rule")
+            .iter()
+            .map(|c| c.name())
+            .collect();
+        assert_eq!(names, vec!["mailA", "mailB"]);
+
+        // Empty body → ambiguous (the just-typed discovery moment).
+        let empty = Body::fresh(Vec::new());
+        assert!(idx
+            .ambiguous_union_variants(&variants_of(&same_class), &empty)
+            .is_some());
+
+        // Annotated body → never ambiguous (even with an unknown annotation:
+        // the ORACLE is about the D2 rule, which does not fire there — the
+        // unknown name is NML2051's job).
+        let annotated = body_of("x X:\n    slot as modelB:\n        k = \"v\"\n");
+        let slot = nested_body(&annotated, "slot");
+        assert!(idx
+            .ambiguous_union_variants(&variants_of(&same_class), slot)
+            .is_none());
+
+        // List-shaped body → not ambiguous (shape selects); single nameable →
+        // not ambiguous.
+        let listy = body_of("x X:\n    - A:\n        k = \"v\"\n");
+        assert!(idx
+            .ambiguous_union_variants(&variants_of(&same_class), &listy)
+            .is_none());
+        assert!(idx
+            .ambiguous_union_variants(&variants_of(&disjoint), &keyed)
+            .is_none());
     }
 
     #[test]

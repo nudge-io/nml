@@ -956,6 +956,46 @@ async fn directive_hover_renders_vocabulary_entry() {
     );
 }
 
+/// RFC 0010 tier 1 end-to-end: hovering a diagnostic's span returns the
+/// error-index explanation summary through the real handler chain — cache
+/// fill, narrowest-hit selection, compose, wire — with the diagnostic's
+/// range as the hover range (explanation-only case).
+#[tokio::test]
+async fn hover_on_a_diagnostic_explains_the_code() {
+    let base = temp_dir("hover-explanation");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let ws = base.join("ws");
+    fs::create_dir_all(&ws).expect("create ws");
+    let app = ws.join("app.nml");
+    let text = "service Api:\n    x = 1.2.3\n";
+    fs::write(&app, text).expect("write app");
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness.open(&app, text).await;
+    let result = harness
+        .request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                // Inside the `1.2.3` literal (NML0013's token-width span).
+                "position": { "line": 1, "character": 10 },
+            }),
+        )
+        .await;
+    let value = result["contents"]["value"]
+        .as_str()
+        .expect("markdown hover");
+    assert!(value.contains("**NML0013**"), "{value}");
+    assert!(value.contains("Invalid number"), "{value}");
+    assert!(value.contains("nml explain NML0013"), "{value}");
+    assert_eq!(
+        result["range"]["start"]["line"], 1,
+        "explanation-only hover carries the diagnostic's range: {result}"
+    );
+}
+
 /// Schema-driven block-keyword completion (RFC 0012 editor package): an open
 /// document completes block keywords from its resolved schema context — the
 /// scope registry's concrete models — labeled with "schema" provenance.

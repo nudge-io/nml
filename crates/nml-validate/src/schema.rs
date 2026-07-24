@@ -362,13 +362,20 @@ impl SchemaValidator {
                     let mut ok = false;
                     let mut block_capable = false;
                     for field in &defining {
-                        // Block-capable = anything `validate_target_instance`
-                        // can validate a body against: a model, a `oneof`
-                        // (discriminator-aware), or a list/set (per-item) —
-                        // NOT Model-only, which false-errored on `[]sub` and
-                        // oneof declarers and on a union's list variant
+                        // Block-capable = anything a block can legally fill: what
+                        // `validate_target_instance` validates (model, oneof,
+                        // list/set per-item, arms) PLUS declared-opaque `object`
+                        // (free-form by definition — content accepted without a
+                        // schema walk, exactly like the non-union path). NOT
+                        // Model-only, which false-errored on `[]sub`, oneof, and
+                        // object declarers and on a union's list variant
                         // legitimately selected by an item-shaped block.
                         let target = self.index.resolve_type_in_body(&field.field_type, body);
+                        if matches!(target, FieldTarget::Object) {
+                            ok = true;
+                            block_capable = true;
+                            break;
+                        }
                         let mut local = Vec::new();
                         if self.validate_target_instance(
                             &target,
@@ -3752,6 +3759,21 @@ workflow W:
         assert!(
             d3.iter().all(|x| x.code != Some(codes::TYPE_MISMATCH)),
             "oneof declarers are block-capable: {d3:?}"
+        );
+    }
+
+    /// Round-14: `object`-typed declarers are block-capable (free-form) —
+    /// symmetric with the non-union path, no false TYPE_MISMATCH.
+    #[test]
+    fn union_block_shared_property_accepts_object_declarers() {
+        let schema = "model modelA:\n    sub object?\nmodel modelB:\n    sub object?\nmodel host:\n    slots [](modelA | modelB)?\n";
+        let d = diags_for(
+            schema,
+            "host H:\n    slots:\n        .sub:\n            anything = \"v\"\n        - one as modelB:\n            sub:\n                more = 1\n",
+        );
+        assert!(
+            d.is_empty(),
+            "object declarers accept free-form blocks: {d:?}"
         );
     }
 

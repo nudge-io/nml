@@ -4,6 +4,20 @@
 
 ### Added
 
+- **In-editor error explanations (RFC 0010 tier 1)**: hovering a
+  diagnostic shows its error-index **summary** — the meaning paragraph,
+  never the examples — after any regular hover content (or alone, on the
+  diagnostic's range), with a pointer to `nml explain` for the full
+  entry. One new primitive, `nml_core::diagnostic::explain_summary`,
+  derives the summary from the same embedded index as `explain`
+  (relative links stripped so nothing dangles in hover context); all 82
+  documented codes are covered on day one. Behind it, the language
+  server gains a per-document **diagnostics cache** validated against
+  the exact buffer text it was computed from (an in-flight compute that
+  races an edit can never serve stale ranges), invalidated by document
+  edits, schema-registry rebuilds, and project-config changes — which
+  also makes the document-pull's *Unchanged* path recompute-free.
+
 - **The parse-error taxonomy is closed (RFC 0009)**: every syntax
   diagnostic derives its message, stable code, and any machine-applicable
   fix from a payload-carrying kind — the transitional prose carrier and

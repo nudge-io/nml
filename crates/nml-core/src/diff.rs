@@ -1374,18 +1374,26 @@ fn push_variant_switch(
     path: &FieldPath,
     out: &mut Vec<FieldChange>,
 ) {
+    // The annotation ident's own span, from the REPRESENTATIVE file — the
+    // last (rev-first) annotated overlay file, matching how
+    // `resolve_diff_target` selected the variant — so the witness points at
+    // the token that changed, not the first file's unrelated content.
     let origin = new
-        .first()
-        .or_else(|| old.first())
-        .map(|(f, b)| Origin::File {
-            file: f.clone(),
-            span: b
-                .type_annotation
-                .as_ref()
-                .map(|i| i.span)
-                .or_else(|| b.entries.first().map(|e| e.span))
-                .unwrap_or(Span { start: 0, end: 0 }),
+        .iter()
+        .rev()
+        .find_map(|(f, b)| b.type_annotation.as_ref().map(|i| (f.clone(), i.span)))
+        .or_else(|| {
+            new.first().or_else(|| old.first()).map(|(f, b)| {
+                (
+                    f.clone(),
+                    b.entries
+                        .first()
+                        .map(|e| e.span)
+                        .unwrap_or(Span { start: 0, end: 0 }),
+                )
+            })
         })
+        .map(|(file, span)| Origin::File { file, span })
         .unwrap_or(Origin::Default);
     push(
         path,

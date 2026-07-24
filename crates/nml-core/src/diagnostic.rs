@@ -333,6 +333,48 @@ pub fn explain(code: &str) -> Option<&'static str> {
         (head.trim() == code).then(|| body.trim())
     })
 }
+
+/// The first paragraph of a code's index section — the bounded hover summary
+/// (RFC 0010 tier 1: the meaning line, never the examples; hover real estate
+/// is precious). One splitter beside [`explain`], never re-derived per
+/// consumer. Relative markdown links are stripped to their text (they would
+/// dangle in hover context); absolute `http(s)` links are kept — they become
+/// useful the day the index is published.
+pub fn explain_summary(code: &str) -> Option<String> {
+    let body = explain(code)?;
+    let para = body.split("\n\n").next()?.trim().replace('\n', " ");
+    Some(strip_relative_links(&para))
+}
+
+/// Rewrite `[text](target)` to `text` for non-absolute targets, keeping
+/// absolute links intact. A hand-rolled scan (no regex): the index is our
+/// own review-guarded content — simple links only, and an unmatched shape
+/// passes through verbatim rather than being mangled.
+fn strip_relative_links(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let Some(mid_rel) = rest[open..].find("](") else {
+            break;
+        };
+        let mid = open + mid_rel;
+        let Some(close_rel) = rest[mid + 2..].find(')') else {
+            break;
+        };
+        let close = mid + 2 + close_rel;
+        let label = &rest[open + 1..mid];
+        let target = &rest[mid + 2..close];
+        out.push_str(&rest[..open]);
+        if target.starts_with("http://") || target.starts_with("https://") {
+            out.push_str(&rest[open..=close]);
+        } else {
+            out.push_str(label);
+        }
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
 /// One reported finding. Constructed via the builders ([`Diagnostic::error`]
 /// et al.) — `non_exhaustive`, so fields may be added without a breaking
 /// change.
@@ -546,6 +588,42 @@ mod tests {
             diag.to_string(),
             "error: invalid value \"wran\" (did you mean \"warn\"?)"
         );
+    }
+
+    #[test]
+    fn explain_summary_is_first_paragraph_with_links_grounded() {
+        // The meaning paragraph only — never the example blocks.
+        let s = explain_summary("NML2007").expect("known code");
+        assert!(s.starts_with("**Missing required field.**"), "{s}");
+        assert!(!s.contains("```"), "no examples in a summary: {s}");
+
+        // NML0001's first paragraph carries a relative link — stripped to
+        // its text so nothing dangles in hover context.
+        let s = explain_summary("NML0001").expect("known code");
+        assert!(s.contains("stability policy"), "{s}");
+        assert!(!s.contains("](../"), "relative links must be stripped: {s}");
+
+        // Unknown codes are None — same contract as `explain`.
+        assert!(explain_summary("NML9999").is_none());
+
+        // Every coded section yields a non-empty summary (the hover surface
+        // covers the whole index by construction).
+        for (_, code) in codes::ALL {
+            let s = explain_summary(&code.to_string())
+                .unwrap_or_else(|| panic!("{code} has no summary"));
+            assert!(!s.is_empty());
+        }
+    }
+
+    #[test]
+    fn strip_relative_links_keeps_absolute_ones() {
+        assert_eq!(
+            strip_relative_links("see [the policy](../stability.md) and [site](https://nml.dev)"),
+            "see the policy and [site](https://nml.dev)"
+        );
+        // Unmatched shapes pass through verbatim, never mangled.
+        assert_eq!(strip_relative_links("a [lone bracket"), "a [lone bracket");
+        assert_eq!(strip_relative_links("no links at all"), "no links at all");
     }
 
     #[test]

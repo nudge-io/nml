@@ -157,6 +157,7 @@ editor quick-fixes apply what can be applied mechanically).
 | [Integration Guide](docs/integration.md) | Embedding NML in a Rust project |
 | [Language Specification](spec/README.md) | Formal grammar and semantics, for implementers |
 | [Error Index](docs/errors/README.md) | Every `NML0000` diagnostic code, with verified examples and fixes |
+| [Editor Integration](docs/reference/editors.md) | LSP + VS Code surfaces: diagnostics, quick fixes, hover explanations, completion |
 | [Stability Policy](docs/stability.md) | What pre-1.0 means here; breaking changes ship with fixers |
 | [RFC index](docs/rfcs/README.md) | Language evolution and design records |
 

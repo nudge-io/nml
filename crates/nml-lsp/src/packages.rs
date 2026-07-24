@@ -254,6 +254,8 @@ pub struct PackageResolver {
     /// Validators cached per (content hash, binding name) — sound because
     /// binding is exclusive: the hash covers every input.
     validator_cache: Mutex<HashMap<(String, String), Arc<SchemaValidator>>>,
+    /// Resolution generation — see [`Self::generation`].
+    generation: std::sync::atomic::AtomicU64,
     /// Memoized [`package_claims_file_under`] answers per
     /// (package content hash, root): the walk reads up to 2048 `read_dir`
     /// entries and `vocabulary_for` runs per validation pass, so an uncached
@@ -298,7 +300,22 @@ impl PackageResolver {
             manifest_cache: Mutex::new(HashMap::new()),
             validator_cache: Mutex::new(HashMap::new()),
             claims_cache: Mutex::new(HashMap::new()),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Monotonic resolution generation (RFC 0010 tier 1): bumped whenever a
+    /// stat/fingerprint guard observes actual change (a store pointer
+    /// transition, a manifest rebuild). Consumers caching anything derived
+    /// from resolution compare this — an out-of-band `schema sync` then
+    /// invalidates their entries the moment any resolve notices it.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn bump_generation(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// [`package_claims_file_under`] behind the claims cache: consult the
@@ -794,6 +811,10 @@ impl PackageResolver {
                     }
                     _ => {}
                 }
+                // A pointer transition (or first load) changes resolution
+                // output for every bound document — generation-invalidate
+                // downstream caches (RFC 0010 tier 1).
+                self.bump_generation();
                 cache.insert(
                     name.to_string(),
                     StoreCacheEntry {
@@ -897,6 +918,9 @@ impl PackageResolver {
             )),
         };
 
+        // A manifest rebuild (fingerprint change or first load) changes
+        // resolution output — generation-invalidate downstream caches.
+        self.bump_generation();
         self.manifest_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())

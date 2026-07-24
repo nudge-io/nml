@@ -26,8 +26,33 @@ const MAX_FILE_COUNT: usize = 10_000;
 /// `Client` (diagnostics delivery, logging) lives on `NmlLanguageServer`, not
 /// here. Under the pull model there is no background task, so `Inner` is
 /// touched only by request handlers, all on the one server task.
+/// One document's computed diagnostics plus the exact text they were
+/// computed from (RFC 0010 tier 1). Reads validate `text` against the
+/// current buffer: an in-flight compute that finishes after an edit
+/// inserts an entry that self-describes as stale and reads as a miss —
+/// never served against the wrong text (ranges would lie).
+struct CachedDiagnostics {
+    text: String,
+    /// The resolver generation at compute time — an out-of-band store sync
+    /// or manifest rebuild changes diagnostics without touching any buffer;
+    /// reads compare against the CURRENT generation (after a cheap
+    /// stat-guarded resolve) so those entries read as misses.
+    generation: u64,
+    /// Shared, not cloned: hover reads borrow through the `Arc`; only the
+    /// pull (which must build an owned report) pays a deep copy.
+    items: Arc<Vec<tower_lsp::lsp_types::Diagnostic>>,
+}
+
 pub struct Inner {
     documents: Mutex<HashMap<Url, String>>,
+    /// Per-document diagnostics cache (RFC 0010 tier 1), filled lazily by
+    /// whichever consumer computes first — the document pull or hover's
+    /// explanation lookup — so hover never recomputes per-request and the
+    /// pull's *Unchanged* path stops re-validating. Invalidated per-document
+    /// on change/close and wholesale by [`Inner::rebuild_schema_registry`]
+    /// and project-config changes (a registry edit changes OTHER documents'
+    /// diagnostics without touching their text).
+    diags_cache: Mutex<HashMap<Url, CachedDiagnostics>>,
     indexed_uris: Mutex<HashSet<Url>>,
     /// Documents currently open in the editor (didOpen without a matching
     /// didClose). Guards watched-file disk events from clobbering an open
@@ -153,6 +178,7 @@ impl NmlLanguageServer {
             client,
             inner: Arc::new(Inner {
                 documents: Mutex::new(HashMap::new()),
+                diags_cache: Mutex::new(HashMap::new()),
                 indexed_uris: Mutex::new(HashSet::new()),
                 open_docs: Mutex::new(HashSet::new()),
                 scoped_models: Mutex::new(HashMap::new()),
@@ -241,6 +267,13 @@ impl Inner {
     }
 
     fn rebuild_schema_registry(&self) {
+        // The registry changes every document's diagnostics without touching
+        // their text — the whole cache is stale, by construction, for every
+        // caller of this rebuild (RFC 0010 tier 1).
+        self.diags_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         let mut scoped_models: HashMap<String, Vec<ModelDef>> = HashMap::new();
         let mut scoped_enums: HashMap<String, Vec<EnumDef>> = HashMap::new();
@@ -618,6 +651,68 @@ impl NmlLanguageServer {
     /// the document-pull handler — the frequent path that holds the `Client` —
     /// so it replaces the deleted background notifier. Drain fully under the
     /// lock into a `Vec`, then log outside it (never hold a lock across await).
+    /// This document's diagnostics via the RFC 0010 tier-1 cache — computed
+    /// at most once per text state, by whichever consumer asks first (the
+    /// document pull or hover's explanation lookup). The entry is validated
+    /// against the CURRENT buffer text, so an insert from a compute that
+    /// raced an edit reads as a miss — never served as stale ranges. `None`
+    /// for an unknown document.
+    async fn cached_diagnostics(
+        &self,
+        uri: &Url,
+    ) -> Option<Arc<Vec<tower_lsp::lsp_types::Diagnostic>>> {
+        let text = self
+            .documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(uri)
+            .cloned()?;
+        // Let the stat-guarded resolver notice out-of-band changes (a store
+        // `schema sync`, a manifest edit on disk) — cheap when nothing
+        // changed, and it advances the generation when something did.
+        let _ = self.resolve_document(uri);
+        let generation = self.resolver.generation();
+        if let Some(entry) = self
+            .diags_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(uri)
+        {
+            if entry.text == text && entry.generation == generation {
+                return Some(Arc::clone(&entry.items));
+            }
+        }
+        let items = Arc::new(self.validate_document(uri, &text));
+        // Store-health events queued during this resolution surface promptly
+        // on whichever path computed (the drain's charter).
+        self.drain_store_events().await;
+        self.diags_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                uri.clone(),
+                CachedDiagnostics {
+                    text,
+                    generation,
+                    items: Arc::clone(&items),
+                },
+            );
+        Some(items)
+    }
+
+    /// The RFC 0010 tier-1 hover augmentation at a position: explanation
+    /// summaries of the coded diagnostics intersecting it, plus the
+    /// narrowest hit's range (the hover highlight). `None` when nothing
+    /// coded intersects. The cache makes this recompute-free per hover.
+    async fn diagnostic_explanations_at(
+        &self,
+        uri: &Url,
+        pos: Position,
+    ) -> Option<(String, Range)> {
+        let items = self.cached_diagnostics(uri).await?;
+        explanations_at_position(&items, pos)
+    }
+
     async fn drain_store_events(&self) {
         let events: Vec<packages::StoreEvent> = {
             let mut rx = self.store_events.lock().unwrap_or_else(|e| e.into_inner());
@@ -643,6 +738,13 @@ impl NmlLanguageServer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(uri.clone(), text.clone());
+        // This document's cached diagnostics are stale (text changed). The
+        // project-config and registry branches below clear wholesale — those
+        // changes affect every document.
+        self.diags_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uri);
 
         if uri.as_str().ends_with("nml-project.nml") {
             let file = nml_core::cst::parse_best_effort(&text);
@@ -651,6 +753,12 @@ impl NmlLanguageServer {
                 .project_config
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = config;
+            // Project config (modifiers, template namespaces) shapes every
+            // document's diagnostics — wholesale invalidation.
+            self.diags_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
             return;
         }
         if uri.as_str().ends_with(".model.nml") {
@@ -1688,6 +1796,94 @@ enum AsSlot {
     Item,
 }
 
+/// Pure selection half of the RFC 0010 hover augmentation, unit-testable in
+/// isolation: the coded diagnostics whose ranges contain `pos`, narrowest
+/// first (most specific), deduplicated by code, capped at three (hover real
+/// estate is precious). Each renders as `**CODE** — summary` with the CLI
+/// pointer; the returned range is the narrowest hit's — the hover highlight.
+fn explanations_at_position(
+    items: &[tower_lsp::lsp_types::Diagnostic],
+    pos: Position,
+) -> Option<(String, Range)> {
+    fn narrowness(r: &Range) -> (u32, u32) {
+        let lines = r.end.line.saturating_sub(r.start.line);
+        let chars = if lines == 0 {
+            r.end.character.saturating_sub(r.start.character)
+        } else {
+            u32::MAX
+        };
+        (lines, chars)
+    }
+    let mut hits: Vec<&tower_lsp::lsp_types::Diagnostic> = items
+        .iter()
+        .filter(|d| range_contains(&d.range, pos) && d.code.is_some())
+        .collect();
+    hits.sort_by_key(|d| narrowness(&d.range));
+    let range = hits.first()?.range;
+    let mut seen: Vec<&str> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    for d in &hits {
+        let Some(tower_lsp::lsp_types::NumberOrString::String(code)) = &d.code else {
+            continue;
+        };
+        if seen.contains(&code.as_str()) {
+            continue;
+        }
+        seen.push(code);
+        // Only codes with an index section explain (the guard makes that
+        // every code in practice; a foreign code string simply skips).
+        let Some(summary) = nml_core::diagnostic::explain_summary(code) else {
+            continue;
+        };
+        parts.push(format!(
+            "**{code}** — {summary}\n\n_Run `nml explain {code}` for the full entry._"
+        ));
+        if parts.len() == 3 {
+            break;
+        }
+    }
+    (!parts.is_empty()).then(|| (parts.join("\n\n"), range))
+}
+
+/// Position-in-range, end-inclusive: hovering the last column of a squiggle
+/// still counts as hovering the diagnostic.
+fn range_contains(range: &Range, pos: Position) -> bool {
+    (range.start.line < pos.line
+        || (range.start.line == pos.line && range.start.character <= pos.character))
+        && (pos.line < range.end.line
+            || (pos.line == range.end.line && pos.character <= range.end.character))
+}
+
+/// The RFC 0010 compose point — the ONE place base hover and diagnostic
+/// explanation meet. No base + an explanation ⇒ an explanation-only hover
+/// carrying the DIAGNOSTIC's range (the squiggle is what the user asked
+/// about).
+fn merge_hover(base: Option<Hover>, aug: Option<(String, Range)>) -> Option<Hover> {
+    match (base, aug) {
+        (base, None) => base,
+        (None, Some((md, range))) => Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: md,
+            }),
+            range: Some(range),
+        }),
+        (Some(mut h), Some((md, _))) => {
+            match &mut h.contents {
+                HoverContents::Markup(mc) => {
+                    mc.value.push_str("\n\n---\n\n");
+                    mc.value.push_str(&md);
+                }
+                // Every base hover today is Markup; a future non-markup base
+                // keeps itself and drops the augmentation rather than
+                // mangling either.
+                _ => {}
+            }
+            Some(h)
+        }
+    }
+}
+
 fn as_position_field(line: &str, cursor_byte: usize) -> Option<AsSlot> {
     let before = line.get(..cursor_byte)?;
     // Still in the header type slot — a `:` (body) or `=` (value) means we have
@@ -1798,8 +1994,10 @@ fn find_union_list_field_at<'i>(
         // Cursor on an item header: a union-elemented list IS the slot's field.
         return inner.union_variants().is_some().then_some(field);
     }
-    // Otherwise descend into a model-typed block and keep looking.
-    if let FieldTarget::Model(child) = index.resolve_field(field) {
+    // Otherwise descend and keep looking — body-aware, so a union-typed or
+    // oneof-typed block on the path (its variant selected by annotation, shape,
+    // or discriminator) descends exactly like a plain model block.
+    if let Some(child) = variant_model_for_body(index, &field.field_type, nested_body) {
         return find_union_list_field_at(child, nested_body, pos, index, line_index);
     }
     None
@@ -2901,20 +3099,13 @@ impl LanguageServer for NmlLanguageServer {
         params: DocumentDiagnosticParams,
     ) -> Result<DocumentDiagnosticReportResult> {
         let uri = params.text_document.uri;
-        let text = self
-            .documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&uri)
-            .cloned();
         // An unknown document (never opened, not indexed) has nothing to
-        // report — an empty full report, never an error.
-        let items = match text.as_deref() {
-            Some(text) => self.validate_document(&uri, text),
-            None => Vec::new(),
-        };
-        // Surface any store-health transitions the resolution above queued
-        // (this handler now owns that delivery — see `drain_store_events`).
+        // report — an empty full report, never an error. A cache hit means
+        // the *Unchanged* comparison below costs no re-validation (RFC 0010).
+        let items = self.cached_diagnostics(&uri).await.unwrap_or_default();
+        // The fill path drains; a cache hit skips it — but other handlers may
+        // have queued store events since, so the pull stays the reliable
+        // delivery path (cheap no-op when empty).
         self.drain_store_events().await;
 
         let result_id = diagnostics_result_id(&items);
@@ -2933,7 +3124,9 @@ impl LanguageServer for NmlLanguageServer {
                 related_documents: None,
                 full_document_diagnostic_report: FullDocumentDiagnosticReport {
                     result_id: Some(result_id),
-                    items,
+                    // The one deep copy, paid only when the report actually
+                    // ships (the Unchanged path above never clones).
+                    items: (*items).clone(),
                 },
             }),
         ))
@@ -2958,6 +3151,10 @@ impl LanguageServer for NmlLanguageServer {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.open_docs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uri);
+        self.diags_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&uri);
@@ -3032,6 +3229,10 @@ impl LanguageServer for NmlLanguageServer {
                     // content, or vice versa) — worse than either consistent
                     // state.
                     self.documents
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&change.uri);
+                    self.diags_cache
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&change.uri);
@@ -3608,22 +3809,34 @@ impl LanguageServer for NmlLanguageServer {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let pos = params.text_document_position_params.position;
+        // RFC 0010 tier 1 — ONE compose point by construction: the whole
+        // base hover runs inside an async block (its `return`s exit the
+        // block), so every exit — including the (0,0) binding summary,
+        // exactly where file-start diagnostics live — composes with the
+        // diagnostic explanation appended below.
+        let aug_uri = params
+            .text_document_position_params
+            .text_document
+            .uri
+            .clone();
+        let aug_pos = params.text_document_position_params.position;
+        let base = async {
+            let uri = params.text_document_position_params.text_document.uri;
+            let pos = params.text_document_position_params.position;
 
-        // Document-start hover (RFC 0030 introspection): the binding summary —
-        // which package validates this file, from where, at which hash.
-        // Position (0,0) only, so it can never shadow a real token's hover
-        // (a token's hover is requested at the token, not at the file edge).
-        if pos.line == 0 && pos.character == 0 {
-            if let Some(resolved) = self.resolve_document(&uri) {
-                if let Resolution::Bound(b) = &resolved.resolution {
-                    let roots = self
-                        .workspace_roots
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    let summary = format!(
+            // Document-start hover (RFC 0030 introspection): the binding summary —
+            // which package validates this file, from where, at which hash.
+            // Position (0,0) only, so it can never shadow a real token's hover
+            // (a token's hover is requested at the token, not at the file edge).
+            if pos.line == 0 && pos.character == 0 {
+                if let Some(resolved) = self.resolve_document(&uri) {
+                    if let Resolution::Bound(b) = &resolved.resolution {
+                        let roots = self
+                            .workspace_roots
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        let summary = format!(
                         "**Schema package:** `{}` {} · `{}` · {} · binding `{}`\n\nroot: `{}`{}",
                         b.package_name,
                         b.package_version,
@@ -3637,174 +3850,181 @@ impl LanguageServer for NmlLanguageServer {
                             ""
                         }
                     );
+                        return Ok(Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: summary,
+                            }),
+                            range: None,
+                        }));
+                    }
+                }
+            }
+
+            let source_clone = {
+                let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+                match docs.get(&uri) {
+                    Some(s) => s.clone(),
+                    None => return Ok(None),
+                }
+            };
+
+            let Some(line) = position::line_at(&source_clone, pos.line) else {
+                return Ok(None);
+            };
+            let byte_col = position::utf16_to_byte(line, pos.character);
+
+            // Directive hover (RFC 0030/0032): `#name` in a covered model file
+            // renders the vocabulary entry. Unknown names get no hover — the
+            // vocabulary diagnostic already explains them.
+            if uri.as_str().ends_with(".model.nml") {
+                if let Some(name) = directive_name_at(line, byte_col) {
+                    // Covered files only: without a known vocabulary there is no
+                    // entry to render (undetermined coverage already surfaced
+                    // through the info diagnostic).
+                    if let packages::VocabularyOutcome::Covered(vocab) =
+                        self.vocabulary_for_document(&uri)
+                    {
+                        if let Some(d) = vocab.directives.iter().find(|d| d.name == name) {
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    // Fence-escaped: vocabulary docs are
+                                    // author-supplied text (see
+                                    // `escape_markdown_fences`).
+                                    value: format!(
+                                        "**#{}** ({}) — {}",
+                                        d.name,
+                                        d.arg.label(),
+                                        escape_markdown_fences(&d.doc)
+                                    ),
+                                }),
+                                range: None,
+                            }));
+                        }
+                    }
+                }
+            }
+
+            let word = extract_word_at(line, byte_col);
+
+            if word.starts_with('@') {
+                let hover_text = word.strip_prefix('@').and_then(|stripped| {
+                    let (keyword, name) = stripped.split_once('/')?;
+                    self.find_tagged_ref_hover(keyword, name)
+                });
+                if let Some(text) = hover_text {
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
                             kind: MarkupKind::Markdown,
-                            value: summary,
+                            value: text,
+                        }),
+                        range: None,
+                    }));
+                }
+                return Ok(None);
+            }
+
+            let is_prop = is_property_name_position(line, &word, byte_col);
+
+            if is_prop && !word.is_empty() {
+                let file = nml_core::cst::parse_best_effort(&source_clone);
+                let line_index = LineIndex::new(&source_clone);
+                if let Some(keyword) = find_enclosing_block_keyword(&file, pos, &line_index) {
+                    let handle = self.schema_index_for(&uri);
+                    if let Some(model) = handle.index().model(&keyword) {
+                        if let Some(field) = model.fields.iter().find(|f| f.name == word) {
+                            // In source syntax the `|` sigil belongs to the
+                            // field name (`|allow []string`), not the type.
+                            let sigil = if matches!(field.field_type, FieldType::Modifier(_)) {
+                                "|"
+                            } else {
+                                ""
+                            };
+                            let opt = if field.optional { "?" } else { "" };
+                            let mut text = format!(
+                                "**{keyword}** field\n\n```nml\n  {sigil}{} {}{opt}\n```",
+                                field.name, field.field_type
+                            );
+                            // The schema author's leading comment block (RFC 0004
+                            // §4.3) is the field's documentation — rendered as a
+                            // markdown paragraph under the signature.
+                            if let Some(doc) = &field.doc {
+                                text.push_str("\n\n");
+                                // Fence-escaped: the doc is author-supplied text
+                                // spliced after our own fenced signature block
+                                // (see `escape_markdown_fences`).
+                                text.push_str(&escape_markdown_fences(doc));
+                            }
+                            return Ok(Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: text,
+                                }),
+                                range: None,
+                            }));
+                        }
+                    }
+                }
+            }
+
+            if !is_prop {
+                let builtin_info = match word.as_str() {
+                    "string" => Some("**string** -- Quoted text value"),
+                    "number" => Some("**number** -- General-purpose numeric (integer or decimal)"),
+                    "money" => Some(
+                        "**money** -- Exact currency value with ISO 4217 code (e.g., `19.99 USD`)",
+                    ),
+                    "bool" => Some("**bool** -- Boolean value (`true` or `false`)"),
+                    "duration" => {
+                        Some("**duration** -- Time duration (e.g., `\"72h\"`, `\"30s\"`)")
+                    }
+                    "path" => Some("**path** -- URL path with variables and wildcards"),
+                    "secret" => Some("**secret** -- Value resolved from environment (`$ENV.X`)"),
+                    "model" => Some("**model** -- Define a custom object type"),
+                    "enum" => Some("**enum** -- Define a restricted set of allowed values"),
+                    _ => None,
+                };
+
+                if let Some(text) = builtin_info {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: text.to_string(),
                         }),
                         range: None,
                     }));
                 }
             }
-        }
 
-        let source_clone = {
-            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-            match docs.get(&uri) {
-                Some(s) => s.clone(),
-                None => return Ok(None),
-            }
-        };
+            if !word.is_empty() {
+                let model_ref_type = if !is_prop {
+                    let file = nml_core::cst::parse_best_effort(&source_clone);
+                    let handle = self.schema_index_for(&uri);
+                    let line_index = LineIndex::new(&source_clone);
+                    find_model_ref_type_at(&file, &source_clone, pos, handle.index(), &line_index)
+                } else {
+                    None
+                };
 
-        let Some(line) = position::line_at(&source_clone, pos.line) else {
-            return Ok(None);
-        };
-        let byte_col = position::utf16_to_byte(line, pos.character);
-
-        // Directive hover (RFC 0030/0032): `#name` in a covered model file
-        // renders the vocabulary entry. Unknown names get no hover — the
-        // vocabulary diagnostic already explains them.
-        if uri.as_str().ends_with(".model.nml") {
-            if let Some(name) = directive_name_at(line, byte_col) {
-                // Covered files only: without a known vocabulary there is no
-                // entry to render (undetermined coverage already surfaced
-                // through the info diagnostic).
-                if let packages::VocabularyOutcome::Covered(vocab) =
-                    self.vocabulary_for_document(&uri)
+                let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(text) = find_declaration_hover(&docs, &word, model_ref_type.as_deref())
                 {
-                    if let Some(d) = vocab.directives.iter().find(|d| d.name == name) {
-                        return Ok(Some(Hover {
-                            contents: HoverContents::Markup(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                // Fence-escaped: vocabulary docs are
-                                // author-supplied text (see
-                                // `escape_markdown_fences`).
-                                value: format!(
-                                    "**#{}** ({}) — {}",
-                                    d.name,
-                                    d.arg.label(),
-                                    escape_markdown_fences(&d.doc)
-                                ),
-                            }),
-                            range: None,
-                        }));
-                    }
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: text,
+                        }),
+                        range: None,
+                    }));
                 }
             }
+
+            Ok(None)
         }
-
-        let word = extract_word_at(line, byte_col);
-
-        if word.starts_with('@') {
-            let hover_text = word.strip_prefix('@').and_then(|stripped| {
-                let (keyword, name) = stripped.split_once('/')?;
-                self.find_tagged_ref_hover(keyword, name)
-            });
-            if let Some(text) = hover_text {
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: text,
-                    }),
-                    range: None,
-                }));
-            }
-            return Ok(None);
-        }
-
-        let is_prop = is_property_name_position(line, &word, byte_col);
-
-        if is_prop && !word.is_empty() {
-            let file = nml_core::cst::parse_best_effort(&source_clone);
-            let line_index = LineIndex::new(&source_clone);
-            if let Some(keyword) = find_enclosing_block_keyword(&file, pos, &line_index) {
-                let handle = self.schema_index_for(&uri);
-                if let Some(model) = handle.index().model(&keyword) {
-                    if let Some(field) = model.fields.iter().find(|f| f.name == word) {
-                        // In source syntax the `|` sigil belongs to the
-                        // field name (`|allow []string`), not the type.
-                        let sigil = if matches!(field.field_type, FieldType::Modifier(_)) {
-                            "|"
-                        } else {
-                            ""
-                        };
-                        let opt = if field.optional { "?" } else { "" };
-                        let mut text = format!(
-                            "**{keyword}** field\n\n```nml\n  {sigil}{} {}{opt}\n```",
-                            field.name, field.field_type
-                        );
-                        // The schema author's leading comment block (RFC 0004
-                        // §4.3) is the field's documentation — rendered as a
-                        // markdown paragraph under the signature.
-                        if let Some(doc) = &field.doc {
-                            text.push_str("\n\n");
-                            // Fence-escaped: the doc is author-supplied text
-                            // spliced after our own fenced signature block
-                            // (see `escape_markdown_fences`).
-                            text.push_str(&escape_markdown_fences(doc));
-                        }
-                        return Ok(Some(Hover {
-                            contents: HoverContents::Markup(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: text,
-                            }),
-                            range: None,
-                        }));
-                    }
-                }
-            }
-        }
-
-        if !is_prop {
-            let builtin_info = match word.as_str() {
-                "string" => Some("**string** -- Quoted text value"),
-                "number" => Some("**number** -- General-purpose numeric (integer or decimal)"),
-                "money" => {
-                    Some("**money** -- Exact currency value with ISO 4217 code (e.g., `19.99 USD`)")
-                }
-                "bool" => Some("**bool** -- Boolean value (`true` or `false`)"),
-                "duration" => Some("**duration** -- Time duration (e.g., `\"72h\"`, `\"30s\"`)"),
-                "path" => Some("**path** -- URL path with variables and wildcards"),
-                "secret" => Some("**secret** -- Value resolved from environment (`$ENV.X`)"),
-                "model" => Some("**model** -- Define a custom object type"),
-                "enum" => Some("**enum** -- Define a restricted set of allowed values"),
-                _ => None,
-            };
-
-            if let Some(text) = builtin_info {
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: text.to_string(),
-                    }),
-                    range: None,
-                }));
-            }
-        }
-
-        if !word.is_empty() {
-            let model_ref_type = if !is_prop {
-                let file = nml_core::cst::parse_best_effort(&source_clone);
-                let handle = self.schema_index_for(&uri);
-                let line_index = LineIndex::new(&source_clone);
-                find_model_ref_type_at(&file, &source_clone, pos, handle.index(), &line_index)
-            } else {
-                None
-            };
-
-            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(text) = find_declaration_hover(&docs, &word, model_ref_type.as_deref()) {
-                return Ok(Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: text,
-                    }),
-                    range: None,
-                }));
-            }
-        }
-
-        Ok(None)
+        .await?;
+        let aug = self.diagnostic_explanations_at(&aug_uri, aug_pos).await;
+        Ok(merge_hover(base, aug))
     }
 
     async fn goto_definition(
@@ -5281,6 +5501,24 @@ workflow VoiceAgent:
         assert_eq!(offered, vec!["temperature", "baseUrl"]);
     }
 
+    /// Round-13 F2: a union variant that is a ONEOF (`(modelA | mail)`,
+    /// `slot as mail:` + discriminator) completes its selected variant-model's
+    /// fields — previously Model-only guards left it completion-dead.
+    #[test]
+    fn union_oneof_variant_completes_through_its_discriminator() {
+        let schema = "model modelA:\n    a string?\nmodel logM:\n    level string?\n\noneof mail by kind:\n    \"log\" -> logM\n\nmodel host:\n    slot (modelA | mail)?\n";
+        let idx = field_index(schema);
+        let source = "host H:\n    slot as mail:\n        kind = \"log\"\n        \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let li = LineIndex::new(source);
+        let resolved = find_model_body_at(&file, Position::new(3, 8), &idx, &li);
+        assert_eq!(
+            resolved.map(|(m, _)| m.name.as_str()),
+            Some("logM"),
+            "the oneof variant's selected model must complete"
+        );
+    }
+
     /// Round-11: the item-slot finder reaches a union list NESTED inside a
     /// `[]model` item (descending through items via per-item body-aware
     /// resolution), and in-item field completion resolves the ANNOTATED
@@ -5318,6 +5556,95 @@ workflow VoiceAgent:
             resolved.map(|(m, _)| m.name.as_str()),
             Some("modelB"),
             "field completion inside an annotated item must resolve its variant"
+        );
+    }
+
+    fn coded_diag(code: &str, start: (u32, u32), end: (u32, u32)) -> Diagnostic {
+        Diagnostic {
+            range: Range::new(Position::new(start.0, start.1), Position::new(end.0, end.1)),
+            code: Some(tower_lsp::lsp_types::NumberOrString::String(
+                code.to_string(),
+            )),
+            message: "m".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn explanations_pick_narrowest_dedup_and_cap() {
+        // Wide outer + narrow inner at one position: narrowest first, its
+        // range is the hover highlight; duplicate codes collapse.
+        let items = vec![
+            coded_diag("NML2007", (1, 0), (3, 0)),
+            coded_diag("NML2008", (2, 4), (2, 9)),
+            coded_diag("NML2008", (2, 4), (2, 9)),
+        ];
+        let (md, range) = explanations_at_position(&items, Position::new(2, 5))
+            .expect("coded diagnostics intersect");
+        assert!(
+            md.contains("**NML2008**") && md.contains("**NML2007**"),
+            "{md}"
+        );
+        assert_eq!(md.matches("**NML2008**").count(), 1, "dedup by code: {md}");
+        assert!(md.contains("nml explain NML2008"), "{md}");
+        assert_eq!(range.start, Position::new(2, 4), "narrowest range wins");
+
+        // Position outside every range → no augmentation.
+        assert!(explanations_at_position(&items, Position::new(9, 0)).is_none());
+
+        // An uncoded diagnostic never augments.
+        let uncoded = vec![Diagnostic {
+            range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            ..Default::default()
+        }];
+        assert!(explanations_at_position(&uncoded, Position::new(0, 2)).is_none());
+    }
+
+    #[test]
+    fn range_contains_is_end_inclusive() {
+        let r = Range::new(Position::new(1, 2), Position::new(1, 6));
+        assert!(range_contains(&r, Position::new(1, 2)));
+        assert!(range_contains(&r, Position::new(1, 6)), "end-inclusive");
+        assert!(!range_contains(&r, Position::new(1, 7)));
+        assert!(!range_contains(&r, Position::new(0, 4)));
+    }
+
+    #[test]
+    fn merge_hover_composes_all_four_cases() {
+        let base = || Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: "base".into(),
+            }),
+            range: None,
+        };
+        let aug = || {
+            (
+                "**NML2007** — …".to_string(),
+                Range::new(Position::new(0, 0), Position::new(0, 4)),
+            )
+        };
+        // No base, no aug.
+        assert!(merge_hover(None, None).is_none());
+        // Base only: unchanged.
+        assert!(matches!(
+            merge_hover(Some(base()), None),
+            Some(Hover { contents: HoverContents::Markup(mc), .. }) if mc.value == "base"
+        ));
+        // Aug only: explanation-only hover carrying the DIAGNOSTIC's range.
+        let h = merge_hover(None, Some(aug())).expect("aug-only hover");
+        assert_eq!(h.range, Some(aug().1));
+        // Both: appended after a separator.
+        let h = merge_hover(Some(base()), Some(aug())).unwrap();
+        let HoverContents::Markup(mc) = h.contents else {
+            panic!()
+        };
+        assert!(
+            mc.value.starts_with("base")
+                && mc.value.contains("---")
+                && mc.value.contains("NML2007"),
+            "{}",
+            mc.value
         );
     }
 
