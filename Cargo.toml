@@ -24,8 +24,8 @@ edition = "2021"
 # minor-version event, always CHANGELOG-noted.
 rust-version = "1.86"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/nicknudge/nml"
-homepage = "https://github.com/nicknudge/nml"
+repository = "https://github.com/nudge-io/nml"
+homepage = "https://github.com/nudge-io/nml"
 keywords = ["configuration", "config", "language", "parser", "schema"]
 categories = ["config", "parser-implementations"]
 

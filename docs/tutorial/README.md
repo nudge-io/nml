@@ -34,7 +34,7 @@ Install the CLI:
 
 ```bash
 # until the crates.io release:
-cargo install --locked --git https://github.com/nicknudge/nml nml-cli
+cargo install --locked --git https://github.com/nudge-io/nml nml-cli
 ```
 
 That gives you the `nml` binary (`nml help` to confirm). For the best

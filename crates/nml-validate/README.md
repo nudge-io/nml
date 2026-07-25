@@ -46,8 +46,8 @@ Parsing lives in [`nml-core`](https://crates.io/crates/nml-core); the
 
 ## Documentation
 
-- [Integration guide](https://github.com/nicknudge/nml/blob/main/docs/integration.md)
-- [Language guide](https://github.com/nicknudge/nml/blob/main/docs/language-guide.md)
+- [Integration guide](https://github.com/nudge-io/nml/blob/main/docs/integration.md)
+- [Language guide](https://github.com/nudge-io/nml/blob/main/docs/language-guide.md)
 
 ## License
 

@@ -67,9 +67,9 @@ formatting in [`nml-fmt`](https://crates.io/crates/nml-fmt); the CLI is
 
 ## Documentation
 
-- [Language guide](https://github.com/nicknudge/nml/blob/main/docs/language-guide.md)
-- [Integration guide](https://github.com/nicknudge/nml/blob/main/docs/integration.md)
-- [Language specification](https://github.com/nicknudge/nml/blob/main/spec/README.md)
+- [Language guide](https://github.com/nudge-io/nml/blob/main/docs/language-guide.md)
+- [Integration guide](https://github.com/nudge-io/nml/blob/main/docs/integration.md)
+- [Language specification](https://github.com/nudge-io/nml/blob/main/spec/README.md)
 
 ## License
 

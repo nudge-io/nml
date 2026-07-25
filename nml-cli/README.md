@@ -29,8 +29,8 @@ editor support is [`nml-lsp`](https://crates.io/crates/nml-lsp).
 
 ## Documentation
 
-- [Language guide](https://github.com/nicknudge/nml/blob/main/docs/language-guide.md)
-- [Integration guide](https://github.com/nicknudge/nml/blob/main/docs/integration.md)
+- [Language guide](https://github.com/nudge-io/nml/blob/main/docs/language-guide.md)
+- [Integration guide](https://github.com/nudge-io/nml/blob/main/docs/integration.md)
 
 ## License
 

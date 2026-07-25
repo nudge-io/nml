@@ -35,8 +35,8 @@ your program consumes directly (more on references below).
 
 ```toml
 [dependencies]
-nml-core = { git = "https://github.com/nicknudge/nml" }       # crates.io: soon
-nml-validate = { git = "https://github.com/nicknudge/nml" }
+nml-core = { git = "https://github.com/nudge-io/nml" }       # crates.io: soon
+nml-validate = { git = "https://github.com/nudge-io/nml" }
 serde = { version = "1", features = ["derive"] }
 ```
 
