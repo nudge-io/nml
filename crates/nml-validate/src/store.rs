@@ -142,7 +142,7 @@ impl Store {
             _ => {
                 return Err(StoreError::Corrupt {
                     detail: "pointer must hold a slot name and a blake3 hash".to_string(),
-                })
+                });
             }
         };
         // Slot names are single path components; a pointer must not be able

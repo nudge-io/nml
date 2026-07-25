@@ -17,7 +17,7 @@ use serde::Deserialize;
 use crate::ast::*;
 use crate::de::{self, from_body};
 use crate::model::{FieldType, ModelDef, OneOfDef};
-use crate::resolve::{apply_shared_properties, ValueResolver};
+use crate::resolve::{ValueResolver, apply_shared_properties};
 use crate::schema_index::{FieldTarget, SchemaIndex};
 use crate::span::Span;
 use crate::types::{SpannedValue, Value};
@@ -100,7 +100,7 @@ where
         None => {
             return Err(serde::de::Error::custom(format!(
                 "block `{keyword} {name}` not found in document"
-            )))
+            )));
         }
     };
     let inlined = inline_array_references(doc, body, 0);
@@ -1245,8 +1245,7 @@ mod scope_tests {
         interval: String,
     }
 
-    const SCHEMA: &str =
-        "trait monitored:\n    timeout duration = \"5s\"\n    interval duration = \"60s\"\n\n\
+    const SCHEMA: &str = "trait monitored:\n    timeout duration = \"5s\"\n    interval duration = \"60s\"\n\n\
                           model endpoint is monitored:\n    url string+\n\n\
                           model service:\n    endpoints []endpoint\n";
 

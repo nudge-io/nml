@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo run --example parse_config
 
-use nml_core::{parse, Document};
+use nml_core::{Document, parse};
 
 fn main() {
     let source = r#"

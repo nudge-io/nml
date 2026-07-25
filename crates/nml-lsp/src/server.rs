@@ -3602,7 +3602,7 @@ impl NmlLanguageServer {
 /// patch. `None` when the edit is redundant (already pinned / already opted
 /// out) or the file has no `project` block to target.
 fn project_file_insertion(text: &str, edit: &ProjectEdit) -> Option<String> {
-    use nml_core::cst::edit::{insert_entry_at_path, EntryPosition};
+    use nml_core::cst::edit::{EntryPosition, insert_entry_at_path};
     // Idempotency is decided structurally, through the SAME parser that reads
     // pins at resolution time (`ProjectConfig::from_file`) — so the check can
     // never disagree with how the config is actually interpreted, and a
@@ -5540,8 +5540,7 @@ project MyApp:
 
     #[test]
     fn find_name_nested_block() {
-        let source =
-            "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - s1:\n            provider = GroqFast\n";
+        let source = "workflow W:\n    entrypoint = \"start\"\n    steps:\n        - s1:\n            provider = GroqFast\n";
         let file = nml_core::cst::parse_to_ast(source).unwrap();
         let line_index = LineIndex::new(source);
         assert!(find_name_in_file(&file, "steps", &line_index).is_some());
@@ -6509,13 +6508,17 @@ workflow VoiceAgent:
         };
         // The suppression case: modelA's `string` declaration comes first.
         assert_eq!(
-            at("enum modeKind:\n    - fast\n    - slow\nmodel modelA:\n    mode string?\nmodel modelB:\n    mode modeKind?\nmodel host:\n    slot (modelA | modelB)?\n"),
+            at(
+                "enum modeKind:\n    - fast\n    - slow\nmodel modelA:\n    mode string?\nmodel modelB:\n    mode modeKind?\nmodel host:\n    slot (modelA | modelB)?\n"
+            ),
             Some(vec!["fast".into(), "slow".into()]),
             "a string declaration in an earlier variant must not suppress a later variant's enum"
         );
         // Two enum declarations: variants union in candidate order.
         assert_eq!(
-            at("enum kindA:\n    - a1\n    - a2\nenum kindB:\n    - b1\n    - b2\nmodel modelA:\n    mode kindA?\nmodel modelB:\n    mode kindB?\nmodel host:\n    slot (modelA | modelB)?\n"),
+            at(
+                "enum kindA:\n    - a1\n    - a2\nenum kindB:\n    - b1\n    - b2\nmodel modelA:\n    mode kindA?\nmodel modelB:\n    mode kindB?\nmodel host:\n    slot (modelA | modelB)?\n"
+            ),
             Some(vec!["a1".into(), "a2".into(), "b1".into(), "b2".into()])
         );
     }

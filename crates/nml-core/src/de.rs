@@ -46,11 +46,11 @@
 
 use std::fmt;
 
+use serde::Deserialize;
 use serde::de::{
     self, DeserializeSeed, Deserializer as _, EnumAccess, MapAccess, SeqAccess, VariantAccess,
     Visitor,
 };
-use serde::Deserialize;
 
 use crate::ast::*;
 use crate::resolve::{self, ValueResolver};
@@ -1802,18 +1802,22 @@ workflow W:
     /// consumer's no-silent-misparse rule).
     #[test]
     fn role_conjunction_errors_are_targeted() {
-        assert!(parse_to_ast(
-            "server App:
+        assert!(
+            parse_to_ast(
+                "server App:
     allow = [@role/a &]
 "
-        )
-        .is_err());
-        assert!(parse_to_ast(
-            "server App:
+            )
+            .is_err()
+        );
+        assert!(
+            parse_to_ast(
+                "server App:
     allow = [& @role/a]
 "
-        )
-        .is_err());
+            )
+            .is_err()
+        );
         let err = parse_to_ast(
             "server App:
     allow = [@role/a && @role/b]

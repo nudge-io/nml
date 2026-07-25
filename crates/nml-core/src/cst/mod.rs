@@ -29,8 +29,8 @@ mod syntax;
 mod value;
 
 pub use syntax::{NmlLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
-pub use value::decode_value;
 pub(crate) use value::KNOWN_NAMESPACES;
+pub use value::decode_value;
 
 use crate::error::NmlError;
 use rowan::GreenNode;
@@ -374,7 +374,7 @@ mod tests {
         }
     }
 
-    fn block_decls(root: &SyntaxNode) -> impl Iterator<Item = BlockDecl> {
+    fn block_decls(root: &SyntaxNode) -> impl Iterator<Item = BlockDecl> + use<> {
         root.children().filter_map(BlockDecl::cast)
     }
 
@@ -1182,6 +1182,12 @@ service App is Base:
         // Common leading indent stripped; blank first/last lines trimmed.
         let v = decode_first("\"\"\"\n    Hello\n    World\n    \"\"\"");
         assert_eq!(v, Value::String("Hello\nWorld".into()));
+
+        // A CRLF source yields the SAME value — line endings are transport,
+        // not content; a checkout's eol convention must never change what a
+        // document means.
+        let v = decode_first("\"\"\"\r\n    Hello\r\n    World\r\n    \"\"\"");
+        assert_eq!(v, Value::String("Hello\nWorld".into()));
     }
 
     #[test]
@@ -1304,12 +1310,13 @@ service App is Base:
             ]
         );
         // `is Base, Mixin` is an Extends on the *declaration*, not in the body.
-        assert!(root
-            .descendants()
-            .find(|n| n.kind() == SyntaxKind::BlockDecl)
-            .unwrap()
-            .children()
-            .any(|n| n.kind() == SyntaxKind::Extends));
+        assert!(
+            root.descendants()
+                .find(|n| n.kind() == SyntaxKind::BlockDecl)
+                .unwrap()
+                .children()
+                .any(|n| n.kind() == SyntaxKind::Extends)
+        );
     }
 
     #[test]

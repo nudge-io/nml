@@ -779,8 +779,7 @@ mod tests {
     fn test_format_arm_literal_targets_roundtrip() {
         // RFC 0007 §6: a string-literal arm target (path/url for flat routers)
         // renders quoted, aligns like any arm, round-trips, and is idempotent.
-        let source =
-            "service App:\n    dispatch:\n        @role/admin -> \"admin.workflow.nml\"\n        else -> \"default.workflow.nml\"\n";
+        let source = "service App:\n    dispatch:\n        @role/admin -> \"admin.workflow.nml\"\n        else -> \"default.workflow.nml\"\n";
         let formatted = format(&parse(source).unwrap());
         assert!(
             formatted.contains("        @role/admin -> \"admin.workflow.nml\"\n"),
@@ -936,7 +935,9 @@ mod tests {
 
     #[test]
     fn roundtrip_list_items() {
-        roundtrip("workflow W:\n    steps:\n        - step1:\n            x = 1\n        - step2:\n            y = 2\n");
+        roundtrip(
+            "workflow W:\n    steps:\n        - step1:\n            x = 1\n        - step2:\n            y = 2\n",
+        );
     }
 
     #[test]
@@ -1003,7 +1004,9 @@ mod tests {
 
     #[test]
     fn roundtrip_scalar_and_block_shared_property() {
-        roundtrip("workflow W:\n    .interval = 900\n    .defaults:\n        retries = 3\n    - step1:\n        x = 1\n");
+        roundtrip(
+            "workflow W:\n    .interval = 900\n    .defaults:\n        retries = 3\n    - step1:\n        x = 1\n",
+        );
     }
 
     #[test]
@@ -1025,12 +1028,16 @@ mod tests {
 
     #[test]
     fn roundtrip_array_with_block_modifier() {
-        roundtrip("[]resource resources:\n    |allow:\n        - @role/admin\n        - @role/editor\n\n    - Dashboard:\n        path = \"/dashboard\"\n");
+        roundtrip(
+            "[]resource resources:\n    |allow:\n        - @role/admin\n        - @role/editor\n\n    - Dashboard:\n        path = \"/dashboard\"\n",
+        );
     }
 
     #[test]
     fn roundtrip_array_with_multiple_modifiers() {
-        roundtrip("[]route routes:\n    |allow = [@authenticated]\n    |deny = [@anonymous]\n\n    - Home:\n        path = \"/\"\n");
+        roundtrip(
+            "[]route routes:\n    |allow = [@authenticated]\n    |deny = [@anonymous]\n\n    - Home:\n        path = \"/\"\n",
+        );
     }
 
     #[test]
@@ -1056,7 +1063,9 @@ mod tests {
 
     #[test]
     fn idempotent_complex() {
-        idempotent("workflow W:\n    steps:\n        - s1:\n            provider = \"fast\"\n        - s2:\n            provider = \"slow\"\n");
+        idempotent(
+            "workflow W:\n    steps:\n        - s1:\n            provider = \"fast\"\n        - s2:\n            provider = \"slow\"\n",
+        );
     }
 
     // -------------------------------------------------------------------

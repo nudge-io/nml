@@ -302,10 +302,11 @@ oneof email by provider as providerKind = \"log\":
             Some(Value::Money(_))
         ));
         // A modifier field (`|visibility`) is extracted with a Modifier type.
-        assert!(plan
-            .fields
-            .iter()
-            .any(|f| matches!(f.field_type, FieldType::Modifier(_)) && f.optional));
+        assert!(
+            plan.fields
+                .iter()
+                .any(|f| matches!(f.field_type, FieldType::Modifier(_)) && f.optional)
+        );
 
         let email = &schema.oneofs[0];
         assert_eq!(email.discriminator, "provider");

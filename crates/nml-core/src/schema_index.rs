@@ -600,28 +600,32 @@ mod tests {
 
         // Empty body → ambiguous (the just-typed discovery moment).
         let empty = Body::fresh(Vec::new());
-        assert!(idx
-            .ambiguous_union_variants(&variants_of(&same_class), &empty)
-            .is_some());
+        assert!(
+            idx.ambiguous_union_variants(&variants_of(&same_class), &empty)
+                .is_some()
+        );
 
         // Annotated body → never ambiguous (even with an unknown annotation:
         // the ORACLE is about the D2 rule, which does not fire there — the
         // unknown name is NML2051's job).
         let annotated = body_of("x X:\n    slot as modelB:\n        k = \"v\"\n");
         let slot = nested_body(&annotated, "slot");
-        assert!(idx
-            .ambiguous_union_variants(&variants_of(&same_class), slot)
-            .is_none());
+        assert!(
+            idx.ambiguous_union_variants(&variants_of(&same_class), slot)
+                .is_none()
+        );
 
         // List-shaped body → not ambiguous (shape selects); single nameable →
         // not ambiguous.
         let listy = body_of("x X:\n    - A:\n        k = \"v\"\n");
-        assert!(idx
-            .ambiguous_union_variants(&variants_of(&same_class), &listy)
-            .is_none());
-        assert!(idx
-            .ambiguous_union_variants(&variants_of(&disjoint), &keyed)
-            .is_none());
+        assert!(
+            idx.ambiguous_union_variants(&variants_of(&same_class), &listy)
+                .is_none()
+        );
+        assert!(
+            idx.ambiguous_union_variants(&variants_of(&disjoint), &keyed)
+                .is_none()
+        );
     }
 
     #[test]
@@ -670,9 +674,10 @@ mod tests {
         );
 
         // `select_variant_by_type_name` is exact and membership-checked.
-        assert!(idx
-            .select_variant_by_type_name(variants, "modelB")
-            .is_some());
+        assert!(
+            idx.select_variant_by_type_name(variants, "modelB")
+                .is_some()
+        );
         assert!(idx.select_variant_by_type_name(variants, "nope").is_none());
         assert_eq!(
             idx.nameable_variant_names(variants),

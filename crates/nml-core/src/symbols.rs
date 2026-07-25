@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
-use crate::diagnostic::{codes, Diagnostic};
+use crate::diagnostic::{Diagnostic, codes};
 use crate::span::Span;
 use crate::types::Value;
 

@@ -16,7 +16,7 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 # The MSRV contract (docs/stability.md): measured floor, enforced by the CI
 # `msrv` job on exactly this toolchain (which reads the number from this
 # line — this is the single source of truth). Set by the icu_* dependency

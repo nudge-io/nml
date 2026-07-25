@@ -269,7 +269,9 @@ pub enum PrimitiveType {
 
 /// Error returned when a string is not a recognized primitive type name.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown primitive type `{0}` (expected one of: string, number, money, bool, duration, path, secret, object, role)")]
+#[error(
+    "unknown primitive type `{0}` (expected one of: string, number, money, bool, duration, path, secret, object, role)"
+)]
 pub struct UnknownPrimitiveType(pub String);
 
 impl std::str::FromStr for PrimitiveType {

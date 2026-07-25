@@ -9,7 +9,7 @@ use nml_core::diagnostic::Severity;
 use nml_core::query::Document;
 use nml_core::schema_index::SchemaIndex;
 use nml_core::symbols::SymbolTable;
-use nml_core::{parse, ValueResolver};
+use nml_core::{ValueResolver, parse};
 use nml_validate::loader::load_schema;
 use nml_validate::schema::SchemaValidator;
 use serde::Deserialize;

@@ -7,7 +7,7 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 
-use nml_core::diff::{diff_config, ChangeKind, FieldChange, Origin};
+use nml_core::diff::{ChangeKind, FieldChange, Origin, diff_config};
 use nml_core::parse;
 use nml_core::query::Document;
 use nml_core::schema_index::SchemaIndex;

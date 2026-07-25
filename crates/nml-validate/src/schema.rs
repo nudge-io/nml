@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
-use nml_core::schema::{report_graph_cycles, ExtractedSchema};
+use nml_core::schema::{ExtractedSchema, report_graph_cycles};
 use nml_core::schema_index::{BodyShape, FieldTarget, SchemaIndex};
 use nml_core::span::Span;
 use nml_core::types::{PrimitiveType, Value};
 
-use nml_core::diagnostic::{codes, Diagnostic};
+use nml_core::diagnostic::{Diagnostic, codes};
 
 const MAX_VALIDATION_DEPTH: u32 = 64;
 
@@ -2814,9 +2814,11 @@ mod tests {
         let source = "service Svc:\n    |forbid = [@public]\n    localMount = \"/\"\n";
         let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags
-            .iter()
-            .any(|d| d.message.contains("unknown modifier '|forbid'")));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown modifier '|forbid'"))
+        );
     }
 
     #[test]
@@ -2825,9 +2827,10 @@ mod tests {
         let source = "service Svc:\n    name string\n";
         let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags.iter().any(|d| d
-            .message
-            .contains("field definitions are only allowed in model declarations")));
+        assert!(diags.iter().any(|d| {
+            d.message
+                .contains("field definitions are only allowed in model declarations")
+        }));
     }
 
     #[test]
@@ -2851,9 +2854,11 @@ mod tests {
         let source = "mount Test:\n    path = \"/\"\n    unknown = \"value\"\n";
         let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags
-            .iter()
-            .any(|d| d.message.contains("unknown property 'unknown'")));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown property 'unknown'"))
+        );
     }
 
     #[test]
@@ -2864,9 +2869,11 @@ mod tests {
         let source = "mount Test:\n    wasm = \"handler.wasm\"\n";
         let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags
-            .iter()
-            .any(|d| d.message.contains("missing required field 'path'")));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("missing required field 'path'"))
+        );
     }
 
     #[test]
@@ -2892,9 +2899,12 @@ mod tests {
         let source = "mount Test:\n    path = 42\n";
         let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags
-            .iter()
-            .any(|d| d.message.contains("type mismatch") && d.message.contains("expected string")));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("type mismatch")
+                    && d.message.contains("expected string"))
+        );
     }
 
     #[test]
@@ -2935,17 +2945,18 @@ mod tests {
         let source = "provider Groq:\n    type = \"gemini\"\n";
         let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags
-            .iter()
-            .any(|d| d.message.contains("invalid value \"gemini\"")));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("invalid value \"gemini\""))
+        );
     }
 
     #[test]
     fn test_enum_invalid_suggests_nearest_variant() {
         // Diagnostics are fuzzy (case-insensitive first, then edit distance);
         // acceptance stays exact — the value is still rejected.
-        let schema =
-            "enum sameSite:\n    - \"Strict\"\n    - \"Lax\"\n    - \"None\"\n\nmodel c:\n    policy sameSite\n";
+        let schema = "enum sameSite:\n    - \"Strict\"\n    - \"Lax\"\n    - \"None\"\n\nmodel c:\n    policy sameSite\n";
         let validator = make_validator(schema);
 
         // Wrong casing → suggest the canonical spelling.
@@ -2965,26 +2976,30 @@ mod tests {
 
         // A light typo → nearest by edit distance.
         let file = nml_core::cst::parse_to_ast("c C:\n    policy = \"Stric\"\n").unwrap();
-        assert!(validator
-            .validate(&file)
-            .iter()
-            .any(|d| d.rendered_message().contains("did you mean \"Strict\"?")));
+        assert!(
+            validator
+                .validate(&file)
+                .iter()
+                .any(|d| d.rendered_message().contains("did you mean \"Strict\"?"))
+        );
 
         // A transposition — the dominant real-world typo — must be caught
         // even on a short value (OSA distance 1; plain Levenshtein would
         // score it 2 and miss it).
         let file = nml_core::cst::parse_to_ast("c C:\n    policy = \"aLx\"\n").unwrap();
-        assert!(validator
-            .validate(&file)
-            .iter()
-            .any(|d| d.rendered_message().contains("did you mean \"Lax\"?")));
+        assert!(
+            validator
+                .validate(&file)
+                .iter()
+                .any(|d| d.rendered_message().contains("did you mean \"Lax\"?"))
+        );
 
         // Something far from every variant → no (misleading) suggestion.
         let file = nml_core::cst::parse_to_ast("c C:\n    policy = \"whatever\"\n").unwrap();
-        assert!(validator.validate(&file).iter().any(|d| d
-            .rendered_message()
-            .contains("invalid value \"whatever\"")
-            && !d.rendered_message().contains("did you mean")));
+        assert!(validator.validate(&file).iter().any(|d| {
+            d.rendered_message().contains("invalid value \"whatever\"")
+                && !d.rendered_message().contains("did you mean")
+        }));
     }
 
     #[test]
@@ -3105,9 +3120,11 @@ mod tests {
             "[]mount mounts:\n    |restrict = [@admin]\n    - Test:\n        path = \"/\"\n";
         let file = nml_core::cst::parse_to_ast(source).unwrap();
         let diags = validator.validate(&file);
-        assert!(diags
-            .iter()
-            .any(|d| d.message.contains("unknown modifier '|restrict'")));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown modifier '|restrict'"))
+        );
     }
 
     #[test]
@@ -4845,8 +4862,7 @@ workflow W:
 
         // V = a oneof (denial) → a literal target is a category error; a
         // reference is the natural form.
-        let schema =
-            "model denialCard:\n    title string?\noneof denial by kind = \"card\":\n    \"card\" -> denialCard\nmodel mount:\n    denial (role -> denial)?\n";
+        let schema = "model denialCard:\n    title string?\noneof denial by kind = \"card\":\n    \"card\" -> denialCard\nmodel mount:\n    denial (role -> denial)?\n";
         let bad = diags(
             schema,
             "mount M:\n    denial:\n        @role/admin -> \"oops\"\n",
@@ -5671,11 +5687,7 @@ mod closed_vocabulary_tests {
         let schema = nml_core::cst::extract_schema("model server:\n    port number\n").0;
         let v =
             SchemaValidator::new(schema.models, schema.enums, schema.oneofs).closed_vocabulary();
-        if strict {
-            v.strict()
-        } else {
-            v
-        }
+        if strict { v.strict() } else { v }
     }
 
     fn codes_of(diags: &[Diagnostic]) -> Vec<(String, Severity)> {
@@ -5774,9 +5786,11 @@ mod duration_tests {
             );
         }
         // Wrong KIND stays NML2008 — format checking never absorbs it.
-        assert!(diags_for("30")
-            .iter()
-            .any(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2008")),);
+        assert!(
+            diags_for("30")
+                .iter()
+                .any(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2008")),
+        );
     }
 }
 
@@ -5839,9 +5853,11 @@ mod shared_property_validation_tests {
     fn array_level_shared_properties_are_validated_too() {
         let src =
             "[]endpoint eps:\n    .timeuot = \"10s\"\n\n    - A:\n        url = \"https://a\"\n";
-        assert!(check(src, false)
-            .iter()
-            .any(|d| d.message.contains("unknown shared property '.timeuot'")));
+        assert!(
+            check(src, false)
+                .iter()
+                .any(|d| d.message.contains("unknown shared property '.timeuot'"))
+        );
     }
 
     #[test]
@@ -5863,9 +5879,11 @@ mod shared_property_validation_tests {
         // A correct modifier stays silent.
         let good =
             "[]endpoint eps:\n    |allow = [@public]\n\n    - A:\n        url = \"https://a\"\n";
-        assert!(check(good, false)
-            .iter()
-            .all(|d| d.code.map(|c| c.to_string()).as_deref() != Some("NML2002")));
+        assert!(
+            check(good, false)
+                .iter()
+                .all(|d| d.code.map(|c| c.to_string()).as_deref() != Some("NML2002"))
+        );
     }
 }
 
@@ -5922,9 +5940,11 @@ mod union_shared_property_tests {
             hit.suggestions.first().map(|s| s.replacement.as_str()),
             Some("label")
         );
-        assert!(check(src, true)
-            .iter()
-            .any(|d| d.message.contains("no union variant") && d.severity == Severity::Error));
+        assert!(
+            check(src, true)
+                .iter()
+                .any(|d| d.message.contains("no union variant") && d.severity == Severity::Error)
+        );
     }
 
     #[test]

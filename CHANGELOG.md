@@ -4,6 +4,16 @@
 
 ### Changed
 
+- **Rust edition 2021 → 2024** across the workspace (one inherited line; the
+  MSRV stays 1.86, which predates the flip and supports edition 2024). The
+  audited migration surface was 12 sites, all rowan node-handle temporaries
+  in `cst/` whose 2024 drop/scoping changes are semantically inert — each
+  verified individually, and the natural `if let` forms kept over the
+  migration tool's defensive rewrites. Code delta: one `use<>` capture
+  bound in a test helper. Formatting adopts the 2024 style edition
+  (mechanical sweep, separate from the semantic change). Downstream crates
+  on any edition are unaffected.
+
 - **`nml_core::de::from_block` is now `from_body`** — it always took a
   `&Body`, and every other deserialization entry point is named for its
   input type (`from_value`, `from_body_resolved`, the `defaults` family);

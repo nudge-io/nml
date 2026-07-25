@@ -5,7 +5,7 @@ use std::error::Error;
 use std::path::Path;
 
 use nml_validate::package::SchemaPackage;
-use nml_validate::store::{hash8, PublishOutcome, Store};
+use nml_validate::store::{PublishOutcome, Store, hash8};
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Load the package: the .package.nml manifest plus every schema source

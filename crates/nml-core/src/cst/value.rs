@@ -12,7 +12,7 @@
 //! leaving this the single source of truth.)
 
 use crate::cst::syntax::{
-    content_span, node_span, text_offset, SyntaxKind, SyntaxNode, SyntaxToken,
+    SyntaxKind, SyntaxNode, SyntaxToken, content_span, node_span, text_offset,
 };
 
 /// Decode a bare string-literal token (`"…"`) to its value — used where the
@@ -107,7 +107,7 @@ fn decode_scalar(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
                     context: None,
                 },
                 span,
-            ))
+            ));
         }
     };
     Ok(SpannedValue::new(value, span))
@@ -227,8 +227,14 @@ fn decode_escapes(inner: &str, inner_start: usize) -> Result<String, NmlError> {
 
 /// Strip the common leading-space indent from a triple-quoted body and trim the
 /// blank first/last lines (mirrors the legacy `dedent_multiline_string`).
+/// Line endings normalize to LF: CRLF is transport, not content, so a document
+/// means the same value on every checkout (the policy Rust and Swift string
+/// literals follow).
 fn dedent_multiline(raw: &str) -> String {
-    let mut lines: Vec<&str> = raw.split('\n').collect();
+    let mut lines: Vec<&str> = raw
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
     if lines
         .first()
         .is_some_and(|l| l.chars().all(char::is_whitespace))

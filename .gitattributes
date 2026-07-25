@@ -1,0 +1,4 @@
+# LF at checkout on every platform: `include_str!` assets must be
+# byte-identical everywhere (see `error_index_is_lf_only` in nml-core's
+# diagnostic.rs). The repo has no files that require CRLF.
+* text=auto eol=lf

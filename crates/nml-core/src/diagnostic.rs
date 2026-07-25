@@ -759,6 +759,20 @@ mod tests {
     }
 
     #[test]
+    fn error_index_is_lf_only() {
+        // `.gitattributes` pins LF at checkout so the `include_str!` bytes
+        // are platform-stable; a CRLF checkout silently breaks the `"\n\n"`
+        // paragraph splitter in `summary_of`. Fail by name here rather than
+        // obliquely in every derivation test.
+        assert!(
+            !ERROR_INDEX.contains('\r'),
+            "error-index.md was checked out with CRLF line endings — the \
+             repo-root .gitattributes (`* text=auto eol=lf`) should prevent \
+             this; renormalize the checkout"
+        );
+    }
+
+    #[test]
     fn explain_summary_is_first_paragraph_with_links_grounded() {
         // The meaning paragraph only — never the example blocks.
         let s = explain_summary("NML2007").expect("known code");

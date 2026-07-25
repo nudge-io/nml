@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::diagnostic::{codes, Code, Diagnostic, Severity};
+use crate::diagnostic::{Code, Diagnostic, Severity, codes};
 use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, ModelKind, OneOfDef};
 
 /// Schema definitions (models / enums / oneofs) extracted from a source file.
@@ -818,9 +818,11 @@ mod tests {
         };
         let errors = find_extends_cycles(&schema);
         assert_eq!(errors.len(), 3, "one diagnostic per cycle member");
-        assert!(errors
-            .iter()
-            .all(|e| e.message.contains("circular inheritance")));
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.message.contains("circular inheritance"))
+        );
     }
 
     #[test]
@@ -851,10 +853,12 @@ mod tests {
             oneofs: vec![],
         };
         resolve_model_inheritance(&mut schema); // must not hang or panic
-        assert!(schema
-            .models
-            .iter()
-            .all(|m| m.fields.iter().any(|f| f.name.starts_with('f'))));
+        assert!(
+            schema
+                .models
+                .iter()
+                .all(|m| m.fields.iter().any(|f| f.name.starts_with('f')))
+        );
     }
 
     #[test]
@@ -1562,9 +1566,10 @@ mod composition_tests {
              model m:\n    a cap?\n    b []cap?\n    c set<cap>?\n    d (string | cap)?\n    |e cap?\n    f (cap -> string)?\n",
         );
         assert_eq!(errs.len(), 6, "{errs:?}");
-        assert!(errs
-            .iter()
-            .all(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2022")));
+        assert!(
+            errs.iter()
+                .all(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2022"))
+        );
     }
 
     #[test]

@@ -296,16 +296,18 @@ mod tests {
             doc.block("service", "MyApp").property("name").as_str(),
             Some("my-app")
         );
-        assert!(doc
-            .block("service", "MyApp")
-            .property("missing")
-            .as_str()
-            .is_none());
-        assert!(doc
-            .block("service", "Other")
-            .property("port")
-            .as_f64()
-            .is_none());
+        assert!(
+            doc.block("service", "MyApp")
+                .property("missing")
+                .as_str()
+                .is_none()
+        );
+        assert!(
+            doc.block("service", "Other")
+                .property("port")
+                .as_f64()
+                .is_none()
+        );
     }
 
     #[test]
@@ -320,12 +322,13 @@ mod tests {
                 .as_str(),
             Some("hello")
         );
-        assert!(doc
-            .block("workflow", "W")
-            .nested("missing")
-            .property("system")
-            .as_str()
-            .is_none());
+        assert!(
+            doc.block("workflow", "W")
+                .nested("missing")
+                .property("system")
+                .as_str()
+                .is_none()
+        );
     }
 
     #[test]
@@ -412,49 +415,54 @@ mod tests {
     fn query_property_wrong_type() {
         let file = parse_doc("service App:\n    port = 8080\n");
         let doc = Document::new(&file);
-        assert!(doc
-            .block("service", "App")
-            .property("port")
-            .as_str()
-            .is_none());
-        assert!(doc
-            .block("service", "App")
-            .property("port")
-            .as_bool()
-            .is_none());
+        assert!(
+            doc.block("service", "App")
+                .property("port")
+                .as_str()
+                .is_none()
+        );
+        assert!(
+            doc.block("service", "App")
+                .property("port")
+                .as_bool()
+                .is_none()
+        );
     }
 
     #[test]
     fn query_bool_as_number_returns_none() {
         let file = parse_doc("service App:\n    debug = true\n");
         let doc = Document::new(&file);
-        assert!(doc
-            .block("service", "App")
-            .property("debug")
-            .as_f64()
-            .is_none());
+        assert!(
+            doc.block("service", "App")
+                .property("debug")
+                .as_f64()
+                .is_none()
+        );
     }
 
     #[test]
     fn query_number_as_bool_returns_none() {
         let file = parse_doc("service App:\n    port = 8080\n");
         let doc = Document::new(&file);
-        assert!(doc
-            .block("service", "App")
-            .property("port")
-            .as_bool()
-            .is_none());
+        assert!(
+            doc.block("service", "App")
+                .property("port")
+                .as_bool()
+                .is_none()
+        );
     }
 
     #[test]
     fn query_string_array_on_non_array() {
         let file = parse_doc("service App:\n    port = 8080\n");
         let doc = Document::new(&file);
-        assert!(doc
-            .block("service", "App")
-            .property("port")
-            .as_string_array()
-            .is_none());
+        assert!(
+            doc.block("service", "App")
+                .property("port")
+                .as_string_array()
+                .is_none()
+        );
     }
 
     #[test]
@@ -475,12 +483,13 @@ mod tests {
     fn query_nested_block_missing() {
         let file = parse_doc("server S:\n    port = 8080\n");
         let doc = Document::new(&file);
-        assert!(doc
-            .block("server", "S")
-            .nested("db")
-            .property("url")
-            .as_str()
-            .is_none());
+        assert!(
+            doc.block("server", "S")
+                .nested("db")
+                .property("url")
+                .as_str()
+                .is_none()
+        );
     }
 
     #[test]

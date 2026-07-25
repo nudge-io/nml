@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use nml_core::ProjectConfig;
-use nml_validate::package::{builtin_meta_package, DirectiveDecl, PackageError, SchemaPackage};
+use nml_validate::package::{DirectiveDecl, PackageError, SchemaPackage, builtin_meta_package};
 use nml_validate::schema::SchemaValidator;
 use nml_validate::store::{Store, StoreError};
 
@@ -704,7 +704,7 @@ impl PackageResolver {
                     package,
                     hash,
                     source: DefinitionSource::Store,
-                })
+                });
             }
             StoreOutcome::Failed(message) => {
                 // The pin names this package explicitly — its failure is
@@ -771,10 +771,7 @@ impl PackageResolver {
                             // on overflow (see StoreEvent: newest-dropped).
                             for w in slot.package.manifest.shadow_warnings() {
                                 let _ = self.events.try_send(StoreEvent {
-                                    message: format!(
-                                        "schema package '{name}': {}",
-                                        w.message
-                                    ),
+                                    message: format!("schema package '{name}': {}", w.message),
                                     warning: true,
                                 });
                             }
@@ -1198,7 +1195,7 @@ fn ancestors_within_roots(path: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
-    use nml_validate::test_support::{publish_demo, DEMO_CORE as CORE, DEMO_MANIFEST as MANIFEST};
+    use nml_validate::test_support::{DEMO_CORE as CORE, DEMO_MANIFEST as MANIFEST, publish_demo};
 
     fn temp_ws(tag: &str) -> PathBuf {
         // pid + process-wide counter: pid alone collides when a re-used pid

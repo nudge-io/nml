@@ -20,7 +20,7 @@
 use rowan::GreenNode;
 
 use crate::cst::lexer::LexToken;
-use crate::cst::syntax::{raw, SyntaxKind};
+use crate::cst::syntax::{SyntaxKind, raw};
 use crate::error::NmlError;
 use crate::span::Span;
 
@@ -562,10 +562,10 @@ impl<'a> Parser<'a> {
             // A property/block *named* `as` is unaffected: that `as` is the
             // bumped name and the next token is `=`/`:`, not this branch.
             self.bump(); // as
-                         // The variant must follow `as` on the SAME line (line-significance,
-                         // exactly like a field type — see `at_field_type`). Without this
-                         // guard a bare `field as` would swallow the NEXT entry's name as the
-                         // variant, since the offside lexer carries no line-boundary token.
+            // The variant must follow `as` on the SAME line (line-significance,
+            // exactly like a field type — see `at_field_type`). Without this
+            // guard a bare `field as` would swallow the NEXT entry's name as the
+            // variant, since the offside lexer carries no line-boundary token.
             self.expect_kw_same_line_ident("a union variant type after `as`");
             self.expect(SyntaxKind::Colon);
             self.body();
@@ -782,9 +782,9 @@ impl<'a> Parser<'a> {
             }
             self.bump(); // constructor name
             self.bump(); // <
-                         // Inside the angles the union is already bounded, so variants are
-                         // bare and canonical: `set<a | b>`. Grouping parens also parse
-                         // (`set<(a | b)>`) — fmt strips them as redundant.
+            // Inside the angles the union is already bounded, so variants are
+            // bare and canonical: `set<a | b>`. Grouping parens also parse
+            // (`set<(a | b)>`) — fmt strips them as redundant.
             self.type_expr();
             while self.eat(SyntaxKind::Pipe) {
                 self.type_expr();

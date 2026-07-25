@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower::{Service, ServiceExt};
 use tower_lsp::jsonrpc::{Request, Response};
 use tower_lsp::lsp_types::Url;
@@ -24,7 +24,7 @@ use tower_lsp::{ClientSocket, LspService};
 
 use nml_lsp::server::NmlLanguageServer;
 use nml_validate::store::Store;
-use nml_validate::test_support::{demo_package, publish_demo, DEMO_MANIFEST_WITH_DIRECTIVES};
+use nml_validate::test_support::{DEMO_MANIFEST_WITH_DIRECTIVES, demo_package, publish_demo};
 
 /// Generous slack for a server→client notification. Store-health
 /// `window/logMessage`s are emitted during the diagnostic-pull handler
@@ -449,8 +449,7 @@ async fn as_position_completion_offers_union_variants_end_to_end() {
     let ws = base.join("ws");
     fs::create_dir_all(&ws).expect("create workspace");
     let model = ws.join("union.model.nml");
-    let model_text =
-        "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slot (modelA | modelB)?\n";
+    let model_text = "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slot (modelA | modelB)?\n";
     fs::write(&model, model_text).expect("write model");
     let config = ws.join("app.nml");
     let config_text = "host H:\n    slot as \n";
@@ -490,8 +489,7 @@ async fn as_position_completion_works_on_list_elements_end_to_end() {
     let ws = base.join("ws");
     fs::create_dir_all(&ws).expect("create workspace");
     let model = ws.join("union.model.nml");
-    let model_text =
-        "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slots [](modelA | modelB)?\n";
+    let model_text = "model modelA:\n    a string?\nmodel modelB:\n    b string?\nmodel host:\n    slots [](modelA | modelB)?\n";
     fs::write(&model, model_text).expect("write model");
     let config = ws.join("app.nml");
     let config_text = "host H:\n    slots:\n        - one as \n";

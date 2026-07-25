@@ -12,8 +12,8 @@ use std::collections::HashSet;
 // Import the passes by name (not the module) so the bare `schema` identifier stays
 // free for the local `ExtractedSchema` value and our own `crate::schema` module.
 use nml_core::schema::{
-    find_composition_errors, find_enum_errors, find_extends_cycles, find_model_cycles,
-    find_oneof_errors, find_shorthand_errors, resolve_model_inheritance, ExtractedSchema,
+    ExtractedSchema, find_composition_errors, find_enum_errors, find_extends_cycles,
+    find_model_cycles, find_oneof_errors, find_shorthand_errors, resolve_model_inheritance,
 };
 
 use nml_core::diagnostic::Diagnostic;

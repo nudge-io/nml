@@ -2276,8 +2276,7 @@ mod tests {
     /// the collections early-return silently dropped it.
     #[test]
     fn shape_switch_keyed_to_list_keeps_old_content_visible() {
-        let schema =
-            "model step:\n    run string?\n    a string?\nmodel server:\n    slot (step | []step)?\n";
+        let schema = "model step:\n    run string?\n    a string?\nmodel server:\n    slot (step | []step)?\n";
         let (sch, errs) = crate::cst::extract_schema(schema);
         assert!(errs.is_empty(), "{errs:?}");
         let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
@@ -2484,7 +2483,9 @@ mod tests {
         let old = parse_doc(&src(
             "                - \"203.0.113.0/24\"\n                - \"10.0.0.0/8\"\n",
         ));
-        let new = parse_doc(&src("                - \"10.0.0.0/8\"\n                - \"203.0.113.0/24\"\n                - \"198.51.100.0/24\"\n"));
+        let new = parse_doc(&src(
+            "                - \"10.0.0.0/8\"\n                - \"203.0.113.0/24\"\n                - \"198.51.100.0/24\"\n",
+        ));
         let d = diff_config(
             &idx,
             "server",
@@ -2735,9 +2736,15 @@ mod tests {
         assert!(errs.is_empty(), "{errs:?}");
         let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
         let src = |plugins: &str| format!("server s:\n    grants:\n        - \"_op\":\n{plugins}");
-        let one = src("            - \"[v]-a.v1\":\n                egress:\n                    - http:\n                        - \"10.0.5.0/24\"\n");
-        let two = src("            - \"[v]-a.v1\":\n                egress:\n                    - http:\n                        - \"10.0.5.0/24\"\n            - \"[v]-b.v1\":\n                egress:\n                    - http:\n                        - \"10.0.9.0/24\"\n");
-        let edited = src("            - \"[v]-a.v1\":\n                egress:\n                    - http:\n                        - \"10.0.6.0/24\"\n");
+        let one = src(
+            "            - \"[v]-a.v1\":\n                egress:\n                    - http:\n                        - \"10.0.5.0/24\"\n",
+        );
+        let two = src(
+            "            - \"[v]-a.v1\":\n                egress:\n                    - http:\n                        - \"10.0.5.0/24\"\n            - \"[v]-b.v1\":\n                egress:\n                    - http:\n                        - \"10.0.9.0/24\"\n",
+        );
+        let edited = src(
+            "            - \"[v]-a.v1\":\n                egress:\n                    - http:\n                        - \"10.0.6.0/24\"\n",
+        );
         let d2 = |o: &str, n: &str| {
             let (of, nf) = (parse_doc(o), parse_doc(n));
             diff_config(
@@ -2881,7 +2888,9 @@ mod tests {
         let (sch, errs) = crate::cst::extract_schema(schema);
         assert!(errs.is_empty(), "{errs:?}");
         let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
-        let old = parse_doc("server s:\n    p:\n        kind = \"post\"\n        token = \"t\"\n        addr = \"a\"\n");
+        let old = parse_doc(
+            "server s:\n    p:\n        kind = \"post\"\n        token = \"t\"\n        addr = \"a\"\n",
+        );
         let new = parse_doc("server s:\n    p:\n        kind = \"log\"\n");
         let d = diff_config(
             &idx,
@@ -2916,7 +2925,9 @@ mod tests {
         let old = parse_doc(
             "server s:\n    denials:\n        - NotFound:\n            kind = \"builtin\"\n",
         );
-        let new = parse_doc("server s:\n    denials:\n        - NotFound:\n            kind = \"card\"\n            title = \"t\"\n");
+        let new = parse_doc(
+            "server s:\n    denials:\n        - NotFound:\n            kind = \"card\"\n            title = \"t\"\n",
+        );
         let d = diff_config(
             &idx,
             "server",
@@ -2997,8 +3008,8 @@ mod tests {
         let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
         let src = |cid: &str| {
             format!(
-            "server s:\n    steps:\n        - A:\n            parallel:\n                - br:\n                    - C:\n                        id = \"{cid}\"\n                    - D:\n                        id = \"d\"\n"
-        )
+                "server s:\n    steps:\n        - A:\n            parallel:\n                - br:\n                    - C:\n                        id = \"{cid}\"\n                    - D:\n                        id = \"d\"\n"
+            )
         };
         let old = parse_doc(&src("c1"));
         let new = parse_doc(&src("c2"));

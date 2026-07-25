@@ -3,7 +3,7 @@
 //! Run with: cargo run --example serde_deserialize
 
 use nml_core::de::from_body;
-use nml_core::{parse, Document};
+use nml_core::{Document, parse};
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]

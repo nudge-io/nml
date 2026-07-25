@@ -23,6 +23,6 @@ pub mod test_support;
 // core layers (cst, diff, …) are an explicit `nml-core` dependency away.
 pub use nml_core::diagnostic::{Diagnostic, Severity};
 pub use nml_core::{
-    apply_defaults, from_body_defaulted, from_document_defaulted, parse, Document, File,
-    SchemaIndex, ValueResolver,
+    Document, File, SchemaIndex, ValueResolver, apply_defaults, from_body_defaulted,
+    from_document_defaulted, parse,
 };

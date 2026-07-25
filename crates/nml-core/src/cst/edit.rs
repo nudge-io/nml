@@ -21,7 +21,7 @@
 //! shapes the parser itself produces.
 
 use super::ast::{self, AstNode as _};
-use super::{parse, NmlLanguage, SyntaxKind, SyntaxNode};
+use super::{NmlLanguage, SyntaxKind, SyntaxNode, parse};
 
 /// A child element (node or token) of the NML tree.
 type SyntaxElement = rowan::SyntaxElement<NmlLanguage>;

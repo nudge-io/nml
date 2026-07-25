@@ -650,10 +650,12 @@ mod tests {
         let r = ValueResolver::env();
         let result = r.resolve(&Value::Secret("$FOOBAR.KEY".into()));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unknown variable source"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown variable source")
+        );
     }
 
     // -------------------------------------------------------------------
@@ -799,10 +801,12 @@ workflow W:
         let merged = apply_shared_properties(body);
 
         // SharedProperty should be removed
-        assert!(merged
-            .entries
-            .iter()
-            .all(|e| !matches!(&e.kind, BodyEntryKind::SharedProperty(_))));
+        assert!(
+            merged
+                .entries
+                .iter()
+                .all(|e| !matches!(&e.kind, BodyEntryKind::SharedProperty(_)))
+        );
 
         // StepA should have defaults injected as a NestedBlock
         if let BodyEntryKind::ListItem(item) = &merged.entries[0].kind {
@@ -1050,10 +1054,12 @@ workflow W:
 
         let merged = apply_shared_properties(body);
         // Both shared properties should be consumed
-        assert!(merged
-            .entries
-            .iter()
-            .all(|e| !matches!(&e.kind, BodyEntryKind::SharedProperty(_))));
+        assert!(
+            merged
+                .entries
+                .iter()
+                .all(|e| !matches!(&e.kind, BodyEntryKind::SharedProperty(_)))
+        );
         // StepA should have config and limits injected
         if let BodyEntryKind::ListItem(item) = &merged.entries[0].kind {
             if let ListItemKind::Named { body, .. } = &item.kind {

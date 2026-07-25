@@ -1,5 +1,5 @@
 use nml_core::ast::*;
-use nml_core::diagnostic::{codes, Severity};
+use nml_core::diagnostic::{Severity, codes};
 use nml_core::model::{EnumDef, ModelDef, OneOfDef};
 use nml_core::types::{TemplateSegment, Value};
 use nml_validate::schema::{MembershipSemantics, SchemaValidator};
@@ -852,9 +852,11 @@ package demo:
         let source = "service\n";
         let diags = compute_registry(source, &[], &[], &[], &default_config());
         assert!(!diags.is_empty(), "parse error should produce diagnostics");
-        assert!(diags
-            .iter()
-            .any(|d| d.severity == Some(DiagnosticSeverity::ERROR)));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+        );
     }
 
     #[test]

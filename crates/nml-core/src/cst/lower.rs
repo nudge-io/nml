@@ -9,7 +9,7 @@
 
 use crate::ast::*;
 use crate::cst::ast::{self, AstNode};
-use crate::cst::syntax::{content_span, token_span, SyntaxToken};
+use crate::cst::syntax::{SyntaxToken, content_span, token_span};
 use crate::cst::value::decode_string_token;
 use crate::error::NmlError;
 use crate::span::Span;
