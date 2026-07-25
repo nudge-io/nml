@@ -761,6 +761,63 @@ async fn oneof_discovery_moment_end_to_end() {
         labels.contains(&"\"log\"") && labels.contains(&"\"post\""),
         "the switching state must complete every arm: {labels:?}"
     );
+    // The honest label: arm keys are discriminator values, not enum variants.
+    let log = items
+        .iter()
+        .find(|i| i["label"] == json!("\"log\""))
+        .unwrap();
+    assert_eq!(
+        log["detail"],
+        json!("discriminator value"),
+        "arm keys must render as what they are: {log}"
+    );
+}
+
+/// Round 26 (mutation-found gap): the top-level oneof discriminator path
+/// sorts arm keys in DECLARATION order — one regime across all value
+/// positions. The fixture's declaration order deliberately differs from
+/// alphabetical, so a regression to the old alphabetical key fails.
+#[tokio::test]
+async fn top_level_discriminator_values_sort_in_declaration_order() {
+    let base = temp_dir("oneof-toplevel-sort");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let ws = base.join("ws");
+    fs::create_dir_all(&ws).expect("create workspace");
+    let model = ws.join("mail.model.nml");
+    let model_text = "model zebraM:\n    z string?\nmodel alphaM:\n    a string?\n\noneof mail by kind:\n    \"zebra\" -> zebraM\n    \"alpha\" -> alphaM\n";
+    fs::write(&model, model_text).expect("write model");
+    let config = ws.join("app.nml");
+    let config_text = "mail X:\n    kind = \n";
+    fs::write(&config, config_text).expect("write config");
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness.open(&model, model_text).await;
+    harness.open(&config, config_text).await;
+    let result = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": file_uri(&config) },
+                "position": { "line": 1, "character": 11 },
+            }),
+        )
+        .await;
+    let items = result.as_array().expect("completion item array");
+    let sort_of = |label: &str| {
+        items
+            .iter()
+            .find(|i| i["label"] == json!(label))
+            .and_then(|i| i["sortText"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| panic!("{label} offered: {result}"))
+    };
+    assert!(
+        sort_of("\"zebra\"") < sort_of("\"alpha\""),
+        "declaration order, not alphabetical: zebra={} alpha={}",
+        sort_of("\"zebra\""),
+        sort_of("\"alpha\"")
+    );
 }
 
 /// Round 23, end-to-end: a body resolved through a oneof's DEFAULT

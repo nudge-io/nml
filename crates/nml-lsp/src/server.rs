@@ -2296,8 +2296,11 @@ enum DescentTarget<'i, 'f> {
         /// The `oneof` the landing body resolved through, when it did — the
         /// raw fact; consumers apply their own policy. The field-completion
         /// knob filters it through [`defaulted_knob`]; the value governors
-        /// use it as-is so the discriminator's arm keys complete even at a
-        /// VALID authored value (the variant-switching moment).
+        /// apply the validator's CLAIM policy — at the discriminator's value
+        /// position the arm keys REPLACE the field channel (a shadowing
+        /// field's values would all be validator-rejected), which is also
+        /// what makes a valid authored value still complete every arm (the
+        /// variant-switching moment).
         via_oneof: Option<&'i OneOfDef>,
     },
     Ambiguous {
@@ -6942,6 +6945,24 @@ workflow VoiceAgent:
             .expect("modifier field completes");
         assert_eq!(values2.variants, vec!["fast", "slow"]);
         assert!(values2.arms.is_empty());
+        // Cross-dedup: in an AMBIGUOUS body both channels fire (either
+        // resolution is still pickable), and a value present in both
+        // surfaces ONCE — variants win the overlap.
+        let overlap_idx = field_index(
+            "enum modeKind:\n    - fast\n    - log\nmodel modelA:\n    kind modeKind?\nmodel logM:\n    level string?\nmodel postM:\n    server string?\n\noneof mail by kind:\n    \"log\" -> logM\n    \"post\" -> postM\n\nmodel host:\n    slot (modelA | mail)?\n",
+        );
+        let source3 = "host H:\n    slot:\n        kind = \n";
+        let file3 = nml_core::cst::parse_best_effort(source3);
+        let li3 = LineIndex::new(source3);
+        let values3 =
+            find_value_completions_at(&file3, source3, Position::new(2, 15), &overlap_idx, &li3)
+                .expect("both channels complete in the ambiguous body");
+        assert_eq!(values3.variants, vec!["fast", "log"]);
+        assert_eq!(
+            values3.arms,
+            vec!["post"],
+            "the overlapping value surfaces once, in the variants channel"
+        );
     }
 
     /// Round-20 audit F4: the code-action consumer cap counts VALID entries —
