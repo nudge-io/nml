@@ -167,7 +167,6 @@ editor quick-fixes apply what can be applied mechanically).
 | [Error Index](docs/errors/README.md) | Every `NML0000` diagnostic code, with verified examples and fixes |
 | [Editor Integration](docs/reference/editors.md) | LSP + VS Code surfaces: diagnostics, quick fixes, hover explanations, completion |
 | [Stability Policy](docs/stability.md) | What pre-1.0 means here; breaking changes ship with fixers |
-| [RFC index](docs/rfcs/README.md) | Language evolution and design records |
 
 Docs examples are executable: tagged ```` ```nml ```` blocks run through the
 real CLI in CI (`just docs-test`), every tutorial chapter's finished config
@@ -197,7 +196,8 @@ just install # build + install the LSP and VS Code extension locally
 ```
 
 Minimum supported Rust: see `rust-version` in [Cargo.toml](Cargo.toml).
-Contributions welcome — see [CONTRIBUTING](CONTRIBUTING.md).
+Contributions welcome — a CONTRIBUTING guide lands with the first public
+release.
 
 ## License
 

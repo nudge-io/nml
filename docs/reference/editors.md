@@ -69,7 +69,7 @@ annotation preservation.
 
 ## Schema packages
 
-Documents covered by a schema package ([RFC 0030 lineage — see the RFC
-index](../rfcs/README.md)) validate against the package's composed
+Documents covered by a schema package (RFC 0030 lineage) validate
+against the package's composed
 schemas automatically; `.model.nml` files feed the workspace registry in
 open mode.

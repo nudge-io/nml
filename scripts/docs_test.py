@@ -511,13 +511,34 @@ def check_error_index() -> list[tuple[str, str]]:
     return failures
 
 
+def tracked_files() -> set[str]:
+    """Repo-relative POSIX paths of every git-TRACKED file. Links are judged
+    against this, not the local filesystem: a target that exists locally but
+    is gitignored or uncommitted (docs/rfcs/, held governance files) is
+    BROKEN in every clean checkout and on GitHub — exactly the failure CI
+    sees and a local `exists()` check cannot. Falls back to empty (existence
+    check only) if git is unavailable."""
+    try:
+        out = subprocess.run(
+            ["git", "ls-files"], capture_output=True, text=True, cwd=REPO, timeout=30
+        )
+        if out.returncode == 0:
+            return set(out.stdout.splitlines())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return set()
+
+
+TRACKED = tracked_files()
+
+
 def check_relative_links(path: Path) -> list[tuple[str, str]]:
-    """Every relative link in `path` must resolve to a real file (or
-    directory) inside the repo, from the document's own directory. The error
-    index already moved home once (docs/errors/ → crates/nml-core/assets/),
-    stranding links written for the old home; this guard makes that class of
-    rot a visible failure for every scanned page. Fenced lines are code
-    content, not prose — skipped, matching the `explain_document` composer."""
+    """Every relative link in `path` must resolve to a git-TRACKED file (or
+    a directory containing one) inside the repo, from the document's own
+    directory. Existence alone is not enough — see [`tracked_files`]. The
+    error index already moved home once, stranding links written for the
+    old home; this guard makes both rot classes a visible failure. Fenced
+    lines are code content, not prose — skipped."""
     failures = []
     where = path.relative_to(REPO).as_posix()
     in_fence = False
@@ -531,11 +552,24 @@ def check_relative_links(path: Path) -> list[tuple[str, str]]:
             if target.startswith(("http://", "https://", "#", "mailto:")):
                 continue
             resolved = (path.parent / target.split("#")[0]).resolve()
-            # Same containment rule as schema= dirs above: a doc link that
-            # escapes the repo is wrong even if the path happens to exist.
-            if not resolved.exists() or not resolved.is_relative_to(REPO):
+            if not resolved.is_relative_to(REPO):
                 failures.append(
-                    (where, f"line {number}: relative link does not resolve: {target}")
+                    (where, f"line {number}: link escapes the repo: {target}")
+                )
+                continue
+            rel = resolved.relative_to(REPO).as_posix()
+            ok = resolved.exists() and (
+                not TRACKED
+                or rel in TRACKED
+                or any(t.startswith(rel + "/") for t in TRACKED)
+            )
+            if not ok:
+                failures.append(
+                    (
+                        where,
+                        f"line {number}: relative link does not resolve to a "
+                        f"tracked file: {target}",
+                    )
                 )
     return failures
 

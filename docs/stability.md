@@ -21,7 +21,7 @@ commitment, demonstrated by the two renames already shipped:
   `=>` in an arm today produces "`=>` was replaced by `->`" at the exact span.
 - Where the rewrite is mechanical, `nml fmt` and the language server's
   quick-fixes apply it for you.
-- Syntax changes go through an [RFC](rfcs/README.md) with a required
+- Syntax changes go through an RFC (design records) with a required
   Documentation section — a change is not "Implemented" until its docs and
   migration story have landed.
 
