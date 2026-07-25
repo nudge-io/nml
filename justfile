@@ -61,6 +61,7 @@ fmt-check:
 # (see scripts/docs_test.py for the tag grammar). Matches the CI docs job.
 docs-test:
     unset CARGO_TARGET_DIR && cargo build -p nml-cli --locked
+    unset CARGO_TARGET_DIR && cargo build -p nml-cookbook --examples --tests --locked
     python3 scripts/docs_test.py
 
 # The declared floor toolchain (read from Cargo.toml, the single source of

@@ -74,6 +74,13 @@ struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     fn run(mut self) -> Lexed<'a> {
+        // A leading U+FEFF is a byte-order mark (Windows-editor interop):
+        // filed as trivia so it stays in the lossless tree without becoming
+        // a token. Interior U+FEFF is the source policy's error, not ours.
+        if self.bytes.starts_with(b"\xEF\xBB\xBF") {
+            self.push(SyntaxKind::Whitespace, 0, 3);
+            self.pos = 3;
+        }
         while self.pos < self.bytes.len() {
             if self.at_line_start {
                 self.handle_line_start();
@@ -300,7 +307,22 @@ impl<'a> Lexer<'a> {
             let mut end = start + 1;
             loop {
                 match self.bytes.get(end) {
+                    // A CR that is half of CRLF belongs to the line ending,
+                    // not the string: excluding it keeps an unterminated
+                    // string's content identical under LF and CRLF (the
+                    // eol-insensitivity property). A bare CR stays content —
+                    // the source policy reports it.
                     None | Some(b'\n') => {
+                        self.push_error_kind(
+                            crate::error::ParseErrorKind::UnterminatedString {
+                                open: Span::new(start, start + 1),
+                                multiline: false,
+                            },
+                            Span::new(start, end),
+                        );
+                        break;
+                    }
+                    Some(b'\r') if self.bytes.get(end + 1) == Some(&b'\n') => {
                         self.push_error_kind(
                             crate::error::ParseErrorKind::UnterminatedString {
                                 open: Span::new(start, start + 1),

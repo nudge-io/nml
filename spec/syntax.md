@@ -2,9 +2,49 @@
 
 ## Lexical Structure
 
-### Encoding
+### Source text
 
-NML files are UTF-8 encoded text files with the `.nml` extension.
+NML files are UTF-8 encoded text files with the `.nml` extension. The
+character-level contract below is checked by a dedicated policy pass on
+every parse, before structure is considered; its governing principle is
+**raw is transport, escaped is content**.
+
+**Line endings** are LF or CRLF. The two transcriptions of a document are
+the *same document*: line endings are transport, not content, so CRLF
+normalizes to LF inside multiline string values, and no value can observe
+which convention the file used (a fuzzed property test holds the parser to
+this). A carriage return with no following line feed is an error
+([NML0016](../crates/nml-core/assets/error-index.md#nml0016)) with a
+machine-applicable deletion fix. This fence is re-transcribed to CRLF by
+the docs harness before it runs, making the claim executable:
+
+```nml check eol=crlf
+service Api:
+    port = 8080
+    motd = """
+        same value
+        on every checkout
+        """
+```
+
+**Raw source is printable.** C0 control characters (other than tab and
+line endings) and DEL are rejected wherever they appear — values,
+comments, or between tokens
+([NML0017](../crates/nml-core/assets/error-index.md#nml0017)). Control
+characters are content, and content belongs in `\u{…}` escapes, where
+review can see it. Tab is legal raw in string content; indentation
+restricts it separately (NML0005).
+
+**Nothing invisible may steer the reader.** The bidirectional control
+characters U+202A–U+202E and U+2066–U+2069 (the Trojan Source attack,
+CVE-2021-42574) and interior U+FEFF are rejected in raw form
+([NML0018](../crates/nml-core/assets/error-index.md#nml0018)); the banned
+set matches rustc's. Right-to-left text itself is unaffected — Hebrew and
+Arabic values need no bidi controls. A *leading* U+FEFF is accepted as a
+byte-order mark for Windows-editor interoperability.
+
+Every banned character has exactly one sanctioned spelling — its escape —
+so no capability is lost, and intent becomes visible in review.
 
 ### Comments
 
@@ -51,13 +91,18 @@ system = """
     """
 ```
 
-The content is dedented: the minimum leading indent is stripped from each line. The newline immediately after the opening `"""` and before the closing `"""` is trimmed (TOML-style).
+The content is dedented: the minimum leading indent is stripped from each line. The newline immediately after the opening `"""` and before the closing `"""` is trimmed (TOML-style). Line endings in the body normalize to LF in the value — CRLF is transport, not content (see [Source text](#source-text)).
 
 Escape sequences (same for single and multiline strings):
 - `\"` -- literal double quote
 - `\\` -- literal backslash
 - `\n` -- newline
 - `\t` -- tab
+- `\r` -- carriage return (the only way to put a CR in a value)
+- `\u{…}` -- 1–6 hex digits naming a Unicode scalar (as in Rust and
+  Swift), e.g. `\u{E9}` é, `\u{1F389}` 🎉. Surrogates and code points
+  above `10FFFF` are rejected. This is the sanctioned spelling for every
+  character the [Source text](#source-text) policy bans raw.
 
 ### Template Expressions
 

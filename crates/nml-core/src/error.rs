@@ -36,6 +36,18 @@ pub enum ParseErrorKind {
     UnexpectedCharacter { ch: char },
     /// A tab in indentation (spec: spaces only).
     TabInIndent,
+    /// A carriage return not followed by a line feed. Line endings are LF or
+    /// CRLF (spec: Source text); a bare CR is invisible in most tools and is
+    /// either corruption or content smuggling, never intent.
+    BareCarriageReturn,
+    /// A raw control character (C0 other than tab and line endings, or DEL)
+    /// anywhere in source. Control characters are content, and content
+    /// belongs in escapes (`\u{1B}`), where review can see it.
+    ForbiddenControlCharacter { ch: char },
+    /// An invisible character that can make source display differently than
+    /// it parses: a bidirectional control (Trojan Source, CVE-2021-42574) or
+    /// an interior U+FEFF. The `\u{…}` escape is the sanctioned spelling.
+    InvisibleCharacter { ch: char },
     /// A dedent to a column matching no enclosing block. `valid` lists the
     /// open indentation levels — the offside rule, taught at the site.
     BadDedent { found: usize, valid: Vec<usize> },
@@ -54,6 +66,9 @@ pub enum ParseErrorKind {
     DuplicateDirective,
     /// An unknown (`Some`) or unterminated (`None`) string escape.
     InvalidEscape { escape: Option<char> },
+    /// A malformed `\u{…}` escape; the payload names the precise failure so
+    /// the message can teach the exact fix.
+    InvalidUnicodeEscape { issue: UnicodeEscapeIssue },
     /// A numeric literal no number parses from (e.g. `1.2.3`).
     InvalidNumber { raw: String },
     /// An integer outside `i64` — numbers are exact by design, never
@@ -83,6 +98,23 @@ pub enum ExpectedItem {
 pub struct FoundToken {
     pub kind: crate::cst::SyntaxKind,
     pub text: String,
+}
+
+/// Why a `\u{…}` escape failed to decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnicodeEscapeIssue {
+    /// `\u` not followed by `{`.
+    MissingBrace,
+    /// No closing `}` before the string ended.
+    Unterminated,
+    /// `\u{}` — zero digits.
+    Empty,
+    /// More than 6 hex digits.
+    Overlong,
+    /// A non-hex character between the braces; carried for the message.
+    BadDigit(char),
+    /// Hex parsed but is a surrogate or above U+10FFFF; carries the value.
+    NotAScalar(u32),
 }
 
 /// Why a `$NS.key` reference failed to parse.
@@ -171,6 +203,20 @@ impl ParseErrorKind {
                 format!("unexpected character `{}`", echo(&ch.to_string()))
             }
             TabInIndent => "tabs are not permitted in indentation; use spaces".to_string(),
+            BareCarriageReturn => "bare carriage return (a CR with no following LF); \
+                                   line endings are LF or CRLF — for a literal CR in a \
+                                   string, write `\\r`"
+                .to_string(),
+            ForbiddenControlCharacter { ch } => format!(
+                "raw control character U+{:04X} is not permitted in source; \
+                 write it as `\\u{{{:X}}}` inside a string",
+                *ch as u32, *ch as u32
+            ),
+            InvisibleCharacter { ch } => format!(
+                "invisible character U+{:04X} can make source display differently \
+                 than it parses; write it as `\\u{{{:X}}}` inside a string",
+                *ch as u32, *ch as u32
+            ),
             BadDedent { found, valid } => {
                 let levels = valid
                     .iter()
@@ -196,12 +242,34 @@ impl ParseErrorKind {
                 "duplicate directive — each directive may appear once per field".to_string()
             }
             InvalidEscape { escape: Some(ch) } => format!(
-                "unknown escape sequence '\\{}' (valid escapes: \\\" \\\\ \\n \\t)",
+                "unknown escape sequence '\\{}' (valid escapes: \\\" \\\\ \\n \\t \\r \\u{{…}})",
                 echo(&ch.to_string())
             ),
             InvalidEscape { escape: None } => {
                 "unexpected end of string inside an escape sequence".to_string()
             }
+            InvalidUnicodeEscape { issue } => match issue {
+                UnicodeEscapeIssue::MissingBrace => {
+                    "`\\u` must be followed by `{` (e.g. `\\u{1F600}`)".to_string()
+                }
+                UnicodeEscapeIssue::Unterminated => {
+                    "unterminated `\\u{…}` escape: missing closing `}`".to_string()
+                }
+                UnicodeEscapeIssue::Empty => {
+                    "empty `\\u{}` escape: expected 1–6 hex digits".to_string()
+                }
+                UnicodeEscapeIssue::Overlong => {
+                    "overlong `\\u{…}` escape: at most 6 hex digits".to_string()
+                }
+                UnicodeEscapeIssue::BadDigit(ch) => format!(
+                    "invalid character `{}` in `\\u{{…}}` escape: expected a hex digit",
+                    echo(&ch.to_string())
+                ),
+                UnicodeEscapeIssue::NotAScalar(cp) => format!(
+                    "`\\u{{{cp:X}}}` is not a Unicode scalar value \
+                     (surrogates and code points above 10FFFF cannot be written)"
+                ),
+            },
             InvalidNumber { raw } => format!("invalid number: \"{}\"", echo(raw)),
             NumberOutOfRange { raw } => {
                 format!("integer \"{}\" out of range for 64-bit integer", echo(raw))
@@ -234,6 +302,9 @@ impl ParseErrorKind {
             UnterminatedString { .. } => codes::UNTERMINATED_STRING,
             UnexpectedCharacter { .. } => codes::UNEXPECTED_CHARACTER,
             TabInIndent => codes::TAB_IN_INDENT,
+            BareCarriageReturn => codes::BARE_CARRIAGE_RETURN,
+            ForbiddenControlCharacter { .. } => codes::FORBIDDEN_CONTROL,
+            InvisibleCharacter { .. } => codes::INVISIBLE_CHARACTER,
             BadDedent { .. } => codes::BAD_DEDENT,
             NestingLimit { .. } => codes::NESTING_LIMIT,
             SetSeparator => codes::SET_SEPARATOR,
@@ -241,6 +312,7 @@ impl ParseErrorKind {
             UnknownTypeConstructor { .. } => codes::UNKNOWN_TYPE_CONSTRUCTOR,
             DuplicateDirective => codes::DUPLICATE_DIRECTIVE,
             InvalidEscape { .. } => codes::INVALID_ESCAPE,
+            InvalidUnicodeEscape { .. } => codes::INVALID_ESCAPE,
             InvalidNumber { .. } => codes::INVALID_NUMBER,
             NumberOutOfRange { .. } => codes::NUMBER_OUT_OF_RANGE,
             BadSecretRef { .. } => codes::BAD_SECRET_REF,
@@ -260,6 +332,9 @@ impl ParseErrorKind {
             )),
             // `&&` → `&`, over the span the emission anchored on both amps.
             DoubleAmp => Some(("&".to_string(), span)),
+            // Deleting the stray CR provably preserves intent: it is never
+            // content (that spelling is `\r`) and never a line ending.
+            BareCarriageReturn => Some((String::new(), span)),
             // The comma becomes the alternative separator, in place.
             SetSeparator => Some(("|".to_string(), span)),
             UnknownTypeConstructor { found } => {
@@ -342,6 +417,12 @@ impl NmlError {
                     None => diag,
                 };
                 let diag = match kind.suggestion(*span) {
+                    // An empty replacement is a deletion — structurally a
+                    // fix ("remove"), never a did-you-mean (there is no
+                    // near-miss spelling of nothing).
+                    Some((replacement, fix_span)) if replacement.is_empty() => {
+                        diag.with_fix(replacement, fix_span)
+                    }
                     Some((replacement, fix_span)) => diag.with_suggestion(replacement, fix_span),
                     None => diag,
                 };

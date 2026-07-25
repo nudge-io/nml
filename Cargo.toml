@@ -12,6 +12,9 @@ members = [
     "docs/tutorial/examples/07/app",
     "docs/tutorial/examples/08/app",
     "docs/tutorial/examples/09/app",
+    # Cookbook recipes — every guide page's Rust is a compiled, executed
+    # example target here (scripts/docs_test.py runs them all).
+    "docs/guides/examples/cookbook",
 ]
 
 [workspace.package]

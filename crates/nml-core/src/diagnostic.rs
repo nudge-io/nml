@@ -157,6 +157,16 @@ pub mod codes {
         NUMBER_OUT_OF_RANGE = 14;
         /// A malformed `$NS.key` variable reference.
         BAD_SECRET_REF = 15;
+        /// A carriage return with no following line feed (spec: Source
+        /// text — line endings are LF or CRLF).
+        BARE_CARRIAGE_RETURN = 16;
+        /// A raw control character (C0 minus tab/line endings, or DEL)
+        /// in source; the `\u{…}` escape is the sanctioned spelling.
+        FORBIDDEN_CONTROL = 17;
+        /// An invisible character that can make source display
+        /// differently than it parses (bidirectional controls, interior
+        /// U+FEFF) — the Trojan Source defense.
+        INVISIBLE_CHARACTER = 18;
 
         /// The same name is declared more than once in one namespace.
         DUPLICATE_DECLARATION = 1000;
@@ -641,6 +651,11 @@ impl fmt::Display for Rendered<'_> {
         const RENDERED_FIXES: usize = 3;
         match fixes.as_slice() {
             [] => {}
+            // An empty replacement is a deletion fix — say so instead of
+            // rendering an empty backtick pair.
+            [one] if one.replacement.is_empty() => {
+                f.write_str(" (fix: remove)")?;
+            }
             [one] => {
                 f.write_str(" (fix: `")?;
                 write_sanitized(f, &one.replacement)?;

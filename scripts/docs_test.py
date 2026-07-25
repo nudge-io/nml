@@ -13,6 +13,9 @@ Tag grammar (the fence info string after the language word):
                                         contain <text> (spaces: use expect-error="a b")
     ```nml check expect-output=<text>   output must contain <text>, exit code
                                         free (for warning-severity examples)
+    ```nml check eol=crlf|cr            re-transcribe the block's line endings
+                                        before running (fences are stored LF)
+                                        so line-ending claims are executable
 
 Opt-in (v1): only blocks tagged `check` are verified; untagged blocks are
 counted and reported so coverage is visible. Once the guides are rewritten
@@ -198,7 +201,22 @@ def run_check(block: Block) -> tuple[bool, str]:
         return False, block.malformed
     with tempfile.TemporaryDirectory() as td:
         sample = Path(td) / "example.nml"
-        sample.write_text(block.text, encoding="utf-8")
+        text = block.text
+        eol = block.value("eol")
+        if eol is not None:
+            # Fences are stored LF (the repo pins LF at checkout); `eol=`
+            # re-transcribes the snippet before it runs, so line-ending
+            # claims are executable, not prose: `crlf` proves Windows
+            # transcriptions mean the same document, `cr` demonstrates the
+            # bare-CR diagnostic (NML0016).
+            if eol == "crlf":
+                text = text.replace("\n", "\r\n")
+            elif eol == "cr":
+                text = text.replace("\n", "\r")
+            else:
+                return False, f"unknown eol= value {eol!r} (expected crlf or cr)"
+        # Bytes, not text mode: the transcription must reach the file exactly.
+        sample.write_bytes(text.encode("utf-8"))
         cmd = [str(nml_bin()), "check"]
         if block.has("strict"):
             cmd.append("--strict")
@@ -254,7 +272,10 @@ def banned_tokens_in(text: str) -> list[str]:
 
 
 def run_cmd(
-    cmd: list[str], timeout: int = 60, cwd: Path | None = None
+    cmd: list[str],
+    timeout: int = 60,
+    cwd: Path | None = None,
+    stdin: int | None = None,
 ) -> tuple[int | None, str]:
     """Run a subprocess; returns (returncode, combined output). A timeout
     yields (None, <message>) so one hanging example fails fast instead of
@@ -264,7 +285,13 @@ def run_cmd(
     env = {k: v for k, v in os.environ.items() if k != "CARGO_TARGET_DIR"}
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, env=env
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
+            stdin=stdin,
         )
     except subprocess.TimeoutExpired:
         return None, f"{cmd[0]} did not finish within {timeout}s"
@@ -347,6 +374,45 @@ def check_tutorial_files() -> tuple[int, int, list[tuple[str, str]]]:
                 failures.append((where, output.strip()))
             else:
                 passed += 1
+    return checked, passed, failures
+
+
+COOKBOOK_DIR = "docs/guides/examples/cookbook"
+
+
+def run_cookbook() -> tuple[int, int, list[tuple[str, str]]]:
+    """Run EVERY cookbook example (auto-enumerated — a new recipe can't be
+    forgotten) plus the crate's tests (the TOML-equivalence and schema-test
+    recipes). Each example must print `recipe OK`; stdin is closed so the
+    embed-lsp recipe's server exits on EOF. Returns (checked, passed,
+    failures)."""
+    checked = passed = 0
+    failures: list[tuple[str, str]] = []
+    examples_dir = REPO / COOKBOOK_DIR / "examples"
+    examples = sorted(p.stem for p in examples_dir.glob("*.rs"))
+    if not examples:
+        return 1, 0, [(COOKBOOK_DIR, "no cookbook examples found — wiring broken?")]
+    for name in examples:
+        checked += 1
+        code, output = run_cmd(
+            ["cargo", "run", "--quiet", "-p", "nml-cookbook", "--example", name],
+            timeout=300,
+            stdin=subprocess.DEVNULL,
+        )
+        if code != 0:
+            failures.append((f"cookbook:{name}", output.strip()))
+        elif "recipe OK" not in output:
+            failures.append((f"cookbook:{name}", f"missing 'recipe OK' marker; got:\n{output.strip()}"))
+        else:
+            passed += 1
+    checked += 1
+    code, output = run_cmd(
+        ["cargo", "test", "--quiet", "-p", "nml-cookbook"], timeout=300
+    )
+    if code != 0:
+        failures.append(("cookbook:tests", output.strip()))
+    else:
+        passed += 1
     return checked, passed, failures
 
 
@@ -441,34 +507,56 @@ def check_error_index() -> list[tuple[str, str]]:
         failures.append((ERROR_INDEX, f"codes missing a section: {', '.join(undocumented)}"))
     if orphaned := sorted(documented - declared):
         failures.append((ERROR_INDEX, f"sections for undeclared codes: {', '.join(orphaned)}"))
-    failures.extend(check_index_relative_links(index_path))
+    failures.extend(check_relative_links(index_path))
     return failures
 
 
-def check_index_relative_links(index_path) -> list[tuple[str, str]]:
-    """Every relative link in the error index must resolve from the index's
-    own directory. The index has already moved home once (docs/errors/ →
-    crates/nml-core/assets/), stranding links written for the old home; this
-    guard makes that class of rot a visible failure. Fenced lines are code
+def check_relative_links(path: Path) -> list[tuple[str, str]]:
+    """Every relative link in `path` must resolve to a real file (or
+    directory) inside the repo, from the document's own directory. The error
+    index already moved home once (docs/errors/ → crates/nml-core/assets/),
+    stranding links written for the old home; this guard makes that class of
+    rot a visible failure for every scanned page. Fenced lines are code
     content, not prose — skipped, matching the `explain_document` composer."""
     failures = []
+    where = path.relative_to(REPO).as_posix()
     in_fence = False
-    for number, line in enumerate(index_path.read_text(encoding="utf-8").splitlines(), 1):
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if line.lstrip().startswith("```"):
             in_fence = not in_fence
             continue
         if in_fence:
             continue
         for target in re.findall(r"\]\(([^)]+)\)", line):
-            if target.startswith(("http://", "https://", "#")):
+            if target.startswith(("http://", "https://", "#", "mailto:")):
                 continue
-            resolved = (index_path.parent / target.split("#")[0]).resolve()
+            resolved = (path.parent / target.split("#")[0]).resolve()
             # Same containment rule as schema= dirs above: a doc link that
             # escapes the repo is wrong even if the path happens to exist.
-            if not resolved.is_file() or not resolved.is_relative_to(REPO):
+            if not resolved.exists() or not resolved.is_relative_to(REPO):
                 failures.append(
-                    (ERROR_INDEX, f"line {number}: relative link does not resolve: {target}")
+                    (where, f"line {number}: relative link does not resolve: {target}")
                 )
+    return failures
+
+
+def check_guide_links() -> list[tuple[str, str]]:
+    """The cookbook's pages link across the docs tree and into the example
+    crate, and the proof-surface pages (case study, footprint) link into
+    both; every one of those links must resolve. (Whole-tree link checking
+    is the site build's job at plan Phase 5; these are covered now because
+    they are new and link-dense.)"""
+    failures = []
+    pages = sorted((REPO / "docs/guides").glob("*.md"))
+    pages += [
+        REPO / "docs/case-study.md",
+        REPO / "docs/footprint.md",
+        # The front door and the release record: their links break loudest.
+        REPO / "README.md",
+        REPO / "CHANGELOG.md",
+    ]
+    for page in pages:
+        failures.extend(check_relative_links(page))
     return failures
 
 
@@ -529,7 +617,10 @@ def main() -> int:
     failures.extend(tut_failures)
     apps_checked, apps_passed, app_failures = run_tutorial_apps()
     failures.extend(app_failures)
+    cb_checked, cb_passed, cb_failures = run_cookbook()
+    failures.extend(cb_failures)
     failures.extend(check_error_index())
+    failures.extend(check_guide_links())
 
     for where, detail in failures:
         print(f"FAIL {where}")
@@ -541,6 +632,7 @@ def main() -> int:
         f" {files_passed}/{files_checked} example files passed,"
         f" {tut_passed}/{tut_checked} tutorial fixtures passed,"
         f" {apps_passed}/{apps_checked} tutorial programs passed,"
+        f" {cb_passed}/{cb_checked} cookbook recipes passed,"
         f" {rust_synced} rust listings source-synced,"
         f" {unverified} untagged/fragment blocks not verified"
     )

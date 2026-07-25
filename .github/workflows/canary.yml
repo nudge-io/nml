@@ -1,0 +1,56 @@
+name: Toolchain canary
+
+# Early warning, decoupled from the gates. The pinned toolchain
+# (rust-toolchain.toml) keeps PRs and main deterministic, so NEW lints and
+# rustfmt changes arrive HERE — on floating stable and beta, weekly —
+# instead of redding the gates overnight. Beta buys ~6 weeks of notice.
+# Failure files (or updates) a tracking issue; nothing blocks. Fixes belong
+# in a toolchain-bump PR (toolchain-bump.yml), never in loosened gates.
+
+on:
+  schedule:
+    - cron: '17 6 * * 1' # Mondays 06:17 UTC (off the top-of-hour spike)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  canary:
+    name: canary (${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, beta]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
+        with:
+          toolchain: ${{ matrix.channel }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: File or update the tracking issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ matrix.channel }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="toolchain canary: ${CHANNEL} is failing"
+          body="The weekly toolchain canary failed on \`${CHANNEL}\`: ${RUN_URL}
+
+          New lints or rustfmt changes usually land here first. Fix them in a
+          toolchain-bump PR (rust-toolchain.toml), never by loosening the gates."
+          number="$(gh issue list --state open --search "in:title \"$title\"" \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

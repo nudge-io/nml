@@ -1,0 +1,31 @@
+# The cookbook's compiled truth: one example target per recipe page in
+# docs/guides/. `just docs-test` builds and RUNS every example (each must
+# print "recipe OK"), and the pages' Rust listings are `source=`-synced from
+# these files — a recipe that stops compiling or drifts from its page fails
+# CI by name.
+[package]
+name = "nml-cookbook"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+nml-core.workspace = true
+nml-validate.workspace = true
+nml-fmt.workspace = true
+serde.workspace = true
+# Recipe: "Embed the LSP" — `<your-tool> lsp` is one .await; the example
+# actually serves (and exits cleanly on stdin EOF, which is how its CI run
+# terminates).
+nml-lsp = { path = "../../../../crates/nml-lsp" }
+tokio = { workspace = true }
+
+[dev-dependencies]
+# Recipe: "Migrate from TOML" — the equivalence test parses the SAME config
+# from TOML and NML into one struct and asserts equality, so the migration
+# cheatsheet's claims are executed, not asserted.
+toml = "0.8"
+# Recipe: "Test your schemas" — the shared fixtures tool authors use.
+nml-validate = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true

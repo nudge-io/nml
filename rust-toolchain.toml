@@ -1,0 +1,10 @@
+# The one dev/CI toolchain. Pinning makes every contributor's rustfmt and
+# clippy verdict byte-identical to CI's (rustfmt style follows the manifest
+# edition; clippy's lint set follows this version), so gates never drift
+# overnight when upstream ships a new stable. New-toolchain fallout arrives
+# via the weekly canary (canary.yml) and is fixed in a reviewed bump PR
+# (toolchain-bump.yml) — never on main. The MSRV floor is a separate,
+# manifest-owned contract (Cargo.toml `rust-version`; rust-ci.yml msrv job).
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

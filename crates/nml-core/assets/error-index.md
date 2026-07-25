@@ -180,16 +180,24 @@ model server:
 
 ## NML0012
 
-**Invalid string escape.** The escape is unknown, or the string ends
-mid-escape. Valid escapes: `\"` `\\` `\n` `\t` — the message lists them.
+**Invalid string escape.** The escape is unknown, the string ends
+mid-escape, or a `\u{…}` escape is malformed. Valid escapes: `\"` `\\`
+`\n` `\t` `\r` `\u{…}` (1–6 hex digits naming a Unicode scalar, as in
+Rust and Swift) — the message names the exact problem.
 
 ```nml check expect-error='[NML0012]'
 service Api:
     x = "a\q"
 ```
 
+```nml check expect-error='[NML0012]'
+service Api:
+    x = "\u{D800}"
+```
+
 **Fix:** use a valid escape, or double the backslash for a literal one
-(`"a\\q"`).
+(`"a\\q"`). Surrogates (D800–DFFF) and code points above 10FFFF are not
+scalars and cannot be written.
 
 ## NML0013
 
@@ -230,6 +238,69 @@ service Api:
 ```
 
 **Fix:** apply the suggestion (`$ENV.API_KEY`).
+
+## NML0016
+
+**Bare carriage return.** A CR with no following LF. NML line endings
+are LF or CRLF (the source-character policy: *raw is transport, escaped
+is content*); a bare CR is invisible in most editors and diff viewers,
+so it is either file corruption or content smuggling — never intent.
+The file still parses (the CR is treated as whitespace), and the fix is
+machine-applicable: remove it.
+
+The fence below is stored with LF endings and converted to lone-CR
+("old Mac") endings by the docs harness before it runs, so this
+example is executable, not illustrative:
+
+```nml check eol=cr expect-error='[NML0016]'
+service Api:
+    port = 8080
+```
+
+**Fix:** remove the stray CR (apply the suggestion), or re-save the
+file with LF or CRLF line endings. For a literal CR *inside a string
+value*, write `\r`.
+
+## NML0017
+
+**Raw control character.** A C0 control (other than tab and line
+endings) or DEL appears raw in source — in a value, a comment, or
+between tokens. Control characters are content, and content belongs in
+escapes, where review can see it: a raw ESC in a value is a
+terminal-injection primitive when that value is later printed, and a
+raw NUL truncates C strings downstream. Tab is legal raw in string
+content; only indentation restricts it ([NML0005](#nml0005)).
+
+The escaped spelling is always available and is the fix:
+
+```nml check
+service Api:
+    ansi_reset = "\u{1B}[0m"
+```
+
+**Fix:** replace the raw control character with its `\u{…}` escape.
+
+## NML0018
+
+**Invisible directionality character.** A bidirectional control
+(U+202A–U+202E, U+2066–U+2069) or an interior U+FEFF can make source
+*display* differently than it *parses* — the Trojan Source attack
+(CVE-2021-42574). NML matches rustc's banned set. A leading U+FEFF is
+accepted as a byte-order mark; everywhere else U+FEFF is this error.
+
+Right-to-left *text* is unaffected: Hebrew and Arabic string values
+need no bidi controls to render correctly. Only the explicit override
+and isolate controls — the ones that can reorder what a reviewer sees —
+are banned, and only in their raw form:
+
+```nml check
+service Api:
+    rlo = "\u{202E}"
+```
+
+**Fix:** if the character is intentional content, write its `\u{…}`
+escape so it is visible in review; otherwise delete it (it usually
+arrives via copy-paste from rendered text).
 
 ## NML1000
 

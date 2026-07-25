@@ -27,6 +27,27 @@
 
 ### Added
 
+- **The proof surface**: a [case study](docs/case-study.md) describing how
+  a production workflow platform embeds NML end to end (schema packages +
+  embedded `<tool> lsp`, diff-driven `#live`/`#restart` reload, config as
+  a security surface — attribution generic until the platform's launch),
+  and a [footprint page](docs/footprint.md) with measured, reproducible
+  numbers: 19 packages for core parse+serde embedding (no async stack),
+  ~0.75 MiB release example binary, corpus parse throughput via a
+  committed measurement example (`measure_parse`).
+
+- **The cookbook** (`docs/guides/`): fourteen task-oriented recipes for
+  embedding NML as a library — parse/query, serde deserialization, custom
+  secret resolvers, schema defaults, CI validation, semantic diff +
+  `#live`/`#restart` classification, format-preserving edits, collect-all
+  errors, directive vocabularies, schema packages & the store, embedding
+  the language server, idempotent formatting, schema testing, and a
+  migrate-from-TOML guide whose side-by-side claims are *executed*: the
+  same config is parsed from TOML and NML into one struct and asserted
+  equal in CI. Every recipe is a compiled example (or test) in the new
+  `nml-cookbook` workspace crate; the docs harness runs all of them and
+  verbatim-syncs every page listing against the compiled source.
+
 - **MSRV: measured, declared, and enforced — Rust 1.86.** The floor was
   established by an audited bisect (every build target, the
   `wasm32-wasip1` server, and doctests, each candidate resolved with the

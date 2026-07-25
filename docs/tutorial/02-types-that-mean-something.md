@@ -129,6 +129,13 @@ service Api:
     banner = StatusBanner
 ```
 
+Line endings never change what a string means: a file saved with Windows
+CRLF endings produces byte-identical values to the same file saved with
+LF, and characters that can't appear raw in source (control characters,
+for instance) are written as escapes like `\u{1B}` — the
+[Source text](../../spec/syntax.md#source-text) section of the spec has
+the full contract.
+
 ## Templates
 
 Strings can interpolate `{{namespace.key}}` expressions. They are *not*

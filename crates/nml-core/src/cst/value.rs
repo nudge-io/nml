@@ -65,7 +65,13 @@ fn decode_scalar(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
             // `span.start` is the string token's start (it is the only
             // significant token, so `content_span` begins there).
             let decoded = decode_string(first.text(), span.start)?;
-            if decoded.contains("{{") {
+            // Template detection reads the RAW token text: templates are
+            // syntax, escapes are content, so `\u{7B}\u{7B}` means a
+            // literal `{{` — the escape hatch for the collision — and an
+            // escape can never smuggle a template past review. (No escape
+            // could produce a brace before `\u{…}` existed, so this is
+            // observationally identical for every prior document.)
+            if first.text().contains("{{") {
                 Value::TemplateString(template::parse_template_string(&decoded, span.start))
             } else {
                 Value::String(decoded)
@@ -188,13 +194,22 @@ fn decode_string(raw: &str, tok_start: usize) -> Result<String, NmlError> {
     }
 }
 
-/// Decode `\" \\ \n \t`; `inner_start` is the source offset of `inner`'s first
-/// byte, used to point errors at the exact escape.
+/// Decode `\" \\ \n \t \r \u{…}`; `inner_start` is the source offset of
+/// `inner`'s first byte, used to point errors at the exact escape.
 fn decode_escapes(inner: &str, inner_start: usize) -> Result<String, NmlError> {
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.char_indices();
     while let Some((i, c)) = chars.next() {
         if c != '\\' {
+            // A raw CRLF (multiline bodies only) is transport, not content:
+            // drop the CR half HERE — at true source offsets, so escape-error
+            // spans stay exact — and let the LF land on its own iteration.
+            // Content CRs arrive via `\r`/`\u{D}` and never hit this arm; a
+            // bare raw CR passes through, already flagged by the source
+            // policy (NML0016).
+            if c == '\r' && inner.as_bytes().get(i + 1) == Some(&b'\n') {
+                continue;
+            }
             out.push(c);
             continue;
         }
@@ -203,6 +218,8 @@ fn decode_escapes(inner: &str, inner_start: usize) -> Result<String, NmlError> {
             Some((_, '\\')) => out.push('\\'),
             Some((_, 'n')) => out.push('\n'),
             Some((_, 't')) => out.push('\t'),
+            Some((_, 'r')) => out.push('\r'),
+            Some((_, 'u')) => out.push(decode_unicode_escape(&mut chars, inner, inner_start, i)?),
             Some((j, other)) => {
                 // Span the `\` (at `i`) through the escape char (ending at `j + len`).
                 let span = Span::new(inner_start + i, inner_start + j + other.len_utf8());
@@ -225,16 +242,67 @@ fn decode_escapes(inner: &str, inner_start: usize) -> Result<String, NmlError> {
     Ok(out)
 }
 
+/// Decode the braced tail of a `\u{…}` escape (Rust/Swift syntax: 1–6 hex
+/// digits naming a Unicode scalar), `chars` positioned just past the `u`.
+/// `backslash` is the escape's start within `inner`, so every error spans
+/// from the `\` through the offending character — the same precision as
+/// [`decode_escapes`]' simple arms.
+fn decode_unicode_escape(
+    chars: &mut std::str::CharIndices<'_>,
+    inner: &str,
+    inner_start: usize,
+    backslash: usize,
+) -> Result<char, NmlError> {
+    use crate::error::UnicodeEscapeIssue;
+    let err = |issue: UnicodeEscapeIssue, end: usize| {
+        NmlError::syntax(
+            crate::error::ParseErrorKind::InvalidUnicodeEscape { issue },
+            Span::new(inner_start + backslash, inner_start + end),
+        )
+    };
+    match chars.next() {
+        Some((_, '{')) => {}
+        Some((j, c)) => return Err(err(UnicodeEscapeIssue::MissingBrace, j + c.len_utf8())),
+        None => return Err(err(UnicodeEscapeIssue::MissingBrace, inner.len())),
+    }
+    let mut value: u32 = 0;
+    let mut digits = 0usize;
+    loop {
+        match chars.next() {
+            Some((j, '}')) => {
+                let end = j + 1;
+                return if digits == 0 {
+                    Err(err(UnicodeEscapeIssue::Empty, end))
+                } else if digits > 6 {
+                    Err(err(UnicodeEscapeIssue::Overlong, end))
+                } else {
+                    char::from_u32(value)
+                        .ok_or_else(|| err(UnicodeEscapeIssue::NotAScalar(value), end))
+                };
+            }
+            Some((j, c)) => match c.to_digit(16) {
+                Some(d) => {
+                    digits += 1;
+                    // Stop accumulating past 6 digits: the escape is already
+                    // Overlong, and an unbounded run must not overflow.
+                    if digits <= 6 {
+                        value = value * 16 + d;
+                    }
+                }
+                None => return Err(err(UnicodeEscapeIssue::BadDigit(c), j + c.len_utf8())),
+            },
+            None => return Err(err(UnicodeEscapeIssue::Unterminated, inner.len())),
+        }
+    }
+}
+
 /// Strip the common leading-space indent from a triple-quoted body and trim the
 /// blank first/last lines (mirrors the legacy `dedent_multiline_string`).
-/// Line endings normalize to LF: CRLF is transport, not content, so a document
-/// means the same value on every checkout (the policy Rust and Swift string
-/// literals follow).
+/// Input is already LF-only transport: [`decode_escapes`] dropped raw CRLF's
+/// CR half (CRLF is transport, not content — the policy Rust and Swift string
+/// literals follow), so any CR here is escaped *content* and survives.
 fn dedent_multiline(raw: &str) -> String {
-    let mut lines: Vec<&str> = raw
-        .split('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
-        .collect();
+    let mut lines: Vec<&str> = raw.split('\n').collect();
     if lines
         .first()
         .is_some_and(|l| l.chars().all(char::is_whitespace))

@@ -77,6 +77,7 @@ pub mod resolve;
 /// the leaf definitions; this holds the aggregate and the checks.
 pub mod schema;
 pub mod schema_index;
+pub mod source_policy;
 pub mod span;
 /// The near-miss suggestion engine (RFC 0008; formerly in nml-validate) —
 /// one metric and one policy behind every "did you mean" hint.

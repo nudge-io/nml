@@ -10,15 +10,29 @@ permissions:
   contents: read
 
 jobs:
+  # Gate jobs install the PINNED toolchain (rust-toolchain.toml — read the
+  # same way the msrv job reads Cargo.toml, so the file stays the single
+  # source of truth): deterministic fmt/clippy verdicts, identical to every
+  # contributor's. New stables land via canary.yml + a reviewed bump PR.
   lint:
     name: fmt · clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Read the pinned toolchain from rust-toolchain.toml
+        id: pin
+        shell: bash
+        run: |
+          version="$(grep -m1 '^channel' rust-toolchain.toml | cut -d '"' -f 2)"
+          if [ -z "$version" ]; then
+            echo "::error::no channel found in rust-toolchain.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
         with:
-          toolchain: stable
+          toolchain: ${{ steps.pin.outputs.version }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all -- --check
@@ -52,9 +66,19 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Read the pinned toolchain from rust-toolchain.toml
+        id: pin
+        shell: bash
+        run: |
+          version="$(grep -m1 '^channel' rust-toolchain.toml | cut -d '"' -f 2)"
+          if [ -z "$version" ]; then
+            echo "::error::no channel found in rust-toolchain.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
         with:
-          toolchain: stable
+          toolchain: ${{ steps.pin.outputs.version }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test --workspace --locked
 
@@ -110,11 +134,21 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Read the pinned toolchain from rust-toolchain.toml
+        id: pin
+        shell: bash
+        run: |
+          version="$(grep -m1 '^channel' rust-toolchain.toml | cut -d '"' -f 2)"
+          if [ -z "$version" ]; then
+            echo "::error::no channel found in rust-toolchain.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
         with:
-          toolchain: stable
+          toolchain: ${{ steps.pin.outputs.version }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo package --workspace --exclude 'nml-tutorial-*' --locked
+      - run: cargo package --workspace --exclude 'nml-tutorial-*' --exclude nml-cookbook --locked
 
   # Declared version bounds are promises (`serde = "1"` claims we build
   # against serde 1.0.0). Resolve every DIRECT dependency to its declared
@@ -128,12 +162,25 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Read the pinned toolchain from rust-toolchain.toml
+        id: pin
+        shell: bash
+        run: |
+          version="$(grep -m1 '^channel' rust-toolchain.toml | cut -d '"' -f 2)"
+          if [ -z "$version" ]; then
+            echo "::error::no channel found in rust-toolchain.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
         with:
           toolchain: nightly
+      # Installed second so the check step below runs on the PIN (dtolnay
+      # exports the last-installed toolchain); nightly is reached explicitly
+      # for the resolver flag only.
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
         with:
-          toolchain: stable
+          toolchain: ${{ steps.pin.outputs.version }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo +nightly update -Zdirect-minimal-versions
-      - run: cargo +stable check --workspace --all-targets
+      - run: cargo check --workspace --all-targets

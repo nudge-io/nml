@@ -158,6 +158,9 @@ editor quick-fixes apply what can be applied mechanically).
 | Start here | |
 |---|---|
 | [Tutorial](docs/tutorial/README.md) | Nine chapters, one growing config — from first file to shipped schemas |
+| [Cookbook](docs/guides/README.md) | Fourteen library recipes, every one compiled and run in CI |
+| [Case Study](docs/case-study.md) | How a production workflow platform embeds NML |
+| [Footprint & Performance](docs/footprint.md) | Dependency counts, binary size, parse throughput — measured, reproducible |
 | [Language Guide](docs/language-guide.md) | Writing NML — syntax and features |
 | [Integration Guide](docs/integration.md) | Embedding NML in a Rust project |
 | [Language Specification](spec/README.md) | Formal grammar and semantics, for implementers |

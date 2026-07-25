@@ -520,10 +520,12 @@ fn quote_string(s: &str) -> String {
 
 fn format_value(out: &mut String, value: &Value, depth: usize) {
     match value {
-        Value::String(s) => format_string(out, s, depth),
+        Value::String(s) => format_string(out, s, depth, true),
         Value::TemplateString(segments) => {
+            // Braces stay raw: the reparse re-detects the template from
+            // them, so the value's TYPE survives the round-trip.
             let s = template::segments_to_string(segments);
-            format_string(out, &s, depth);
+            format_string(out, &s, depth, false);
         }
         // Number's Display is exact: integers print all 64 bits, floats
         // print the shortest representation that round-trips.
@@ -587,17 +589,38 @@ fn render_directives(out: &mut String, directives: &[nml_core::types::Directive]
     }
 }
 
-fn format_string(out: &mut String, s: &str, depth: usize) {
+/// `escape_braces` distinguishes literal strings (true — a `{{` renders as
+/// `\u{7B}{`, so raw-text template detection cannot re-fire on reparse and
+/// the value stays a String) from template strings (false — braces are the
+/// syntax the reparse must re-detect).
+fn format_string(out: &mut String, s: &str, depth: usize, escape_braces: bool) {
     if s.contains('\n') {
         out.push_str("\"\"\"\n");
         for line in s.split('\n') {
             for _ in 0..(depth + 1) {
                 out.push_str(INDENT);
             }
-            for ch in line.chars() {
-                match ch {
-                    '\\' => out.push_str("\\\\"),
-                    c => out.push(c),
+            let mut chars = line.chars().peekable();
+            // A raw `"""` inside the body would close the string early on
+            // reparse — escape the THIRD quote of any consecutive run (and
+            // only that one), so quote-heavy content (JSON) stays readable
+            // while a closing-delimiter run can never form.
+            let mut quote_run = 0usize;
+            while let Some(ch) = chars.next() {
+                if ch == '"' {
+                    quote_run += 1;
+                    if quote_run == 3 {
+                        out.push_str("\\\"");
+                        quote_run = 0;
+                        continue;
+                    }
+                } else {
+                    quote_run = 0;
+                }
+                if escape_braces && ch == '{' && chars.peek() == Some(&'{') {
+                    out.push_str("\\u{7B}");
+                } else {
+                    push_value_char(out, ch);
                 }
             }
             out.push('\n');
@@ -608,15 +631,33 @@ fn format_string(out: &mut String, s: &str, depth: usize) {
         out.push_str("\"\"\"");
     } else {
         out.push('"');
-        for ch in s.chars() {
+        let mut chars = s.chars().peekable();
+        while let Some(ch) = chars.next() {
             match ch {
                 '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
                 '\t' => out.push_str("\\t"),
-                c => out.push(c),
+                '{' if escape_braces && chars.peek() == Some(&'{') => out.push_str("\\u{7B}"),
+                c => push_value_char(out, c),
             }
         }
         out.push('"');
+    }
+}
+
+/// Render one string-value character, escaping what the parser's
+/// source-character policy bans raw (`must_escape` is the policy's own
+/// predicate, so formatted output can never carry a character the parser
+/// rejects — a formatter emitting a raw ESC or bidi control would be
+/// writing NML0017/NML0018 into the file it produces).
+fn push_value_char(out: &mut String, ch: char) {
+    use std::fmt::Write as _;
+    match ch {
+        '\\' => out.push_str("\\\\"),
+        '\r' => out.push_str("\\r"),
+        c if nml_core::source_policy::must_escape(c) => {
+            let _ = write!(out, "\\u{{{:X}}}", c as u32);
+        }
+        c => out.push(c),
     }
 }
 
@@ -648,6 +689,51 @@ mod tests {
         let file2 = parse(&first).unwrap();
         let second = format(&file2);
         assert_eq!(first, second, "formatting is not idempotent");
+    }
+
+    /// The formatter can never emit a document the parser rejects: string
+    /// values holding policy-banned characters (reachable only via `\u{…}`
+    /// escapes) render back AS escapes. `roundtrip` is the enforcement —
+    /// a raw ESC/bidi/CR in the output would fail the reparse with
+    /// NML0016–NML0018.
+    #[test]
+    fn banned_value_characters_render_as_escapes() {
+        let source = "service App:\n    ansi = \"\\u{1B}[0m\"\n    bidi = \"\\u{202E}\"\n    cr = \"a\\rb\"\n";
+        roundtrip(source);
+        idempotent(source);
+        let formatted = format_source(source).unwrap();
+        assert!(formatted.contains("\\u{1B}[0m"), "{formatted}");
+        assert!(formatted.contains("\\u{202E}"), "{formatted}");
+        assert!(formatted.contains("a\\rb"), "{formatted}");
+    }
+
+    /// A multiline value containing `"""` (writable via `\"\"\"`) must not
+    /// re-emit a raw closing run — the third quote of any consecutive run
+    /// renders escaped, so the reparse sees the same value instead of a
+    /// truncated string (this was a live data-destroying round-trip bug).
+    /// Quote PAIRS stay raw so JSON-ish content remains readable.
+    #[test]
+    fn triple_quotes_in_multiline_values_roundtrip() {
+        let source = "service App:\n    x = \"\"\"\n        a\\\"\\\"\\\"b {\"k\": \"\"}\n        c\n        \"\"\"\n";
+        roundtrip(source);
+        idempotent(source);
+        let formatted = format_source(source).unwrap();
+        assert!(formatted.contains("a\"\"\\\"b"), "{formatted}");
+        assert!(formatted.contains("{\"k\": \"\"}"), "{formatted}");
+    }
+
+    /// Value TYPES survive the round-trip across the template boundary: a
+    /// literal `{{` (writable only via `\u{7B}`) re-escapes its first brace
+    /// so raw-text template detection cannot re-fire, while a real template
+    /// keeps raw braces and re-detects.
+    #[test]
+    fn literal_braces_stay_string_templates_stay_templates() {
+        let source = "service App:\n    lit = \"\\u{7B}\\u{7B}x}}\"\n    tpl = \"{{args.x}}\"\n";
+        roundtrip(source);
+        idempotent(source);
+        let formatted = format_source(source).unwrap();
+        assert!(formatted.contains("\\u{7B}{x}}"), "{formatted}");
+        assert!(formatted.contains("\"{{args.x}}\""), "{formatted}");
     }
 
     /// RFC 0032: directives SURVIVE formatting (rendering them is load-bearing

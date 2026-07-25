@@ -1,0 +1,66 @@
+name: Toolchain bump
+
+# Closes the pin's loop: weekly, compare the latest stable release against
+# rust-toolchain.toml and open a bump PR when it moved. The PR runs the full
+# gates, so new-lint fallout is fixed in review — never overnight on main.
+# Deliberately uses only git + the preinstalled gh CLI: no third-party
+# automation gets write access (the same supply-chain doctrine as the
+# SHA-pinned actions). Known GitHub limitation: PRs created with the
+# workflow token do not trigger CI themselves — close/reopen the PR (or
+# push to its branch) to start the gates; the PR body carries the reminder.
+
+on:
+  schedule:
+    - cron: '23 6 * * 1' # Mondays 06:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Open a bump PR if stable moved
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pinned="$(grep -m1 '^channel' rust-toolchain.toml | cut -d '"' -f 2)"
+          # The release channel manifest's [pkg.rust] version line, e.g.
+          # `version = "1.97.1 (8bab26f4f 2026-07-14)"` — take the number.
+          latest="$(curl -fsSL --retry 3 https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            | awk '/^\[pkg.rust\]/{f=1;next} f && /^version = /{print; exit}' \
+            | cut -d '"' -f 2 | cut -d ' ' -f 1)"
+          if [ -z "$latest" ]; then
+            echo "::error::could not read the latest stable version"
+            exit 1
+          fi
+          if [ "$pinned" = "$latest" ]; then
+            echo "pinned toolchain $pinned is current"
+            exit 0
+          fi
+          branch="toolchain-bump/$latest"
+          if [ "$(gh pr list --head "$branch" --state open --json number --jq length)" != "0" ]; then
+            echo "bump PR for $latest already open"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          sed -i "s/^channel = \"$pinned\"/channel = \"$latest\"/" rust-toolchain.toml
+          git commit -am "Bump pinned Rust toolchain to $latest"
+          git push -u origin "$branch"
+          gh pr create --title "Bump pinned Rust toolchain to $latest" --body "$(cat <<EOF
+          Bumps the pinned toolchain (rust-toolchain.toml) $pinned → $latest.
+
+          The gates on this PR are the review: any new lints or rustfmt
+          changes in $latest surface and get fixed here, never on main.
+
+          Note: workflow-token PRs do not start CI by themselves — close and
+          reopen this PR (or push to it) to run the gates.
+          EOF
+          )"

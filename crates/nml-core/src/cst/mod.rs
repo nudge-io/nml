@@ -75,7 +75,7 @@ impl Parse {
 /// (`super::MAX_ERRORS`) and the parser, then again on the merged list below —
 /// so memory stays bounded during and after parsing on pathological input
 /// (RFC 0004 §9, "bounded output").
-const MAX_ERRORS: usize = 128;
+pub(crate) const MAX_ERRORS: usize = 128;
 
 /// Parse NML source into a lossless CST. Never fails, never panics.
 pub fn parse(source: &str) -> Parse {
@@ -151,9 +151,28 @@ fn parse_lowered(source: &str) -> (Parse, crate::ast::File, Vec<NmlError>, usize
     let root = ast::Root::cast(parsed.syntax()).expect("parse always yields a Root node");
     let (file, mut errors, lower_suppressed) = lower::to_ast_with_errors(&root);
     errors.extend(parsed.errors().iter().cloned());
+    // The source-character policy (spec: Source text) runs beside every
+    // parse, so no consumer can forget it. Its teaching diagnostic
+    // supersedes the lexer's generic `UnexpectedCharacter` at the same
+    // span — and ONLY where one actually exists: the policy list is
+    // bounded, so past its cap the generic error survives (per-site
+    // coverage is never silently narrowed).
+    let (policy_errors, policy_suppressed) = crate::source_policy::check(source);
+    let policy_spans: std::collections::HashSet<(usize, usize)> = policy_errors
+        .iter()
+        .map(|e| (e.span().start, e.span().end))
+        .collect();
+    errors.retain(|e| match e {
+        NmlError::Syntax {
+            kind: crate::error::ParseErrorKind::UnexpectedCharacter { .. },
+            span,
+        } => !policy_spans.contains(&(span.start, span.end)),
+        _ => true,
+    });
+    errors.extend(policy_errors);
     errors.sort_by_key(|e| e.span().start);
     coalesce_expected(&mut errors);
-    let suppressed = parsed.suppressed + lower_suppressed;
+    let suppressed = parsed.suppressed + lower_suppressed + policy_suppressed;
     (parsed, file, errors, suppressed)
 }
 
@@ -1188,6 +1207,31 @@ service App is Base:
         // document means.
         let v = decode_first("\"\"\"\r\n    Hello\r\n    World\r\n    \"\"\"");
         assert_eq!(v, Value::String("Hello\nWorld".into()));
+
+        // Escaped CRs are CONTENT and survive dedent even at end-of-line in
+        // a CRLF body — only the raw CRLF pair is transport (`\r` decodes
+        // after the transport CR was already dropped at true offsets).
+        let v = decode_first("\"\"\"\r\n    a\\r\r\n    b\r\n    \"\"\"");
+        assert_eq!(v, Value::String("a\r\nb".into()));
+        let v = decode_first("\"\"\"\n    a\\u{D}\n    b\n    \"\"\"");
+        assert_eq!(v, Value::String("a\r\nb".into()));
+    }
+
+    /// Template detection reads RAW text: `\u{7B}\u{7B}` is a literal `{{`
+    /// (the escape hatch — previously inexpressible), never a template, so
+    /// an escape can't smuggle a template expression past review; written
+    /// plainly, `{{…}}` still templates.
+    #[test]
+    fn escaped_braces_are_literal_never_template() {
+        use crate::types::Value;
+        assert_eq!(
+            decode_first("\"\\u{7B}\\u{7B}x\\u{7D}\\u{7D}\""),
+            Value::String("{{x}}".into())
+        );
+        assert!(matches!(
+            decode_first("\"{{args.x}}\""),
+            Value::TemplateString(_)
+        ));
     }
 
     #[test]
@@ -1412,7 +1456,7 @@ service App is Base:
         let alphabet = [
             "service", "App", ":", "=", "=>", "->", " ", "    ", "\n", "\r\n", "\"", "\"\"\"",
             "\\", "//c", "x", "1", "12.5", "@role/x", "$ENV.K", "-", "|", ".", "[", "]", "(", ")",
-            ",", "?", "\t", "é", "\0", "\u{1}", "🎉", "\u{2028}",
+            ",", "?", "\t", "é", "\0", "\u{1}", "🎉", "\u{2028}", "\u{FEFF}",
         ];
         let mut state: u64 = 0x2545_F491_4F6C_DD1D;
         let mut next = || {
@@ -1456,6 +1500,147 @@ service App is Base:
             let _ = parse_to_ast(&src);
             let _ = parse_with_comments(&src);
             let _ = extract_schema(&src);
+        }
+    }
+
+    /// Serialize a lowered [`crate::ast::File`] with every `span` key
+    /// stripped — semantic shape only. (The serde_json dev-dependency
+    /// exists for exactly this span-stripped comparison.)
+    fn spanless(file: &crate::ast::File) -> serde_json::Value {
+        fn strip(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    map.remove("span");
+                    for v in map.values_mut() {
+                        strip(v);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for v in items.iter_mut() {
+                        strip(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut v = serde_json::to_value(file).expect("File serializes");
+        strip(&mut v);
+        v
+    }
+
+    /// Spec (Source text): line endings are transport, not content — a
+    /// document and its CRLF transcription lower to the SAME `File`, valid
+    /// or invalid (error recovery included). Fuzzed so every value path
+    /// present *and future* is covered, not just the literal forms someone
+    /// remembered to hand-test. The alphabet is the termination fuzzer's
+    /// minus its explicit CRLF entry (transcribing an existing CRLF would
+    /// manufacture a bare CR, which is its own contract — NML0016).
+    #[test]
+    fn fuzz_eol_insensitivity_lf_and_crlf_mean_the_same_file() {
+        let alphabet = [
+            "service", "App", ":", "=", "=>", "->", " ", "    ", "\n", "\"", "\"\"\"", "\\", "//c",
+            "x", "1", "12.5", "@role/x", "$ENV.K", "-", "|", ".", "[", "]", "(", ")", ",", "?",
+            "\t", "é", "🎉", "\u{FEFF}",
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..2000 {
+            let len = (next() % 40) as usize;
+            let mut src = String::new();
+            for _ in 0..len {
+                src.push_str(alphabet[(next() as usize) % alphabet.len()]);
+            }
+            let crlf = src.replace('\n', "\r\n");
+            let (lf_file, _) = parse_to_ast_all(&src);
+            let (crlf_file, _) = parse_to_ast_all(&crlf);
+            assert_eq!(
+                spanless(&lf_file),
+                spanless(&crlf_file),
+                "LF and CRLF transcriptions must mean the same File: {src:?}"
+            );
+        }
+    }
+
+    // ── Source-character policy (spec: Source text) ──
+
+    /// Policy diagnostics ride the one findings channel every consumer
+    /// shares, and the policy's teaching error supersedes the lexer's
+    /// generic `UnexpectedCharacter` for the same character — one
+    /// diagnostic per hostile character, the specific one.
+    #[test]
+    fn source_policy_flows_through_parse_and_supersedes_generic_errors() {
+        // Inside a string: only the policy can see it.
+        let (_, diags) = parse_to_ast_all("service App:\n    x = \"a\u{202E}b\"\n");
+        let rendered: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+        assert!(
+            rendered.iter().any(|m| m.contains("NML0018")),
+            "{rendered:?}"
+        );
+
+        // In token position: the policy error replaces the generic
+        // unexpected-character error — exactly one diagnostic, the one
+        // that teaches the fix.
+        let (_, diags) = parse_to_ast_all("service App:\n    x = \u{1}1\n");
+        let about_char: Vec<String> = diags
+            .iter()
+            .map(|d| d.to_string())
+            .filter(|m| m.contains("NML0017") || m.contains("NML0004"))
+            .collect();
+        assert_eq!(about_char.len(), 1, "{about_char:?}");
+        assert!(about_char[0].contains("NML0017"), "{about_char:?}");
+
+        // The bare-CR diagnostic carries the machine-applicable deletion.
+        let (_, diags) = parse_to_ast_all("service App:\r    port = 1\n");
+        let cr: Vec<String> = diags
+            .iter()
+            .map(|d| d.to_string())
+            .filter(|m| m.contains("NML0016"))
+            .collect();
+        assert_eq!(cr.len(), 1, "{cr:?}");
+        assert!(cr[0].contains("(fix: remove)"), "{cr:?}");
+    }
+
+    /// A leading U+FEFF is a byte-order mark: accepted, filed as trivia
+    /// (lossless), and invisible to the policy. Everywhere else it is
+    /// NML0018.
+    #[test]
+    fn leading_bom_accepted_interior_feff_rejected() {
+        let src = "\u{FEFF}service App:\n    port = 1\n";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "{:?}", p.errors());
+        assert_eq!(tree_text(&p), src, "BOM stays in the lossless tree");
+        let (_, diags) = parse_to_ast_all(src);
+        assert!(diags.is_empty(), "{diags:?}");
+
+        let (_, diags) = parse_to_ast_all("service App:\n    x = \"\u{FEFF}\"\n");
+        assert!(diags.iter().any(|d| d.to_string().contains("NML0018")));
+    }
+
+    /// `\u{…}` and `\r` decode end-to-end; every malformed shape gets its
+    /// precise teaching message (NML0012), spanned from the backslash.
+    #[test]
+    fn value_decode_unicode_and_cr_escapes() {
+        use crate::types::Value;
+        assert_eq!(
+            decode_first("\"H\\u{E9}\\u{1F389}\\r\\u{0}\""),
+            Value::String("Hé🎉\r\u{0}".into())
+        );
+        for (body, needle) in [
+            ("\\uX", "must be followed by `{`"),
+            ("\\u{12", "unterminated"),
+            ("\\u{}", "empty"),
+            ("\\u{1234567}", "overlong"),
+            ("\\u{12G}", "expected a hex digit"),
+            ("\\u{D800}", "not a Unicode scalar"),
+            ("\\u{110000}", "not a Unicode scalar"),
+        ] {
+            let e = parse_to_ast(&format!("service App:\n    x = \"{body}\"\n")).expect_err(body);
+            assert!(e.message().contains(needle), "{body}: {}", e.message());
         }
     }
 

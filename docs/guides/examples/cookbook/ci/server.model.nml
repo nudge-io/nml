@@ -1,0 +1,4 @@
+// Backing schema for the validate-in-ci recipe's checked blocks.
+model server:
+    host string
+    port number
