@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo run --example serde_deserialize
 
-use nml_core::de::from_block;
+use nml_core::de::from_body;
 use nml_core::{parse, Document};
 use serde::Deserialize;
 
@@ -34,7 +34,7 @@ service Worker:
 
     for (name, block) in doc.blocks("service") {
         let body = block.body().expect("block should have body");
-        let config: ServiceConfig = from_block(body).expect("failed to deserialize");
+        let config: ServiceConfig = from_body(body).expect("failed to deserialize");
         println!(
             "{name}: listening on {}:{} (debug={}, tags={:?})",
             config.host, config.port, config.debug, config.tags

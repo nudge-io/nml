@@ -23,19 +23,29 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 struct ServiceConfig {
     host: String,
-    port: f64,
+    port: u16, // NML numbers are exact — out-of-range or fractional is an error
     #[serde(rename = "apiKey")]
     api_key: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let source = std::fs::read_to_string("config.nml")?;
-    let file = parse(&source)?;
+    let source = r#"
+service MyApp:
+    host = "0.0.0.0"
+    port = 8080
+    apiKey = $ENV.API_KEY | "dev-key"
+"#;
+    let file = parse(source)?;
     let doc = Document::new(&file);
     let body = doc.block("service", "MyApp").body().ok_or("not found")?;
 
-    // Resolves $ENV secrets and fallback chains, then deserializes.
-    let config: ServiceConfig = from_body_resolved(body, &ValueResolver::env())?;
+    // The resolver decides what `$ENV` references mean: `ValueResolver::env()`
+    // reads real environment variables in production; any closure works —
+    // a vault client, a test fixture — and receives the bare key ("API_KEY").
+    let resolver = ValueResolver::new(|key| Some(format!("demo-{key}")));
+    let config: ServiceConfig = from_body_resolved(body, &resolver)?;
+    assert_eq!(config.port, 8080);
+    assert_eq!(config.api_key, "demo-API_KEY");
     println!("{}:{}", config.host, config.port);
     Ok(())
 }
@@ -53,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **Value resolution** — pluggable secret lookup (`ValueResolver`), fallback
   chains, shared-property inheritance, schema-driven defaulting.
 - **Serde bridge** — deserialize blocks straight into your structs
-  (`from_block`, `from_body_resolved`, `from_value`).
+  (`from_body`, `from_body_resolved`, `from_value`).
 - **Semantic config diff** — schema-aware change detection (`diff_config`)
   with structured paths, set deltas, and file/default origins; the engine
   behind live-reload classification.

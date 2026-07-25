@@ -270,7 +270,7 @@ fn parse_number(raw: &str, span: Span) -> Result<Number, NmlError> {
         raw.parse().map(Number::Float).map_err(|_| {
             NmlError::syntax(
                 crate::error::ParseErrorKind::InvalidNumber {
-                    raw: crate::error::echo_capture(&raw),
+                    raw: crate::error::echo_capture(raw),
                 },
                 span,
             )
@@ -279,7 +279,7 @@ fn parse_number(raw: &str, span: Span) -> Result<Number, NmlError> {
         raw.parse().map(Number::Int).map_err(|_| {
             NmlError::syntax(
                 crate::error::ParseErrorKind::NumberOutOfRange {
-                    raw: crate::error::echo_capture(&raw),
+                    raw: crate::error::echo_capture(raw),
                 },
                 span,
             )

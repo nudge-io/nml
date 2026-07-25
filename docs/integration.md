@@ -58,12 +58,12 @@ For typed access, deserialize NML blocks directly into Rust structs:
 ```rust
 use serde::Deserialize;
 use nml_core::{parse, Document};
-use nml_core::de::from_block;
+use nml_core::de::from_body;
 
 #[derive(Deserialize)]
 struct ServiceConfig {
     host: String,
-    port: f64,
+    port: u16, // NML numbers are exact — integer fields deserialize as integers
     debug: bool,
     tags: Vec<String>,
 }
@@ -75,7 +75,7 @@ fn load_config(path: &str) -> Result<ServiceConfig, Box<dyn std::error::Error>> 
     let body = doc.block("service", "MyApp")
         .body()
         .ok_or("block 'service MyApp' not found")?;
-    let config: ServiceConfig = from_block(body)?;
+    let config: ServiceConfig = from_body(body)?;
     Ok(config)
 }
 ```

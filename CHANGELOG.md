@@ -2,6 +2,19 @@
 
 ## [0.1.0] - Unreleased
 
+### Changed
+
+- **`nml_core::de::from_block` is now `from_body`** — it always took a
+  `&Body`, and every other deserialization entry point is named for its
+  input type (`from_value`, `from_body_resolved`, the `defaults` family);
+  the naming rule is now stated normatively in the `de` module docs.
+  Pre-publish rename, no deprecation alias. Also: `nml_core::File` is
+  re-exported on the crate facade beside `parse` (its return type), and
+  `nml-validate` re-exports the core facade essentials (`parse`, `File`,
+  `Document`, `ValueResolver`, `Diagnostic`, `Severity`, `SchemaIndex`,
+  the defaults family) so the common parse → validate → defaults →
+  deserialize flow is a single dependency.
+
 ### Added
 
 - **MSRV: measured, declared, and enforced — Rust 1.86.** The floor was

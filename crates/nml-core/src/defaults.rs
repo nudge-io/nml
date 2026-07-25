@@ -8,14 +8,14 @@
 //!
 //! [`from_body_defaulted`] / [`from_block_defaulted`] compose it into the
 //! canonical deserialize pipeline `apply_shared_properties → apply_defaults →
-//! resolve_body → from_block`. Resolution runs **last** so an injected
+//! resolve_body → from_body`. Resolution runs **last** so an injected
 //! `$ENV`/fallback default is resolved on equal footing with author-written
 //! values, and the schema-aware passes never handle resolved secret material.
 
 use serde::Deserialize;
 
 use crate::ast::*;
-use crate::de::{self, from_block};
+use crate::de::{self, from_body};
 use crate::model::{FieldType, ModelDef, OneOfDef};
 use crate::resolve::{apply_shared_properties, ValueResolver};
 use crate::schema_index::{FieldTarget, SchemaIndex};
@@ -66,7 +66,7 @@ where
     let shared = apply_shared_properties(&positional);
     let defaulted = apply_defaults(index, root, &shared);
     let resolved = resolver.resolve_body(&defaulted)?;
-    from_block(&resolved)
+    from_body(&resolved)
 }
 
 /// Materialization bound for declaration-reference inlining: far beyond any
@@ -827,7 +827,7 @@ mod tests {
 
     /// The RFC 0015 END-TO-END guarantee, through the REAL pipeline
     /// (`apply_positional → apply_shared_properties → apply_defaults →
-    /// resolve_body → from_block`), not pass-by-pass: the annotation must
+    /// resolve_body → from_body`), not pass-by-pass: the annotation must
     /// survive every body-rebuilding transform (each must use
     /// `Body::with_entries`, never a fresh construction), select the named variant's
     /// DEFAULTS, and reach the deserializer's synthesized tag so the built Rust

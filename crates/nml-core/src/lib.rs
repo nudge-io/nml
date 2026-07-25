@@ -31,7 +31,7 @@
 //! ```rust
 //! use serde::Deserialize;
 //! use nml_core::{parse, Document};
-//! use nml_core::de::from_block;
+//! use nml_core::de::from_body;
 //!
 //! #[derive(Deserialize)]
 //! struct Config {
@@ -43,14 +43,13 @@
 //! let file = parse(source).unwrap();
 //! let doc = Document::new(&file);
 //! let body = doc.block("service", "MyApp").body().unwrap();
-//! let config: Config = from_block(body).unwrap();
+//! let config: Config = from_body(body).unwrap();
 //! ```
 
 /// The typed **semantic AST** (`File`/`Declaration`/decoded `Value`s …) — the
 /// model that semantic consumers (validation, deserialization, defaulting) read.
-/// Produced by lowering the lossless [`cst`] (see [`cst::lower`]) — the production
-/// parse path that supersedes the legacy parser (which now survives only in
-/// nml-core's own tests, pending removal).
+/// Produced by lowering the lossless [`cst`] (see [`cst::lower`]) — the
+/// production parse path (the pre-CST legacy parser is long removed).
 pub mod ast;
 /// RFC 0004 lossless CST: the production parser (resilient red/green tree with
 /// exact spans, trivia, and comments). Tooling that needs losslessness/resilience
@@ -86,6 +85,8 @@ pub mod symbols;
 pub mod template;
 pub mod types;
 
+/// [`parse`]'s own return type belongs on the facade beside it.
+pub use ast::File;
 /// The top-level parse facade: source → semantic [`ast::File`], reporting the
 /// first error. Ergonomic alias for [`cst::parse_to_ast`] (the layered name).
 pub use cst::parse_to_ast as parse;

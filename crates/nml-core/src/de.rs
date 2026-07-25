@@ -4,32 +4,44 @@
 //! Supports flat properties, nested blocks (recursive), named list items
 //! with label injection, and shared property inheritance (`.key:` blocks and `.key = value` scalars).
 //!
+//! **Naming law (normative):** entry points are named for their **input
+//! type** — [`from_body`]`(&Body)`, [`from_value`]`(&Value)`,
+//! [`from_body_resolved`]`(&Body, …)`; likewise the `defaults` family
+//! (`from_block_defaulted` takes a `BlockDecl`, `from_document_defaulted`
+//! a `Document`). A new entry point that breaks this rule is misnamed.
+//!
 //! # Example
+//!
+//! NML numbers are exact — integer fields deserialize as integers (a
+//! fractional or out-of-range value is a typed error, never a silent cast):
 //!
 //! ```rust
 //! use serde::Deserialize;
-//! use nml_core::de::from_block;
+//! use nml_core::de::from_body;
 //! use nml_core::query::Document;
 //!
 //! #[derive(Deserialize)]
 //! struct ServerConfig {
-//!     port: f64,
+//!     port: u16,
 //!     host: String,
 //!     debug: bool,
 //! }
 //!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let source = r#"
 //! service MyApp:
 //!     port = 8080
 //!     host = "localhost"
 //!     debug = true
 //! "#;
-//! let file = nml_core::cst::parse_to_ast(source).unwrap();
+//! let file = nml_core::parse(source)?;
 //! let doc = Document::new(&file);
-//! let body = doc.block("service", "MyApp").body().unwrap();
-//! let config: ServerConfig = from_block(body).unwrap();
-//! assert_eq!(config.port, 8080.0);
+//! let body = doc.block("service", "MyApp").body().ok_or("no MyApp block")?;
+//! let config: ServerConfig = from_body(body)?;
+//! assert_eq!(config.port, 8080);
 //! assert_eq!(config.host, "localhost");
+//! # Ok(())
+//! # }
 //! ```
 
 use std::fmt;
@@ -135,7 +147,7 @@ fn number_to_int<T: TryFrom<i64>>(n: Number, type_name: &'static str) -> Result<
 /// primary value only. Configuration that uses env vars or fallbacks must
 /// go through [`from_body_resolved`], which resolves both before
 /// deserializing.
-pub fn from_block<'de, T: Deserialize<'de>>(body: &'de Body) -> Result<T, Error> {
+pub fn from_body<'de, T: Deserialize<'de>>(body: &'de Body) -> Result<T, Error> {
     let deserializer = BodyDeserializer { body };
     T::deserialize(deserializer)
 }
@@ -148,14 +160,14 @@ pub fn from_value<'de, T: Deserialize<'de>>(value: &'de Value) -> Result<T, Erro
 
 /// Resolve values, apply shared property inheritance, then deserialize.
 ///
-/// Pipeline: `resolve_body` -> `apply_shared_properties` -> `from_block`.
+/// Pipeline: `resolve_body` -> `apply_shared_properties` -> `from_body`.
 pub fn from_body_resolved<T: for<'de> Deserialize<'de>>(
     body: &Body,
     resolver: &ValueResolver,
 ) -> Result<T, Error> {
     let resolved = resolver.resolve_body(body)?;
     let merged = resolve::apply_shared_properties(&resolved);
-    from_block(&merged)
+    from_body(&merged)
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +199,7 @@ impl<'de> de::Deserializer<'de> for BodyDeserializer<'de> {
         self.deserialize_map(visitor)
     }
 
-    /// RFC 0015 at the ROOT: `from_block` called directly on an annotated body
+    /// RFC 0015 at the ROOT: `from_body` called directly on an annotated body
     /// deserializing into a Rust enum takes the same synthesized-external-tag
     /// path as every nested level — full symmetry, no "works one level down but
     /// not at the top" asymmetry. Un-annotated bodies are unchanged.
@@ -890,7 +902,7 @@ mod tests {
     use serde::Deserialize;
 
     #[test]
-    fn deserialize_struct_from_block() {
+    fn deserialize_struct_from_body() {
         #[derive(Deserialize, Debug, PartialEq)]
         struct Config {
             port: f64,
@@ -907,7 +919,7 @@ service MyApp:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "MyApp").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.port, 8080.0);
         assert_eq!(config.host, "localhost");
         assert!(config.debug);
@@ -932,7 +944,7 @@ service MyApp:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("host", "H").body().unwrap();
-        from_block(body)
+        from_body(body)
     }
 
     #[test]
@@ -976,7 +988,7 @@ service MyApp:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.tags, vec!["web", "api"]);
     }
 
@@ -1018,7 +1030,7 @@ server App:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
-        let config: Server = from_block(body).unwrap();
+        let config: Server = from_body(body).unwrap();
         assert_eq!(config.port, 8080);
         assert_eq!(config.db.backend, "postgres");
         assert_eq!(config.db.url, "postgres://localhost/dev");
@@ -1041,7 +1053,7 @@ server App:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
-        let config: Server = from_block(body).unwrap();
+        let config: Server = from_body(body).unwrap();
         assert_eq!(config.port, 3000);
         assert!(config.db.map(|db| db.url).is_none());
     }
@@ -1070,7 +1082,7 @@ workflow W:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("workflow", "W").body().unwrap();
-        let config: Workflow = from_block(body).unwrap();
+        let config: Workflow = from_body(body).unwrap();
         assert_eq!(config.steps.len(), 2);
         assert_eq!(config.steps[0].name, "classify");
         assert_eq!(config.steps[0].provider, "fast");
@@ -1101,7 +1113,7 @@ service S:
         struct S {
             items: Vec<Item>,
         }
-        let config: S = from_block(body).unwrap();
+        let config: S = from_body(body).unwrap();
         assert_eq!(config.items[0].name, "OverriddenName");
         assert_eq!(config.items[0].url, "/api");
     }
@@ -1126,7 +1138,7 @@ service App:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.port, 8080);
         assert_eq!(config.retries, 3);
         assert_eq!(config.offset, -10);
@@ -1149,7 +1161,7 @@ service S:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "S").body().unwrap();
-        let config: Tools = from_block(body).unwrap();
+        let config: Tools = from_body(body).unwrap();
         assert_eq!(config.items, vec!["tool-a", "tool-b"]);
     }
 
@@ -1170,7 +1182,7 @@ service S:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "S").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.paths, vec!["/api/v1", "/api/v2", "/health"]);
     }
 
@@ -1206,7 +1218,7 @@ service S:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "S").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
 
         assert_eq!(config.items.len(), 3);
 
@@ -1266,7 +1278,7 @@ auth MyAuth:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("auth", "MyAuth").body().unwrap();
-        let config: Auth = from_block(body).unwrap();
+        let config: Auth = from_body(body).unwrap();
         assert_eq!(config.provider, "oidc");
         assert_eq!(config.oidc_providers.len(), 2);
         assert_eq!(config.oidc_providers[0].name, "Google");
@@ -1327,7 +1339,7 @@ auth MyAuth:
             })
             .expect("list item");
         if let ListItemKind::Named { body, .. } = &item.kind {
-            let step: Step = from_block(body).unwrap();
+            let step: Step = from_body(body).unwrap();
             assert_eq!(
                 step,
                 Step {
@@ -1358,7 +1370,7 @@ auth MyAuth:
         let file = parse_to_ast(complete).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.host, "localhost");
         assert_eq!(config.port, 8080);
 
@@ -1366,7 +1378,7 @@ auth MyAuth:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let result: Result<Config, _> = from_block(body);
+        let result: Result<Config, _> = from_body(body);
         let err = result.expect_err("missing required field 'port' should error");
         assert!(err.to_string().contains("port"), "got: {err}");
     }
@@ -1382,7 +1394,7 @@ auth MyAuth:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.host, "localhost");
     }
 
@@ -1426,7 +1438,7 @@ auth MyAuth:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("root", "R").body().unwrap();
-        let config: L1 = from_block(body).unwrap();
+        let config: L1 = from_body(body).unwrap();
         assert_eq!(config.l2.l3.value, "deep");
     }
 
@@ -1444,7 +1456,7 @@ auth MyAuth:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert!(config.host.is_none());
         assert!(config.port.is_none());
     }
@@ -1462,7 +1474,7 @@ auth MyAuth:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.api_key, "abc");
         assert_eq!(config.max_retries, 3);
     }
@@ -1513,7 +1525,7 @@ auth MyAuth:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.host, "localhost");
         assert!(config.port.is_none());
     }
@@ -1530,7 +1542,7 @@ auth MyAuth:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.host, "localhost");
         assert_eq!(config.port, Some(3000));
     }
@@ -1596,7 +1608,7 @@ workflow W:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("workflow", "W").body().unwrap();
-        let config: Workflow = from_block(body).unwrap();
+        let config: Workflow = from_body(body).unwrap();
         assert_eq!(config.entrypoint, "step1");
         assert_eq!(config.steps.len(), 2);
         assert_eq!(config.steps[0].name, "step1");
@@ -1616,7 +1628,7 @@ workflow W:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("plan", "ProPlan").body().unwrap();
-        let plan: Plan = from_block(body).unwrap();
+        let plan: Plan = from_body(body).unwrap();
         assert_eq!(plan.monthly_price, "29.99 USD");
     }
 
@@ -1630,7 +1642,7 @@ workflow W:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "S").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.port, 3000);
     }
 
@@ -1683,7 +1695,7 @@ workflow W:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "S").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert!(config.enabled);
     }
 
@@ -1706,7 +1718,7 @@ workflow W:
         let file = parse_to_ast(nml).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
-        from_block(body)
+        from_body(body)
     }
 
     // ── RFC 0014: role-conjunction expressions (`&`) ──────────────────────
@@ -1720,7 +1732,7 @@ workflow W:
         let file = parse_to_ast(nml).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
-        from_block(body)
+        from_body(body)
     }
 
     /// THE cross-repo contract (RFC 0014): a role-conjunction expression
@@ -1781,7 +1793,7 @@ workflow W:
         )
         .unwrap();
         let doc = crate::query::Document::new(&file);
-        let one: One = from_block(doc.block("server", "App").body().unwrap()).unwrap();
+        let one: One = from_body(doc.block("server", "App").body().unwrap()).unwrap();
         assert_eq!(one.gate, "@role/a & @role/b");
     }
 
@@ -1859,14 +1871,14 @@ workflow W:
         let file = parse_to_ast(nml).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.level, 255);
 
         let nml_bad = "server App:\n    level = 256\n";
         let file2 = parse_to_ast(nml_bad).unwrap();
         let doc2 = crate::query::Document::new(&file2);
         let body2 = doc2.block("server", "App").body().unwrap();
-        let result: Result<Config, _> = from_block(body2);
+        let result: Result<Config, _> = from_body(body2);
         assert!(result.is_err(), "256 should not fit in u8");
     }
 
@@ -1880,14 +1892,14 @@ workflow W:
         let file = parse_to_ast(nml).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.offset, -128);
 
         let nml_bad = "server App:\n    offset = 128\n";
         let file2 = parse_to_ast(nml_bad).unwrap();
         let doc2 = crate::query::Document::new(&file2);
         let body2 = doc2.block("server", "App").body().unwrap();
-        let result: Result<Config, _> = from_block(body2);
+        let result: Result<Config, _> = from_body(body2);
         assert!(result.is_err(), "128 should not fit in i8");
     }
 
@@ -1901,7 +1913,7 @@ workflow W:
         let file = parse_to_ast(nml).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
-        from_block(body)
+        from_body(body)
     }
 
     #[test]
@@ -1962,7 +1974,7 @@ workflow W:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.id, 9_007_199_254_740_993);
         assert_eq!(config.max, i64::MAX);
     }
@@ -2007,7 +2019,7 @@ workflow W:
         let file = crate::cst::parse_to_ast(source).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.access, "@role/admin");
     }
 
@@ -2021,7 +2033,7 @@ workflow W:
         let file = crate::cst::parse_to_ast(source).unwrap();
         let doc = crate::query::Document::new(&file);
         let body = doc.block("role", "admin").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.members, vec!["@role/editor", "@public"]);
     }
 
@@ -2044,7 +2056,7 @@ workflow W:
         let file = parse_to_ast(nml).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
-        from_block(body)
+        from_body(body)
     }
 
     #[test]
@@ -2085,7 +2097,7 @@ workflow W:
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "App").body().unwrap();
-        let config: Config = from_block(body).unwrap();
+        let config: Config = from_body(body).unwrap();
         assert_eq!(config.mode, Mode::AllInOne);
     }
 
