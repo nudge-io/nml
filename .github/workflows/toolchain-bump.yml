@@ -39,6 +39,12 @@ jobs:
             echo "::error::could not read the latest stable version"
             exit 1
           fi
+          # Network-sourced value about to reach sed/git/gh: accept only a
+          # bare semver — anything else is a manifest anomaly, not a bump.
+          if ! [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::unexpected version format: $latest"
+            exit 1
+          fi
           if [ "$pinned" = "$latest" ]; then
             echo "pinned toolchain $pinned is current"
             exit 0

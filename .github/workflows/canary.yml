@@ -25,6 +25,12 @@ jobs:
       fail-fast: false
       matrix:
         channel: [stable, beta]
+    # Without this the canary is SILENT: rust-toolchain.toml outranks the
+    # installed default, so plain `cargo` below would run the PIN — testing
+    # the pin against itself weekly and never seeing a new stable/beta. The
+    # env var outranks the pin file (same fix as the msrv job).
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.channel }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)

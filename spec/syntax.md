@@ -93,6 +93,24 @@ system = """
 
 The content is dedented: the minimum leading indent is stripped from each line. The newline immediately after the opening `"""` and before the closing `"""` is trimmed (TOML-style). Line endings in the body normalize to LF in the value — CRLF is transport, not content (see [Source text](#source-text)).
 
+Three rules make the value depend on transport shape alone (the Java
+text-block order, JEP 378):
+
+- **Dedent is computed on source lines, before escapes are interpreted.**
+  An escaped `\n` produces a newline in the *value* without creating a
+  line for indentation purposes, and escaped whitespace survives
+  stripping — `\u{20}` at the start of a line is protected content, not
+  indentation (the capability Java added `\s` for).
+- **Content must begin on the line after the opening `"""`**
+  ([NML0019](../crates/nml-core/assets/error-index.md#nml0019), the
+  Swift/Java rule) — text on the opening line would participate in the
+  indent computation. Whitespace alone there is harmless and legal, as is
+  the empty `""""""`; short values use ordinary `"…"` strings.
+- **The formatter protects edge spaces**: when it renders a multiline
+  value, a line's first and last space are emitted as `\u{20}`, so
+  neither reparse dedent nor an editor's trim-on-save can change the
+  value.
+
 Escape sequences (same for single and multiline strings):
 - `\"` -- literal double quote
 - `\\` -- literal backslash

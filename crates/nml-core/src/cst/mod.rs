@@ -1217,6 +1217,55 @@ service App is Base:
         assert_eq!(v, Value::String("a\r\nb".into()));
     }
 
+    /// The JEP 378 (Java text-block) order: dedent is computed on SOURCE
+    /// lines BEFORE escapes are interpreted, so content can never steer
+    /// transport interpretation. Each case here was validated by the
+    /// differential battery (scratchpad crlf-probe) before the port.
+    #[test]
+    fn multiline_dedent_is_transport_only() {
+        use crate::types::Value;
+        // An escaped newline can no longer zero min-indent — indentation
+        // stays transport and never leaks into the value.
+        let v = decode_first("\"\"\"\n        a\\u{A}b\n        c\n        \"\"\"");
+        assert_eq!(v, Value::String("a\nb\nc".into()));
+        let v = decode_first("\"\"\"\n        a\\nb\n        c\n        \"\"\"");
+        assert_eq!(v, Value::String("a\nb\nc".into()));
+
+        // Escaped leading whitespace is CONTENT: it survives dedent
+        // (protected space — Java needed `\s` for this; ours is emergent).
+        let v = decode_first("\"\"\"\n    \\u{20}x\n    \\u{20}y\n    \"\"\"");
+        assert_eq!(v, Value::String(" x\n y".into()));
+
+        // A decode-blank line abutting the closing quotes is raw content,
+        // never edge-trimmed (blankness is a transport property).
+        let v = decode_first("\"\"\"\n    x\n    \\u{20}\"\"\"");
+        assert_eq!(v, Value::String("x\n ".into()));
+
+        // The empty multiline degenerate stays legal.
+        let v = decode_first("\"\"\"\"\"\"");
+        assert_eq!(v, Value::String(String::new()));
+    }
+
+    /// NML0019: multi-line string content must begin on a new line (the
+    /// Swift/Java rule) — content on the opening line is the one remaining
+    /// way dedent could be steered, so it is closed. Recovery is NML0012
+    /// parity: error recorded, value degrades to the placeholder, lowering
+    /// stays total.
+    #[test]
+    fn multiline_content_on_opening_line_is_an_error() {
+        let (_, diags) =
+            parse_to_ast_all("service App:\n    x = \"\"\"abc\n        def\n        \"\"\"\n");
+        assert!(
+            diags.iter().any(|d| d.to_string().contains("NML0019")),
+            "{diags:?}"
+        );
+        // Whitespace-only after the opening quotes is harmless (it cannot
+        // participate in min-indent) and stays legal.
+        let (_, diags) =
+            parse_to_ast_all("service App:\n    x = \"\"\"   \n        ok\n        \"\"\"\n");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
     /// Template detection reads RAW text: `\u{7B}\u{7B}` is a literal `{{`
     /// (the escape hatch — previously inexpressible), never a template, so
     /// an escape can't smuggle a template expression past review; written

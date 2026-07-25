@@ -167,6 +167,9 @@ pub mod codes {
         /// differently than it parses (bidirectional controls, interior
         /// U+FEFF) — the Trojan Source defense.
         INVISIBLE_CHARACTER = 18;
+        /// Content on a multi-line string's opening line (content must
+        /// begin on a new line — the Swift/Java text-block rule).
+        MULTILINE_OPENING_CONTENT = 19;
 
         /// The same name is declared more than once in one namespace.
         DUPLICATE_DECLARATION = 1000;

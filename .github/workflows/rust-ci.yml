@@ -3,6 +3,17 @@ name: Rust CI
 # Reusable: the single source of truth for the Rust checks. Called by ci.yml (on
 # push/PR) and release.yml (as a gate — the release's publish job needs it, so a
 # fmt/clippy/test failure blocks the release before anything is published).
+#
+# TOOLCHAIN ARCHITECTURE: gate jobs run THE PINNED toolchain, and the pin
+# lives in exactly one place — rust-toolchain.toml (channel + components).
+# rustup honors that file natively, so pinned jobs never restate a version:
+# an argless `rustup toolchain install` materializes the file's toolchain,
+# components included, and every later cargo call resolves to it. The only
+# jobs that name a toolchain are the ones whose PURPOSE is a different
+# toolchain: msrv (the floor from Cargo.toml, forced via RUSTUP_TOOLCHAIN —
+# the env var outranks the pin file) and minimal-versions' nightly resolver
+# step (reached via explicit `cargo +nightly`). New stables land via
+# canary.yml + a reviewed toolchain-bump PR — never by drift.
 on:
   workflow_call:
 
@@ -10,30 +21,14 @@ permissions:
   contents: read
 
 jobs:
-  # Gate jobs install the PINNED toolchain (rust-toolchain.toml — read the
-  # same way the msrv job reads Cargo.toml, so the file stays the single
-  # source of truth): deterministic fmt/clippy verdicts, identical to every
-  # contributor's. New stables land via canary.yml + a reviewed bump PR.
   lint:
     name: fmt · clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Read the pinned toolchain from rust-toolchain.toml
-        id: pin
-        shell: bash
-        run: |
-          version="$(grep -m1 '^channel' rust-toolchain.toml | cut -d '"' -f 2)"
-          if [ -z "$version" ]; then
-            echo "::error::no channel found in rust-toolchain.toml"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
-        with:
-          toolchain: ${{ steps.pin.outputs.version }}
-          components: rustfmt, clippy
+      # The file names the channel AND components (rustfmt, clippy).
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -66,19 +61,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Read the pinned toolchain from rust-toolchain.toml
-        id: pin
-        shell: bash
-        run: |
-          version="$(grep -m1 '^channel' rust-toolchain.toml | cut -d '"' -f 2)"
-          if [ -z "$version" ]; then
-            echo "::error::no channel found in rust-toolchain.toml"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
-        with:
-          toolchain: ${{ steps.pin.outputs.version }}
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo test --workspace --locked
 
@@ -111,6 +94,12 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          # rust-toolchain.toml overrides the installed DEFAULT at cargo-run
+          # time — without this, the job would silently check the PINNED
+          # toolchain and the MSRV gate would be green-but-vacuous. The env
+          # var outranks the pin file; every later step in this job now
+          # really runs the floor toolchain.
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
@@ -125,62 +114,39 @@ jobs:
   # Publish-readiness, continuously: `cargo package` validates metadata,
   # file sets, and (via its verify build) that each publishable crate
   # compiles from its own tarball — so publish day is a decision, not a
-  # debugging session. The tutorial apps are excluded explicitly:
-  # `publish = false` blocks *uploading*, but `cargo package` still
-  # packages such members (measured), and they are not publish surface.
+  # debugging session. The tutorial apps and the cookbook are excluded
+  # explicitly: `publish = false` blocks *uploading*, but `cargo package`
+  # still packages such members (measured), and they are not publish
+  # surface.
   package:
     name: cargo package
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Read the pinned toolchain from rust-toolchain.toml
-        id: pin
-        shell: bash
-        run: |
-          version="$(grep -m1 '^channel' rust-toolchain.toml | cut -d '"' -f 2)"
-          if [ -z "$version" ]; then
-            echo "::error::no channel found in rust-toolchain.toml"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
-        with:
-          toolchain: ${{ steps.pin.outputs.version }}
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo package --workspace --exclude 'nml-tutorial-*' --exclude nml-cookbook --locked
 
   # Declared version bounds are promises (`serde = "1"` claims we build
   # against serde 1.0.0). Resolve every DIRECT dependency to its declared
   # minimum (nightly resolver flag), then prove the workspace still
-  # compiles on stable. Catches under-declared bounds before a downstream
-  # user's cold lockfile does. Deliberately unlocked: this job's whole
-  # point is a different resolution.
+  # compiles on the pinned toolchain. Catches under-declared bounds before
+  # a downstream user's cold lockfile does. Deliberately unlocked: this
+  # job's whole point is a different resolution.
   minimal-versions:
     name: minimal versions
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Read the pinned toolchain from rust-toolchain.toml
-        id: pin
-        shell: bash
-        run: |
-          version="$(grep -m1 '^channel' rust-toolchain.toml | cut -d '"' -f 2)"
-          if [ -z "$version" ]; then
-            echo "::error::no channel found in rust-toolchain.toml"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The pin (for the check step, via the file)…
+      - run: rustup toolchain install
+      # …plus nightly, reached ONLY via explicit `cargo +nightly` (the
+      # resolver flag needs it; the pin file governs everything else).
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
         with:
           toolchain: nightly
-      # Installed second so the check step below runs on the PIN (dtolnay
-      # exports the last-installed toolchain); nightly is reached explicitly
-      # for the resolver flag only.
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
-        with:
-          toolchain: ${{ steps.pin.outputs.version }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo +nightly update -Zdirect-minimal-versions
       - run: cargo check --workspace --all-targets

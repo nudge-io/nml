@@ -19,10 +19,13 @@ jobs:
 
       # Building the WASM server here also guards that the wasm32 cfg-gated code
       # (the synchronous pump) compiles.
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
-        with:
-          toolchain: stable
-          targets: wasm32-wasip1
+      #
+      # The pin file (rust-toolchain.toml) is the only toolchain authority:
+      # rustup materializes it (channel + components) from an argless
+      # install, and the target is added to THAT toolchain — installing
+      # either for any other named toolchain (e.g. `stable`) leaves the one
+      # cargo actually uses target-less (E0463 "can't find crate for core").
+      - run: rustup toolchain install && rustup target add wasm32-wasip1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Build the WASM neutral server
         # --locked: this wasm ships inside the VSIX — the release artifact

@@ -600,13 +600,27 @@ fn format_string(out: &mut String, s: &str, depth: usize, escape_braces: bool) {
             for _ in 0..(depth + 1) {
                 out.push_str(INDENT);
             }
-            let mut chars = line.chars().peekable();
+            // Edge spaces are CONTENT the transport layer would eat: a raw
+            // leading space is indistinguishable from indentation on
+            // reparse (min-indent would strip it) and a raw trailing space
+            // is one editor trim-on-save away from a changed value — so a
+            // line's first and last space render as `\u{20}` (the concern
+            // Java added `\s` for).
+            let bytes = line.as_bytes();
+            let protect_first = bytes.first() == Some(&b' ');
+            let protect_last = line.len() > 1 && bytes.last() == Some(&b' ');
+            let mut chars = line.char_indices().peekable();
             // A raw `"""` inside the body would close the string early on
             // reparse — escape the THIRD quote of any consecutive run (and
             // only that one), so quote-heavy content (JSON) stays readable
             // while a closing-delimiter run can never form.
             let mut quote_run = 0usize;
-            while let Some(ch) = chars.next() {
+            while let Some((i, ch)) = chars.next() {
+                if (i == 0 && protect_first) || (i == line.len() - 1 && protect_last) {
+                    out.push_str("\\u{20}");
+                    quote_run = 0;
+                    continue;
+                }
                 if ch == '"' {
                     quote_run += 1;
                     if quote_run == 3 {
@@ -617,7 +631,7 @@ fn format_string(out: &mut String, s: &str, depth: usize, escape_braces: bool) {
                 } else {
                     quote_run = 0;
                 }
-                if escape_braces && ch == '{' && chars.peek() == Some(&'{') {
+                if escape_braces && ch == '{' && chars.peek().map(|(_, c)| *c) == Some('{') {
                     out.push_str("\\u{7B}");
                 } else {
                     push_value_char(out, ch);
@@ -705,6 +719,21 @@ mod tests {
         assert!(formatted.contains("\\u{1B}[0m"), "{formatted}");
         assert!(formatted.contains("\\u{202E}"), "{formatted}");
         assert!(formatted.contains("a\\rb"), "{formatted}");
+    }
+
+    /// Edge spaces in multiline values (writable via `\u{20}`, which
+    /// survives dedent under the text-block order) round-trip: the
+    /// formatter re-escapes a line's first/last space so reparse dedent
+    /// and editor whitespace-trimming can't eat them. Idempotence is the
+    /// enforcement — a lost space would change the second format.
+    #[test]
+    fn edge_spaces_in_multiline_values_are_protected() {
+        let source = "service App:\n    x = \"\"\"\n        \\u{20}lead\n        tail\\u{20}\n        \"\"\"\n";
+        roundtrip(source);
+        idempotent(source);
+        let formatted = format_source(source).unwrap();
+        assert!(formatted.contains("\\u{20}lead"), "{formatted}");
+        assert!(formatted.contains("tail\\u{20}"), "{formatted}");
     }
 
     /// A multiline value containing `"""` (writable via `\"\"\"`) must not

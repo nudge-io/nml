@@ -302,6 +302,27 @@ service Api:
 escape so it is visible in review; otherwise delete it (it usually
 arrives via copy-paste from rendered text).
 
+## NML0019
+
+**Content on a multi-line string's opening line.** The content of a
+`"""` string begins on the line *after* the opening quotes — the same
+rule Swift and Java text blocks enforce. Text on the opening line would
+participate in the indentation-stripping computation, making the value
+depend on where the content happens to sit; NML's dedent is computed
+from transport shape alone, so this is closed as an error rather than
+left as a trap.
+
+```nml check expect-error='[NML0019]'
+service Api:
+    motd = """All systems operational.
+        Subscribe for updates.
+        """
+```
+
+**Fix:** move the content to the next line. For a short single-line
+value, use an ordinary `"…"` string. (Whitespace alone after the
+opening quotes is harmless and legal, as is the empty `""""""`.)
+
 ## NML1000
 
 **Duplicate declaration.** Two top-level declarations share one name; names

@@ -48,6 +48,11 @@ pub enum ParseErrorKind {
     /// it parses: a bidirectional control (Trojan Source, CVE-2021-42574) or
     /// an interior U+FEFF. The `\u{…}` escape is the sanctioned spelling.
     InvisibleCharacter { ch: char },
+    /// Content on a multi-line string's opening line (the Swift/Java rule:
+    /// content begins on a new line). Text there would participate in
+    /// dedent's min-indent — the one way transport interpretation could
+    /// still be steered by where content sits.
+    MultilineOpeningContent,
     /// A dedent to a column matching no enclosing block. `valid` lists the
     /// open indentation levels — the offside rule, taught at the site.
     BadDedent { found: usize, valid: Vec<usize> },
@@ -217,6 +222,10 @@ impl ParseErrorKind {
                  than it parses; write it as `\\u{{{:X}}}` inside a string",
                 *ch as u32, *ch as u32
             ),
+            MultilineOpeningContent => "multi-line string content must begin on the \
+                                        line after the opening `\"\"\"` (text on the \
+                                        opening line would steer indentation stripping)"
+                .to_string(),
             BadDedent { found, valid } => {
                 let levels = valid
                     .iter()
@@ -305,6 +314,7 @@ impl ParseErrorKind {
             BareCarriageReturn => codes::BARE_CARRIAGE_RETURN,
             ForbiddenControlCharacter { .. } => codes::FORBIDDEN_CONTROL,
             InvisibleCharacter { .. } => codes::INVISIBLE_CHARACTER,
+            MultilineOpeningContent => codes::MULTILINE_OPENING_CONTENT,
             BadDedent { .. } => codes::BAD_DEDENT,
             NestingLimit { .. } => codes::NESTING_LIMIT,
             SetSeparator => codes::SET_SEPARATOR,

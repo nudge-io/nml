@@ -3,13 +3,13 @@
 //! Interprets a *syntactic* `Value` / `ArrayValue` / `Fallback` CST node into a
 //! *semantic* [`SpannedValue`] — the inverse of the parser's "syntax only"
 //! discipline. All the interpretation the lexer/parser deliberately deferred
-//! lives here: string-escape decoding, multiline dedent, number range-checking,
-//! money parsing, `$ENV` namespace validation, `true`/`false`, and template
-//! strings. Money and template parsing **reuse** the existing `money`/`template`
-//! modules; the escape/dedent/number logic mirrors the legacy lexer exactly and
-//! is pinned to it by a differential test (`cst::tests`), so capability is
-//! preserved, not reinvented. (At P7 the legacy lexer's copies are deleted,
-//! leaving this the single source of truth.)
+//! lives here: string-escape decoding, multiline resolution (the text-block
+//! order — see [`decode_multiline`]), number range-checking, money parsing,
+//! `$ENV` namespace validation, `true`/`false`, and template strings. Money
+//! and template parsing **reuse** the existing `money`/`template` modules.
+//! This module is the single source of truth for value interpretation; its
+//! behavior is spec-defined (spec/syntax.md: Source text, Strings) and
+//! pinned by the `cst::tests` unit suite plus the fuzz batteries there.
 
 use crate::cst::syntax::{
     SyntaxKind, SyntaxNode, SyntaxToken, content_span, node_span, text_offset,
@@ -26,7 +26,7 @@ use crate::span::Span;
 use crate::types::{Number, SpannedValue, Value};
 use crate::{money, template};
 
-/// Variable-reference namespaces recognized after `$` (mirrors the legacy lexer).
+/// Variable-reference namespaces recognized after `$`.
 pub(crate) const KNOWN_NAMESPACES: &[&str] = &["ENV"];
 
 /// Decode a value node (`Value`, `ArrayValue`, or `Fallback`) into a
@@ -148,8 +148,8 @@ fn decode_array(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
     Ok(SpannedValue::new(Value::Array(items), content_span(node)))
 }
 
-/// `a | b | c` decodes right-associatively to `Fallback(a, Fallback(b, c))`,
-/// matching the legacy recursive `parse_value_or_fallback`.
+/// `a | b | c` decodes right-associatively to `Fallback(a, Fallback(b, c))`
+/// — the resolver tries left-to-right, so the chain nests rightward.
 fn decode_fallback(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
     let mut values = value_children(node)
         .map(|c| decode_value(&c))
@@ -176,16 +176,16 @@ fn decode_fallback(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
     Ok(acc)
 }
 
-// ── scalar decoders (mirror the legacy lexer; pinned by a differential test) ──
+// ── scalar decoders (spec: Strings; pinned by cst::tests + the fuzz batteries) ──
 
 /// Decode a string token's raw text (`"…"` or `"""…"""`) into its value: strip
-/// the delimiters, process escapes, and dedent triple-quoted bodies. `tok_start`
-/// is the token's source offset, so escape errors get a span covering exactly
-/// the offending `\x` (matching the legacy lexer's precision).
+/// the delimiters, process escapes, and (triple-quoted) resolve the body in
+/// the text-block order — see [`decode_multiline`]. `tok_start` is the
+/// token's source offset, so escape errors get char-precise spans.
 fn decode_string(raw: &str, tok_start: usize) -> Result<String, NmlError> {
     if let Some(body) = raw.strip_prefix("\"\"\"") {
         let body = body.strip_suffix("\"\"\"").unwrap_or(body);
-        Ok(dedent_multiline(&decode_escapes(body, tok_start + 3)?))
+        decode_multiline(body, tok_start + 3)
     } else if let Some(body) = raw.strip_prefix('"') {
         let body = body.strip_suffix('"').unwrap_or(body);
         decode_escapes(body, tok_start + 1)
@@ -194,22 +194,21 @@ fn decode_string(raw: &str, tok_start: usize) -> Result<String, NmlError> {
     }
 }
 
-/// Decode `\" \\ \n \t \r \u{…}`; `inner_start` is the source offset of
-/// `inner`'s first byte, used to point errors at the exact escape.
+/// [`decode_escapes_into`], collected — for the single-line callers.
 fn decode_escapes(inner: &str, inner_start: usize) -> Result<String, NmlError> {
     let mut out = String::with_capacity(inner.len());
+    decode_escapes_into(&mut out, inner, inner_start)?;
+    Ok(out)
+}
+
+/// Decode `\" \\ \n \t \r \u{…}` into `out`; `inner_start` is the source
+/// offset of `inner`'s first byte, so errors point at the exact escape.
+/// Content only, by construction: single-line tokens cannot span lines and
+/// the multiline splitter owns line terminators, so none reach this loop.
+fn decode_escapes_into(out: &mut String, inner: &str, inner_start: usize) -> Result<(), NmlError> {
     let mut chars = inner.char_indices();
     while let Some((i, c)) = chars.next() {
         if c != '\\' {
-            // A raw CRLF (multiline bodies only) is transport, not content:
-            // drop the CR half HERE — at true source offsets, so escape-error
-            // spans stay exact — and let the LF land on its own iteration.
-            // Content CRs arrive via `\r`/`\u{D}` and never hit this arm; a
-            // bare raw CR passes through, already flagged by the source
-            // policy (NML0016).
-            if c == '\r' && inner.as_bytes().get(i + 1) == Some(&b'\n') {
-                continue;
-            }
             out.push(c);
             continue;
         }
@@ -239,7 +238,7 @@ fn decode_escapes(inner: &str, inner_start: usize) -> Result<String, NmlError> {
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Decode the braced tail of a `\u{…}` escape (Rust/Swift syntax: 1–6 hex
@@ -296,45 +295,79 @@ fn decode_unicode_escape(
     }
 }
 
-/// Strip the common leading-space indent from a triple-quoted body and trim the
-/// blank first/last lines (mirrors the legacy `dedent_multiline_string`).
-/// Input is already LF-only transport: [`decode_escapes`] dropped raw CRLF's
-/// CR half (CRLF is transport, not content — the policy Rust and Swift string
-/// literals follow), so any CR here is escaped *content* and survives.
-fn dedent_multiline(raw: &str) -> String {
-    let mut lines: Vec<&str> = raw.split('\n').collect();
-    if lines
-        .first()
-        .is_some_and(|l| l.chars().all(char::is_whitespace))
-    {
-        lines.remove(0);
+/// Decode a triple-quoted body in the text-block order (spec: Strings; the
+/// order Java's JEP 378 specifies): **transport first** — split RAW lines
+/// (a CRLF's CR belongs to the terminator), trim the blank first/last
+/// lines, compute min-indent — **then content**: decode escapes per
+/// retained line slice at its true source offset, so escape errors span
+/// exact bytes with no remapping. Content therefore can never steer
+/// transport interpretation, and escaped whitespace survives dedent
+/// ("protected space" — the capability Java added `\s` for).
+fn decode_multiline(body: &str, body_start: usize) -> Result<String, NmlError> {
+    let bytes = body.as_bytes();
+    let mut lines: Vec<(usize, &str)> = Vec::new();
+    let mut start = 0;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            let mut end = i;
+            if end > start && bytes[end - 1] == b'\r' {
+                end -= 1;
+            }
+            lines.push((start, &body[start..end]));
+            start = i + 1;
+        }
     }
-    if lines
-        .last()
-        .is_some_and(|l| l.chars().all(char::is_whitespace))
-    {
-        lines.pop();
+    lines.push((start, &body[start..]));
+
+    let is_blank = |l: &str| l.chars().all(char::is_whitespace);
+
+    // NML0019 (the Swift/Java rule): content begins on a NEW line — the
+    // opening line is the one remaining place raw text could steer
+    // min-indent. Whitespace-only is harmless (blank lines are filtered
+    // from the indent computation) and stays legal, as does `""""""`.
+    if let Some((off, first)) = lines.first().copied() {
+        if !is_blank(first) {
+            let content = off + (first.len() - first.trim_start().len());
+            return Err(NmlError::syntax(
+                crate::error::ParseErrorKind::MultilineOpeningContent,
+                Span::new(body_start + content, body_start + off + first.len()),
+            ));
+        }
     }
+
+    let mut s = 0;
+    let mut e = lines.len();
+    if lines.first().is_some_and(|(_, l)| is_blank(l)) {
+        s = 1;
+    }
+    if e > s && is_blank(lines[e - 1].1) {
+        e -= 1;
+    }
+    let lines = &lines[s..e];
     if lines.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
+
     let min_indent = lines
         .iter()
-        .filter(|l| !l.chars().all(char::is_whitespace))
-        .map(|l| l.chars().take_while(|c| *c == ' ').count())
+        .filter(|(_, l)| !is_blank(l))
+        .map(|(_, l)| l.chars().take_while(|c| *c == ' ').count())
         .min()
         .unwrap_or(0);
-    lines
-        .iter()
-        .map(|l| {
-            if l.len() >= min_indent && l.chars().take(min_indent).all(|c| c == ' ') {
-                &l[min_indent..]
-            } else {
-                l
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+
+    let mut out = String::new();
+    for (idx, (off, l)) in lines.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        let stripped = if l.len() >= min_indent && l.chars().take(min_indent).all(|c| c == ' ') {
+            min_indent
+        } else {
+            0
+        };
+        decode_escapes_into(&mut out, &l[stripped..], body_start + off + stripped)?;
+    }
+    Ok(out)
 }
 
 /// Parse a number literal. Integers without a decimal point are exact `i64`
