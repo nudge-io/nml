@@ -4,9 +4,10 @@
 //! *semantic* [`SpannedValue`] — the inverse of the parser's "syntax only"
 //! discipline. All the interpretation the lexer/parser deliberately deferred
 //! lives here: string-escape decoding, multiline resolution (the text-block
-//! order — see [`decode_multiline`]), number range-checking, money parsing,
-//! `$ENV` namespace validation, `true`/`false`, and template strings. Money
-//! and template parsing **reuse** the existing `money`/`template` modules.
+//! order — see [`decode_multiline`]), number range-checking, money and
+//! duration parsing, `$ENV` namespace validation, `true`/`false`, and
+//! template strings. Money, duration, and template parsing **reuse** the
+//! existing `money`/`duration`/`template` modules.
 //! This module is the single source of truth for value interpretation; its
 //! behavior is spec-defined (spec/syntax.md: Source text, Strings) and
 //! pinned by the `cst::tests` unit suite plus the fuzz batteries there.
@@ -196,7 +197,14 @@ fn decode_scalar(node: &SyntaxNode, sink: &mut ValueErrors) -> SpannedValue {
     SpannedValue::new(value, span)
 }
 
-/// `Number (currency)?` or, when `negative`, `- Number (currency)?`.
+/// `Number (unit)?` or, when `negative`, `- Number (unit)?` — a bare
+/// number, money, or a duration (RFC 0017). The parser consumed any
+/// same-line trailing identifier as the unit *shape*; this is where it is
+/// classified, totally and structurally: 3 uppercase letters → currency
+/// (money's job to judge ISO validity), a duration suffix or anything
+/// else → the duration decoder (which owns `NML3004` for unknown units).
+/// Disjoint by construction — currency codes are uppercase, duration
+/// units lowercase — so no lookahead is needed.
 fn number_or_money(toks: &[SyntaxToken], span: Span, negative: bool) -> Result<Value, NmlError> {
     let num_idx = usize::from(negative);
     // Incomplete (`-` with no number) is a syntactic failure the parser reported;
@@ -211,9 +219,9 @@ fn number_or_money(toks: &[SyntaxToken], span: Span, negative: bool) -> Result<V
     };
 
     match toks.get(num_idx + 1) {
-        Some(cur) if cur.kind() == SyntaxKind::Ident => {
+        Some(unit) if unit.kind() == SyntaxKind::Ident => {
             // RFC 0016 §1.8: the trailing-dot malformation is a
-            // literal-layer rejection that fires BEFORE money parsing —
+            // literal-layer rejection that fires BEFORE unit parsing —
             // anchored on the number token's REAL end. (`raw` is
             // reconstructed as `-` + digits, but the source may hold
             // trivia between the dash and the digits — `- 1299. JPY` —
@@ -228,7 +236,19 @@ fn number_or_money(toks: &[SyntaxToken], span: Span, negative: bool) -> Result<V
                     Span::new(span.start, num_end),
                 ));
             }
-            Ok(Value::Money(money::parse_money(&raw, cur.text(), span)?))
+            if money::is_currency_code(unit.text()) {
+                return Ok(Value::Money(money::parse_money(&raw, unit.text(), span)?));
+            }
+            let unit_span = Span::new(
+                text_offset(unit.text_range().start()),
+                text_offset(unit.text_range().end()),
+            );
+            Ok(Value::Duration(crate::duration::parse_duration_literal(
+                &raw,
+                unit.text(),
+                span,
+                unit_span,
+            )?))
         }
         _ => Ok(Value::Number(parse_number(&raw, span)?)),
     }
@@ -563,7 +583,7 @@ fn parse_number(raw: &str, span: Span) -> Result<Number, NmlError> {
             // of the three parse-reachable kinds (TooManyDigits/TooLarge/
             // TooSmall) — the error-index NML0014 entry enumerates exactly
             // those; the try_new-only kinds (CoefficientTooWide/
-            // ScaleOutOfRange) never flow through a parse.
+            // ScaleOutOfRange/NegativeScaleZero) never flow through a parse.
             crate::decimal::NumberError::Range(issue) => {
                 crate::error::ParseErrorKind::NumberOutOfRange { issue }
             }

@@ -9,8 +9,8 @@ enum logLevel:
     - "error"
 
 trait monitored:
-    checkInterval duration = "60s"
-    timeout duration = "5s"
+    checkInterval duration = 60s
+    timeout duration = 5s
 
 model database:
     url string
@@ -43,7 +43,7 @@ model service:
     port number
     publicUrl string
     logLevel logLevel = "info"
-    requestTimeout duration = "30s"
+    requestTimeout duration = 30s
     retries number = 3
     banner string?
     welcome string?

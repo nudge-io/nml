@@ -87,14 +87,14 @@ debug = false
 
 ### `duration`
 
-Quoted time duration strings — an unsigned integer immediately followed
-by one unit suffix (see [syntax.md](syntax.md) §Duration Literals for the
-exact grammar; enforced as `NML2029`):
+Exact time duration literals (RFC 0017) — an unsigned integer
+immediately followed by one unit suffix (see [syntax.md](syntax.md)
+§Duration Literals for the exact grammar):
 
 ```
-sessionDuration = "72h"
-timeout = "30s"
-pollInterval = "500ms"
+sessionDuration = 72h
+timeout = 30s
+pollInterval = 500ms
 ```
 
 Supported units:
@@ -102,6 +102,14 @@ Supported units:
 - `m` -- minutes
 - `s` -- seconds
 - `ms` -- milliseconds
+
+Durations are stored as the authored `(magnitude, unit)` pair — the
+formatter never rescales `72h` — and compare **semantically**: `30s`
+equals `30000ms`, so a set cannot hold both and a reload diff between
+the two spellings is no change. Deserialization lands in the consumer's
+native duration type; a duration-typed field fed from `$ENV` arrives as
+resolved text and is coerced to the same typed value at that boundary,
+exactly as numbers and bools are.
 
 ### `path`
 

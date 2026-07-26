@@ -32,6 +32,7 @@ oneof email by kind:
 |---|---|---|
 | `=>` (arm arrow) | `->` | RFC 0006 |
 | `&&` (never valid — C-family habit) | `&` | RFC 0014 |
+| `"30s"` (quoted duration in a `duration`-typed field) | the duration literal `30s` | RFC 0017 |
 
 Earlier pre-code migrations, for the record: the `!` positional marker
 became `+` (RFC 0005 rev. 1), and the never-implemented angle-bracket
@@ -816,20 +817,16 @@ enum pending:
 
 ## NML2029
 
-**Invalid duration.** A `duration`-typed value must match the spec grammar
-— an unsigned integer immediately followed by one unit: `h`, `m`, `s`, or
-`ms` (`"72h"`, `"30m"`, `"5s"`, `"500ms"`). No sign, no decimals, no
-compound forms.
-
-```nml check expect-error='[NML2029]'
-model job:
-    timeout duration
-
-job Nightly:
-    timeout = "30x"
-```
-
-**Fix:** use a valid unit (`"30s"`).
+**Retired** (RFC 0017 — durations became literals). This code guarded the
+duration *format* back when a duration was a quoted string only schema
+validation could judge. The parser now guarantees the format, so the
+check cannot fire: a malformed literal surfaces at decode as
+[NML3004](#nml3004) (unknown unit), [NML3005](#nml3005) (fractional
+magnitude), or [NML3006](#nml3006) (out of domain); a quoted duration in
+a duration-typed field is the [NML0001](#nml0001) migration; and any
+other value there is the ordinary [NML2008](#nml2008) type mismatch.
+Codes are never renumbered or reused, so this section remains as the
+tombstone.
 
 ## NML2030
 
@@ -1354,6 +1351,56 @@ product Widget:
 ```
 
 **Fix:** apply the suggestion (`USD`), or use any ISO 4217 code.
+
+## NML3004
+
+**Unknown unit.** A number's trailing identifier is neither a currency
+code (exactly 3 uppercase letters, e.g. `USD`) nor a duration unit (`h`,
+`m`, `s`, `ms` — RFC 0017). Case is meaningful: `30S` is a rejection with
+a fix, never a case-fold, so one spelling per value holds and `M`/`m`
+stays unambiguous forever. Near-miss units get a machine-applicable
+suggestion on the suffix itself.
+
+```nml check expect-error='[NML3004]'
+service Api:
+    requestTimeout = 30S
+```
+
+**Fix:** apply the suggestion (`30s`), or write one of `h`, `m`, `s`,
+`ms`.
+
+## NML3005
+
+**Fractional duration magnitude.** A duration magnitude is a whole
+number — `30.5s` is rejected rather than rounded or multi-unit-parsed
+(one spelling per value, the same error-over-guessing rule exact numbers
+follow). When the value is expressible in a finer unit, the fix respells
+it exactly (`30.5s` → `30500ms`, `1.5h` → `90m`).
+
+```nml check expect-error='[NML3005]'
+service Api:
+    requestTimeout = 30.5s
+```
+
+**Fix:** apply the suggestion (`30500ms`), or pick the intended whole
+magnitude.
+
+## NML3006
+
+**Duration out of domain.** Durations are unsigned and bounded: the
+total must not exceed `std::time::Duration::MAX` (about 5.8 × 10¹¹
+years), so every parsed duration converts to a runtime duration
+infallibly — the same reject-at-decode posture money takes for amounts
+beyond `i64` minor units ([NML3003](#nml3003)). Negative durations do
+not exist (elapsed time has no sign in configuration; money differs
+deliberately — refunds are real).
+
+```nml check expect-error='[NML3006]'
+service Api:
+    requestTimeout = -30s
+```
+
+**Fix:** use a non-negative magnitude within the unit's stated maximum.
 
 ## NML5000
 

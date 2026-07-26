@@ -40,7 +40,7 @@ service Api:
     port = $ENV.PORT | 8080
     publicUrl = "https://status.skylight.dev"
     tags = ["web", "api"]
-    requestTimeout = "30s"
+    requestTimeout = 30s
     retries = MaxRetries
     banner = StatusBanner
     welcome = "Welcome to {{config.appName}} — status you can trust."
@@ -56,7 +56,7 @@ service Api:
         poolSize = 10
 
     endpoints:
-        .timeout = "10s"
+        .timeout = 10s
 
         - Api:
             url = "https://api.skylight.dev"

@@ -1184,10 +1184,10 @@ mod tests {
             #[serde(rename = "siteName")]
             site_name: String,
             #[serde(rename = "sessionDuration")]
-            session_duration: String,
+            session_duration: std::time::Duration,
         }
         let idx = index_from(
-            "model webProfile:\n    siteName string\n    debug string?\n    sessionDuration duration = \"24h\"\n",
+            "model webProfile:\n    siteName string\n    debug string?\n    sessionDuration duration = 24h\n",
         );
         let resolver = ValueResolver::new(|_| None);
         let wp: WebProfile = from_body_defaulted(
@@ -1198,7 +1198,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(wp.site_name, "acme");
-        assert_eq!(wp.session_duration, "24h");
+        assert_eq!(
+            wp.session_duration,
+            std::time::Duration::from_secs(24 * 3600)
+        );
     }
 
     #[test]
@@ -1247,11 +1250,11 @@ mod scope_tests {
         #[serde(default)]
         name: String,
         url: String,
-        timeout: String,
-        interval: String,
+        timeout: std::time::Duration,
+        interval: std::time::Duration,
     }
 
-    const SCHEMA: &str = "trait monitored:\n    timeout duration = \"5s\"\n    interval duration = \"60s\"\n\n\
+    const SCHEMA: &str = "trait monitored:\n    timeout duration = 5s\n    interval duration = 60s\n\n\
                           model endpoint is monitored:\n    url string+\n\n\
                           model service:\n    endpoints []endpoint\n";
 
@@ -1270,28 +1273,28 @@ mod scope_tests {
     #[test]
     fn nested_list_shared_property_beats_schema_default() {
         let service = deserialize(
-            "service Api:\n    endpoints:\n        .timeout = \"10s\"\n\n        - Web:\n            url = \"https://a\"\n\n        - Fast:\n            url = \"https://b\"\n            timeout = \"2s\"\n",
+            "service Api:\n    endpoints:\n        .timeout = 10s\n\n        - Web:\n            url = \"https://a\"\n\n        - Fast:\n            url = \"https://b\"\n            timeout = 2s\n",
         );
         let by_name = |n: &str| service.endpoints.iter().find(|e| e.name == n).unwrap();
         // The authored shared value wins over the trait default — at depth.
-        assert_eq!(by_name("Web").timeout, "10s");
+        assert_eq!(by_name("Web").timeout, std::time::Duration::from_secs(10));
         // An item's own value still beats the shared one.
-        assert_eq!(by_name("Fast").timeout, "2s");
+        assert_eq!(by_name("Fast").timeout, std::time::Duration::from_secs(2));
         // Defaults fill only what nothing authored.
-        assert_eq!(by_name("Web").interval, "60s");
+        assert_eq!(by_name("Web").interval, std::time::Duration::from_secs(60));
     }
 
     #[test]
     fn positional_item_receives_shared_properties_and_defaults() {
         let service = deserialize(
-            "service Api:\n    endpoints:\n        .timeout = \"10s\"\n\n        - \"https://bare\"\n",
+            "service Api:\n    endpoints:\n        .timeout = 10s\n\n        - \"https://bare\"\n",
         );
         let bare = &service.endpoints[0];
         // The bare item's key filled the positional field…
         assert_eq!(bare.url, "https://bare");
         // …and its materialized body participates in shared merge + defaults.
-        assert_eq!(bare.timeout, "10s");
-        assert_eq!(bare.interval, "60s");
+        assert_eq!(bare.timeout, std::time::Duration::from_secs(10));
+        assert_eq!(bare.interval, std::time::Duration::from_secs(60));
         // No label ⇒ no injected name (bare items are anonymous by design).
         assert_eq!(bare.name, "");
     }
@@ -1303,7 +1306,11 @@ mod scope_tests {
         let service = deserialize(
             "service Api:\n    endpoints:\n        - Web:\n            url = \"https://a\"\n",
         );
-        assert_eq!(service.endpoints[0].timeout, "5s", "trait default applies");
+        assert_eq!(
+            service.endpoints[0].timeout,
+            std::time::Duration::from_secs(5),
+            "trait default applies"
+        );
     }
 }
 

@@ -21,7 +21,7 @@ struct ServiceConfig {
     port: u16,
     public_url: String,
     log_level: String,
-    request_timeout: String,
+    request_timeout: std::time::Duration,
     retries: u32,
     tags: Vec<String>,
     api_key: String,
@@ -44,8 +44,8 @@ struct Endpoint {
     #[serde(default)]
     name: String,
     url: String,
-    timeout: String,
-    check_interval: String,
+    timeout: std::time::Duration,
+    check_interval: std::time::Duration,
     regions: Option<Vec<String>>,
 }
 
@@ -118,7 +118,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &ep.name
         };
         println!(
-            "  - {} {} (timeout {}, every {}, regions: {})",
+            "  - {} {} (timeout {:?}, every {:?}, regions: {})",
             name,
             ep.url,
             ep.timeout,
@@ -129,7 +129,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
     println!(
-        "  database {} (pool {}) — api key {} chars, tags {:?}, timeout {}",
+        "  database {} (pool {}) — api key {} chars, tags {:?}, timeout {:?}",
         config.database.url,
         config.database.pool_size,
         config.api_key.len(),

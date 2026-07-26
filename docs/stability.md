@@ -15,12 +15,14 @@ judge adoption risk on facts rather than version-number vibes.
 ## Breaking syntax changes ship with fixers
 
 When the language changes shape, the tooling carries you across — this is a
-commitment, demonstrated by the two renames already shipped:
+commitment, demonstrated by the migrations already shipped (`=>` → `->`,
+`&&` → `&`, quoted durations → duration literals):
 
 - The old form is **rejected with a pointer**, not silently misparsed: writing
   `=>` in an arm today produces "`=>` was replaced by `->`" at the exact span.
-- Where the rewrite is mechanical, `nml fmt` and the language server's
-  quick-fixes apply it for you.
+- Where the rewrite is mechanical, `nml fix` applies it in bulk (whole
+  trees, `--dry-run` for a preview) and the language server's quick-fixes
+  apply it in place.
 - Syntax changes go through an RFC (design records) with a required
   Documentation section — a change is not "Implemented" until its docs and
   migration story have landed.

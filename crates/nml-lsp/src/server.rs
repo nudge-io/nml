@@ -1906,6 +1906,87 @@ fn find_value_completions_at(
     (!variants.is_empty() || !arms.is_empty()).then_some(ValueCompletions { variants, arms })
 }
 
+/// What a duration unit-suffix completion replaces (RFC 0017): the typed
+/// digits and their precise edit ranges. `insert` covers exactly the
+/// digits before the cursor; `replace` extends through any letter run
+/// after it (re-triggering inside an existing `30s` replaces the old
+/// suffix instead of stacking a second one). The digits and suffix are
+/// ASCII by grammar, so the UTF-16 column arithmetic is exact.
+struct DurationUnitContext {
+    digits: String,
+    insert: Range,
+    replace: Range,
+}
+
+/// Duration unit-suffix completion (RFC 0017): when the cursor sits
+/// immediately after a bare integer in a duration-typed value position,
+/// return the typed digits and their edit ranges so the handler can offer
+/// the full literals (`30s`/`30ms`/…). The detector computes the digits'
+/// own ranges rather than borrowing the scalar-value token range — in a
+/// list position (`retries = [30`) the token heuristic would start at the
+/// bracket and an accepted edit would eat it. Built on the same governor
+/// walk as the other value detectors; `None` anywhere else, so a number
+/// in a `number`-typed field never grows unit noise.
+fn find_duration_unit_completions_at(
+    file: &File,
+    source: &str,
+    pos: Position,
+    index: &SchemaIndex,
+    line_index: &LineIndex,
+) -> Option<DurationUnitContext> {
+    fn governs_duration(ty: &FieldType) -> bool {
+        match ty {
+            FieldType::Primitive(nml_core::types::PrimitiveType::Duration) => true,
+            FieldType::List(inner) | FieldType::Set(inner) | FieldType::Modifier(inner) => {
+                governs_duration(inner)
+            }
+            FieldType::Union(members) => members.iter().any(governs_duration),
+            FieldType::Arms { target, .. } => governs_duration(target),
+            _ => false,
+        }
+    }
+    let context = {
+        let line = position::line_at(source, pos.line)?;
+        let mut col = position::utf16_to_byte(line, pos.character).min(line.len());
+        while col > 0 && !line.is_char_boundary(col) {
+            col -= 1;
+        }
+        let before = &line[..col];
+        let start = before
+            .rfind(|c: char| !c.is_ascii_digit())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let digits = &before[start..];
+        // The digits must START a value token: preceded only by the value
+        // introducers, never mid-word (`x30` is an identifier tail).
+        let prev = before[..start].trim_end().chars().next_back();
+        if digits.is_empty() || !matches!(prev, Some('=' | '[' | ',' | '|') | None) {
+            return None;
+        }
+        let cursor_char = position::byte_to_utf16(line, col);
+        let digits_start = Position::new(pos.line, cursor_char - digits.len() as u32);
+        let suffix_run = line[col..]
+            .bytes()
+            .take_while(|b| b.is_ascii_alphabetic())
+            .count();
+        DurationUnitContext {
+            digits: digits.to_string(),
+            insert: Range::new(digits_start, Position::new(pos.line, cursor_char)),
+            replace: Range::new(
+                digits_start,
+                Position::new(pos.line, cursor_char + suffix_run as u32),
+            ),
+        }
+    };
+    let prop_name = value_position_prop_name(source, pos)?;
+    let governors = value_governors_at(file, pos, index, line_index, prop_name);
+    governors
+        .fields
+        .iter()
+        .any(|f| governs_duration(&f.field_type))
+        .then_some(context)
+}
+
 // ── Schema-driven field completion (RFC 0003) ─────────────────────────────────
 
 /// Resolve the model whose fields are valid at the cursor's body, **and that body** (so the
@@ -2899,6 +2980,7 @@ fn render_scalar(value: &Value) -> Option<String> {
         Value::String(s) => format!("{s:?}"),
         Value::Number(n) => n.to_string(),
         Value::Money(m) => m.format_display(),
+        Value::Duration(d) => d.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Reference(s) | Value::Role(s) | Value::Secret(s) => s.clone(),
         _ => return None,
@@ -3226,12 +3308,27 @@ fn format_value(value: &Value) -> String {
         Value::String(s) => format!("\"{}\"", s),
         Value::Number(n) => n.to_string(),
         Value::Money(m) => m.format_display(),
+        Value::Duration(d) => d.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Reference(r) => r.clone(),
         Value::Secret(s) => s.clone(),
         Value::Role(r) => r.clone(),
         _ => "...".to_string(),
     }
+}
+
+/// `30000` → `30,000` — the hover-side thousands grouping for a duration's
+/// normalized total.
+fn group_thousands(n: u128) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Whether a property name suggests credential material.
@@ -3416,6 +3513,46 @@ fn quoted_value_item(
         sort_text: Some(sort),
         filter_text: Some(quoted),
         text_edit,
+        ..Default::default()
+    }
+}
+
+/// A duration unit-suffix completion item (RFC 0017): the full literal
+/// (`30s`) as label and filter text — clients filter against the token
+/// text (the typed digits), so a bare-suffix label would be filtered out
+/// before the user ever saw it. The edit replaces exactly the digits
+/// (and, in replace mode, any stale suffix after the cursor), with the
+/// same capability-gated `InsertReplaceEdit` handling as
+/// [`quoted_value_item`].
+fn duration_unit_item(
+    ctx: &DurationUnitContext,
+    suffix: &str,
+    unit_name: &str,
+    sort: String,
+    insert_replace: bool,
+) -> CompletionItem {
+    let literal = format!("{}{suffix}", ctx.digits);
+    let text_edit = if insert_replace {
+        CompletionTextEdit::InsertAndReplace(InsertReplaceEdit {
+            new_text: literal.clone(),
+            insert: ctx.insert,
+            replace: ctx.replace,
+        })
+    } else {
+        // Plain-edit clients get the replace range (as [`quoted_value_item`]
+        // does), so a stale suffix after the cursor is swapped, not stacked.
+        CompletionTextEdit::Edit(TextEdit {
+            range: ctx.replace,
+            new_text: literal.clone(),
+        })
+    };
+    CompletionItem {
+        label: literal.clone(),
+        kind: Some(CompletionItemKind::UNIT),
+        detail: Some(unit_name.to_string()),
+        sort_text: Some(sort),
+        filter_text: Some(literal),
+        text_edit: Some(text_edit),
         ..Default::default()
     }
 }
@@ -4147,10 +4284,11 @@ impl LanguageServer for NmlLanguageServer {
             // than re-cloning it per detector. A package-bound document (RFC
             // 0030) completes against its package's exclusive definitions —
             // the same exclusivity rule diagnostics apply.
-            let (model_ref_types, discriminator_values, value_completions): (
+            let (model_ref_types, discriminator_values, value_completions, duration_context): (
                 Vec<String>,
                 Option<Vec<String>>,
                 Option<ValueCompletions>,
+                Option<DurationUnitContext>,
             ) = {
                 let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
                 match docs
@@ -4170,9 +4308,16 @@ impl LanguageServer for NmlLanguageServer {
                                 });
                         let values =
                             find_value_completions_at(&file, source, pos, index, &line_index);
-                        (model_refs, discriminator, values)
+                        let duration = find_duration_unit_completions_at(
+                            &file,
+                            source,
+                            pos,
+                            index,
+                            &line_index,
+                        );
+                        (model_refs, discriminator, values, duration)
                     }
-                    None => (Vec::new(), None, None),
+                    None => (Vec::new(), None, None, None),
                 }
             };
 
@@ -4202,6 +4347,29 @@ impl LanguageServer for NmlLanguageServer {
             let insert_replace = self
                 .insert_replace_support
                 .load(std::sync::atomic::Ordering::Relaxed);
+
+            // Unit suffixes after a bare number in a duration-typed field
+            // (RFC 0017): `30` offers the full literals `30s`/`30ms`/`30m`/
+            // `30h`, replacing exactly the typed digits — full-literal
+            // labels, because clients filter against the token text (`30`),
+            // which a bare suffix label would never match.
+            if let Some(ctx) = duration_context {
+                const UNIT_NAMES: [(&str, &str); 4] = [
+                    ("s", "seconds"),
+                    ("ms", "milliseconds"),
+                    ("m", "minutes"),
+                    ("h", "hours"),
+                ];
+                for (i, (suffix, unit_name)) in UNIT_NAMES.iter().enumerate() {
+                    items.push(duration_unit_item(
+                        &ctx,
+                        suffix,
+                        unit_name,
+                        format!("0_{i:03}"),
+                        insert_replace,
+                    ));
+                }
+            }
 
             // Inside a `oneof` block, offer the arm keys as discriminator values.
             if let Some(values) = discriminator_values {
@@ -4892,6 +5060,26 @@ impl LanguageServer for NmlLanguageServer {
             }
 
             if !is_prop {
+                // Duration literal hover (RFC 0017): the authored form with
+                // its normalized total (`30s — 30,000ms`), so cross-unit
+                // values compare at a glance. Milliseconds literals skip
+                // the echo — the total IS the authored form.
+                if let Ok(d) = nml_core::duration::Duration::parse_text(&word) {
+                    let mut text = format!("**duration** `{d}`");
+                    if d.unit() != nml_core::duration::DurationUnit::Milliseconds {
+                        text.push_str(&format!(
+                            " — {}ms",
+                            group_thousands(d.total_nanos() / 1_000_000)
+                        ));
+                    }
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: text,
+                        }),
+                        range: None,
+                    }));
+                }
                 let builtin_info = match word.as_str() {
                     "string" => Some("**string** -- Quoted text value"),
                     "number" => Some(
@@ -4902,9 +5090,10 @@ impl LanguageServer for NmlLanguageServer {
                         "**money** -- Exact currency value with ISO 4217 code (e.g., `19.99 USD`)",
                     ),
                     "bool" => Some("**bool** -- Boolean value (`true` or `false`)"),
-                    "duration" => {
-                        Some("**duration** -- Time duration (e.g., `\"72h\"`, `\"30s\"`)")
-                    }
+                    "duration" => Some(
+                        "**duration** -- Exact time duration with unit suffix \
+                         (e.g., `72h`, `30s`, `250ms`); `30s == 30000ms`",
+                    ),
                     "path" => Some("**path** -- URL path with variables and wildcards"),
                     "secret" => Some("**secret** -- Value resolved from environment (`$ENV.X`)"),
                     "model" => Some("**model** -- Define a custom object type"),
@@ -6519,6 +6708,57 @@ workflow VoiceAgent:
             .map(ValueCompletions::merged)
             .expect("enum variants for a modelB-unique field");
         assert_eq!(variants, vec!["fast", "slow"]);
+    }
+
+    /// RFC 0017 §6: unit-suffix completion fires exactly after a bare
+    /// integer in a duration-typed value position — never in a
+    /// number-typed one, never mid-identifier — and returns the typed
+    /// digits with edit ranges covering exactly them (NOT the whole value
+    /// token: in a list position that heuristic would start at the `[`
+    /// and an accepted edit would eat the bracket).
+    #[test]
+    fn duration_unit_completion_detects_bare_number_in_duration_field() {
+        let idx = field_index(
+            "model service:\n    timeout duration?\n    retries set<duration>?\n    port number?\n    name string?\n",
+        );
+        let detect = |source: &str, line: u32, character: u32| {
+            let file = nml_core::cst::parse_best_effort(source);
+            let li = LineIndex::new(source);
+            find_duration_unit_completions_at(
+                &file,
+                source,
+                Position::new(line, character),
+                &idx,
+                &li,
+            )
+        };
+        let span_of = |r: Range| (r.start.character, r.end.character);
+        // Cursor right after `30` in a duration-typed value position.
+        let src = "service Api:\n    timeout = 30\n";
+        let ctx = detect(src, 1, 16).expect("duration position completes");
+        assert_eq!(ctx.digits, "30");
+        assert_eq!(span_of(ctx.insert), (14, 16));
+        assert_eq!(span_of(ctx.replace), (14, 16));
+        // Re-triggering inside an existing literal: replace covers the
+        // stale suffix so accepting swaps it instead of stacking.
+        let src = "service Api:\n    timeout = 30ms\n";
+        let ctx = detect(src, 1, 16).expect("mid-literal retrigger");
+        assert_eq!(span_of(ctx.insert), (14, 16));
+        assert_eq!(span_of(ctx.replace), (14, 18));
+        // List position: the ranges cover the digits only — never the `[`.
+        let src = "service Api:\n    retries = [30\n";
+        let ctx = detect(src, 1, 17).expect("list element completes");
+        assert_eq!(ctx.digits, "30");
+        assert_eq!(span_of(ctx.insert), (15, 17));
+        // A number-typed field must not grow unit noise.
+        let src = "service Api:\n    port = 30\n";
+        assert!(detect(src, 1, 13).is_none());
+        // Digits mid-identifier are not a value start.
+        let src = "service Api:\n    name = x30\n";
+        assert!(detect(src, 1, 15).is_none());
+        // No digits typed yet ⇒ nothing to suffix.
+        let src = "service Api:\n    timeout = \n";
+        assert!(detect(src, 1, 14).is_none());
     }
 
     /// Round-17 border pins: a modifier-declared field completes WITH its

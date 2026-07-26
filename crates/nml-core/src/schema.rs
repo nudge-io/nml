@@ -1524,7 +1524,7 @@ mod composition_tests {
     #[test]
     fn clean_composition_has_no_findings() {
         let errs = find(
-            "trait monitored:\n    timeout duration = \"5s\"\n\n\
+            "trait monitored:\n    timeout duration = 5s\n\n\
              trait audited is monitored:\n    auditedBy string?\n\n\
              model endpoint is audited:\n    url string+\n",
         );
@@ -1584,16 +1584,16 @@ mod composition_tests {
     #[test]
     fn inheritance_merges_trait_fields_with_defaults() {
         let (mut schema, errs) = extract_schema(
-            "trait monitored:\n    timeout duration = \"5s\"\n    interval duration = \"60s\"\n\n\
-             model endpoint is monitored:\n    url string+\n    timeout duration = \"9s\"\n",
+            "trait monitored:\n    timeout duration = 5s\n    interval duration = 60s\n\n\
+             model endpoint is monitored:\n    url string+\n    timeout duration = 9s\n",
         );
         assert!(errs.is_empty(), "{errs:?}");
         resolve_model_inheritance(&mut schema);
         let endpoint = schema.models.iter().find(|m| m.name == "endpoint").unwrap();
         let field = |n: &str| endpoint.fields.iter().find(|f| f.name == n).unwrap();
         let default_text = |n: &str| match field(n).default_value.as_ref().map(|sv| &sv.value) {
-            Some(crate::types::Value::String(s)) => s.clone(),
-            other => panic!("expected a textual default for '{n}', got {other:?}"),
+            Some(crate::types::Value::Duration(d)) => d.to_string(),
+            other => panic!("expected a duration default for '{n}', got {other:?}"),
         };
         // Inherited default comes along; the model's own field overrides.
         assert_eq!(default_text("interval"), "60s");

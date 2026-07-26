@@ -366,6 +366,80 @@ fn insert_after_bare_header(
     Some(())
 }
 
+// ── Span splicing (RFC 0017 §4.1) ─────────────────────────────────────────
+
+/// One byte-range replacement for [`splice`] — the applier shape of a
+/// machine-applicable [`Suggestion`](crate::diagnostic::Suggestion).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpliceEdit {
+    /// The exact byte range the replacement substitutes.
+    pub span: crate::span::Span,
+    /// The text spliced in at `span` (empty = deletion).
+    pub replacement: String,
+}
+
+/// Why [`splice`] refused. Refusal is total — a splice that could apply
+/// *some* of its edits would leave the file in a state no diagnostic
+/// described.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SpliceError {
+    #[error("edit span {start}..{end} is out of bounds (source is {len} bytes)")]
+    OutOfBounds {
+        start: usize,
+        end: usize,
+        len: usize,
+    },
+    #[error("edit spans {a_start}..{a_end} and {b_start}..{b_end} overlap")]
+    Overlap {
+        a_start: usize,
+        a_end: usize,
+        b_start: usize,
+        b_end: usize,
+    },
+    #[error("edit span {start}..{end} does not fall on character boundaries")]
+    NotCharBoundary { start: usize, end: usize },
+}
+
+/// Apply byte-span replacements to `source` in one pass — the span-splice
+/// primitive `nml fix` applies suggestions with (RFC 0017 §4.1). Edits
+/// are applied **highest-offset-first**, so earlier edits can never
+/// invalidate later spans; input order is irrelevant. Overlapping,
+/// out-of-bounds, or non-boundary spans refuse the whole batch
+/// ([`SpliceError`]) — the caller filters candidates, this validates as
+/// the last line of defense.
+pub fn splice(source: &str, edits: &[SpliceEdit]) -> Result<String, SpliceError> {
+    let mut ordered: Vec<&SpliceEdit> = edits.iter().collect();
+    ordered.sort_by_key(|e| (e.span.start, e.span.end));
+    for pair in ordered.windows(2) {
+        if pair[1].span.start < pair[0].span.end {
+            return Err(SpliceError::Overlap {
+                a_start: pair[0].span.start,
+                a_end: pair[0].span.end,
+                b_start: pair[1].span.start,
+                b_end: pair[1].span.end,
+            });
+        }
+    }
+    for e in &ordered {
+        let (start, end) = (e.span.start, e.span.end);
+        if start > end || end > source.len() {
+            return Err(SpliceError::OutOfBounds {
+                start,
+                end,
+                len: source.len(),
+            });
+        }
+        if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+            return Err(SpliceError::NotCharBoundary { start, end });
+        }
+    }
+    let mut out = source.to_string();
+    for e in ordered.iter().rev() {
+        out.replace_range(e.span.start..e.span.end, &e.replacement);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,6 +792,58 @@ project P:
         assert_eq!(
             insert_entry_at_path(src, &["project"], "", EntryPosition::Last),
             None
+        );
+    }
+
+    // ── splice (RFC 0017 §4.1) ────────────────────────────────────────────
+
+    fn edit(start: usize, end: usize, replacement: &str) -> SpliceEdit {
+        SpliceEdit {
+            span: crate::span::Span::new(start, end),
+            replacement: replacement.to_string(),
+        }
+    }
+
+    #[test]
+    fn splice_applies_highest_offset_first_regardless_of_input_order() {
+        // Two replacements of different widths: applying low-first would
+        // shift the second span; the primitive must be order-independent.
+        let src = "a = \"30s\"\nb = \"5m\"\n";
+        let edits = [edit(4, 9, "30s"), edit(14, 18, "5m")];
+        let expected = "a = 30s\nb = 5m\n";
+        assert_eq!(splice(src, &edits).unwrap(), expected);
+        let reversed = [edit(14, 18, "5m"), edit(4, 9, "30s")];
+        assert_eq!(splice(src, &reversed).unwrap(), expected);
+    }
+
+    #[test]
+    fn splice_supports_deletions_insertions_and_empty_batches() {
+        assert_eq!(splice("abc", &[]).unwrap(), "abc");
+        assert_eq!(splice("abc", &[edit(1, 2, "")]).unwrap(), "ac");
+        assert_eq!(splice("ac", &[edit(1, 1, "b")]).unwrap(), "abc");
+    }
+
+    #[test]
+    fn splice_refuses_bad_batches_totally() {
+        // Overlap refuses the WHOLE batch — partial application would
+        // leave a state no diagnostic described.
+        assert!(matches!(
+            splice("abcdef", &[edit(0, 3, "x"), edit(2, 4, "y")]),
+            Err(SpliceError::Overlap { .. })
+        ));
+        assert!(matches!(
+            splice("abc", &[edit(1, 9, "x")]),
+            Err(SpliceError::OutOfBounds { .. })
+        ));
+        // Mid-UTF-8 spans refuse rather than panic.
+        assert!(matches!(
+            splice("é", &[edit(1, 2, "x")]),
+            Err(SpliceError::NotCharBoundary { .. })
+        ));
+        // Touching-but-not-overlapping edits are legal.
+        assert_eq!(
+            splice("abcd", &[edit(0, 2, "X"), edit(2, 4, "Y")]).unwrap(),
+            "XY"
         );
     }
 }

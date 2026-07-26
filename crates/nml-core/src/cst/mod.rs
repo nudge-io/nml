@@ -1726,6 +1726,98 @@ service App is Base:
     }
 
     #[test]
+    fn duration_does_not_cross_newline() {
+        // A field named `s`/`m`/`h` starting the next line is its own entry,
+        // not the previous number's duration unit. This matters MORE than
+        // the currency pin above: one-letter field names are plausible in
+        // real configuration, so a cross-line join would be live corruption
+        // (RFC 0017 §1).
+        let p = parse_ok("service App:\n    count = 5\n    s = 1\n    m = 2\n    h = 3\n");
+        let root = p.syntax();
+        assert_eq!(count_kind(&root, SyntaxKind::Property), 4);
+        assert!(matches!(decode_first("5"), crate::types::Value::Number(_)));
+        // Same-line unit still parses as a duration — attached or spaced
+        // (whitespace between number and unit is insignificant, as for
+        // money; fmt canonicalizes to attached).
+        for expr in ["5s", "5 s"] {
+            assert!(
+                matches!(decode_first(expr), crate::types::Value::Duration(_)),
+                "{expr}"
+            );
+        }
+    }
+
+    /// RFC 0017 §1: suffix classification is total and structural — three
+    /// uppercase letters route to money, lowercase units to duration, and
+    /// everything else is the coded unknown-unit rejection (never a
+    /// generic parse error).
+    #[test]
+    fn number_suffix_classification_is_total() {
+        use crate::diagnostic::codes;
+        let d = |expr: &str| match decode_first(expr) {
+            crate::types::Value::Duration(d) => d,
+            other => panic!("{expr} should be a duration, got {other:?}"),
+        };
+        assert_eq!(d("30s").to_string(), "30s");
+        assert_eq!(d("500ms").to_string(), "500ms");
+        assert_eq!(d("72h").to_string(), "72h");
+        assert_eq!(d("5m").to_string(), "5m");
+        // Magnitude spelling normalizes through the decoded value.
+        assert_eq!(d("030s").to_string(), "30s");
+        assert!(matches!(
+            decode_first("19.99 USD"),
+            crate::types::Value::Money(_)
+        ));
+
+        let err_code = |expr: &str| {
+            let src = wrap(expr);
+            decode_value(&first_value_node(&parse(&src).syntax()))
+                .expect_err(expr)
+                .to_diagnostic()
+                .code
+                .map(|c| c.to_string())
+        };
+        // Unknown, wrong-case, and spelled-out units are NML3004 — `30S`
+        // is a rejection with a fix, never a case-fold (RFC 0017 §1).
+        for expr in ["30x", "30S", "30sec", "30 units"] {
+            assert_eq!(
+                err_code(expr),
+                Some(codes::UNKNOWN_UNIT.to_string()),
+                "{expr}"
+            );
+        }
+        assert_eq!(
+            err_code("30.5s"),
+            Some(codes::FRACTIONAL_DURATION.to_string())
+        );
+        for expr in ["-30s", "12345678901234567890123s"] {
+            assert_eq!(
+                err_code(expr),
+                Some(codes::DURATION_OUT_OF_RANGE.to_string()),
+                "{expr}"
+            );
+        }
+        // Precedence: the trailing-dot malformation fires BEFORE duration
+        // decoding, exactly as it does for money (`19. USD`).
+        assert_eq!(err_code("30. s"), Some(codes::INVALID_NUMBER.to_string()));
+    }
+
+    /// The `30S` fix is machine-applicable on the suffix's own sub-span.
+    #[test]
+    fn unknown_unit_fix_targets_the_suffix() {
+        let src = wrap("30S");
+        let diag = decode_value(&first_value_node(&parse(&src).syntax()))
+            .expect_err("30S is not a unit")
+            .to_diagnostic();
+        let sug = diag.suggestions.first().expect("nearest-unit fix");
+        assert_eq!(sug.replacement, "s");
+        // `wrap` puts the value at "service App:\n    k = " — the suffix
+        // `S` is the literal's last byte.
+        let start = src.find("30S").unwrap() + 2;
+        assert_eq!((sug.span.start, sug.span.end), (start, start + 1));
+    }
+
+    #[test]
     fn body_entry_sequence_is_structurally_correct() {
         // Order *and* kind of every entry in the outer block body must be right
         // — losslessness can't catch a mis-typed or mis-nested entry.

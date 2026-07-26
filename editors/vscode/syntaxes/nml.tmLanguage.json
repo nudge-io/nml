@@ -136,6 +136,7 @@
         { "include": "#multiline-string" },
         { "include": "#string" },
         { "include": "#money-literal" },
+        { "include": "#duration-literal" },
         { "include": "#number" },
         { "include": "#boolean" },
         { "include": "#secret-ref" },
@@ -199,6 +200,13 @@
       "captures": {
         "1": { "name": "constant.numeric.money.nml" },
         "2": { "name": "constant.other.currency.nml" }
+      }
+    },
+    "duration-literal": {
+      "match": "\\b(\\d+)(h|ms|m|s)\\b",
+      "captures": {
+        "1": { "name": "constant.numeric.duration.nml" },
+        "2": { "name": "keyword.other.unit.duration.nml" }
       }
     },
     "number": {

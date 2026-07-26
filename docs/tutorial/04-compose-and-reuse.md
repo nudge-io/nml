@@ -39,8 +39,8 @@ fields belong together, and other models will want them later. That's a
 
 ```nml check
 trait monitored:
-    checkInterval duration = "60s"
-    timeout duration = "5s"
+    checkInterval duration = 60s
+    timeout duration = 5s
 
 model endpoint is monitored:
     url string+
@@ -69,7 +69,7 @@ property** every list item inherits:
 
 ```nml fragment
 []endpoint monitoredEndpoints:
-    .timeout = "10s"
+    .timeout = 10s
 
     - Api:
         url = "https://api.skylight.dev"
@@ -143,19 +143,19 @@ against [`examples/04/skylight.model.nml`](examples/04/skylight.model.nml) —
 
 1. Add a `StatusApi` endpoint at `https://api.skylight.dev/status`
    monitored from `us-east` only, keeping the shared timeout. Then give it
-   its own `timeout = "2s"` and convince yourself the override wins (then
+   its own `timeout = 2s` and convince yourself the override wins (then
    try `timeout = 2` and read the type error).
 
    <details><summary>Solution</summary>
 
    ```nml check schema=docs/tutorial/examples/04
    []endpoint monitoredEndpoints:
-       .timeout = "10s"
+       .timeout = 10s
 
        - StatusApi:
            url = "https://api.skylight.dev/status"
            regions = ["us-east"]
-           timeout = "2s"
+           timeout = 2s
    ```
 
    `timeout = 2` fails with `error[NML2008]: type mismatch for 'timeout':

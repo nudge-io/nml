@@ -1,5 +1,5 @@
 trait monitored:
-    timeout duration = "5s"
+    timeout duration = 5s
 
 model endpoint is monitored:
     url string+

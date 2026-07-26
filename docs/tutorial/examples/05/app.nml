@@ -9,7 +9,7 @@ const StatusBanner =
     """
 
 []endpoint monitoredEndpoints:
-    .timeout = "10s"
+    .timeout = 10s
 
     - Api:
         url = "https://api.skylight.dev"
@@ -39,7 +39,7 @@ service Api:
     port = $ENV.PORT | 8080
     publicUrl = "https://status.skylight.dev"
     tags = ["web", "api"]
-    requestTimeout = "30s"
+    requestTimeout = 30s
     retries = MaxRetries
     banner = StatusBanner
     welcome = "Welcome to {{config.appName}} — status you can trust."

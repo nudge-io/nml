@@ -89,7 +89,9 @@ serde = { version = "1", features = ["derive"] }
   `0.20` is 0.20, never 0.2000000000000000111; up to 34 significant digits,
   integers well past `u64`), `money`
   (ISO 4217, integer minor units — `19.99 USD` never becomes `19.990000001`),
-  `bool`, `duration`, `path`, `secret`, `object`, `role`
+  `bool`, `duration` (typed literals, RFC 0017: `30s` equals `30000ms`
+  semantically, deserializes to `std::time::Duration`), `path`, `secret`,
+  `object`, `role`
 - **Schemas as part of the language** — `model`, `trait` (composable,
   non-instantiable mixins), `enum`,
   `oneof` discriminated unions, typed arm maps `(K -> V)`, `set<T>`,
@@ -131,6 +133,7 @@ nml parse <file>                  # dump the AST as JSON (reports ALL errors)
 nml validate <file>               # duplicates + unresolved references
 nml fmt <file>                    # canonical formatting, comment-preserving
 nml check --schema <dir> <file>   # full validation; non-zero exit for CI
+nml fix [--dry-run] <path>...     # apply machine-applicable fixes in bulk
 nml explain NML2007               # the full error-index entry, offline
 ```
 
@@ -152,7 +155,7 @@ raised only in minor releases ([policy](docs/stability.md#minimum-supported-rust
 needs (keep TOML); your host application isn't Rust (bindings are on the
 roadmap, not shipped); or you need a decade-stable format today — NML is
 pre-1.0 and syntax can still change (breaking changes ship with migration
-fixers: the tooling tells you exactly what to rewrite, and `nml fmt` and
+fixers: the tooling tells you exactly what to rewrite, and `nml fix` and
 editor quick-fixes apply what can be applied mechanically).
 
 ## Documentation

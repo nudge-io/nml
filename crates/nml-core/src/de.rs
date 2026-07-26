@@ -842,6 +842,30 @@ fn coerce_to_number(value: &Value, target: &'static str) -> Result<Number, Error
     Number::parse_coercion(s).map_err(|e| Error::De(format!("expected {target}, got {kind} ({e})")))
 }
 
+/// Coerce a Value to a duration (RFC 0017 §3.1). Typed durations pass
+/// through; string-typed values parse via [`Duration::parse_text`] — the
+/// same reason this family exists for numbers and bools: env vars resolve
+/// to `Value::String`, so `sessionTtl = $ENV.TTL` must arrive typed at a
+/// duration target. Failures embed the parse's *reason* but never the
+/// value — the resolver erases provenance, so ANY coerced string could be
+/// a resolved secret, and echoing content here would leak credentials
+/// into logs (the family's never-echo rule, inherited).
+fn coerce_to_duration(value: &Value) -> Result<crate::duration::Duration, Error> {
+    let (s, kind) = match value {
+        Value::Duration(d) => return Ok(*d),
+        Value::String(s) => (s, "string"),
+        Value::Secret(s) => (s, "secret"),
+        other => {
+            return Err(Error::De(format!(
+                "expected duration, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    crate::duration::Duration::parse_text(s)
+        .map_err(|e| Error::De(format!("expected duration, got {kind} ({e})")))
+}
+
 /// Coerce a string-typed Value to bool if it matches common truthy/falsy strings.
 fn coerce_to_bool(value: &Value) -> Option<bool> {
     match value {
@@ -898,6 +922,11 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
             Value::Secret(s) | Value::Role(s) => visitor.visit_str(s),
             Value::Reference(s) => visitor.visit_str(s),
             Value::Money(m) => visitor.visit_string(m.format_display()),
+            // Self-describing consumers get the canonical source text
+            // (`30s`), money's pattern; typed `std::time::Duration`
+            // targets never reach here — they go through the
+            // `deserialize_struct` handshake below.
+            Value::Duration(d) => visitor.visit_string(d.to_string()),
             // `deserialize_any` reaches here only for self-describing
             // targets (untagged enums, `Value`-like), which consume the
             // whole sequence; fixed-size targets go through
@@ -953,6 +982,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
             Value::Secret(s) => visitor.visit_str(s),
             Value::Reference(s) | Value::Role(s) => visitor.visit_str(s),
             Value::Money(m) => visitor.visit_string(m.format_display()),
+            Value::Duration(d) => visitor.visit_string(d.to_string()),
             _ => Err(Error::De(format!(
                 "expected string, got {}",
                 self.value.type_name()
@@ -1052,6 +1082,30 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
         self.deserialize_any(visitor)
     }
 
+    /// The duration handshake (RFC 0017 §6): `std::time::Duration`'s
+    /// stock `Deserialize` requests a struct named `"Duration"` with
+    /// `{secs, nanos}` fields; synthesize that map from the coerced value
+    /// — the typed variant *or* a coerced string (§3.1) — so a
+    /// duration-typed field lands in `std::time::Duration` from every
+    /// provenance. This deliberately differs from money, which stringifies
+    /// (it has no std type to land in); durations do, and landing there is
+    /// the point. `"Duration"` is a public, collidable struct name (unlike
+    /// the private `Number` newtype token): a user struct so named
+    /// receives `{secs, nanos}` and fails with an ordinary field error —
+    /// accepted and documented. Everything else forwards as before.
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        if name == "Duration" {
+            let std = coerce_to_duration(self.value)?.as_std();
+            return visitor.visit_map(DurationMapAccess { std, field: 0 });
+        }
+        self.deserialize_any(visitor)
+    }
+
     /// Fixed-arity targets route through `deserialize_seq` so the
     /// leftover-element check applies (forwarding these to
     /// `deserialize_any` would silently discard extra array elements —
@@ -1075,7 +1129,51 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
 
     serde::forward_to_deserialize_any! {
         char bytes byte_buf unit unit_struct
-        map struct identifier
+        map identifier
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Duration map access
+// ---------------------------------------------------------------------------
+
+/// The `{secs, nanos}` map behind the duration handshake — exactly the
+/// shape `std::time::Duration`'s `Deserialize` requests. Values come from
+/// an already-domain-checked [`crate::duration::Duration`], so both fit
+/// their targets by construction.
+struct DurationMapAccess {
+    std: std::time::Duration,
+    field: u8,
+}
+
+impl<'de> MapAccess<'de> for DurationMapAccess {
+    type Error = Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, Self::Error> {
+        let key = match self.field {
+            0 => "secs",
+            1 => "nanos",
+            _ => return Ok(None),
+        };
+        seed.deserialize(de::value::StrDeserializer::<Error>::new(key))
+            .map(Some)
+    }
+
+    fn next_value_seed<V: DeserializeSeed<'de>>(
+        &mut self,
+        seed: V,
+    ) -> Result<V::Value, Self::Error> {
+        let field = self.field;
+        self.field += 1;
+        match field {
+            0 => seed.deserialize(de::value::U64Deserializer::<Error>::new(self.std.as_secs())),
+            _ => seed.deserialize(de::value::U32Deserializer::<Error>::new(
+                self.std.subsec_nanos(),
+            )),
+        }
     }
 }
 
@@ -2444,6 +2542,72 @@ workflow W:
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
         assert!(from_body::<V>(body).is_ok(), "Vec must accept any length");
+    }
+
+    /// The duration handshake + coercion family (RFC 0017 §3.1/§6): a
+    /// `std::time::Duration` target lands typed from EVERY provenance —
+    /// the literal directly, and the string shape `$ENV` resolution
+    /// produces through `coerce_to_duration`. String-typed Rust targets
+    /// still accept the literal as its canonical text (money's stringly
+    /// pattern), and `Option` wrapping composes.
+    #[test]
+    fn duration_lands_in_std_duration_from_every_provenance() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct C {
+            timeout: std::time::Duration,
+            resolved: std::time::Duration,
+            label: String,
+            opt: Option<std::time::Duration>,
+        }
+        // `resolved` is a plain string — exactly what `resolve.rs` leaves
+        // behind for `$ENV.TTL` — and must coerce identically.
+        let source = "service App:\n    timeout = 90m\n    resolved = \"1500ms\"\n    label = 250ms\n    opt = 2h\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let c: C = from_body(body).unwrap();
+        assert_eq!(c.timeout, std::time::Duration::from_secs(90 * 60));
+        assert_eq!(c.resolved, std::time::Duration::from_millis(1500));
+        assert_eq!(c.label, "250ms");
+        assert_eq!(c.opt, Some(std::time::Duration::from_secs(7200)));
+    }
+
+    /// The coercion inherits the family's never-echo rule: a failed
+    /// duration coercion states the reason, never the text (which may be
+    /// a resolved secret). And a colliding user struct named `Duration`
+    /// fails with an ordinary field error, never a panic — the documented
+    /// cost of keying the handshake on the public struct name.
+    #[test]
+    fn duration_coercion_failures_redact_and_collisions_degrade() {
+        #[derive(Deserialize, Debug)]
+        struct C {
+            #[serde(rename = "t")]
+            _t: std::time::Duration,
+        }
+        let source = "service App:\n    t = \"hunter2-XYZZY\"\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let err = from_body::<C>(body).unwrap_err().to_string();
+        assert!(!err.contains("hunter2"), "coerced text leaked: {err}");
+        assert!(err.contains("expected duration"), "{err}");
+
+        #[derive(Deserialize, Debug)]
+        struct Duration {
+            #[serde(rename = "label")]
+            _label: String,
+        }
+        #[derive(Deserialize, Debug)]
+        struct D {
+            #[serde(rename = "t")]
+            _t: Duration,
+        }
+        let source = "service App:\n    t = 30s\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let err = from_body::<D>(body).unwrap_err().to_string();
+        assert!(err.contains("label") || err.contains("secs"), "{err}");
     }
 
     /// Security posture (implementation review): serde-generated errors

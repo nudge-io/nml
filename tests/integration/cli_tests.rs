@@ -137,6 +137,33 @@ fn test_parse_money_values() {
 }
 
 #[test]
+fn test_parse_duration_values() {
+    // The duration wire shape is an API (RFC 0017 §6), pinned exactly:
+    // externally tagged, magnitude bare, unit as its source suffix.
+    let output = nml_bin()
+        .args(["parse", "tests/fixtures/valid/duration-values.nml"])
+        .output()
+        .expect("failed to run nml");
+
+    assert!(
+        output.status.success(),
+        "parse should succeed for duration values"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let value = &json["declarations"][0]["kind"]["Block"]["body"]["entries"][0]["kind"]["Property"]
+        ["value"]["value"];
+    assert_eq!(
+        value,
+        &serde_json::json!({"Duration": {"magnitude": 30, "unit": "s"}}),
+        "wire shape drifted: {value}"
+    );
+    for unit in ["\"s\"", "\"ms\"", "\"h\"", "\"m\""] {
+        assert!(stdout.contains(unit), "missing unit {unit}");
+    }
+}
+
+#[test]
 fn test_parse_secret_values() {
     let output = nml_bin()
         .args(["parse", "tests/fixtures/valid/secret-values.nml"])
@@ -281,6 +308,154 @@ fn test_fmt_produces_output() {
     assert!(contents.contains("localMount = \"/\""));
 
     std::fs::remove_file(&temp).ok();
+}
+
+/// `nml fix` (RFC 0017 §4.1) end to end: the duration migration
+/// (`"30s"` → `30s`, including schema defaults) and the ledgered
+/// `=>` → `->` fix apply in one invocation over a directory; the result
+/// is idempotent and passes `check`; `--dry-run` prints a unified diff
+/// and writes nothing.
+#[test]
+fn test_fix_applies_migrations_and_is_idempotent() {
+    let dir = std::env::temp_dir().join(format!("nml_fix_test_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let app = dir.join("app.nml");
+    std::fs::write(
+        &app,
+        "model job:\n    timeout duration\n    backoff duration = \"250ms\"\n\njob Nightly:\n    timeout = \"30s\"\n",
+    )
+    .expect("write");
+    let legacy = dir.join("legacy.nml");
+    std::fs::write(
+        &legacy,
+        "oneof email by kind:\n    \"log\" => emailLog\n\nmodel emailLog:\n    path string?\n",
+    )
+    .expect("write");
+
+    // Dry-run: a diff, no writes.
+    let output = nml_bin()
+        .args(["fix", "--dry-run", dir.to_str().unwrap()])
+        .output()
+        .expect("run nml");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("-    timeout = \"30s\""), "{stdout}");
+    assert!(stdout.contains("+    timeout = 30s"), "{stdout}");
+    assert!(stdout.contains("+    \"log\" -> emailLog"), "{stdout}");
+    assert!(
+        std::fs::read_to_string(&app).unwrap().contains("\"30s\""),
+        "dry-run must not write"
+    );
+
+    // Apply: both files rewritten, then a second run finds nothing.
+    let output = nml_bin()
+        .args(["fix", dir.to_str().unwrap()])
+        .output()
+        .expect("run nml");
+    assert!(output.status.success(), "{output:?}");
+    let fixed = std::fs::read_to_string(&app).unwrap();
+    assert!(fixed.contains("timeout = 30s"), "{fixed}");
+    assert!(fixed.contains("backoff duration = 250ms"), "{fixed}");
+    assert!(
+        std::fs::read_to_string(&legacy)
+            .unwrap()
+            .contains("\"log\" -> emailLog")
+    );
+    let output = nml_bin()
+        .args(["fix", dir.to_str().unwrap()])
+        .output()
+        .expect("run nml");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("0 edit(s) applied"), "idempotent: {stdout}");
+
+    // The fixed file passes check.
+    let output = nml_bin()
+        .args(["check", app.to_str().unwrap()])
+        .output()
+        .expect("run nml");
+    assert!(output.status.success(), "fixed file must check clean");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The fixer's structural-injection guard: a suggestion whose replacement
+/// embeds decoded user content containing a line break (here the
+/// role-literal fix for a string authored with `\n` escapes) is refused —
+/// file content must never smuggle new structure through an auto-applied
+/// edit. The file stays byte-identical.
+#[test]
+fn test_fix_refuses_replacements_with_control_characters() {
+    let dir = std::env::temp_dir().join(format!("nml_fix_inject_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let file = dir.join("inject.nml");
+    let source = "model svc:\n    owner role\n\nsvc A:\n    owner = \"admin\\n    evil = 1\"\n";
+    std::fs::write(&file, source).expect("write");
+    let output = nml_bin()
+        .args(["fix", file.to_str().unwrap()])
+        .output()
+        .expect("run nml");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("0 edit(s) applied"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), source);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Atomic writes preserve the original's permission bits: a fixer rewrite
+/// of a 0600 config must not silently widen it to the umask default.
+#[cfg(unix)]
+#[test]
+fn test_fix_preserves_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("nml_fix_perms_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let file = dir.join("private.nml");
+    std::fs::write(
+        &file,
+        "model job:\n    timeout duration\n\njob A:\n    timeout = \"30s\"\n",
+    )
+    .expect("write");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let output = nml_bin()
+        .args(["fix", file.to_str().unwrap()])
+        .output()
+        .expect("run nml");
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("timeout = 30s"),
+        "fix applied"
+    );
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "permissions must survive the rewrite");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The fixer's refusals: a value with no machine-applicable fix (the
+/// deliberately-invalid duration fixture) is left byte-identical, and
+/// unfixable diagnostics are reported as remaining.
+#[test]
+fn test_fix_never_touches_unfixable_files() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let fixture = workspace_root.join("tests/fixtures/invalid/bad-duration-default.model.nml");
+    let before = std::fs::read_to_string(&fixture).unwrap();
+    let output = nml_bin()
+        .args(["fix", fixture.to_str().unwrap()])
+        .output()
+        .expect("run nml");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("0 edit(s) applied"), "{stdout}");
+    assert!(
+        stdout.contains("1 diagnostic(s) not auto-fixable"),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture).unwrap(),
+        before,
+        "unfixable file must be untouched"
+    );
 }
 
 #[test]
@@ -457,8 +632,12 @@ fn test_file_vs_schema_dir_collision_is_nml2009() {
 
 #[test]
 fn test_validate_and_check_agree_on_definition_files() {
-    // A bad schema default (duration "5x") must fail BOTH verbs with the
-    // same code — the definitions verbs can never disagree.
+    // A bad schema default (the string "5x" in a duration field — not
+    // duration text, so not even migratable to a literal) must fail BOTH
+    // verbs with the same code — the definitions verbs can never disagree.
+    // Since RFC 0017 a non-duration value in a duration field is the
+    // ordinary type mismatch, and this fixture is a value `nml fix` must
+    // never rewrite (no machine-applicable suggestion exists for it).
     let fixture = "tests/fixtures/invalid/bad-duration-default.model.nml";
     for verb in ["validate", "check"] {
         let output = nml_bin()
@@ -471,7 +650,7 @@ fn test_validate_and_check_agree_on_definition_files() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(combined.contains("NML2029"), "{verb}: {combined}");
+        assert!(combined.contains("NML2008"), "{verb}: {combined}");
     }
 }
 

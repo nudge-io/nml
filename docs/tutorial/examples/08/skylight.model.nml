@@ -19,8 +19,8 @@ model role:
     members []role?
 
 trait monitored:
-    checkInterval duration = "60s"
-    timeout duration = "5s"
+    checkInterval duration = 60s
+    timeout duration = 5s
 
 model database:
     url string
@@ -53,7 +53,7 @@ model service is accessControlled:
     port number #restart
     publicUrl string
     logLevel logLevel = "info" #live
-    requestTimeout duration = "30s" #live
+    requestTimeout duration = 30s #live
     retries number = 3 #live
     banner string? #live
     welcome string? #live

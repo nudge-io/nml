@@ -47,6 +47,7 @@ pub enum Value {
     TemplateString(Vec<TemplateSegment>),
     Number(Number),
     Money(Money),
+    Duration(Duration),
     Bool(bool),
     Secret(String),
     Role(String),
@@ -68,48 +69,14 @@ impl SpannedValue {
     }
 }
 
-/// A duration's unit (spec/syntax.md §Duration Literals).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DurationUnit {
-    Hours,
-    Minutes,
-    Seconds,
-    Milliseconds,
-}
-
-impl DurationUnit {
-    /// The unit's source suffix (`"h"`, `"m"`, `"s"`, `"ms"`).
-    pub fn suffix(self) -> &'static str {
-        match self {
-            DurationUnit::Hours => "h",
-            DurationUnit::Minutes => "m",
-            DurationUnit::Seconds => "s",
-            DurationUnit::Milliseconds => "ms",
-        }
-    }
-}
-
-/// Parse a duration per the spec grammar — an unsigned integer immediately
-/// followed by one unit suffix (`"72h"`, `"30m"`, `"5s"`, `"500ms"`); no
-/// sign, no decimals, no compound forms. The **single source of truth** for
-/// duration syntax: schema validation (`NML2029`) and consumers parse the
-/// same grammar, so "validated" and "parseable at runtime" cannot drift.
-pub fn parse_duration(text: &str) -> Option<(u64, DurationUnit)> {
-    // `ms` first: it must win over its `m`/`s` suffix prefixes.
-    const UNITS: [(&str, DurationUnit); 4] = [
-        ("ms", DurationUnit::Milliseconds),
-        ("h", DurationUnit::Hours),
-        ("m", DurationUnit::Minutes),
-        ("s", DurationUnit::Seconds),
-    ];
-    let (digits, unit) = UNITS
-        .iter()
-        .find_map(|(suffix, unit)| text.strip_suffix(suffix).map(|d| (d, *unit)))?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok().map(|n| (n, unit))
-}
+/// The exact duration (RFC 0017). Lives in [`crate::duration`];
+/// re-exported here beside [`Value`] like [`Number`] is.
+///
+/// NML's `duration` domain is `total_nanos ≤ std::time::Duration::MAX`,
+/// stored faithfully as the authored `(magnitude, unit)` pair and compared
+/// semantically (`30s == 30000ms`); [`Duration::as_std`] is infallible by
+/// construction.
+pub use crate::duration::{Duration, DurationUnit};
 
 /// A field directive (RFC 0032): `#name` / `#name(value)` trailing a field
 /// definition. **Opaque to nml-core** — the language parses and syntax-checks
@@ -182,8 +149,10 @@ pub enum PrimitiveType {
     /// integer minor units for precision.
     Money,
     Bool,
-    /// Tooling hint for values representing time durations.
-    /// No parser-level coercion -- treated as a string at runtime.
+    /// Exact time duration with unit suffix (RFC 0017; e.g. `30s`,
+    /// `250ms`). The parser recognises duration literal syntax and stores
+    /// values as the authored `(magnitude, unit)` pair, compared
+    /// semantically (`30s == 30000ms`).
     Duration,
     /// Tooling hint for values representing filesystem paths.
     /// No parser-level coercion -- treated as a string at runtime.
@@ -263,6 +232,7 @@ impl Value {
             Value::String(_) | Value::TemplateString(_) => "string",
             Value::Number(_) => "number",
             Value::Money(_) => "money",
+            Value::Duration(_) => "duration",
             Value::Bool(_) => "bool",
             Value::Secret(_) => "secret",
             Value::Role(_) => "role",
@@ -310,6 +280,16 @@ impl Value {
     pub fn to_u64(&self) -> Option<u64> {
         match self {
             Value::Number(n) => n.to_u64(),
+            _ => None,
+        }
+    }
+
+    /// Extract as an exact [`Duration`] (`Copy`; convert with
+    /// [`Duration::as_std`] for a `std::time::Duration`, or use the
+    /// `TryFrom<&Value>` impl below directly).
+    pub fn as_duration(&self) -> Option<Duration> {
+        match self {
+            Value::Duration(d) => Some(*d),
             _ => None,
         }
     }
@@ -396,6 +376,25 @@ impl TryFrom<&Value> for i128 {
             }),
             _ => Err(ValueTypeError {
                 expected: "number",
+                actual: value.type_name(),
+            }),
+        }
+    }
+}
+
+/// Typed-error extraction of a duration-typed field's literal. Infallible
+/// past the variant check: the decode-time domain bound (RFC 0017 §2)
+/// guarantees every [`Value::Duration`] converts. String-shaped duration
+/// text (`$ENV` resolution) is `de`'s `coerce_to_duration` territory, not
+/// this impl's — `TryFrom` reads the raw AST, where a string is a string.
+impl TryFrom<&Value> for std::time::Duration {
+    type Error = ValueTypeError;
+
+    fn try_from(value: &Value) -> Result<std::time::Duration, Self::Error> {
+        match value {
+            Value::Duration(d) => Ok(d.as_std()),
+            _ => Err(ValueTypeError {
+                expected: "duration",
                 actual: value.type_name(),
             }),
         }
@@ -631,6 +630,40 @@ mod tests {
             !n("9007199254740993.0").semantic_eq(&n("9007199254740992.0")),
             "distinct values beyond 2^53 must NOT classify as cosmetic (the f64-era bug)"
         );
+    }
+
+    /// RFC 0017 §2: the duration analogue of the numeric pin above, at the
+    /// same semantic_eq layer the RFC 0032 reload differ reads. Duration
+    /// equality is MANUAL over `total_nanos()` — a derived `(magnitude,
+    /// unit)` equality would compile, pass every other test, and silently
+    /// report `30s` → `30000ms` as a change (forcing a needless restart);
+    /// this is the test that goes red instead.
+    #[test]
+    fn semantic_eq_duration_pairs() {
+        let d = |mag: u64, unit: DurationUnit| {
+            Value::Duration(Duration::new(mag, unit).expect("in-domain"))
+        };
+        assert!(
+            d(30, DurationUnit::Seconds).semantic_eq(&d(30_000, DurationUnit::Milliseconds)),
+            "unit respelling is cosmetic"
+        );
+        assert!(!d(30, DurationUnit::Seconds).semantic_eq(&d(31, DurationUnit::Seconds)));
+        assert!(!d(30, DurationUnit::Seconds).semantic_eq(&d(30, DurationUnit::Minutes)));
+    }
+
+    #[test]
+    fn as_duration_and_try_from_std() {
+        let d = Duration::new(90, DurationUnit::Minutes).unwrap();
+        let v = Value::Duration(d);
+        assert_eq!(v.as_duration(), Some(d));
+        assert_eq!(
+            std::time::Duration::try_from(&v).unwrap(),
+            std::time::Duration::from_secs(90 * 60)
+        );
+        assert!(Value::String("90m".into()).as_duration().is_none());
+        // TryFrom reads the raw AST: a string is a string — coercion is
+        // `de`'s job, deliberately not duplicated here.
+        assert!(std::time::Duration::try_from(&Value::String("90m".into())).is_err());
     }
 
     #[test]

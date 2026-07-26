@@ -37,7 +37,7 @@ model service is accessControlled:
     host string #restart
     port number #restart
     logLevel logLevel = "info" #live
-    requestTimeout duration = "30s" #live
+    requestTimeout duration = 30s #live
     apiKey secret #live
     database database #restart
     endpoints []endpoint #live

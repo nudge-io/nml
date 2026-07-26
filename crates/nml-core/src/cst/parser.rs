@@ -141,7 +141,7 @@ impl<'a> Parser<'a> {
     /// At a contextual keyword (`is`/`by`/`as`) **on the current line**. These
     /// keywords continue a declaration header, so — like every other
     /// line-significant decision ([`Self::at_fallback_pipe`],
-    /// [`Self::at_field_type`], [`Self::at_currency`]) — they must not be picked
+    /// [`Self::at_field_type`], [`Self::at_number_suffix`]) — they must not be picked
     /// up from the start of the next entry. (Legacy is protected by its `Newline`
     /// token; NML keeps `Newline` as trivia, so the rule is explicit here.)
     fn at_kw(&self, kw: &str) -> bool {
@@ -991,22 +991,26 @@ impl<'a> Parser<'a> {
         m.complete(self, SyntaxKind::Value);
     }
 
-    /// A number, optionally followed by a **same-line** 3-letter currency code
-    /// (money). The currency is recognized syntactically; validity is the value
-    /// layer's job.
+    /// A number, optionally followed by a **same-line** unit identifier —
+    /// a currency code (money) or a duration unit (RFC 0017). The parser
+    /// recognizes only the `Number Ident` *shape*; classification (3
+    /// uppercase → currency, `h`/`m`/`s`/`ms` → duration unit, anything
+    /// else → `NML3004`) is the value layer's job, so a mistyped suffix
+    /// gets a coded diagnostic with a fix instead of a generic parse error.
     fn number_value(&mut self) {
         self.bump(); // number
-        if self.at_currency() {
+        if self.at_number_suffix() {
             self.bump();
         }
     }
 
-    /// A currency code must follow the number on the same line — otherwise a
-    /// 3-uppercase identifier starting the *next* entry (e.g. a `USD = …`
-    /// property) would be swallowed. Same line-significance rule as
+    /// A unit suffix must follow the number on the same line — otherwise an
+    /// identifier starting the *next* entry (a `USD = …` property, or —
+    /// far more plausibly — a field named `s`, `m`, or `h`) would be
+    /// swallowed into the previous value. Same line-significance rule as
     /// [`Self::at_fallback_pipe`] / [`Self::at_field_type`].
-    fn at_currency(&self) -> bool {
-        self.at(SyntaxKind::Ident) && !self.newline_before() && is_currency(self.current_text())
+    fn at_number_suffix(&self) -> bool {
+        self.at(SyntaxKind::Ident) && !self.newline_before()
     }
 
     /// `[ value (, value)* ,? ]`
@@ -1103,11 +1107,6 @@ impl<'a> Parser<'a> {
     pub(super) fn finish_parse(self) -> (Vec<Event>, Vec<NmlError>, usize) {
         (self.events, self.errors, self.suppressed)
     }
-}
-
-/// A 3-uppercase-letter currency code (e.g. `USD`), recognized syntactically.
-fn is_currency(text: &str) -> bool {
-    text.len() == 3 && text.bytes().all(|b| b.is_ascii_uppercase())
 }
 
 /// Merge the event list with the full (trivia-bearing) token stream into the

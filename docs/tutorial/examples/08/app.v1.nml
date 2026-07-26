@@ -36,7 +36,7 @@ service Api:
     publicUrl = "https://status.skylight.dev"
     tags = ["web", "api"]
     logLevel = "debug"
-    requestTimeout = "30s"
+    requestTimeout = 30s
     retries = MaxRetries
     banner = StatusBanner
     welcome = "Welcome to {{config.appName}} — status you can trust."

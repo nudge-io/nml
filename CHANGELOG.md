@@ -4,17 +4,34 @@
 
 ### Changed
 
-- **`Value::Duration` and `Value::Path` removed** — both variants were
-  unreachable by construction: durations and paths are *quoted* strings in
-  the grammar (spec §Duration Literals, §Path Literals) with no lexeme of
-  their own, so only schema validation can judge duration-ness or
-  path-ness, and no code path ever produced either variant (their
-  `PrimitiveType` docs already said "treated as a string at runtime" —
-  path-typed validation never even accepted `Value::Path`).
-  Duration/path-typed fields keep validating exactly as before (durations:
-  `NML2029` via `parse_duration`; paths: the kind check, as always);
-  consumers keep receiving `Value::String`. Dead match arms across the
-  workspace went with them.
+- **Durations are literals (RFC 0017)** — `30s` parses to a typed
+  `Value::Duration` (magnitude + unit, faithful storage, **semantic**
+  equality: `30s == 30000ms`, so sets and reload diffs treat the two
+  spellings as one value). Units are `h`/`m`/`s`/`ms`, unsigned integer
+  magnitudes only, domain-bounded at decode (`NML3004` unknown unit,
+  `NML3005` fractional magnitude, `NML3006` out of domain — all with
+  machine-applicable fixes where one exists); `NML2029` is retired to a
+  tombstone. A duration-typed field deserializes to
+  `std::time::Duration` from every provenance: literals directly, and
+  `$ENV`-resolved strings through `coerce_to_duration`, joining the
+  existing `de` coercion family (never-echo rule inherited). The quoted
+  spelling `"30s"` in a duration-typed field is an `NML0001` migration
+  with a mechanical fix, applied in bulk by the new `nml fix`.
+
+  *This reverses the earlier in-cycle removal of `Value::Duration`.* The
+  removal's premise — no code path could produce the variant — was
+  correct while durations had no grammar; this RFC adds the grammar and
+  removes the premise. `Value::Path` **stays removed**: a path's
+  meaningful typing is safety (containment, traversal), none of it
+  knowable at parse time — that belongs in the consumer's newtype.
+- **`Value::Path` removed** — the variant was unreachable by
+  construction: paths are *quoted* strings in the grammar with no lexeme
+  of their own, so only schema validation can judge path-ness, and no
+  code path ever produced the variant (its `PrimitiveType` doc already
+  said "treated as a string at runtime" — path-typed validation never
+  even accepted `Value::Path`). Path-typed fields keep validating
+  exactly as before; consumers keep receiving `Value::String`. Dead
+  match arms across the workspace went with it.
 - **Oneof arm values report every bad escape** — bare string-literal
   positions (oneof discriminator/arm values) now use the total decoder:
   all escape errors surface at once (rustc-style, matching property
@@ -109,6 +126,19 @@
   deserialize flow is a single dependency.
 
 ### Added
+
+- **`nml fix` — the batch fixer** (RFC 0017 §4.1): applies
+  machine-applicable suggestions in bulk (`nml fix [--schema <dir>]
+  [--dry-run] <path>...`, directories walked for `.nml`). A suggestion is
+  applied only when it is the **sole candidate for its span** (so RFC
+  0015's N-mutually-exclusive-fixes rule holds by construction), edits
+  splice highest-offset-first via the new span-splice primitive
+  (`cst::edit::splice`), and every round is re-checked before acceptance
+  — a round that does not strictly improve the file is discarded, and
+  writes are atomic. This is the missing half of the stability policy's
+  "breaking changes ship with fixers" commitment: the `=>` → `->` and
+  quoted-duration migrations are now bulk-appliable (and the repo's own
+  examples were migrated with it).
 
 - **The proof surface**: a [case study](docs/case-study.md) describing how
   a production workflow platform embeds NML end to end (schema packages +

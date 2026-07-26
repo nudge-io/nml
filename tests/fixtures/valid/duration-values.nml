@@ -1,0 +1,5 @@
+service Api:
+    requestTimeout = 30s
+    retryBackoff = 250ms
+    sessionTtl = 72h
+    pollEvery = 5m

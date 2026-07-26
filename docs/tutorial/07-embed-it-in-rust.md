@@ -53,7 +53,7 @@ struct ServiceConfig {
     port: u16,
     public_url: String,
     log_level: String,
-    request_timeout: String,
+    request_timeout: std::time::Duration,
     retries: u32,
     tags: Vec<String>,
     api_key: String,
@@ -76,8 +76,8 @@ struct Endpoint {
     #[serde(default)]
     name: String,
     url: String,
-    timeout: String,
-    check_interval: String,
+    timeout: std::time::Duration,
+    check_interval: std::time::Duration,
     regions: Option<Vec<String>>,
 }
 ```
@@ -85,10 +85,14 @@ struct Endpoint {
 (That block — like every Rust listing in this chapter — is checked in CI to
 be a verbatim excerpt of the compiled program.)
 
-Three things to notice:
+Four things to notice:
 
 - `#[serde(rename_all = "camelCase")]` maps NML's `camelCase` properties to
   Rust's `snake_case` fields.
+- `duration`-typed fields land directly in `std::time::Duration` — `30s`
+  in the file, a typed duration in your struct, no re-parsing at call
+  sites. That holds even when the value arrives via `$ENV` (the resolved
+  text is coerced at this boundary, exactly as numbers and bools are).
 - Nested blocks become nested structs; list items become `Vec<T>`, and each
   named item's label arrives as a `name` field — bare positional items have
   no label, so `name` defaults (they're anonymous by design).

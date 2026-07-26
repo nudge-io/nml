@@ -4,6 +4,9 @@ use std::process;
 use nml_core::diagnostic::{Code, Diagnostic, Severity};
 use nml_validate::schema::SchemaValidator;
 
+mod fix;
+mod pipeline;
+
 /// Parse a file via the CST, reporting **every** syntactic and semantic error
 /// at once (not just the first — exceeding the legacy one-at-a-time UX). Returns
 /// the AST when the input is fully valid.
@@ -80,6 +83,7 @@ fn main() {
         "validate" => cmd_validate(&args[2..]),
         "fmt" => cmd_fmt(&args[2..]),
         "check" => cmd_check(&args[2..]),
+        "fix" => fix::cmd_fix(&args[2..]),
         "explain" => cmd_explain(&args[2..]),
         "help" | "--help" | "-h" => {
             print_usage();
@@ -118,6 +122,10 @@ COMMANDS:
     check [--schema <dir>] [--strict] <file>
                                     Parse + validate + schema check (CI-friendly);
                                     --strict makes unknown properties/keywords errors
+    fix [--schema <dir>] [--dry-run] <path>...
+                                    Apply machine-applicable fixes (migrations,
+                                    sole-candidate suggestions) in bulk; directories
+                                    are walked for .nml files; --dry-run prints a diff
     explain <code>                  Explain a diagnostic code (e.g. nml explain NML2007)
     explain --list                  List every diagnostic code with its summary
     help                            Show this help message
@@ -141,6 +149,12 @@ COMMANDS:
 /// readers silently truncate past 2^53 and cannot represent 128-bit
 /// integers at all, so an exact string is the only encoding that survives
 /// the round trip. `str::parse` recovers every value exactly.
+///
+/// **Duration encoding** (RFC 0017): a duration literal emits
+/// `{"Duration": {"magnitude": 30, "unit": "s"}}` — the authored
+/// magnitude and the unit's source suffix, faithful to the source
+/// spelling (never rescaled). Consumers comparing durations across units
+/// must compare totals, not pairs.
 fn cmd_parse(args: &[String]) -> Result<(), String> {
     let path = require_file_arg(args, "parse")?;
     let source = read_file(&path)?;
@@ -312,28 +326,9 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     // types instances. A self-contained file (`model cache` above
     // `cache Foo:`) validates with no flags, and a name declared in both
     // the file and the directory is NML2009 — never a silent shadow.
-    let mut named_sources: Vec<(String, PathBuf, String)> = Vec::new();
-    if let Some(sd) = &schema_dir {
-        for (p, text) in read_schema_dir(sd)? {
-            let load_name = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("schema")
-                .to_string();
-            named_sources.push((load_name, p, text));
-        }
-    }
-    let file_canon = path.canonicalize().ok();
-    let file_is_a_source = file_canon.as_ref().is_some_and(|fc| {
-        named_sources
-            .iter()
-            .any(|(_, p, _)| p.canonicalize().ok().as_ref() == Some(fc))
-    });
-    if !file_is_a_source {
-        // The checked file's load name is its display path — unambiguous
-        // against directory basenames for attribution.
-        named_sources.push((path.display().to_string(), path.clone(), source.clone()));
-    }
+    // Assembly is shared with `nml fix` (pipeline module), so the fixer
+    // can never judge a file differently than this verb does.
+    let named_sources = pipeline::schema_universe(&path, &source, schema_dir.as_ref())?;
     let source_refs: Vec<(&str, &str)> = named_sources
         .iter()
         .map(|(n, _, t)| (n.as_str(), t.as_str()))
@@ -408,36 +403,6 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// Parse all `*.model.nml` / `*.schema.nml` files in `dir` and run them
-/// through the schema-loading pipeline (inheritance resolution, cycle and
-/// duplicate detection).
-/// Read a schema directory's sources (`*.model.nml` / `*.schema.nml`),
-/// sorted for determinism. Loading happens once, in `cmd_check`'s single
-/// schema universe (RFC 0012), so the checked file composes with these.
-fn read_schema_dir(dir: &PathBuf) -> Result<Vec<(PathBuf, String)>, String> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("failed to read schema dir {}: {e}", dir.display()))?;
-
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|name| name.ends_with(".model.nml") || name.ends_with(".schema.nml"))
-        })
-        .collect();
-    paths.sort();
-
-    // `load_schema` later parses over the CST and surfaces any parse error
-    // as an attributed diagnostic rather than aborting on the first
-    // malformed file — reading here only fails on I/O.
-    paths
-        .into_iter()
-        .map(|p| read_file(&p).map(|text| (p, text)))
-        .collect()
-}
-
 fn require_file_arg(args: &[String], cmd: &str) -> Result<PathBuf, String> {
     if args.is_empty() {
         return Err(format!("usage: nml {cmd} <file>"));
@@ -449,7 +414,7 @@ fn read_file(path: &PathBuf) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("failed to read {}: {e}", path.display()))
 }
 
-fn write_file_atomically(path: &PathBuf, contents: &str) -> Result<(), String> {
+pub(crate) fn write_file_atomically(path: &PathBuf, contents: &str) -> Result<(), String> {
     let parent = path.parent().ok_or_else(|| {
         format!(
             "failed to determine parent directory for {}",
@@ -465,6 +430,16 @@ fn write_file_atomically(path: &PathBuf, contents: &str) -> Result<(), String> {
 
     std::fs::write(&tmp_path, contents)
         .map_err(|e| format!("failed to write temp file {}: {e}", tmp_path.display()))?;
+    // Preserve the original's permission bits: the temp file is created at
+    // the umask default, and the rename would otherwise silently widen a
+    // restricted config (0600 → 0644) — a rewrite must never change who
+    // can read the file. A file being created fresh keeps the default.
+    if let Ok(meta) = std::fs::metadata(path) {
+        std::fs::set_permissions(&tmp_path, meta.permissions()).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("failed to preserve permissions on {}: {e}", path.display())
+        })?;
+    }
     std::fs::rename(&tmp_path, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_path);
         format!(

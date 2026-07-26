@@ -534,6 +534,13 @@ fn format_value(out: &mut String, value: &Value, depth: usize) {
         Value::Money(m) => {
             out.push_str(&m.format_display());
         }
+        // Canonical duration form is ATTACHED (`30s`) — a unit is a
+        // suffix, unlike a currency code (RFC 0017 §6). Display renders
+        // the stored value: the authored unit survives (never rescaled),
+        // magnitude spelling normalizes (`030s` → `30s`).
+        Value::Duration(d) => {
+            out.push_str(&d.to_string());
+        }
         Value::Bool(b) => {
             out.push_str(if *b { "true" } else { "false" });
         }
@@ -700,6 +707,33 @@ mod tests {
         let file2 = parse(&first).unwrap();
         let second = format(&file2);
         assert_eq!(first, second, "formatting is not idempotent");
+    }
+
+    /// RFC 0017 §6: canonical duration form is ATTACHED and faithful —
+    /// a spaced unit joins (`30 s` → `30s`), magnitude spelling
+    /// normalizes (`030s` → `30s`), and the authored unit is NEVER
+    /// rescaled (`72h` stays `72h`, not `259200s`) — unlike money, whose
+    /// canonical form is spaced (`19.99 USD`): a currency code is a noun,
+    /// a duration unit is a suffix.
+    #[test]
+    fn duration_formatting_attached_and_faithful() {
+        for (source_value, expected) in [
+            ("30s", "30s"),
+            ("30 s", "30s"),
+            ("030s", "30s"),
+            ("72h", "72h"),
+            ("30000ms", "30000ms"),
+            ("0s", "0s"),
+        ] {
+            let file = parse(&format!("service App:\n    x = {source_value}\n")).unwrap();
+            let formatted = format(&file);
+            assert!(
+                formatted.contains(&format!("x = {expected}\n")),
+                "{source_value}: got {formatted:?}"
+            );
+        }
+        idempotent("service App:\n    x = 72h\n    y = 500 ms\n");
+        roundtrip("service App:\n    x = 30s\n");
     }
 
     /// RFC 0016 §1.10: the exact-decimal fixed-point table. Every output

@@ -112,8 +112,8 @@ macro_rules! codes {
 /// The stable code space, banded by subsystem for allocation convenience
 /// (bands are **not** API — a diagnostic moving between subsystems keeps its
 /// code): 0001–0999 lex/parse · 1000–1999 symbols & resolution · 2000–2999
-/// schema loading & validation · 3000–3999 values & money · 4000–4999
-/// packages & store · 5000–5999 editor/LSP. Sites not yet assigned a code
+/// schema loading & validation · 3000–3999 values, money & durations ·
+/// 4000–4999 packages & store · 5000–5999 editor/LSP. Sites not yet assigned a code
 /// emit `None`; the docs plan's Phase 4 sweep completes coverage. Every code
 /// has a section in the error index (`docs/errors/README.md`) — enforced
 /// bidirectionally by `just docs-test`.
@@ -250,8 +250,12 @@ pub mod codes {
         /// An enum declares no variants — no instance value can satisfy a
         /// field it types, and an `as`-typed `oneof` can never cover it.
         EMPTY_ENUM = 2028;
-        /// A `duration`-typed value does not match the duration grammar
-        /// (spec: a numeric value with unit `h`/`m`/`s`/`ms`, e.g. "30s").
+        /// **Retired** (RFC 0017): durations are literals now, so format
+        /// defects surface at decode as `NML3004`/`NML3005`/`NML3006` and
+        /// this validation-time check can no longer fire. The constant
+        /// stays declared — codes are never renumbered or reused, and the
+        /// uniqueness test enforces that by construction; the error index
+        /// keeps its section as a tombstone.
         INVALID_DURATION = 2029;
         /// A set contains the same element more than once (element identity
         /// is value-level; sets are unique by definition).
@@ -353,6 +357,18 @@ pub mod codes {
         /// The scaled minor-unit amount exceeds `i64` (money is exact by
         /// design, never floated).
         AMOUNT_OUT_OF_RANGE = 3003;
+        /// A number's trailing identifier is neither a currency code nor a
+        /// duration unit (`30x`, `30S`, `30sec`); near-miss units get a
+        /// machine-applicable suggestion (RFC 0017).
+        UNKNOWN_UNIT = 3004;
+        /// A duration magnitude with a fractional part (`30.5s`) —
+        /// durations are integers; the fix respells the value in a finer
+        /// unit (`30500ms`) when one exists (RFC 0017).
+        FRACTIONAL_DURATION = 3005;
+        /// A duration outside the value domain: negative, or a total
+        /// beyond `std::time::Duration::MAX` (durations convert
+        /// infallibly by construction — RFC 0017).
+        DURATION_OUT_OF_RANGE = 3006;
 
         /// A directive name is not in the covering package's vocabulary.
         UNKNOWN_DIRECTIVE = 5000;

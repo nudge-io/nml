@@ -2234,26 +2234,30 @@ impl SchemaValidator {
         diags: &mut Vec<Diagnostic>,
     ) {
         if value_matches_primitive(value, prim) {
-            // Right kind — for durations, also the right *format* (NML2029):
-            // the spec grammar is an integer plus one unit suffix, checked by
-            // the same `parse_duration` consumers use, so "validates" and
-            // "parses at runtime" cannot drift. Template strings resolve
-            // later and are skipped, like every deferred reference.
-            if *prim == PrimitiveType::Duration {
-                if let Value::String(text) = value {
-                    if nml_core::types::parse_duration(text).is_none() {
-                        diags.push(
-                            Diagnostic::error(format!(
-                                "invalid duration \"{text}\" {context} '{field_name}': \
-                                 expected an integer with unit h, m, s, or ms (e.g. \"30s\")"
-                            ))
-                            .with_code(codes::INVALID_DURATION)
-                            .with_span(span),
-                        );
-                    }
+            return;
+        }
+        if *prim == PrimitiveType::Duration {
+            if let Value::String(text) = value {
+                // RFC 0017 §4: a quoted duration is the pre-literal
+                // spelling — a migration (NML0001, the replaced-syntax
+                // engine), not a type mismatch. Machine-applicable: the
+                // replacement spans the WHOLE quoted string (quotes
+                // removed), yielding the canonical literal, and `nml fix`
+                // applies it in bulk. A string that is not duration text
+                // falls through to the ordinary mismatch below.
+                if let Ok(d) = nml_core::duration::Duration::parse_text(text) {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "duration field '{field_name}': a quoted duration was \
+                             replaced by the duration literal (drop the quotes)"
+                        ))
+                        .with_code(codes::REPLACED_SYNTAX)
+                        .with_span(span)
+                        .with_suggestion(d.to_string(), span),
+                    );
+                    return;
                 }
             }
-            return;
         }
         if *prim == PrimitiveType::Role {
             if let Value::String(s) = value {
@@ -2626,8 +2630,11 @@ fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
         PrimitiveType::Number => matches!(value, Value::Number(_)),
         PrimitiveType::Bool => matches!(value, Value::Bool(_)),
         PrimitiveType::Money => matches!(value, Value::Money(_)),
+        // Template strings resolve later and are skipped, like every
+        // deferred reference — the consumer's `de` coercion types the
+        // resolved text (RFC 0017 §3.1).
         PrimitiveType::Duration => {
-            matches!(value, Value::String(_) | Value::TemplateString(_))
+            matches!(value, Value::Duration(_) | Value::TemplateString(_))
         }
         PrimitiveType::Path => matches!(value, Value::String(_) | Value::TemplateString(_)),
         PrimitiveType::Secret => false,
@@ -2746,6 +2753,13 @@ fn duplicate_clarifier(earlier: &Value, current: &Value) -> String {
         (Value::Number(a), Value::Number(b)) if a.to_string() != b.to_string() => {
             format!(" (the same number as '{a}' above, written differently)")
         }
+        // Same case as Number: duration identity is semantic (`30s` and
+        // `30000ms` are one value in two spellings — RFC 0017), and
+        // storage is faithful, so equal values really do display
+        // differently and the duplicate needs its why.
+        (Value::Duration(a), Value::Duration(b)) if a.to_string() != b.to_string() => {
+            format!(" (the same duration as '{a}' above, written differently)")
+        }
         // No money arm, deliberately: money canonicalizes at parse
         // (`19.9 USD` and `19.90 USD` both store 1990 minor units and
         // display `19.90 USD`), so two *equal* amounts can never render
@@ -2778,6 +2792,7 @@ fn value_label(value: &Value) -> String {
         }
         Value::Number(n) => format!(" '{n}'"),
         Value::Money(m) => format!(" '{}'", m.format_display()),
+        Value::Duration(d) => format!(" '{d}'"),
         Value::Bool(b) => format!(" '{b}'"),
         _ => String::new(),
     }
@@ -2789,6 +2804,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::TemplateString(_) => "string",
         Value::Number(_) => "number",
         Value::Money(_) => "money",
+        Value::Duration(_) => "duration",
         Value::Bool(_) => "bool",
         Value::Secret(_) => "secret",
         Value::Role(_) => "role reference",
@@ -5792,9 +5808,11 @@ workflow W:
 
     #[test]
     fn valid_typed_defaults_pass() {
-        // duration accepts a string literal; an `$ENV` secret default is lenient;
-        // a numeric default matches a number field — all reuse the value check.
-        let src = "model cfg:\n    sessionDuration duration = \"24h\"\n    apiKey secret = $ENV.KEY\n    retries number = 3\n";
+        // duration takes a duration literal (RFC 0017 — defaults run the
+        // same value decoder instances do); an `$ENV` secret default is
+        // lenient; a numeric default matches a number field — all reuse
+        // the value check.
+        let src = "model cfg:\n    sessionDuration duration = 24h\n    apiKey secret = $ENV.KEY\n    retries number = 3\n";
         let file = nml_core::cst::parse_to_ast(src).unwrap();
         let schema = nml_core::cst::extract_schema(src).0;
         let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
@@ -6159,8 +6177,11 @@ mod closed_vocabulary_tests {
 
 #[cfg(test)]
 mod duration_tests {
-    //! NML2029: duration values must match the spec grammar — the same
-    //! `nml_core::types::parse_duration` consumers use.
+    //! Duration typing (RFC 0017): a duration-typed field holds a duration
+    //! LITERAL; a quoted duration is the pre-literal spelling and gets the
+    //! NML0001 migration fix; everything else is the ordinary NML2008
+    //! mismatch. (NML2029, the old format check, is retired — format
+    //! defects now surface at decode as NML3004/NML3005/NML3006.)
 
     use super::*;
 
@@ -6171,24 +6192,58 @@ mod duration_tests {
         v.validate(&nml_core::cst::parse_to_ast(&src).unwrap())
     }
 
+    fn code_of(d: &Diagnostic) -> Option<String> {
+        d.code.map(|c| c.to_string())
+    }
+
     #[test]
-    fn spec_grammar_accepted_and_violations_coded() {
-        for ok in ["\"72h\"", "\"30m\"", "\"5s\"", "\"500ms\""] {
-            assert!(diags_for(ok).is_empty(), "{ok} is spec-valid");
+    fn literals_type_check_and_strings_classify() {
+        for ok in ["72h", "30m", "5s", "500ms", "0s"] {
+            assert!(diags_for(ok).is_empty(), "{ok} is a typed duration");
         }
-        for bad in ["\"30x\"", "\"1.5h\"", "\"-3s\"", "\"s\"", "\"12\""] {
+        // The migration: a QUOTED duration is NML0001 with the literal as
+        // the machine-applicable fix (spanning the whole quoted string).
+        let diags = diags_for("\"30s\"");
+        let hit = diags
+            .iter()
+            .find(|d| code_of(d).as_deref() == Some("NML0001"))
+            .expect("quoted duration is the replaced-syntax migration");
+        assert_eq!(
+            hit.suggestions.first().map(|s| s.replacement.as_str()),
+            Some("30s")
+        );
+        // A string that is NOT duration text — and every other wrong kind —
+        // is the ordinary type mismatch, never a special case.
+        for bad in [
+            "\"30x\"", "\"1.5h\"", "\"-3s\"", "\"s\"", "\"12\"", "30", "true",
+        ] {
+            let diags = diags_for(bad);
             assert!(
-                diags_for(bad)
+                diags
                     .iter()
-                    .any(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2029")),
-                "{bad} must be NML2029"
+                    .any(|d| code_of(d).as_deref() == Some("NML2008")),
+                "{bad} must be NML2008: {diags:?}"
             );
         }
-        // Wrong KIND stays NML2008 — format checking never absorbs it.
+    }
+
+    #[test]
+    fn set_duplicates_are_semantic_with_clarifier() {
+        // `30s` and `30000ms` are ONE value in two spellings (RFC 0017 §2)
+        // — a set holding both is a duplicate, and the diagnostic says why
+        // the two visibly different literals collide (the Number pattern).
+        let schema = nml_core::cst::extract_schema("model job:\n    retries set<duration>\n").0;
+        let v = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
+        let src = "job Nightly:\n    retries = [30s, 30000ms]\n";
+        let diags = v.validate(&nml_core::cst::parse_to_ast(src).unwrap());
+        let hit = diags
+            .iter()
+            .find(|d| code_of(d).as_deref() == Some("NML2030"))
+            .unwrap_or_else(|| panic!("semantic duplicate must be flagged: {diags:?}"));
         assert!(
-            diags_for("30")
-                .iter()
-                .any(|d| d.code.map(|c| c.to_string()).as_deref() == Some("NML2008")),
+            hit.message.contains("the same duration as '30s' above"),
+            "clarifier names the earlier spelling: {}",
+            hit.message
         );
     }
 }

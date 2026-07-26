@@ -229,7 +229,7 @@ let config: ServiceConfig =
 
 ```nml check
 []endpoint monitoredEndpoints:
-    .timeout = "10s"
+    .timeout = 10s
 
     - Api:
         url = "https://api.example.dev"
@@ -405,7 +405,7 @@ database Primary:
 
 cache Redis:
     host = "localhost"
-    ttl = "30m"
+    ttl = 30m
 
 pipeline DataSync:
     source = "Primary"

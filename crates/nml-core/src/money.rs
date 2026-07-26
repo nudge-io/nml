@@ -256,6 +256,17 @@ const CURRENCY_BANDS: &[(&[&str], u8)] = &[
     (EXPONENT_4, 4),
 ];
 
+/// The currency-code *shape* — exactly three uppercase ASCII letters —
+/// recognized structurally, before ISO 4217 validity is judged
+/// ([`parse_money`]'s job). The one classification predicate for a
+/// number's trailing identifier on the money side: disjoint by
+/// construction from duration units (one or two lowercase letters), so
+/// the value decoder needs no lookahead to route between them (RFC 0017
+/// §1).
+pub(crate) fn is_currency_code(text: &str) -> bool {
+    text.len() == 3 && text.bytes().all(|b| b.is_ascii_uppercase())
+}
+
 /// Every known ISO 4217 code — the unknown-currency suggestion candidates.
 pub(crate) fn currency_codes() -> impl Iterator<Item = &'static str> {
     CURRENCY_BANDS

@@ -1,2 +1,2 @@
 monitored Probe:
-    timeout = "9s"
+    timeout = 9s

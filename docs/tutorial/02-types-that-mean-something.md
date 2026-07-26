@@ -72,18 +72,21 @@ NML3001` prints the full error-index entry for the code, offline.
 
 ## Durations
 
-Durations are written as quoted values with a unit suffix — `h`, `m`, `s`,
-or `ms`:
+Durations are literals — an integer with a unit suffix attached: `h`,
+`m`, `s`, or `ms`:
 
 ```nml check
 service Api:
-    requestTimeout = "30s"
-    cacheTtl = "15m"
+    requestTimeout = 30s
+    cacheTtl = 15m
 ```
 
-Right now these parse as ordinary values; when a schema types the field as
-`duration` (next chapter), a bare number or boolean in the field becomes a
-type error instead of a surprise at 3 a.m.
+They are typed quantities, not strings: `30s` equals `30000ms` wherever
+values compare, the magnitude is a whole number (`30.5s` is an error with
+a fix — `30500ms`), and a mistyped unit like `30x` is rejected with a
+suggestion. When a schema types the field as `duration` (next chapter), a
+bare number, a boolean, or a quoted string there becomes a check-time
+error instead of a surprise at 3 a.m.
 
 ## Secrets are references, not values
 

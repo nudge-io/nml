@@ -239,6 +239,18 @@ impl<'a> ValueQuery<'a> {
         }
     }
 
+    /// Extract as an exact [`crate::types::Duration`] (RFC 0017; `Copy` —
+    /// convert with [`crate::types::Duration::as_std`] for a
+    /// `std::time::Duration`). Serde-free parity with the other typed
+    /// reads: a duration-typed literal never needs re-parsing at the
+    /// call site.
+    pub fn as_duration(&self) -> Option<crate::types::Duration> {
+        match self {
+            ValueQuery::Found(v) => v.as_duration(),
+            _ => None,
+        }
+    }
+
     /// Extract as a string array.
     pub fn as_string_array(&self) -> Option<Vec<&'a str>> {
         match self {

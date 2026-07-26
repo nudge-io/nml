@@ -426,13 +426,24 @@ pub enum NmlError {
         kind: crate::money::MoneyErrorKind,
         span: Span,
     },
+
+    /// An invalid duration literal (RFC 0017) — money's exact analogue:
+    /// message, code, and any machine-applicable fix (nearest unit,
+    /// finer-unit respelling) all derive from the kind.
+    #[error("{}", kind.message())]
+    Duration {
+        kind: crate::duration::DurationErrorKind,
+        span: Span,
+    },
 }
 
 impl NmlError {
     /// Returns the source span where this error occurred.
     pub fn span(&self) -> Span {
         match self {
-            NmlError::Syntax { span, .. } | NmlError::Money { span, .. } => *span,
+            NmlError::Syntax { span, .. }
+            | NmlError::Money { span, .. }
+            | NmlError::Duration { span, .. } => *span,
         }
     }
 
@@ -442,6 +453,7 @@ impl NmlError {
         match self {
             NmlError::Syntax { kind, .. } => kind.message(),
             NmlError::Money { kind, .. } => kind.message(),
+            NmlError::Duration { kind, .. } => kind.message(),
         }
     }
 
@@ -464,6 +476,32 @@ impl NmlError {
                             None => diag,
                         }
                     }
+                    _ => diag,
+                }
+            }
+            NmlError::Duration { kind, span } => {
+                use crate::duration::{DurationErrorKind, DurationUnit};
+                let diag = diag.with_code(kind.code());
+                match kind {
+                    // Nearest-unit did-you-mean over the suffix's own span
+                    // (`30S` → `30s`); case-insensitive exact matches win in
+                    // the shared engine, so casing typos always get the fix.
+                    DurationErrorKind::UnknownUnit { unit, unit_span } => {
+                        match crate::suggest::suggest(
+                            unit,
+                            DurationUnit::ALL.iter().map(|u| u.suffix()),
+                        ) {
+                            Some(s) => diag.with_suggestion(s, *unit_span),
+                            None => diag,
+                        }
+                    }
+                    // The finer-unit respelling replaces the whole literal
+                    // (`30.5s` → `30500ms`) — value-preserving by
+                    // construction, so machine-applicable.
+                    DurationErrorKind::FractionalMagnitude {
+                        equivalent: Some(equivalent),
+                        ..
+                    } => diag.with_suggestion(equivalent, *span),
                     _ => diag,
                 }
             }

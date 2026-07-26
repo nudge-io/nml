@@ -37,6 +37,7 @@ fn render(value: &Value) -> String {
     match value {
         Value::String(s) => format!("{s:?}"),
         Value::Number(n) => format!("{n}"),
+        Value::Duration(d) => format!("{d}"),
         Value::Bool(b) => format!("{b}"),
         other => format!("{other:?}"),
     }

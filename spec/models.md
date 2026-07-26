@@ -27,7 +27,7 @@ model modelName:
 model webProfile:
     siteName string                // required
     debug logLevel?                // optional
-    sessionDuration duration = "24h"  // has default
+    sessionDuration duration = 24h  // has default
 ```
 
 ### Inline Nested Objects
@@ -36,7 +36,7 @@ For one-off nested structures, define them inline within the model:
 
 ```
 model accessControl:
-    sessionDuration duration = "24h"
+    sessionDuration duration = 24h
 
     urlRoutes:
         homeRoute path = "/"

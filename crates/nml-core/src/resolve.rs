@@ -787,7 +787,7 @@ mod tests {
 workflow W:
     .defaults:
         retries = 3
-        timeout = "30s"
+        timeout = 30s
     - StepA:
         provider = "fast"
     - StepB:
@@ -834,7 +834,7 @@ workflow W:
                     )
                 }) {
                     if let BodyEntryKind::NestedBlock(nb) = &entry.kind {
-                        // Should have retries=5 (from item) and timeout="30s" (from shared)
+                        // Should have retries=5 (from item) and timeout=30s (from shared)
                         assert_eq!(nb.body.entries.len(), 2);
                     }
                 }
@@ -928,7 +928,7 @@ workflow W:
 workflow W:
     .defaults:
         retries = 3
-        timeout = "30s"
+        timeout = 30s
     - StepA:
         retries = 10
 "#;
@@ -976,7 +976,12 @@ workflow W:
                 _ => None,
             })
             .expect("injected defaults block must carry timeout");
-        assert_eq!(*timeout, Value::String("30s".into()));
+        assert_eq!(
+            *timeout,
+            Value::Duration(
+                crate::types::Duration::new(30, crate::types::DurationUnit::Seconds).unwrap()
+            )
+        );
     }
 
     #[test]
@@ -1045,7 +1050,7 @@ workflow W:
     .config:
         retries = 3
     .limits:
-        timeout = "30s"
+        timeout = 30s
     - StepA:
         provider = "fast"
 "#;

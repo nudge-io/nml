@@ -135,7 +135,7 @@ list item fills that field:
 | `number` | Unquoted decimal | `8000`, `3.14`, `-1` |
 | `money` | Amount + currency code | `19.99 USD`, `1299 JPY` |
 | `bool` | Unquoted | `true`, `false` |
-| `duration` | Quoted with unit | `"72h"`, `"30s"`, `"500ms"` |
+| `duration` | Unquoted with unit | `72h`, `30s`, `500ms` |
 | `path` | Quoted URL path | `"/"`, `"/user/{username}"`, `"/assets/{*}"` |
 | `secret` | Environment reference | `$ENV.API_KEY` |
 
@@ -161,6 +161,11 @@ allows at most 2 decimal places.
 | `m` | minutes |
 | `s` | seconds |
 | `ms` | milliseconds |
+
+Durations are typed literals: an unsigned integer attached to one unit
+(`30s`, never `"30s"`, `1.5h`, or `1h30m`). The authored unit is kept —
+`72h` formats as `72h` — while comparison is by value, so `30s` and
+`30000ms` are the same duration to sets and reload diffs.
 
 #### Path Variables
 
@@ -284,7 +289,7 @@ service NudgeService:
 model webProfile:
     siteName string               // required
     description string?           // optional
-    sessionDuration duration = "24h"  // has default
+    sessionDuration duration = 24h  // has default
 ```
 
 ### Traits
@@ -421,7 +426,7 @@ For one-off structures that don't need their own model:
 
 ```
 model accessControl:
-    sessionDuration duration = "24h"
+    sessionDuration duration = 24h
 
     urlRoutes:
         homeRoute path = "/"

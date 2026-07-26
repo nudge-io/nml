@@ -57,7 +57,8 @@ service MyApp:
   errors and reports all of them (`parse_to_ast_all`), preserves comments,
   and supports byte-exact structural editing (`cst::edit`).
 - **Typed values** — `string`, `number` (exact `i64` semantics), `money`
-  (ISO 4217, integer minor units), `bool`, `duration`, `path`, `secret`
+  (ISO 4217, integer minor units), `bool`, `duration` (`30s`, semantic
+  equality across units, lands in `std::time::Duration`), `path`, `secret`
   (`$ENV.X` with fallback chains), `object`, `role`.
 - **Query API** — fluent, serde-free reads (`Document::block(..).property(..)`).
 - **Value resolution** — pluggable secret lookup (`ValueResolver`), fallback

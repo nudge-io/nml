@@ -237,6 +237,9 @@ fn render_key(v: &Value) -> String {
             format!("{s:?}")
         }
         Value::Number(n) => format!("{n}"),
+        // Bare like numbers/bools — the canonical `30s`, never the Debug
+        // form the catch-all below would leak into operator output.
+        Value::Duration(d) => format!("{d}"),
         Value::Bool(b) => format!("{b}"),
         // A secret can never be an element identity in any real schema, but the
         // diff layer is secret-safe BY CONSTRUCTION: never render one, even the
@@ -2083,7 +2086,7 @@ mod tests {
     use super::*;
     use crate::ast::DeclarationKind;
 
-    const SCHEMA: &str = "model limits:\n    cap number = 5\n\nmodel server:\n    port number = 8080\n    name string?\n    token secret?\n    cidrs set<string>? #live\n    order []string?\n    limits limits?\n    providers []provider?\n\nmodel provider:\n    url string?\n    clientSecret secret?\n\noneof email by kind:\n    \"log\" -> emailLog\n    \"post\" -> emailPost\n\nmodel emailLog:\n    path string?\n\nmodel emailPost:\n    apiKey secret?\n";
+    const SCHEMA: &str = "model limits:\n    cap number = 5\n\nmodel server:\n    port number = 8080\n    name string?\n    token secret?\n    timeout duration?\n    cidrs set<string>? #live\n    order []string?\n    limits limits?\n    providers []provider?\n\nmodel provider:\n    url string?\n    clientSecret secret?\n\noneof email by kind:\n    \"log\" -> emailLog\n    \"post\" -> emailPost\n\nmodel emailLog:\n    path string?\n\nmodel emailPost:\n    apiKey secret?\n";
 
     fn index() -> SchemaIndex {
         let (schema, errs) = crate::cst::extract_schema(SCHEMA);
@@ -3198,6 +3201,27 @@ mod tests {
         // Explicitly writing the default is not a change.
         let d = diff_single("server s:\n", "server s:\n    port = 8080\n");
         assert!(d.is_empty(), "explicit default == default: {d:?}");
+    }
+
+    /// RFC 0017 motivation §1, the reload win itself: respelling a duration
+    /// in another unit is NO change (typed values compare semantically, so
+    /// nudge's reload classifier never forces a restart over `30s` →
+    /// `30000ms`), while a real change of the same field reports normally.
+    #[test]
+    fn duration_unit_respelling_is_no_change() {
+        let d = diff_single(
+            "server s:\n    timeout = 30s\n",
+            "server s:\n    timeout = 30000ms\n",
+        );
+        assert!(d.is_empty(), "unit respelling must be invisible: {d:?}");
+
+        let d = diff_single(
+            "server s:\n    timeout = 30s\n",
+            "server s:\n    timeout = 31s\n",
+        );
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(p(&d[0]), "timeout");
+        assert!(matches!(&d[0].kind, ChangeKind::Modified { .. }));
     }
 
     /// Multi-file overlay: a later file overrides an earlier one, and a value

@@ -70,7 +70,7 @@ model service:
     port number
     publicUrl string
     logLevel logLevel = "info"
-    requestTimeout duration = "30s"
+    requestTimeout duration = 30s
     retries number = 3
     banner string?
     welcome string?
