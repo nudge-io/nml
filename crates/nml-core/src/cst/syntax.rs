@@ -99,6 +99,11 @@ pub enum SyntaxKind {
     /// restricts where arms are valid (e.g. RFC 0018 `denial:`).
     Arm,
     TypeExpr,
+    /// RFC 0018: the parenthesized facet list after a type name
+    /// (`number(min = 1, max = 65535)`).
+    FacetList,
+    /// One `key = number` facet inside a [`SyntaxKind::FacetList`].
+    Facet,
     // values
     Value,
     ArrayValue,
@@ -167,6 +172,8 @@ impl SyntaxKind {
             Directive => "a directive",
             Arm => "a routing arm",
             TypeExpr => "a type",
+            FacetList => "a facet list",
+            Facet => "a facet",
             Value => "a value",
             ArrayValue => "an array value",
             Fallback => "a fallback chain",

@@ -2558,10 +2558,13 @@ workflow W:
             resolved: std::time::Duration,
             label: String,
             opt: Option<std::time::Duration>,
+            retries: Vec<std::time::Duration>,
         }
         // `resolved` is a plain string — exactly what `resolve.rs` leaves
-        // behind for `$ENV.TTL` — and must coerce identically.
-        let source = "service App:\n    timeout = 90m\n    resolved = \"1500ms\"\n    label = 250ms\n    opt = 2h\n";
+        // behind for `$ENV.TTL` — and must coerce identically. `retries`
+        // exercises the seq × handshake composition: every array element
+        // routes through the same `deserialize_struct` path.
+        let source = "service App:\n    timeout = 90m\n    resolved = \"1500ms\"\n    label = 250ms\n    opt = 2h\n    retries = [1s, 1500ms]\n";
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
@@ -2570,6 +2573,13 @@ workflow W:
         assert_eq!(c.resolved, std::time::Duration::from_millis(1500));
         assert_eq!(c.label, "250ms");
         assert_eq!(c.opt, Some(std::time::Duration::from_secs(7200)));
+        assert_eq!(
+            c.retries,
+            vec![
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_millis(1500)
+            ]
+        );
     }
 
     /// The coercion inherits the family's never-echo rule: a failed

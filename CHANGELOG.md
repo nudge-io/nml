@@ -127,6 +127,22 @@
 
 ### Added
 
+- **Numeric schema facets (RFC 0018)** — `number` fields constrain
+  their value range first-class in the type:
+  `port number(min = 1, max = 65535)`, with `exclusiveMin`/
+  `exclusiveMax` and `multipleOf`. Enforcement is exact through the
+  RFC 0016 decimal core — boundary comparisons cannot lie and
+  `multipleOf` is exact decimal divisibility (`0.3` IS a multiple of
+  `0.1`; float-based validators famously disagree), via the new
+  `Number::is_multiple_of` predicate (modular arithmetic, no bignum,
+  no rounding). Facets apply element-wise to `[]number`/`set<number>`,
+  hold field defaults to the same rule, render canonically in fmt and
+  hover, and come with two diagnostics: `NML2055` (value violates a
+  facet) and `NML2056` (invalid facet declaration). Schema packages
+  need no format change — packages carry schema source, and a
+  pre-facet parser rejects the new syntax loudly rather than silently
+  under-validating.
+
 - **`nml fix` — the batch fixer** (RFC 0017 §4.1): applies
   machine-applicable suggestions in bulk (`nml fix [--schema <dir>]
   [--dry-run] <path>...`, directories walked for `.nml`). A suggestion is

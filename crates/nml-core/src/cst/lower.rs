@@ -212,7 +212,7 @@ impl Lower {
             )
         } else if let Some(te) = m.type_expr() {
             ModifierValue::TypeAnnotation {
-                field_type: type_expr(&te),
+                field_type: type_expr(&te, &mut self.errors),
                 optional: m.optional(),
                 directives: m
                     .directives()
@@ -323,8 +323,8 @@ impl Lower {
             name: ident_of(f.name()),
             field_type: f
                 .type_expr()
-                .map(|t| type_expr(&t))
-                .unwrap_or_else(|| FieldTypeExpr::Named(empty_ident())),
+                .map(|t| type_expr(&t, &mut self.errors))
+                .unwrap_or_else(|| bare_named(empty_ident())),
             optional: f.optional(),
             shorthand: f.shorthand(),
             default_value: f.default().map(|v| self.decode(&v)),
@@ -386,17 +386,80 @@ impl Lower {
 
 // ── pure structural converters / defaults (no decode) ──────────────────────
 
-fn type_expr(te: &ast::TypeExpr) -> FieldTypeExpr {
+/// A facet-free `Named` — the recovery placeholder and the common case.
+fn bare_named(id: Identifier) -> FieldTypeExpr {
+    FieldTypeExpr::Named {
+        name: id,
+        facets: Vec::new(),
+    }
+}
+
+/// RFC 0018 facet lowering. Facet values are number literals and route
+/// through [`super::value::parse_number`] — the one place a
+/// `NumberError` gains a span and an NML code — so a domain-rejected
+/// facet (`min = 1e9999`) reports the SAME NML0013/NML0014 surface as
+/// any config literal, then recovers to `Number::ZERO` (the error, not
+/// the placeholder, is the contract).
+fn facets_of(te: &ast::TypeExpr, errors: &mut Vec<NmlError>) -> Vec<FacetExpr> {
+    let Some(list) = te.facet_list() else {
+        return Vec::new();
+    };
+    list.facets()
+        .map(|f| {
+            let span = super::syntax::node_span(f.syntax());
+            let key = f.name().map(ident).unwrap_or_else(|| Identifier {
+                name: String::new(),
+                span,
+            });
+            let (text, vspan) = match (f.dash(), f.number()) {
+                (Some(d), Some(n)) => (
+                    format!("-{}", n.text()),
+                    Span::new(
+                        usize::from(d.text_range().start()),
+                        usize::from(n.text_range().end()),
+                    ),
+                ),
+                (None, Some(n)) => (
+                    n.text().to_string(),
+                    Span::new(
+                        usize::from(n.text_range().start()),
+                        usize::from(n.text_range().end()),
+                    ),
+                ),
+                // Parser already errored (expected a number literal);
+                // recover structured.
+                _ => (String::from("0"), span),
+            };
+            let value = match super::value::parse_number(&text, vspan) {
+                Ok(n) => n,
+                Err(e) => {
+                    errors.push(e);
+                    crate::types::Number::ZERO
+                }
+            };
+            FacetExpr {
+                key,
+                value: SpannedValue::new(crate::types::Value::Number(value), vspan),
+                span,
+            }
+        })
+        .collect()
+}
+
+fn type_expr(te: &ast::TypeExpr, errors: &mut Vec<NmlError>) -> FieldTypeExpr {
     match te.kind() {
-        ast::TypeExprKind::Named => FieldTypeExpr::Named(ident_of(te.name())),
+        ast::TypeExprKind::Named => FieldTypeExpr::Named {
+            name: ident_of(te.name()),
+            facets: facets_of(te, errors),
+        },
         ast::TypeExprKind::Array => FieldTypeExpr::Array(Box::new(
             te.children()
                 .next()
-                .map(|t| type_expr(&t))
-                .unwrap_or_else(|| FieldTypeExpr::Named(empty_ident())),
+                .map(|t| type_expr(&t, errors))
+                .unwrap_or_else(|| bare_named(empty_ident())),
         )),
         ast::TypeExprKind::Union => {
-            FieldTypeExpr::Union(te.children().map(|t| type_expr(&t)).collect())
+            FieldTypeExpr::Union(te.children().map(|t| type_expr(&t, errors)).collect())
         }
         ast::TypeExprKind::Arms => {
             // `(K -> V)`: exactly two child type exprs, key then target
@@ -406,8 +469,8 @@ fn type_expr(te: &ast::TypeExpr) -> FieldTypeExpr {
             let mut next = || {
                 children
                     .next()
-                    .map(|t| type_expr(&t))
-                    .unwrap_or_else(|| FieldTypeExpr::Named(empty_ident()))
+                    .map(|t| type_expr(&t, errors))
+                    .unwrap_or_else(|| bare_named(empty_ident()))
             };
             FieldTypeExpr::Arms {
                 key: Box::new(next()),
@@ -418,9 +481,10 @@ fn type_expr(te: &ast::TypeExpr) -> FieldTypeExpr {
             // `set<T>` (RFC 0032): several children = a bare union's variants
             // (canonical `set<a | b>`); one = the element type. Recovery may
             // leave none; the empty-ident fallback matches `Array` above.
-            let mut children: Vec<FieldTypeExpr> = te.children().map(|t| type_expr(&t)).collect();
+            let mut children: Vec<FieldTypeExpr> =
+                te.children().map(|t| type_expr(&t, errors)).collect();
             let element = match children.len() {
-                0 => FieldTypeExpr::Named(empty_ident()),
+                0 => bare_named(empty_ident()),
                 1 => children.pop().expect("len checked"),
                 _ => FieldTypeExpr::Union(children),
             };
@@ -461,6 +525,63 @@ fn empty_value() -> SpannedValue {
 
 #[cfg(test)]
 mod tests {
+    /// RFC 0018: facet lists parse, lower with exact values, render
+    /// canonically, and survive on any Named type (number-only is the
+    /// schema-load rule, so the parse keeps the evidence structured).
+    #[test]
+    fn facet_lists_lower_and_render() {
+        let file = cst_ast(
+            "model server:\n    port number(min = 1, max = 65535)\n    weight number(min = -1.5, exclusiveMax = 1)\n    step set<number(multipleOf = 0.01)>\n    ref denial(min = 2)\n",
+        );
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("expected a block decl");
+        };
+        let fields: Vec<_> = block
+            .body
+            .entries
+            .iter()
+            .map(|e| match &e.kind {
+                BodyEntryKind::FieldDefinition(f) => f,
+                other => panic!("expected a field def, got {other:?}"),
+            })
+            .collect();
+        let FieldTypeExpr::Named { name, facets } = &fields[0].field_type else {
+            panic!("expected named, got {}", fields[0].field_type);
+        };
+        assert_eq!(name.name, "number");
+        assert_eq!(facets.len(), 2);
+        assert_eq!(facets[0].key.name, "min");
+        assert_eq!(
+            fields[0].field_type.to_string(),
+            "number(min = 1, max = 65535)"
+        );
+        assert_eq!(
+            fields[1].field_type.to_string(),
+            "number(min = -1.5, exclusiveMax = 1)"
+        );
+        assert_eq!(
+            fields[2].field_type.to_string(),
+            "set<number(multipleOf = 0.01)>"
+        );
+        // Model refs keep the facet evidence for the NML2031 pass.
+        assert_eq!(fields[3].field_type.to_string(), "denial(min = 2)");
+    }
+
+    /// A domain-rejected facet literal reports the SAME NML0014 surface
+    /// as a config literal (one numeric error vocabulary) and recovers
+    /// to the zero placeholder.
+    #[test]
+    fn facet_literal_out_of_domain_is_nml0014() {
+        let src = format!("model m:\n    x number(min = {})\n", "9".repeat(35));
+        let (_file, errors) = crate::cst::parse_to_ast_all(&src);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("significant digits")),
+            "{errors:?}"
+        );
+    }
+
     use super::*;
     use crate::cst::parse;
 
@@ -605,12 +726,14 @@ mod tests {
         let FieldTypeExpr::Union(variants) = &fields[0].field_type else {
             panic!("expected a union, got {}", fields[0].field_type);
         };
-        assert!(matches!(&variants[0], FieldTypeExpr::Named(n) if n.name == "string"));
+        assert!(matches!(&variants[0], FieldTypeExpr::Named { name: n, .. } if n.name == "string"));
         let FieldTypeExpr::Arms { key, target } = &variants[1] else {
             panic!("expected an arm set, got {}", variants[1]);
         };
-        assert!(matches!(key.as_ref(), FieldTypeExpr::Named(n) if n.name == "role"));
-        assert!(matches!(target.as_ref(), FieldTypeExpr::Named(n) if n.name == "denial"));
+        assert!(matches!(key.as_ref(), FieldTypeExpr::Named { name: n, .. } if n.name == "role"));
+        assert!(
+            matches!(target.as_ref(), FieldTypeExpr::Named { name: n, .. } if n.name == "denial")
+        );
         assert_eq!(
             fields[0].field_type.to_string(),
             "(string | (role -> denial))"

@@ -709,9 +709,10 @@ fn diff_unmodeled_remainder(
     if !o_items.is_empty() || !n_items.is_empty() {
         let synth = FieldDef {
             name: String::new(),
-            field_type: FieldType::List(Box::new(FieldType::Primitive(
-                crate::types::PrimitiveType::String,
-            ))),
+            field_type: FieldType::List(Box::new(FieldType::Primitive {
+                ty: crate::types::PrimitiveType::String,
+                facets: crate::model::NumberFacets::NONE,
+            })),
             optional: true,
             shorthand: false,
             default_value: None,
@@ -812,7 +813,10 @@ fn diff_field(
     // and surface any difference as the typed [`ChangeKind::ObjectChanged`].
     if matches!(
         field.field_type,
-        FieldType::Primitive(PrimitiveType::Object)
+        FieldType::Primitive {
+            ty: PrimitiveType::Object,
+            ..
+        }
     ) {
         diff_declared_object(&old_eff, &new_eff, path, out);
         return;
@@ -2064,7 +2068,10 @@ fn is_set(ft: &FieldType) -> bool {
 
 fn is_secret(ft: &FieldType) -> bool {
     match ft {
-        FieldType::Primitive(PrimitiveType::Secret) => true,
+        FieldType::Primitive {
+            ty: PrimitiveType::Secret,
+            ..
+        } => true,
         FieldType::Modifier(i) | FieldType::List(i) | FieldType::Set(i) => is_secret(i),
         _ => false,
     }

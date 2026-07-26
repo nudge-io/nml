@@ -2284,7 +2284,7 @@ service App is Base:
         let ft = &schema.models[0].fields[0].field_type;
         assert!(
             matches!(ft, FieldType::Set(inner)
-                if matches!(**inner, FieldType::Primitive(PrimitiveType::String))),
+                if matches!(**inner, FieldType::Primitive { ty: PrimitiveType::String, .. })),
             "expected set<string>, got {ft}"
         );
         assert_eq!(ft.to_string(), "set<string>", "canonical Display");

@@ -468,6 +468,29 @@ mod tests {
         );
     }
 
+    /// RFC 0017: the serde-free typed read for durations — the literal
+    /// arrives as a typed value, `as_std()` away from `std::time`, and a
+    /// string is never silently reinterpreted as one.
+    #[test]
+    fn query_duration_accessor() {
+        let file = parse_doc("service App:\n    timeout = 90m\n    label = \"90m\"\n");
+        let doc = Document::new(&file);
+        let d = doc
+            .block("service", "App")
+            .property("timeout")
+            .as_duration()
+            .expect("typed duration");
+        assert_eq!(d.to_string(), "90m");
+        assert_eq!(d.as_std(), std::time::Duration::from_secs(90 * 60));
+        assert!(
+            doc.block("service", "App")
+                .property("label")
+                .as_duration()
+                .is_none(),
+            "a string is a string — coercion is de's job"
+        );
+    }
+
     #[test]
     fn query_string_array_on_non_array() {
         let file = parse_doc("service App:\n    port = 8080\n");

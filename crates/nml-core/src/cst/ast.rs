@@ -601,6 +601,34 @@ impl Directive {
 ast_node!(/// `Name` | `[]TypeExpr` | `(TypeExpr (| TypeExpr)*)` | `(TypeExpr -> TypeExpr)`
     TypeExpr => TypeExpr);
 
+ast_node!(/// RFC 0018: `(min = 1, max = 65535)` after a type name.
+    FacetList => FacetList);
+
+ast_node!(/// One `key = number` facet.
+    Facet => Facet);
+
+impl FacetList {
+    pub fn facets(&self) -> impl Iterator<Item = Facet> + '_ {
+        children(&self.0)
+    }
+}
+
+impl Facet {
+    /// The facet key (`min`, `max`, `exclusiveMin`, `exclusiveMax`,
+    /// `multipleOf`).
+    pub fn name(&self) -> Option<SyntaxToken> {
+        token(&self.0, SyntaxKind::Ident)
+    }
+    /// The value's sign token, when the literal is negative.
+    pub fn dash(&self) -> Option<SyntaxToken> {
+        token(&self.0, SyntaxKind::Dash)
+    }
+    /// The value's number token.
+    pub fn number(&self) -> Option<SyntaxToken> {
+        token(&self.0, SyntaxKind::Number)
+    }
+}
+
 /// The shape of a [`TypeExpr`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeExprKind {
@@ -648,6 +676,12 @@ impl TypeExpr {
     /// Nested type expressions (`[]T`'s element, or a union's variants).
     pub fn children(&self) -> impl Iterator<Item = TypeExpr> + '_ {
         children(&self.0)
+    }
+    /// The RFC 0018 facet list (`number(min = 1)`), when present.
+    /// Only the `Named` form can carry one — the parser attaches it
+    /// after a bare type name exclusively.
+    pub fn facet_list(&self) -> Option<FacetList> {
+        child(&self.0)
     }
 }
 

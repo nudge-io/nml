@@ -211,6 +211,36 @@ impl fmt::Display for NumberRangeIssue {
 
 impl std::error::Error for NumberError {}
 
+/// `(a * b) % m` without overflow: residues are < 10^34 < 2^113, so the
+/// double-and-add accumulator stays under 2^114. Deterministic, loop
+/// length fixed by bit-width — no bignum, no allocation (RFC 0018).
+const fn mulmod(mut a: u128, mut b: u128, m: u128) -> u128 {
+    let mut acc: u128 = 0;
+    a %= m;
+    while b > 0 {
+        if b & 1 == 1 {
+            acc = (acc + a) % m;
+        }
+        a = (a + a) % m;
+        b >>= 1;
+    }
+    acc
+}
+
+/// `10^e % m` by square-and-multiply over [`mulmod`] (RFC 0018).
+const fn powmod10(mut e: u32, m: u128) -> u128 {
+    let mut base = 10u128 % m;
+    let mut acc = 1u128 % m;
+    while e > 0 {
+        if e & 1 == 1 {
+            acc = mulmod(acc, base, m);
+        }
+        base = mulmod(base, base, m);
+        e >>= 1;
+    }
+    acc
+}
+
 const fn digit_count_u128(mut v: u128) -> u32 {
     let mut n = 1u32;
     while v >= 10 {
@@ -508,6 +538,53 @@ impl Number {
             s -= 1;
         }
         (c, s)
+    }
+
+    /// Exact decimal divisibility (RFC 0018): `true` iff `self / m` is
+    /// an integer — decided on the normalized pairs with modular
+    /// arithmetic, never through binary floating point (where
+    /// `0.3 / 0.1` famously is not 3). A predicate, not arithmetic: it
+    /// returns a boolean, rounds nothing, allocates nothing, and keeps
+    /// the RFC 0016 no-arithmetic-engine posture intact.
+    ///
+    /// `m == 0` is `false` (nothing is a multiple of zero; RFC 0018's
+    /// loader rejects `multipleOf = 0` before this is ever asked).
+    /// Zero is a multiple of everything nonzero. Sign is irrelevant
+    /// (`-0.2` is a multiple of `0.1`); divisibility is value-based,
+    /// so every cohort spelling answers identically.
+    pub fn is_multiple_of(&self, m: &Number) -> bool {
+        if m.coeff == 0 {
+            return false;
+        }
+        if self.coeff == 0 {
+            return true;
+        }
+        let (cv, sv) = self.normalized();
+        let (cm, sm) = m.normalized();
+        let cv = cv.unsigned_abs();
+        let cm = cm.unsigned_abs();
+        // v/m = (cv/cm) x 10^(sm - sv); integer iff the power shifts
+        // cv onto a multiple of cm.
+        let d = i64::from(sm) - i64::from(sv);
+        if d >= 0 {
+            // cm | cv * 10^d — via residues: coefficients are < 10^34
+            // (< 2^113), whose products overflow u128, so the multiply
+            // is a double-and-add mulmod; the power is square-and-
+            // multiply (d <= 12352, bounded by the scale window).
+            mulmod(cv % cm, powmod10(d as u32, cm), cm) == 0
+        } else {
+            // (cm * 10^-d) | cv. |cv| < 10^34, so a divisor at or
+            // beyond 10^34 — or one that overflows the checked
+            // multiply — already exceeds cv: false without computing.
+            let k = (-d) as u32;
+            if k >= 34 {
+                return false;
+            }
+            match cm.checked_mul(10u128.pow(k)) {
+                Some(div) => cv % div == 0,
+                None => false,
+            }
+        }
     }
 
     /// The minimal member of this value's cohort with `scale ≥ 0`:
@@ -1476,6 +1553,72 @@ mod tests {
         assert_eq!(parts(n), (p10(33), -67));
         assert_eq!(n.to_string(), pow10_str(100));
         assert_eq!(n.to_u128(), None);
+    }
+
+    /// RFC 0018 §1.3/§2: exact divisibility. The headline pin is the
+    /// f64 lie — `0.3 / 0.1` is not 3 in binary64, and every
+    /// float-based `multipleOf` validator mis-answers it; the exact
+    /// predicate cannot. Plus the full-window spread (no overflow),
+    /// cohort independence, signs, zero on both sides, and a
+    /// brute-force oracle over an exact-rational grid.
+    #[test]
+    fn is_multiple_of_exact() {
+        let n = |s: &str| Number::parse_literal(s).unwrap();
+        // The f64 lie, pinned.
+        assert!(n("0.3").is_multiple_of(&n("0.1")));
+        assert!(!n("0.25").is_multiple_of(&n("0.1")));
+        // Zero on both sides.
+        assert!(n("0").is_multiple_of(&n("0.1")));
+        assert!(n("0.00").is_multiple_of(&n("7")));
+        assert!(!n("5").is_multiple_of(&Number::ZERO));
+        assert!(!Number::ZERO.is_multiple_of(&Number::ZERO));
+        // Signs are irrelevant.
+        assert!(n("-0.2").is_multiple_of(&n("0.1")));
+        assert!(n("0.2").is_multiple_of(&n("-0.1")));
+        assert!(n("-6").is_multiple_of(&n("-3")));
+        // Cohort independence: divisibility is value-based.
+        assert!(n("2.50").is_multiple_of(&n("0.05")));
+        assert!(n("2.5").is_multiple_of(&n("0.050")));
+        assert!(!n("2.50").is_multiple_of(&n("0.075")));
+        // Integers and the unit grid.
+        assert!(n("42").is_multiple_of(&n("1")));
+        assert!(!n("2.5").is_multiple_of(&n("1")));
+        assert!(!n("1").is_multiple_of(&n("2")));
+        assert!(n("42").is_multiple_of(&n("42")));
+        // Full-window spread: coarse value on the finest grid — and a
+        // non-divisor at the same spread — both decide without
+        // overflow.
+        let big = n(&format!("1{}", "0".repeat(6144)));
+        let tiny = n(&format!("0.{}1", "0".repeat(6175)));
+        assert!(big.is_multiple_of(&tiny));
+        let three_tiny = n(&format!("0.{}3", "0".repeat(6175)));
+        assert!(!big.is_multiple_of(&three_tiny));
+        // 34-digit coefficients through the mulmod path.
+        let nines = n(&"9".repeat(34));
+        assert!(nines.is_multiple_of(&n("3")));
+        assert!(!nines.is_multiple_of(&n("7")));
+
+        // Brute-force oracle: v = a/10^sa, m = b/10^sb over a dense
+        // small grid; v multiple of m iff (a * 10^sb) % (b * 10^sa)
+        // == 0 in plain i128 (small enough to be exact).
+        for a in -60i128..=60 {
+            for sa in 0u32..=2 {
+                for b in 1i128..=25 {
+                    for sb in 0u32..=2 {
+                        let v = Number::try_new(a, sa as i16).unwrap_or(Number::ZERO);
+                        let m = Number::try_new(b, sb as i16).unwrap();
+                        let lhs = a.unsigned_abs() * 10u128.pow(sb);
+                        let rhs = b.unsigned_abs() * 10u128.pow(sa);
+                        let oracle = lhs % rhs == 0;
+                        assert_eq!(
+                            v.is_multiple_of(&m),
+                            oracle,
+                            "{a}e-{sa} multiple of {b}e-{sb}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

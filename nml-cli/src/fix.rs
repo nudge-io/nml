@@ -54,6 +54,11 @@ pub fn cmd_fix(args: &[String]) -> Result<(), String> {
                     })?));
             }
             "--dry-run" => dry_run = true,
+            flag if flag.starts_with("--") => {
+                return Err(format!(
+                    "unknown flag {flag}; usage: nml fix [--schema <dir>] [--dry-run] <path>..."
+                ));
+            }
             _ => path_args.push(&args[i]),
         }
         i += 1;

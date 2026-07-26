@@ -156,12 +156,56 @@ fn extract_directives(
         .collect()
 }
 
+/// RFC 0018: build the facet record from a Named type's facet list.
+/// Decode errors extract as the zero placeholder without re-reporting —
+/// the shared lower pass owns the diagnostic (same contract as
+/// [`extract_directives`]); unknown keys and conflicts are the
+/// AST-side definition pass's findings (NML2058), where spans are
+/// richer. Last writer wins here; an invalid definition never loads.
+fn extract_facets(te: &TypeExpr) -> crate::model::NumberFacets {
+    let mut out = crate::model::NumberFacets::NONE;
+    let Some(list) = te.facet_list() else {
+        return out;
+    };
+    for f in list.facets() {
+        let span = node_span(f.syntax());
+        let text = match (f.dash(), f.number()) {
+            (Some(_), Some(n)) => format!("-{}", n.text()),
+            (None, Some(n)) => n.text().to_string(),
+            _ => continue,
+        };
+        let Ok(value) = super::value::parse_number(&text, span) else {
+            continue;
+        };
+        let bound = |exclusive| crate::model::FacetBound {
+            value,
+            exclusive,
+            span,
+        };
+        match token_text(f.name()).as_str() {
+            "min" => out.min = Some(bound(false)),
+            "exclusiveMin" => out.min = Some(bound(true)),
+            "max" => out.max = Some(bound(false)),
+            "exclusiveMax" => out.max = Some(bound(true)),
+            "multipleOf" => out.multiple_of = Some(crate::model::FacetMultiple { value, span }),
+            _ => {}
+        }
+    }
+    out
+}
+
 fn resolve_field_type(te: &TypeExpr) -> FieldType {
     match te.kind() {
         TypeExprKind::Named => {
             let name = token_text(te.name());
             match name.parse::<PrimitiveType>() {
-                Ok(prim) => FieldType::Primitive(prim),
+                Ok(prim) => FieldType::Primitive {
+                    ty: prim,
+                    facets: extract_facets(te),
+                },
+                // Facets on a model ref are a definition error the
+                // AST-side pass reports (NML2058, where the FacetExprs
+                // still exist); the model keeps the plain ref.
                 Err(_) => FieldType::ModelRef(name),
             }
         }

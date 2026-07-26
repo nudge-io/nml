@@ -22,7 +22,7 @@ use crate::ast::{
     Arm, ArmSelector, ArmTarget, Body, BodyEntry, BodyEntryKind, Identifier, ListItem,
     ListItemKind, NestedBlock, Property,
 };
-use crate::model::{FieldType, ModelDef, OneOfDef};
+use crate::model::{FieldType, ModelDef, NumberFacets, OneOfDef};
 use crate::schema_index::{FieldTarget, SchemaIndex};
 use crate::span::Span;
 use crate::types::{SpannedValue, Value};
@@ -438,7 +438,10 @@ mod tests {
     fn fd(name: &str, shorthand: bool) -> FieldDef {
         FieldDef {
             name: name.to_string(),
-            field_type: FieldType::Primitive(PrimitiveType::String),
+            field_type: FieldType::Primitive {
+                ty: PrimitiveType::String,
+                facets: NumberFacets::NONE,
+            },
             optional: false,
             shorthand,
             default_value: None,
@@ -545,8 +548,14 @@ mod tests {
         // grammar's own name-vs-string distinction.
         let mut arm_field = fd("dispatch", true);
         arm_field.field_type = FieldType::Arms {
-            key: Box::new(FieldType::Primitive(PrimitiveType::Role)),
-            target: Box::new(FieldType::Primitive(PrimitiveType::Path)),
+            key: Box::new(FieldType::Primitive {
+                ty: PrimitiveType::Role,
+                facets: NumberFacets::NONE,
+            }),
+            target: Box::new(FieldType::Primitive {
+                ty: PrimitiveType::Path,
+                facets: NumberFacets::NONE,
+            }),
         };
         let m = model(vec![fd("name", false), arm_field]);
 

@@ -820,6 +820,36 @@ impl<'a> Parser<'a> {
             self.expect(SyntaxKind::Gt);
         } else {
             self.expect_desc(SyntaxKind::Ident, "a type name");
+            // RFC 0018: a facet list may follow the type NAME
+            // (`number(min = 1, max = 65535)`). Parsed for ANY name —
+            // "facets attach only to `number`" is a schema-load rule
+            // with its own precise diagnostic (NML2058), not a parse
+            // error, so recovery keeps the tree structured and the
+            // finding singular. No ambiguity: `(` after a bare type
+            // name was previously always a parse error.
+            if self.at(SyntaxKind::LParen) {
+                let fl = self.start();
+                self.bump(); // (
+                loop {
+                    let f = self.start();
+                    self.expect_desc(
+                        SyntaxKind::Ident,
+                        "a facet name (min, max, exclusiveMin, exclusiveMax, multipleOf)",
+                    );
+                    self.expect(SyntaxKind::Eq);
+                    // A number literal, optionally signed — the only
+                    // facet value type (schemas are contracts, not
+                    // programs; no references, no expressions).
+                    self.eat(SyntaxKind::Dash);
+                    self.expect_desc(SyntaxKind::Number, "a number literal");
+                    f.complete(self, SyntaxKind::Facet);
+                    if !self.eat(SyntaxKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(SyntaxKind::RParen);
+                fl.complete(self, SyntaxKind::FacetList);
+            }
         }
         m.complete(self, SyntaxKind::TypeExpr);
         self.depth -= 1;

@@ -1936,7 +1936,10 @@ fn find_duration_unit_completions_at(
 ) -> Option<DurationUnitContext> {
     fn governs_duration(ty: &FieldType) -> bool {
         match ty {
-            FieldType::Primitive(nml_core::types::PrimitiveType::Duration) => true,
+            FieldType::Primitive {
+                ty: nml_core::types::PrimitiveType::Duration,
+                ..
+            } => true,
             FieldType::List(inner) | FieldType::Set(inner) | FieldType::Modifier(inner) => {
                 governs_duration(inner)
             }

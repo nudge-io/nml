@@ -567,7 +567,7 @@ fn decode_multiline(body: &str, body_start: usize, sink: &mut ValueErrors) -> St
 /// gains a span and an NML code. Acceptance is value-based: any finite
 /// decimal128 value parses exactly; inexact or out-of-range is an error,
 /// never a silently rounded float.
-fn parse_number(raw: &str, span: Span) -> Result<Number, NmlError> {
+pub(super) fn parse_number(raw: &str, span: Span) -> Result<Number, NmlError> {
     Number::parse_literal(raw).map_err(|e| {
         let kind = match e {
             crate::decimal::NumberError::Malformed => crate::error::ParseErrorKind::InvalidNumber {

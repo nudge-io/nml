@@ -772,6 +772,25 @@ mod tests {
         }
     }
 
+    /// RFC 0018: facet lists canonicalize (single spaces, ", " joins)
+    /// and round-trip idempotently — fmt renders types through the one
+    /// shared `FieldTypeExpr` renderer.
+    #[test]
+    fn facet_lists_format_canonically() {
+        let src = "model server:\n    port number( min=1 ,  max =65535 )\n    step set<number(multipleOf   =0.01)>\n";
+        let once = format(&parse(src).unwrap());
+        assert!(
+            once.contains("port number(min = 1, max = 65535)"),
+            "{once:?}"
+        );
+        assert!(
+            once.contains("step set<number(multipleOf = 0.01)>"),
+            "{once:?}"
+        );
+        let twice = format(&parse(&once).unwrap());
+        assert_eq!(once, twice, "facet rendering must be a fixed point");
+    }
+
     /// Every extreme literal the language accepts survives formatting:
     /// the boundaries fixture (34-digit integers, clamped 10^34, scale
     /// preservation) formats idempotently and value-preservingly, and

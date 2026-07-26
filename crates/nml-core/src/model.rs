@@ -130,10 +130,57 @@ pub struct FieldDef {
     pub span: Span,
 }
 
+/// One RFC 0018 numeric bound (`min`/`max`, inclusive or exclusive).
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetBound {
+    pub value: crate::types::Number,
+    pub exclusive: bool,
+    /// The facet's `key = value` span in the schema source — config-side
+    /// violations attach it as the related location (RFC 0009), so the
+    /// author sees both halves of the contradiction.
+    pub span: Span,
+}
+
+/// An RFC 0018 `multipleOf` facet.
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetMultiple {
+    pub value: crate::types::Number,
+    pub span: Span,
+}
+
+/// RFC 0018 numeric facets on a `number` field. Empty (`NONE`) for
+/// every non-number primitive — the loader rejects misplaced facets
+/// (NML2031) before enforcement ever consults them.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct NumberFacets {
+    pub min: Option<FacetBound>,
+    pub max: Option<FacetBound>,
+    pub multiple_of: Option<FacetMultiple>,
+}
+
+impl NumberFacets {
+    pub const NONE: NumberFacets = NumberFacets {
+        min: None,
+        max: None,
+        multiple_of: None,
+    };
+    pub fn is_none(&self) -> bool {
+        self.min.is_none() && self.max.is_none() && self.multiple_of.is_none()
+    }
+}
+
 /// The type of a field.
 #[derive(Debug, Clone, Serialize)]
 pub enum FieldType {
-    Primitive(PrimitiveType),
+    /// A primitive, optionally carrying RFC 0018 facets (only ever
+    /// non-empty when `ty` is `Number` in a loaded schema). A struct
+    /// variant deliberately: every pre-facet `Primitive(...)` pattern
+    /// breaks at compile time, so each match site is reviewed rather
+    /// than silently bypassed.
+    Primitive {
+        ty: PrimitiveType,
+        facets: NumberFacets,
+    },
     List(Box<FieldType>),
     ModelRef(String),
     /// A typed modifier field (`|allow []string?`); the inner type is the
@@ -184,7 +231,33 @@ impl FieldType {
 impl std::fmt::Display for FieldType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FieldType::Primitive(p) => f.write_str(p.as_str()),
+            FieldType::Primitive { ty: p, facets } => {
+                f.write_str(p.as_str())?;
+                // RFC 0018: the faceted type IS the contract — hover and
+                // every model-side rendering show it in canonical form.
+                if !facets.is_none() {
+                    let mut parts: Vec<String> = Vec::new();
+                    if let Some(b) = &facets.min {
+                        parts.push(format!(
+                            "{} = {}",
+                            if b.exclusive { "exclusiveMin" } else { "min" },
+                            b.value
+                        ));
+                    }
+                    if let Some(b) = &facets.max {
+                        parts.push(format!(
+                            "{} = {}",
+                            if b.exclusive { "exclusiveMax" } else { "max" },
+                            b.value
+                        ));
+                    }
+                    if let Some(m) = &facets.multiple_of {
+                        parts.push(format!("multipleOf = {}", m.value));
+                    }
+                    write!(f, "({})", parts.join(", "))?;
+                }
+                Ok(())
+            }
             FieldType::List(inner) => write!(f, "[]{inner}"),
             FieldType::ModelRef(name) => f.write_str(name),
             FieldType::Modifier(inner) => write!(f, "{inner}"),

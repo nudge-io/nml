@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostic::{Code, Diagnostic, Severity, codes};
-use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, ModelKind, OneOfDef};
+use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, ModelKind, NumberFacets, OneOfDef};
 
 /// Schema definitions (models / enums / oneofs) extracted from a source file.
 /// Produced by [`crate::cst::extract`] over the CST; the validation/inheritance
@@ -350,7 +350,7 @@ fn collect_trait_refs<'a>(
             collect_trait_refs(key, defs, out);
             collect_trait_refs(target, defs, out);
         }
-        FieldType::Primitive(_) => {}
+        FieldType::Primitive { .. } => {}
     }
 }
 
@@ -837,7 +837,10 @@ mod tests {
             extends: vec![MixinRef::synthetic(parent)],
             fields: vec![FieldDef {
                 name: f.to_string(),
-                field_type: FieldType::Primitive(PrimitiveType::String),
+                field_type: FieldType::Primitive {
+                    ty: PrimitiveType::String,
+                    facets: NumberFacets::NONE,
+                },
                 optional: false,
                 shorthand: false,
                 default_value: None,
@@ -868,7 +871,10 @@ mod tests {
         // fields last. Exercises the memoized merge across a re-converging DAG.
         let field = |name: &str| FieldDef {
             name: name.to_string(),
-            field_type: FieldType::Primitive(PrimitiveType::String),
+            field_type: FieldType::Primitive {
+                ty: PrimitiveType::String,
+                facets: NumberFacets::NONE,
+            },
             optional: false,
             shorthand: false,
             default_value: None,
@@ -1108,7 +1114,10 @@ mod tests {
         assert_eq!(model.fields[1].name, "model");
         assert!(matches!(
             model.fields[1].field_type,
-            FieldType::Primitive(PrimitiveType::String)
+            FieldType::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            }
         ));
 
         assert_eq!(model.fields[2].name, "temperature");
@@ -1171,7 +1180,10 @@ mod tests {
         assert_eq!(model.fields[1].name, "config");
         assert!(matches!(
             &model.fields[1].field_type,
-            FieldType::Primitive(PrimitiveType::Object)
+            FieldType::Primitive {
+                ty: PrimitiveType::Object,
+                ..
+            }
         ));
         assert!(model.fields[1].optional);
     }
@@ -1447,7 +1459,10 @@ model D is B, C:\n    d string\n";
         assert!(
             matches!(
                 b.fields.iter().find(|f| f.name == "x").unwrap().field_type,
-                FieldType::Primitive(PrimitiveType::Number)
+                FieldType::Primitive {
+                    ty: PrimitiveType::Number,
+                    ..
+                }
             ),
             "child's 'x' should be number, not string"
         );

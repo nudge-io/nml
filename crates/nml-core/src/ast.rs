@@ -2,10 +2,29 @@ use crate::span::Span;
 use crate::types::SpannedValue;
 use serde::Serialize;
 
+/// One RFC 0018 facet: `min = 1`. The value is always a number literal
+/// (`SpannedValue` holding `Value::Number`; the lowerer guarantees the
+/// variant, recovering to `Number::ZERO` + a diagnostic on a
+/// domain-rejected literal).
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetExpr {
+    pub key: Identifier,
+    pub value: SpannedValue,
+    /// The whole `key = value` span.
+    pub span: Span,
+}
+
 /// The type expression in a field definition (e.g. `string`, `[]route`).
 #[derive(Debug, Clone, Serialize)]
 pub enum FieldTypeExpr {
-    Named(Identifier),
+    /// A bare or faceted type name: `string`, `number(min = 1)`.
+    /// Facets (RFC 0018) are empty for every non-`number` name in a
+    /// valid schema — the loader rejects them elsewhere with NML2058;
+    /// the parse stays structured either way.
+    Named {
+        name: Identifier,
+        facets: Vec<FacetExpr>,
+    },
     Array(Box<FieldTypeExpr>),
     Union(Vec<FieldTypeExpr>),
     /// `(K -> V)` — a typed arm set (RFC 0007): the field's body is ordered,
@@ -28,7 +47,24 @@ pub enum FieldTypeExpr {
 impl std::fmt::Display for FieldTypeExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FieldTypeExpr::Named(id) => f.write_str(&id.name),
+            FieldTypeExpr::Named { name, facets } => {
+                f.write_str(&name.name)?;
+                if !facets.is_empty() {
+                    f.write_str("(")?;
+                    for (i, facet) in facets.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{} = ", facet.key.name)?;
+                        match &facet.value.value {
+                            crate::types::Value::Number(n) => write!(f, "{n}")?,
+                            other => write!(f, "{other:?}")?,
+                        }
+                    }
+                    f.write_str(")")?;
+                }
+                Ok(())
+            }
             FieldTypeExpr::Array(inner) => write!(f, "[]{inner}"),
             FieldTypeExpr::Union(variants) => {
                 f.write_str("(")?;

@@ -111,6 +111,10 @@ BANNED_PROSE_TOKENS = ["<shorthand>"]
 #   - `&Type` reference marker   → plain references (conjunction atoms
 #     start with `@`, so `&[A-Za-z]` can never hit a legal conjunction)
 #   - `[]@roleRef` element type  → `[]role`
+#   - `duration = "…"` default   → the duration literal (RFC 0017: `= 30s`).
+#     Only the field-DEFINITION shape is pinnable by pattern (a quoted
+#     string in an untyped instance property is legal string data), but a
+#     `duration`-typed default with a quoted value is unambiguous.
 BANNED_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
     (
         "angle-bracket constraint",
@@ -119,6 +123,7 @@ BANNED_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
     ("parenthesized composition", re.compile(r"^(?:model|trait)\s+\w+\s*\(", re.M)),
     ("'&'-reference marker", re.compile(r"&[A-Za-z]")),
     ("'[]@' element type", re.compile(r"\[\]@")),
+    ("quoted duration default", re.compile(r"\bduration\??\s*=\s*\"")),
 ]
 
 # Historical records may (and should) describe removed syntax.

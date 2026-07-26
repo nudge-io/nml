@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{Body, BodyEntryKind};
-use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
+use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, NumberFacets, OneOfDef};
 use crate::types::PrimitiveType;
 
 /// What a model field resolves to, for schema-guided traversal.
@@ -344,8 +344,11 @@ impl SchemaIndex {
 
     fn resolve_type<'a>(&'a self, ty: &'a FieldType) -> FieldTarget<'a> {
         match ty {
-            FieldType::Primitive(PrimitiveType::Object) => FieldTarget::Object,
-            FieldType::Primitive(_) => FieldTarget::Leaf(ty),
+            FieldType::Primitive {
+                ty: PrimitiveType::Object,
+                ..
+            } => FieldTarget::Object,
+            FieldType::Primitive { .. } => FieldTarget::Leaf(ty),
             FieldType::List(inner) => FieldTarget::ListOf(ty, Box::new(self.resolve_type(inner))),
             FieldType::Set(inner) => FieldTarget::SetOf(ty, Box::new(self.resolve_type(inner))),
             // A modifier field carries its declared inner type; classify by it.
@@ -407,11 +410,23 @@ mod tests {
             vec![
                 model(
                     "dup",
-                    vec![field("a", FieldType::Primitive(PrimitiveType::String))],
+                    vec![field(
+                        "a",
+                        FieldType::Primitive {
+                            ty: PrimitiveType::String,
+                            facets: NumberFacets::NONE,
+                        },
+                    )],
                 ),
                 model(
                     "dup",
-                    vec![field("b", FieldType::Primitive(PrimitiveType::String))],
+                    vec![field(
+                        "b",
+                        FieldType::Primitive {
+                            ty: PrimitiveType::String,
+                            facets: NumberFacets::NONE,
+                        },
+                    )],
                 ),
             ],
             vec![],
@@ -437,11 +452,23 @@ mod tests {
         let idx = SchemaIndex::build(vec![model("inner", vec![])], vec![], vec![]);
 
         assert!(matches!(
-            idx.resolve_field(&field("x", FieldType::Primitive(PrimitiveType::String))),
+            idx.resolve_field(&field(
+                "x",
+                FieldType::Primitive {
+                    ty: PrimitiveType::String,
+                    facets: NumberFacets::NONE
+                }
+            )),
             FieldTarget::Leaf(_)
         ));
         assert!(matches!(
-            idx.resolve_field(&field("x", FieldType::Primitive(PrimitiveType::Object))),
+            idx.resolve_field(&field(
+                "x",
+                FieldType::Primitive {
+                    ty: PrimitiveType::Object,
+                    facets: NumberFacets::NONE
+                }
+            )),
             FieldTarget::Object
         ));
         assert!(matches!(
@@ -462,7 +489,10 @@ mod tests {
         assert!(matches!(
             idx.resolve_field(&field(
                 "x",
-                FieldType::Union(vec![FieldType::Primitive(PrimitiveType::String)])
+                FieldType::Union(vec![FieldType::Primitive {
+                    ty: PrimitiveType::String,
+                    facets: NumberFacets::NONE
+                }])
             )),
             FieldTarget::Union(_)
         ));
@@ -515,7 +545,10 @@ mod tests {
         // Rule-completion: a KEYED block body under `(string | model)` selects
         // the MODEL variant, never the scalar (a scalar can't hold properties).
         let sm = FieldType::Union(vec![
-            FieldType::Primitive(PrimitiveType::String),
+            FieldType::Primitive {
+                ty: PrimitiveType::String,
+                facets: NumberFacets::NONE,
+            },
             FieldType::ModelRef("step".into()),
         ]);
         let keyed = body_of("x X:\n    k = \"v\"\n");
@@ -588,7 +621,10 @@ mod tests {
             FieldType::ModelRef("mailB".into()),
         ]);
         let disjoint = FieldType::Union(vec![
-            FieldType::Primitive(PrimitiveType::String),
+            FieldType::Primitive {
+                ty: PrimitiveType::String,
+                facets: NumberFacets::NONE,
+            },
             FieldType::ModelRef("modelA".into()),
         ]);
         let variants_of = |ty: &FieldType| -> Vec<FieldType> {

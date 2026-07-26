@@ -757,7 +757,7 @@ point of mixins.)
 
 ```nml check expect-output='[NML2025]'
 trait monitored:
-    timeout duration = "5s"
+    timeout duration = 5s
 
 model endpoint is monitored, monitored:
     url string+
@@ -1242,6 +1242,7 @@ oneof record by kind:
 collide; a modifier-form field (`|kind`) is distinct authoring and does not
 shadow.
 
+
 ## NML4000
 
 **Fully shadowed validator.** A package validator binding's globs can
@@ -1272,6 +1273,55 @@ host H:
 **Fix:** write the item as a scalar (`- "foo"`), or — if the entries
 are real configuration — give the elements a model type that declares
 those fields.
+
+## NML2057
+
+**Facet violation.** A `number` value falls outside a facet its schema
+declares (RFC 0018): `min`/`max` (inclusive), `exclusiveMin`/
+`exclusiveMax`, or `multipleOf`.
+
+```nml
+model server:
+    port number(min = 1, max = 65535)
+
+server Web:
+    port = 70000
+```
+
+```text
+error[NML2057]: 'port' is 70000, above the schema's max = 65535
+```
+
+Enforcement is **exact**: bounds compare through the RFC 0016 decimal
+core, and `multipleOf` is decided by exact decimal divisibility — so
+`0.3` IS a multiple of `0.1` here (binary-float validators famously say
+otherwise), and boundary values behave like the schema reads. Values
+are checked after the type check, element-wise for `[]number` and
+`set<number>`, and field defaults are held to the same rule.
+
+**Fix:** change the value to satisfy the constraint, or change the
+schema if the constraint is wrong. Nothing is ever clamped or rounded
+for you.
+
+## NML2058
+
+**Invalid facet declaration.** The schema itself misuses facets
+(RFC 0018): facets on a non-`number` type, an unknown or duplicate
+facet key, `min`/`exclusiveMin` (or `max`/`exclusiveMax`) together, an
+unsatisfiable range (`min = 2, max = 1`, or an exclusive bound meeting
+its counterpart), or `multipleOf` that is not positive.
+
+```nml
+model m:
+    name string(min = 1)
+```
+
+```text
+error[NML2058]: 'name': facets attach only to `number` — `string` cannot carry them
+```
+
+**Fix:** move range constraints to `number` fields; string/collection
+length constraints are deliberately not spelled with these keys.
 
 ## NML2013
 

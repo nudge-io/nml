@@ -17,6 +17,33 @@ model modelName:
     fieldName fieldType?
 ```
 
+### Numeric Facets (RFC 0018)
+
+A `number` field may constrain its value range, first-class in the
+type:
+
+```
+model server:
+    port number(min = 1, max = 65535)
+    weight number(min = 0, exclusiveMax = 1)
+    priceStep number(multipleOf = 0.01)
+```
+
+- Keys: `min`, `max` (inclusive), `exclusiveMin`, `exclusiveMax`,
+  `multipleOf` — each at most once, `min`/`exclusiveMin` (and the max
+  pair) mutually exclusive, `multipleOf` positive, and the declared
+  range must be satisfiable. Violations of these rules are schema
+  errors (`NML2058`).
+- Values are number literals only. Facets attach only to `number`;
+  they follow the name anywhere it appears (`[]number(...)`,
+  `set<number(...)>`, union variants), constraining each element for
+  collections.
+- Enforcement is exact (`NML2057`): bounds compare through the exact
+  decimal core, and `multipleOf` is exact decimal divisibility — `0.3`
+  is a multiple of `0.1`, boundary values behave like the schema
+  reads, and `80.0` satisfies an integer bound because it IS 80.
+  Field defaults are held to the same constraints.
+
 ### Field Presence Rules
 
 - **No modifier** -- field is required. Instances must provide it.
