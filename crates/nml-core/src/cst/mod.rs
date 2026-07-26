@@ -1549,6 +1549,15 @@ service App is Base:
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert!(!file.declarations.is_empty());
 
+        // Inside brackets there is no modifier syntax and arrays span
+        // lines, so a NEXT-LINE pipe is still a chain there (unlike the
+        // dash spelling below).
+        let (_, diags) = parse_to_ast_all("w s:\n    keys = [$ENV.A\n        | $ENV.B]\n");
+        assert!(
+            diags.iter().any(|d| d.to_string().contains("NML0021")),
+            "cross-line array chain must still teach: {diags:?}"
+        );
+
         // NON-regression: a next-line `|modifier` entry is NOT a chain (the
         // same-line rule) — nudge's `|grant` syntax depends on this.
         let (_, diags) = parse_to_ast_all(

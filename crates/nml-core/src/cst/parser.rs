@@ -59,6 +59,16 @@ pub(super) struct Parser<'a> {
     suppressed: usize,
 }
 
+/// Where a rejected fallback chain sits — decides the pipe-detection rule
+/// (body position must respect the same-line `|modifier` boundary; bracket
+/// position has no such boundary and arrays may span lines) and whether a
+/// trailing `: body` is consumed during recovery.
+#[derive(Clone, Copy)]
+enum FallbackTailCtx {
+    DashItem,
+    ArrayElement,
+}
+
 /// An open node. Completed into a real node or abandoned (its tombstone is then
 /// skipped by the builder). Consumed on use, so every marker is resolved.
 #[must_use]
@@ -722,7 +732,7 @@ impl<'a> Parser<'a> {
                 Some("after '-'"),
             ),
         }
-        self.reject_fallback_tail(true);
+        self.reject_fallback_tail(FallbackTailCtx::DashItem);
         m.complete(self, SyntaxKind::ListItem);
     }
 
@@ -867,8 +877,16 @@ impl<'a> Parser<'a> {
     /// entries untouched. If chains ever become legal here, this site is
     /// the grammar hook (design parked: identity-is-syntactic, no body on
     /// chains — see the stability notes).
-    fn reject_fallback_tail(&mut self, allow_body: bool) {
-        if !self.at_fallback_pipe() {
+    fn reject_fallback_tail(&mut self, ctx: FallbackTailCtx) {
+        let at_chain = match ctx {
+            // In body position a NEXT-LINE `|` is modifier syntax
+            // (`|grant`), so only a same-line pipe is a chain.
+            FallbackTailCtx::DashItem => self.at_fallback_pipe(),
+            // Inside brackets no modifier syntax exists and arrays may
+            // span lines — ANY pipe is a chain.
+            FallbackTailCtx::ArrayElement => self.at(SyntaxKind::Pipe),
+        };
+        if !at_chain {
             return;
         }
         let start = self.current_span();
@@ -900,7 +918,8 @@ impl<'a> Parser<'a> {
             crate::error::ParseErrorKind::FallbackInListItem,
             Span::new(start.start, end),
         );
-        if allow_body && self.eat(SyntaxKind::Colon) {
+        // Only dash items have the legal `: body` tail to mirror.
+        if matches!(ctx, FallbackTailCtx::DashItem) && self.eat(SyntaxKind::Colon) {
             self.body();
         }
     }
@@ -1001,7 +1020,7 @@ impl<'a> Parser<'a> {
                 _ => {
                     let before = self.pos;
                     self.value();
-                    self.reject_fallback_tail(false);
+                    self.reject_fallback_tail(FallbackTailCtx::ArrayElement);
                     if !self.eat(SyntaxKind::Comma) && !self.at(SyntaxKind::RBracket) {
                         self.expected(
                             vec![

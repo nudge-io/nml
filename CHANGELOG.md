@@ -33,6 +33,11 @@
   - The formatter can never emit a document the parser rejects: edge
     spaces render as `\s`, `"""` runs and template braces are broken by
     escaping, tabs render as `\t`.
+  - A fallback chain in a list position gets a teaching diagnostic
+    (NML0021) instead of a misleading pipe-modifier parse error — with
+    recovery, in both list spellings. Chains stay property-position;
+    the `const`-name idiom (`const K = $ENV.A | $ENV.B`, then
+    `keys = [K]`) is the supported way to use one as an element.
 
 - **Numbers are exact decimals (RFC 0016)** — `Number { Int(i64),
   Float(f64) }` is replaced by a single exact decimal (34 significant
