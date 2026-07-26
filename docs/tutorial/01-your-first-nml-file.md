@@ -53,8 +53,9 @@ service Api:
 ```
 
 Strings are always double-quoted. Numbers are exact — `port` is `8080`, not
-`8080.000001` (NML numbers have integer semantics; you'll meet the full type
-system in Chapter 2).
+`8080.000001`, and that holds for decimals too: NML numbers are exact
+decimals, never binary floats (you'll meet the full type system in
+Chapter 2).
 
 ## Nested blocks
 

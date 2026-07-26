@@ -50,11 +50,11 @@ no tokio, no server); `nml-validate` adds schema loading and validation.
 #[serde(rename_all = "camelCase")]
 struct ServiceConfig {
     host: String,
-    port: f64,
+    port: u16,
     public_url: String,
     log_level: String,
     request_timeout: String,
-    retries: f64,
+    retries: u32,
     tags: Vec<String>,
     api_key: String,
     database: DatabaseConfig,
@@ -65,7 +65,7 @@ struct ServiceConfig {
 #[serde(rename_all = "camelCase")]
 struct DatabaseConfig {
     url: String,
-    pool_size: f64,
+    pool_size: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,7 +220,7 @@ the query API (`doc.blocks(…)`, `doc.array_body(…)`,
    #[serde(rename_all = "camelCase")]
    struct PlanConfig {
        name: String,
-       trial_days: f64,
+       trial_days: u32,
    }
 
    let body = doc

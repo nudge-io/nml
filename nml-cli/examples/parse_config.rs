@@ -30,7 +30,7 @@ const MaxRetries = 5
     let port = doc
         .block("service", "WebApp")
         .property("port")
-        .as_f64()
+        .to_f64()
         .expect("missing port");
     let debug = doc
         .block("service", "WebApp")
@@ -56,7 +56,7 @@ const MaxRetries = 5
         .expect("missing database url");
     println!("DB:    {db_url}");
 
-    let retries = doc.const_value("MaxRetries").as_f64().unwrap_or(3.0);
+    let retries = doc.const_value("MaxRetries").to_f64().unwrap_or(3.0);
     println!("Max retries: {retries}");
 
     println!("\nAll declarations:");

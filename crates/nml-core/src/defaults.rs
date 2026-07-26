@@ -362,12 +362,12 @@ impl<'a> Defaulter<'a> {
             FieldTarget::OneOf(o) => self.oneof_body(o, nb_body, depth + 1),
             // Arm bodies carry only selectors and reference targets (RFC
             // 0007) — nothing to default.
-            FieldTarget::ListOf(_)
-            | FieldTarget::SetOf(_)
+            FieldTarget::ListOf(_, _)
+            | FieldTarget::SetOf(_, _)
             | FieldTarget::Object
-            | FieldTarget::Union
+            | FieldTarget::Union(_)
             | FieldTarget::Arms { .. }
-            | FieldTarget::Leaf => nb_body.clone(),
+            | FieldTarget::Leaf(_) => nb_body.clone(),
         }
     }
 
@@ -389,7 +389,7 @@ impl<'a> Defaulter<'a> {
         match target {
             FieldTarget::Model(m) => self.model_body(m, body, depth),
             FieldTarget::OneOf(o) => self.oneof_body(o, body, depth),
-            FieldTarget::ListOf(inner) | FieldTarget::SetOf(inner) => {
+            FieldTarget::ListOf(_, inner) | FieldTarget::SetOf(_, inner) => {
                 map_item_bodies(body, |item_body| match inner.as_ref() {
                     FieldTarget::Model(m) => self.model_body(m, item_body, depth + 1),
                     FieldTarget::OneOf(o) => self.oneof_body(o, item_body, depth + 1),
@@ -397,9 +397,9 @@ impl<'a> Defaulter<'a> {
                 })
             }
             FieldTarget::Object
-            | FieldTarget::Union
+            | FieldTarget::Union(_)
             | FieldTarget::Arms { .. }
-            | FieldTarget::Leaf => body.clone(),
+            | FieldTarget::Leaf(_) => body.clone(),
         }
     }
 
@@ -699,7 +699,10 @@ mod tests {
             prop(&out, "outputFormat"),
             Some(&Value::String("text".into()))
         );
-        assert_eq!(prop(&out, "temperature"), Some(&Value::number(0.9)));
+        assert_eq!(
+            prop(&out, "temperature"),
+            Some(&Value::number(crate::num!(0.9)))
+        );
     }
 
     #[test]
@@ -796,11 +799,11 @@ mod tests {
         let steps = nested(&out, "steps").expect("steps block");
         assert_eq!(
             prop(item(steps, "StepA").unwrap(), "retries"),
-            Some(&Value::number(5.0))
+            Some(&Value::number(crate::num!(5.0)))
         );
         assert_eq!(
             prop(item(steps, "StepB").unwrap(), "retries"),
-            Some(&Value::number(3.0))
+            Some(&Value::number(crate::num!(3.0)))
         );
     }
 
@@ -817,12 +820,15 @@ mod tests {
 
         // Scalar item → `step` variant → retries default injected.
         let scalar = item(parallel, "Scalar").expect("Scalar item");
-        assert_eq!(prop(scalar, "retries"), Some(&Value::number(3.0)));
+        assert_eq!(
+            prop(scalar, "retries"),
+            Some(&Value::number(crate::num!(3.0)))
+        );
 
         // Listy item → `[]step` variant → each of its sub-items defaulted.
         let listy = item(parallel, "Listy").expect("Listy item");
         let sub = item(listy, "Sub").expect("Sub item under Listy");
-        assert_eq!(prop(sub, "retries"), Some(&Value::number(3.0)));
+        assert_eq!(prop(sub, "retries"), Some(&Value::number(crate::num!(3.0))));
     }
 
     /// The RFC 0015 END-TO-END guarantee, through the REAL pipeline

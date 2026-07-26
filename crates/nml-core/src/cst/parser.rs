@@ -689,8 +689,11 @@ impl<'a> Parser<'a> {
         match self.current() {
             // A scalar key: `- "/api"` or, with a body, `- "/api":` + indented block
             // (scalar-key-with-body — the shorthand fills the model's `+` field, the
-            // body fills the rest).
-            SyntaxKind::String | SyntaxKind::Number => {
+            // body fills the rest). `$ENV.KEY` is a scalar like any other: routing it
+            // through `value()` (rather than a bare `bump`) is what makes it a real
+            // `Value` node, so the whole value layer — decode, `$NS` validation,
+            // shorthand placement, formatting — applies to it by construction.
+            SyntaxKind::String | SyntaxKind::Number | SyntaxKind::Secret => {
                 self.value();
                 if self.eat(SyntaxKind::Colon) {
                     self.body();
@@ -700,7 +703,6 @@ impl<'a> Parser<'a> {
                 self.bump();
                 self.role_conjunction_tail();
             }
-            SyntaxKind::Secret => self.bump(),
             SyntaxKind::Ident => {
                 self.bump(); // name
                 if self.at_kw("as") {
@@ -1144,6 +1146,21 @@ impl TreeBuilder<'_> {
     }
 
     fn bump(&mut self) {
+        // The losslessness floor: a deferred comment may only ever jump
+        // ZERO-WIDTH layout markers. A partial dedent (e.g. 2→1 with the
+        // comment at column 0) leaves the comment's scope unopened while
+        // real tokens arrive — holding on would emit those bytes ahead of
+        // the comment and scramble source order. RFC 0004's foundational
+        // invariant outranks §4.3 attachment: flush everything still held
+        // (the same precision-for-losslessness trade `release_deferred`
+        // documents for non-monotonic columns).
+        if !self.deferred.is_empty() && !self.full[self.cursor].text.is_empty() {
+            for d in std::mem::take(&mut self.deferred) {
+                for idx in d.tokens {
+                    self.emit(idx);
+                }
+            }
+        }
         self.emit(self.cursor);
         self.cursor += 1;
     }

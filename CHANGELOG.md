@@ -4,6 +4,59 @@
 
 ### Changed
 
+- **List validation: spelling parity & the item-shape matrix** — the two
+  spellings of a list field (`f = [v]` and `f:` + `- v`) now validate
+  identically, by construction and by CI-enforced test. — one contract,
+  *raw is transport, escaped is content*, enforced end to end:
+  - New diagnostics: bare CR (NML0016, machine-fixable deletion), raw
+    C0/DEL control characters (NML0017), bidirectional controls and
+    interior U+FEFF — the Trojan Source defense, rustc's banned set
+    (NML0018). A leading U+FEFF is accepted as a BOM.
+  - New escapes: `\r`, `\s` (protected space, as in Java text blocks),
+    and `\u{…}` (1–6 hex digits, as in Rust/Swift) — the sanctioned
+    spelling for every character the policy bans raw. `\u{7B}\u{7B}`
+    writes a literal `{{` (template detection reads raw text, so escapes
+    can never smuggle a template expression).
+  - Multi-line strings adopt the Java text-block order: dedent is
+    computed on source lines *before* escapes are interpreted, so
+    escaped newlines/whitespace are content, never indentation. Content
+    must begin on the line after the opening `"""` (NML0019), an
+    own-line closing `"""` must align with the content (NML0020,
+    machine-fixable), tabs may not appear in body indentation
+    (NML0005 extended), and `\` before a line break is Java/Swift line
+    continuation. Line endings are transport: LF and CRLF documents are
+    byte-identical in value (fuzz-verified).
+  - Value decoding is now *total*: every malformed escape in a string is
+    reported at once (rustc-style) with U+FFFD recovery, via the new
+    `decode_value_all` / `ValueErrors` API; the strict single-error API
+    is unchanged.
+  - The formatter can never emit a document the parser rejects: edge
+    spaces render as `\s`, `"""` runs and template braces are broken by
+    escaping, tabs render as `\t`.
+
+- **Numbers are exact decimals (RFC 0016)** — `Number { Int(i64),
+  Float(f64) }` is replaced by a single exact decimal (34 significant
+  digits, the finite IEEE 754-2019 decimal128 value space): `taxRate =
+  0.20` now stores exactly 0.20, written scale survives formatting and
+  serialization (`2.50` stays `2.50`), and integers parse to 34 digits
+  (previously hard-capped at `i64`). Anything outside the exact domain is
+  a parse error — NML never rounds. Breaking API changes: `Number` is a
+  struct (gains `Eq`/`Ord`/`Hash`, the `num!(…)` const literal macro,
+  `total_cmp`, `to_i128`/`to_u128`, `try_from_f64`); `as_i64`/`as_f64`
+  are now `to_i64`/`to_f64` on `Number`, `Value`, and `ValueQuery`;
+  `From<f64>` and `PartialEq<f64>` are removed (use `num!`);
+  `deserialize_i128`/`u128` are supported and `u64 > i64::MAX`
+  deserializes exactly; `Serialize` never emits binary floats (fraction
+  forms serialize as exact strings); env-string coercion accepts
+  scientific notation exactly and rejects `inf`/`nan`; f32 fields are
+  single-rounded (the old path double-rounded). `NML0014` generalizes
+  from "integer out of `i64`" to "number outside the exact decimal
+  domain" with a structured payload; trailing-dot literals (`1299.`) are
+  now `NML0013` with a machine-applicable fix. Money parses through the
+  same decimal core (`Money::to_number()` is new; exactly-`i64::MIN`
+  minor units are now accepted; >`i64` amounts error as `NML3003` rather
+  than `NML3000`).
+
 - **Rust edition 2021 → 2024** across the workspace (one inherited line; the
   MSRV stays 1.86, which predates the flip and supports edition 2024). The
   audited migration surface was 12 sites, all rowan node-handle temporaries

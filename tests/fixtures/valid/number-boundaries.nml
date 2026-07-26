@@ -1,0 +1,19 @@
+// RFC 0016 exact-decimal boundaries: everything here is a finite
+// decimal128 value and MUST parse exactly.
+service NumberBoundaries:
+    // 34 significant digits — the precision maximum, both forms.
+    maxIntDigits = 9999999999999999999999999999999999
+    maxFracDigits = 0.9999999999999999999999999999999999
+    // Integers past i64/u64 (previously NML0014 at 19+ digits).
+    pastI64 = 9223372036854775808
+    pastU64 = 18446744073709551617
+    // 2^53 + 1: the classic f64 corruption sentinel.
+    pastF64 = 9007199254740993
+    // Written scale is significant and preserved.
+    taxRate = 0.20
+    displayPrice = 2.50
+    // Trailing zeros beyond the 34-digit budget drop losslessly.
+    exactHalf = 0.50000000000000000000000000000000000
+    // 35 written digits whose value needs only one: clamps into the
+    // exponent, stays exact.
+    tenPow34 = 10000000000000000000000000000000000

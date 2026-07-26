@@ -14,99 +14,16 @@ pub enum TemplateSegment {
     },
 }
 
-/// A numeric value: an exact 64-bit integer or an IEEE 754 double.
+/// The exact decimal number (RFC 0016). Lives in [`crate::decimal`];
+/// re-exported here so the established `types::Number` path keeps working.
 ///
-/// NML's `number` type covers whole numbers and decimals with a single
-/// surface type. Internally, literals without a decimal point lex as
-/// [`Number::Int`] so 64-bit integers survive exactly (a bare `f64`
-/// silently corrupts integers above 2^53); literals with a decimal point
-/// lex as [`Number::Float`].
-///
-/// Equality is numeric, not representational: `Int(3) == Float(3.0)`.
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(untagged)]
-pub enum Number {
-    Int(i64),
-    Float(f64),
-}
-
-impl Number {
-    /// The value as an `f64`. Lossy for integers above 2^53; use
-    /// [`Number::as_i64`] when exactness matters.
-    pub fn as_f64(self) -> f64 {
-        match self {
-            Number::Int(i) => i as f64,
-            Number::Float(f) => f,
-        }
-    }
-
-    /// The value as an exact `i64`. `Float`s convert only when they are
-    /// whole and within range; fractional or out-of-range values yield
-    /// `None` (never truncation).
-    pub fn as_i64(self) -> Option<i64> {
-        match self {
-            Number::Int(i) => Some(i),
-            Number::Float(f) => float_to_exact_i64(f),
-        }
-    }
-}
-
-/// Exact `f64` -> `i64` conversion: whole values within `i64` range only.
-/// The upper bound is strict because `i64::MAX as f64` rounds up to 2^63,
-/// which is one past `i64::MAX`.
-fn float_to_exact_i64(f: f64) -> Option<i64> {
-    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
-    (f.fract() == 0.0 && (-TWO_POW_63..TWO_POW_63).contains(&f)).then_some(f as i64)
-}
-
-impl PartialEq for Number {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Number::Int(a), Number::Int(b)) => a == b,
-            (Number::Float(a), Number::Float(b)) => a == b,
-            (Number::Int(a), Number::Float(b)) | (Number::Float(b), Number::Int(a)) => {
-                float_to_exact_i64(*b) == Some(*a)
-            }
-        }
-    }
-}
-
-impl PartialEq<f64> for Number {
-    fn eq(&self, other: &f64) -> bool {
-        *self == Number::Float(*other)
-    }
-}
-
-impl PartialEq<i64> for Number {
-    fn eq(&self, other: &i64) -> bool {
-        *self == Number::Int(*other)
-    }
-}
-
-impl From<i64> for Number {
-    fn from(i: i64) -> Self {
-        Number::Int(i)
-    }
-}
-
-impl From<f64> for Number {
-    fn from(f: f64) -> Self {
-        Number::Float(f)
-    }
-}
-
-impl std::fmt::Display for Number {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Number::Int(i) => write!(f, "{i}"),
-            // A whole float keeps its decimal point (`2.0`, not `2`) so the
-            // int/float distinction survives a format -> reparse round-trip
-            // and the author's literal form is preserved.
-            Number::Float(n) if n.fract() == 0.0 && n.is_finite() => write!(f, "{n:.1}"),
-            Number::Float(n) => write!(f, "{n}"),
-        }
-    }
-}
+/// NML's `number` domain is the finite decimal128 value space: `2.50`
+/// stores coefficient 250 at scale 2 and displays `"2.50"`; integers up to
+/// 34 significant digits survive exactly. Equality/ordering/hashing are
+/// numeric (`2 == 2.0`, `1.5 == 1.50`); conversions are
+/// [`Number::to_i64`] (exact-or-None) and [`Number::to_f64`]
+/// (correctly-rounded, the only sanctioned decimal→binary edge).
+pub use crate::decimal::Number;
 
 /// A parsed value in NML.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -318,7 +235,11 @@ pub struct ValueTypeError {
 }
 
 impl Value {
-    /// Construct a numeric value from any integer or float.
+    /// Construct a numeric value from an `i64` (the one integer `From`;
+    /// see [`Number::from_u64`] and the `TryFrom` impls for wider types).
+    /// Decimal literals use the const [`num!`](crate::num) macro —
+    /// `Value::number(num!(2.50))` — since `From<f64>` is deliberately
+    /// absent under exact decimals (RFC 0016 §1.9).
     pub fn number(n: impl Into<Number>) -> Value {
         Value::Number(n.into())
     }
@@ -353,20 +274,34 @@ impl Value {
         }
     }
 
-    /// Extract as a number (lossy for integers above 2^53; see
-    /// [`Value::as_i64`] for exact integer extraction).
-    pub fn as_f64(&self) -> Option<f64> {
+    /// Extract as an `f64` via the correctly-rounded conversion (lossy for
+    /// integers above 2^53 and precision beyond binary64; see
+    /// [`Value::to_i64`] for exact integer extraction, or match
+    /// [`Value::Number`] for the exact decimal itself).
+    pub fn to_f64(&self) -> Option<f64> {
         match self {
-            Value::Number(n) => Some(n.as_f64()),
+            Value::Number(n) => Some(n.to_f64()),
             _ => None,
         }
     }
 
     /// Extract as an exact integer. Fractional or out-of-range numbers
     /// yield `None` (never truncation).
-    pub fn as_i64(&self) -> Option<i64> {
+    pub fn to_i64(&self) -> Option<i64> {
         match self {
-            Value::Number(n) => n.as_i64(),
+            Value::Number(n) => n.to_i64(),
+            _ => None,
+        }
+    }
+
+    /// Extract as an exact `u64`. Fractional, negative, or out-of-range
+    /// numbers yield `None` (never truncation). Present so a `u64`-typed
+    /// consumer need not route through [`Value::to_i64`], which would
+    /// reject the `(i64::MAX, u64::MAX]` band RFC 0016 made expressible
+    /// — and would do so with a misleading "not an integer" message.
+    pub fn to_u64(&self) -> Option<u64> {
+        match self {
+            Value::Number(n) => n.to_u64(),
             _ => None,
         }
     }
@@ -410,7 +345,7 @@ impl TryFrom<&Value> for f64 {
 
     fn try_from(value: &Value) -> Result<f64, Self::Error> {
         match value {
-            Value::Number(n) => Ok(n.as_f64()),
+            Value::Number(n) => Ok(n.to_f64()),
             _ => Err(ValueTypeError {
                 expected: "number",
                 actual: value.type_name(),
@@ -419,6 +354,15 @@ impl TryFrom<&Value> for f64 {
     }
 }
 
+/// **Handle the `Err`.** Since RFC 0016 every number ≤ 34 significant
+/// digits parses, so a value outside `i64` no longer dies at parse — it
+/// arrives here and fails *this* conversion instead. Config code that
+/// writes `if let Ok(n) = i64::try_from(&v) { limit = Some(n) }` with no
+/// `else` therefore skips silently and leaves the limit **unset**: a
+/// guard disarmed by an out-of-range value. (An audit of a downstream
+/// consumer found exactly this in five proxy guards, one of them a
+/// connection cap.) Convert with an explicit error, and narrow with
+/// `T::try_from` rather than `as` — `4294967296 as u32` is `0`.
 impl TryFrom<&Value> for i64 {
     type Error = ValueTypeError;
 
@@ -426,7 +370,7 @@ impl TryFrom<&Value> for i64 {
         match value {
             // Reject fractional and out-of-range numbers rather than
             // silently truncating (e.g. 3.7 must not become 3).
-            Value::Number(n) => n.as_i64().ok_or(ValueTypeError {
+            Value::Number(n) => n.to_i64().ok_or(ValueTypeError {
                 expected: "integer",
                 actual: "fractional or out-of-range number",
             }),
@@ -495,7 +439,7 @@ mod tests {
 
     #[test]
     fn try_from_number() {
-        let v = Value::number(42.0);
+        let v = Value::number(crate::num!(42.0));
         assert_eq!(f64::try_from(&v).unwrap(), 42.0);
         assert_eq!(i64::try_from(&v).unwrap(), 42);
     }
@@ -529,19 +473,19 @@ mod tests {
         assert_eq!(Value::String("hi".into()).as_str(), Some("hi"));
         assert_eq!(Value::Path("/tmp".into()).as_str(), Some("/tmp"));
         assert_eq!(Value::Reference("Ref".into()).as_str(), Some("Ref"));
-        assert_eq!(Value::number(1.0).as_str(), None);
+        assert_eq!(Value::number(crate::num!(1.0)).as_str(), None);
     }
 
     #[test]
-    fn as_f64_accessor() {
-        assert_eq!(Value::number(2.5).as_f64(), Some(2.5));
-        assert_eq!(Value::String("x".into()).as_f64(), None);
+    fn value_to_f64_accessor() {
+        assert_eq!(Value::number(crate::num!(2.5)).to_f64(), Some(2.5));
+        assert_eq!(Value::String("x".into()).to_f64(), None);
     }
 
     #[test]
     fn as_bool_accessor() {
         assert_eq!(Value::Bool(true).as_bool(), Some(true));
-        assert_eq!(Value::number(1.0).as_bool(), None);
+        assert_eq!(Value::number(crate::num!(1.0)).as_bool(), None);
     }
 
     #[test]
@@ -562,64 +506,95 @@ mod tests {
     #[test]
     fn number_int_exact_above_2_pow_53() {
         // 2^53 + 1 is the smallest integer f64 cannot represent.
-        let n = Number::Int(9_007_199_254_740_993);
-        assert_eq!(n.as_i64(), Some(9_007_199_254_740_993));
-        assert_eq!(Number::Int(i64::MAX).as_i64(), Some(i64::MAX));
-        assert_eq!(Number::Int(i64::MIN).as_i64(), Some(i64::MIN));
+        let n = Number::from(9_007_199_254_740_993);
+        assert_eq!(n.to_i64(), Some(9_007_199_254_740_993));
+        assert_eq!(Number::from(i64::MAX).to_i64(), Some(i64::MAX));
+        assert_eq!(Number::from(i64::MIN).to_i64(), Some(i64::MIN));
     }
 
     #[test]
     fn number_equality_is_numeric() {
-        assert_eq!(Number::Int(3), Number::Float(3.0));
-        assert_eq!(Number::Float(3.0), Number::Int(3));
-        assert_ne!(Number::Int(3), Number::Float(3.5));
-        // i64::MAX as f64 rounds up to 2^63, which is NOT i64::MAX.
-        assert_ne!(Number::Int(i64::MAX), Number::Float(i64::MAX as f64));
-        // i64::MIN is exactly -2^63, which f64 represents exactly.
-        assert_eq!(Number::Int(i64::MIN), Number::Float(i64::MIN as f64));
-        assert_ne!(Number::Float(f64::NAN), Number::Float(f64::NAN));
+        assert_eq!(Number::from(3), crate::num!(3.0));
+        assert_eq!(crate::num!(3.0), Number::from(3));
+        assert_ne!(Number::from(3), crate::num!(3.5));
+        // Exactness at the f64 cliff: under the old float model
+        // `i64::MAX as f64` collapsed to 2^63; the exact decimal keeps
+        // every i64 distinct.
+        assert_ne!(
+            Number::from(i64::MAX),
+            "9223372036854775808".parse::<Number>().unwrap()
+        );
+        assert_eq!(
+            Number::from(i64::MIN),
+            "-9223372036854775808".parse::<Number>().unwrap()
+        );
+        // Scale is presentation, not value (RFC 0016 §1.3).
+        assert_eq!(crate::num!(1.5), crate::num!(1.50));
     }
 
     #[test]
-    fn number_float_to_i64_is_exact_or_none() {
-        assert_eq!(Number::Float(3.5).as_i64(), None);
-        assert_eq!(Number::Float(f64::NAN).as_i64(), None);
-        assert_eq!(Number::Float(f64::INFINITY).as_i64(), None);
+    fn number_to_i64_is_exact_or_none() {
+        assert_eq!(crate::num!(3.5).to_i64(), None);
+        // Value-based integrality: 3.0 is integral even in fraction form.
+        assert_eq!(crate::num!(3.0).to_i64(), Some(3));
         // 2^63 is one past i64::MAX; must not wrap or saturate silently.
-        assert_eq!(Number::Float(9_223_372_036_854_775_808.0).as_i64(), None);
         assert_eq!(
-            Number::Float(-9_223_372_036_854_775_808.0).as_i64(),
+            "9223372036854775808".parse::<Number>().unwrap().to_i64(),
+            None
+        );
+        assert_eq!(
+            "-9223372036854775808".parse::<Number>().unwrap().to_i64(),
             Some(i64::MIN)
         );
     }
 
     #[test]
     fn number_display() {
-        assert_eq!(Number::Int(42).to_string(), "42");
-        assert_eq!(Number::Int(i64::MAX).to_string(), "9223372036854775807");
-        assert_eq!(Number::Float(2.5).to_string(), "2.5");
-        // Whole floats keep their decimal point: the literal form
-        // round-trips through format -> reparse without changing variant.
-        assert_eq!(Number::Float(2.0).to_string(), "2.0");
+        assert_eq!(Number::from(42).to_string(), "42");
+        assert_eq!(Number::from(i64::MAX).to_string(), "9223372036854775807");
+        assert_eq!(crate::num!(2.5).to_string(), "2.5");
+        // The written scale is real information and survives Display
+        // (`2.0` stays `2.0`, `2.50` stays `2.50` — no {n:.1} faking).
+        assert_eq!(crate::num!(2.0).to_string(), "2.0");
+        assert_eq!(crate::num!(2.50).to_string(), "2.50");
     }
 
     #[test]
-    fn number_display_roundtrips_variant() {
-        // Display output must reparse to the same variant.
+    fn number_display_roundtrips_member() {
+        // Display output reparses to the identical stored member.
         for (n, text) in [
-            (Number::Int(8080), "8080"),
-            (Number::Float(8080.0), "8080.0"),
-            (Number::Float(0.75), "0.75"),
+            (Number::from(8080), "8080"),
+            (crate::num!(8080.0), "8080.0"),
+            (crate::num!(0.75), "0.75"),
         ] {
             assert_eq!(n.to_string(), text);
+            assert_eq!(text.parse::<Number>().unwrap(), n);
         }
+    }
+
+    /// RFC 0016 §2: the diff-cosmetic classification pair, pinned at the
+    /// semantic_eq layer (the RFC 0032 reload differ's comparator).
+    /// Scale-only edits are cosmetic; the old f64 fall-through falsely
+    /// equated distinct integers beyond 2^53 — that must never return.
+    #[test]
+    fn semantic_eq_numeric_pairs() {
+        let n = |s: &str| Value::Number(s.parse::<Number>().unwrap());
+        assert!(
+            n("1.5").semantic_eq(&n("1.50")),
+            "scale-only edit is cosmetic"
+        );
+        assert!(n("2").semantic_eq(&n("2.0")));
+        assert!(
+            !n("9007199254740993.0").semantic_eq(&n("9007199254740992.0")),
+            "distinct values beyond 2^53 must NOT classify as cosmetic (the f64-era bug)"
+        );
     }
 
     #[test]
     fn value_as_i64_accessor() {
-        assert_eq!(Value::number(42).as_i64(), Some(42));
-        assert_eq!(Value::number(2.5).as_i64(), None);
-        assert_eq!(Value::String("42".into()).as_i64(), None);
+        assert_eq!(Value::number(42).to_i64(), Some(42));
+        assert_eq!(Value::number(crate::num!(2.5)).to_i64(), None);
+        assert_eq!(Value::String("42".into()).to_i64(), None);
     }
 
     // -------------------------------------------------------------------
@@ -678,7 +653,7 @@ mod tests {
 
     #[test]
     fn try_from_number_to_bool_fails() {
-        let v = Value::number(1.0);
+        let v = Value::number(crate::num!(1.0));
         let result = bool::try_from(&v);
         assert!(result.is_err());
     }
@@ -686,13 +661,13 @@ mod tests {
     #[test]
     fn i64_rejects_fractional() {
         // 3.7 is not an integer; conversion must fail rather than truncate.
-        let v = Value::number(3.7);
+        let v = Value::number(crate::num!(3.7));
         assert!(i64::try_from(&v).is_err());
     }
 
     #[test]
     fn i64_negative() {
-        let v = Value::number(-100.0);
+        let v = Value::number(crate::num!(-100.0));
         assert_eq!(i64::try_from(&v).unwrap(), -100);
     }
 
@@ -700,7 +675,7 @@ mod tests {
     fn vec_string_from_mixed_array_fails() {
         let v = Value::Array(vec![
             SpannedValue::new(Value::String("a".into()), Span::empty(0)),
-            SpannedValue::new(Value::number(42.0), Span::empty(0)),
+            SpannedValue::new(Value::number(crate::num!(42.0)), Span::empty(0)),
         ]);
         let result = Vec::<String>::try_from(&v);
         assert!(result.is_err());
@@ -735,8 +710,8 @@ mod tests {
     }
 
     #[test]
-    fn as_f64_string_returns_none() {
-        assert!(Value::String("42".into()).as_f64().is_none());
+    fn value_to_f64_string_returns_none() {
+        assert!(Value::String("42".into()).to_f64().is_none());
     }
 
     #[test]
@@ -748,7 +723,7 @@ mod tests {
     fn type_name_all_variants() {
         assert_eq!(Value::String("".into()).type_name(), "string");
         assert_eq!(Value::TemplateString(vec![]).type_name(), "string");
-        assert_eq!(Value::number(0.0).type_name(), "number");
+        assert_eq!(Value::number(crate::num!(0.0)).type_name(), "number");
         assert_eq!(Value::Bool(false).type_name(), "bool");
         assert_eq!(Value::Duration("1s".into()).type_name(), "duration");
         assert_eq!(Value::Path("/x".into()).type_name(), "path");

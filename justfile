@@ -47,7 +47,9 @@ test-lsp:
 
 # Run clippy on the workspace (matches CI: --all-targets + --locked)
 lint:
+    cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --locked -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 
 # Format all Rust code
 fmt:

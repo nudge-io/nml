@@ -81,6 +81,47 @@ impl From<ExtractedSchema> for SchemaValidator {
     }
 }
 
+/// How an element's diagnostics name their location: the declaring field
+/// (or block keyword) and the container word the INLINE spelling uses.
+/// Threading it is what makes spelling parity cover message PROSE — a
+/// `set<string>` element must read "in set 'tags'" in both spellings, and
+/// no diagnostic may ever put a TYPE where a field name belongs.
+#[derive(Clone, Copy)]
+struct ElemLabel<'a> {
+    field: &'a str,
+    container: &'a str,
+}
+
+impl<'a> ElemLabel<'a> {
+    /// A list/array element of `field`.
+    fn array(field: &'a str) -> Self {
+        Self {
+            field,
+            container: "in array",
+        }
+    }
+
+    /// The same field, relabelled for a `set<T>` container.
+    fn in_set(self) -> Self {
+        Self {
+            container: "in set",
+            ..self
+        }
+    }
+
+    /// Label an element of `field` whose declared container is `ty` — the
+    /// ONE place the container word is derived from a type, so no call site
+    /// can mislabel a `set<T>` as an array.
+    fn for_type(field: &'a str, ty: &FieldType) -> Self {
+        let base = Self::array(field);
+        if matches!(ty, FieldType::Set(_)) {
+            base.in_set()
+        } else {
+            base
+        }
+    }
+}
+
 impl SchemaValidator {
     pub fn new(models: Vec<ModelDef>, enums: Vec<EnumDef>, oneofs: Vec<OneOfDef>) -> Self {
         Self {
@@ -382,6 +423,7 @@ impl SchemaValidator {
                             body,
                             depth + 1,
                             Some(sp.name.span),
+                            ElemLabel::array(&sp.name.name),
                             &mut local,
                         ) {
                             block_capable = true;
@@ -671,18 +713,22 @@ impl SchemaValidator {
             // the block name — lenient: an explicit `name` in the body wins (RFC 0005
             // §5). `oneof`/other targets keep the prior path.
             let resolved = match self.index.resolve_ref(keyword) {
-                FieldTarget::Model(m) => {
+                Some(FieldTarget::Model(m)) => {
                     let result = nml_core::identity::materialize_named(&block.name, &block.body, m);
                     self.validate_materialized(result, m, 0, Some(block.name.span), diags);
                     true
                 }
-                other => self.validate_target_instance(
+                Some(other) => self.validate_target_instance(
                     &other,
                     &block.body,
                     0,
                     Some(block.name.span),
+                    ElemLabel::array(keyword),
                     diags,
                 ),
+                // A label-only keyword (no model/oneof): nothing to validate
+                // against; the strict-keyword check reports unknowns.
+                None => false,
             };
             if !resolved && self.strict_unknown_fields {
                 let mut diag =
@@ -721,9 +767,11 @@ impl SchemaValidator {
         // both for the strict check and to validate each item below.
         let elem = self.index.resolve_ref(keyword);
         let shared: Vec<&SharedProperty> = arr.body.shared_properties.iter().collect();
-        self.validate_shared_properties(&shared, &elem, 0, diags);
+        if let Some(elem) = &elem {
+            self.validate_shared_properties(&shared, elem, 0, diags);
+        }
         let resolves =
-            !is_schema_def && matches!(elem, FieldTarget::Model(_) | FieldTarget::OneOf(_));
+            !is_schema_def && matches!(elem, Some(FieldTarget::Model(_) | FieldTarget::OneOf(_)));
 
         // Only *named* items carry a body that needs a model/oneof to validate against;
         // a scalar item is a bare value (e.g. `[]plugin globalPlugins:` of plugin-name
@@ -767,13 +815,13 @@ impl SchemaValidator {
                     self.flag_stray_annotation(body, diags);
                 }
             }
-            if !is_schema_def
-                && matches!(
-                    &item.kind,
-                    ListItemKind::Named { .. } | ListItemKind::Shorthand { .. }
-                )
-            {
-                self.validate_inline_item(item, &elem, 0, diags);
+            // Item-shape decisions live in the dispatcher's matrix; the gate
+            // here is only "is there a target at all" (unknown keywords were
+            // reported above) and the schema-def exemption.
+            if !is_schema_def {
+                if let Some(elem) = &elem {
+                    self.validate_inline_item(item, elem, ElemLabel::array(keyword), 0, diags);
+                }
             }
         }
     }
@@ -785,42 +833,126 @@ impl SchemaValidator {
     /// scope and flagged explicitly. This is the single inline-item path shared by
     /// top-level arrays, the `[]T` field arm, and the `ListOf` dispatch — references
     /// and links carry no inline instance and are skipped.
+    /// The item-shape × element-target decision matrix — TOTAL, with no
+    /// catch-all at either level: every (target, item shape) combination is
+    /// an explicit decision, so adding a variant to either enum forces a
+    /// compile-time choice here instead of a silent skip. (Three silent-arm
+    /// bugs preceded this design: the lowering fallthrough that emptied
+    /// secret items, the `Leaf` erasure that skipped dash-item typing, and
+    /// the body-drop this matrix's NML2055 arm now reports.)
+    ///
+    /// `label` names the element's location exactly as the INLINE spelling
+    /// names it (declaring field + container word), so both spellings
+    /// produce identical message PROSE, not merely identical codes.
     fn validate_inline_item(
         &self,
         item: &ListItem,
         elem: &FieldTarget,
+        label: ElemLabel<'_>,
         depth: u32,
         diags: &mut Vec<Diagnostic>,
     ) {
+        use ListItemKind as K;
         let header = match &item.kind {
-            ListItemKind::Named { name, .. } => Some(name.span),
-            ListItemKind::Shorthand { value, .. } => Some(value.span),
-            ListItemKind::Reference(_) | ListItemKind::Role(_) => return,
+            K::Named { name, .. } => Some(name.span),
+            K::Shorthand { value, .. } => Some(value.span),
+            K::Reference(id) => Some(id.span),
+            K::Role(_) => Some(item.span),
         };
-        match elem {
-            // Inline items (named or scalar) validate against the model *after*
-            // identity materialization (a named item's `name` / a scalar's `+` field).
-            FieldTarget::Model(m) => {
-                let result = nml_core::identity::materialize_item(item, m);
-                self.validate_materialized(result, m, depth, header, diags);
-            }
-            // A named item against any non-model target — a `oneof`, or a nested `[]T`
-            // union variant (`parallel [](step | []step)`) — validates its body against
-            // that target. A scalar only fills a model's `+` field, so on a union its
-            // variant isn't yet known and it's out of scope (flagged); against any other
-            // target there is nothing to fill.
-            _ => match &item.kind {
-                ListItemKind::Named { body, .. } => {
-                    self.validate_target_instance(elem, body, depth, header, diags);
-                }
-                ListItemKind::Shorthand { value, .. } if matches!(elem, FieldTarget::OneOf(_)) => {
+        // Tier-1 shared scalar check: THE same total checker the inline-array
+        // spelling uses, so the two spellings agree by construction —
+        // diagnostics, did-you-mean suggestions, fallback-leg recursion, all
+        // of it (the spelling-parity property test pins this).
+        let check_value = |value: &Value,
+                           span: Span,
+                           ty: &FieldType,
+                           diags: &mut Vec<Diagnostic>| {
+            self.validate_value_against_type(value, ty, label.field, label.container, span, diags);
+        };
+        // Tier-2: content with nowhere to go is an error, never a silent
+        // drop — NML2055, the body-side mirror of NML2049's dropped key.
+        let dropped_body =
+            |body: &Body, ty: &FieldType, span: Span, diags: &mut Vec<Diagnostic>| {
+                if !body.entries.is_empty() {
                     diags.push(
-                        Diagnostic::error(UNION_SHORTHAND_MSG.to_string())
-                            .with_code(codes::UNION_SHORTHAND)
-                            .with_span(value.span),
-                    )
+                        Diagnostic::error(format!(
+                            "this item's body has nowhere to go: the element type \
+                             `{ty}` has no fields to fill"
+                        ))
+                        .with_code(codes::DROPPED_ITEM_BODY)
+                        .with_span(span),
+                    );
                 }
-                _ => {}
+            };
+        match elem {
+            // Inline items (named or scalar) validate against the model after
+            // identity materialization (a named item's `name` / a scalar's
+            // `+` field); reference/role items are links — resolved by the
+            // consumer, never validated as inline instances.
+            FieldTarget::Model(m) => match &item.kind {
+                K::Named { .. } | K::Shorthand { .. } => {
+                    let result = nml_core::identity::materialize_item(item, m);
+                    self.validate_materialized(result, m, depth, header, diags);
+                }
+                K::Reference(_) | K::Role(_) => {}
+            },
+            FieldTarget::OneOf(_) => match &item.kind {
+                K::Named { body, .. } => {
+                    self.validate_target_instance(elem, body, depth, header, label, diags);
+                }
+                // A scalar can only fill a model's `+` field; on a union its
+                // variant isn't yet known, so it is out of scope — flagged.
+                K::Shorthand { value, .. } => diags.push(
+                    Diagnostic::error(UNION_SHORTHAND_MSG.to_string())
+                        .with_code(codes::UNION_SHORTHAND)
+                        .with_span(value.span),
+                ),
+                K::Reference(_) | K::Role(_) => {}
+            },
+            // Leaf/Union: value items type-check; bodies have nowhere to go.
+            FieldTarget::Leaf(ty) | FieldTarget::Union(ty) => match &item.kind {
+                K::Shorthand { value, body } => {
+                    check_value(&value.value, value.span, ty, diags);
+                    if let Some(b) = body {
+                        dropped_body(b, ty, value.span, diags);
+                    }
+                }
+                K::Named { name, body } => dropped_body(body, ty, name.span, diags),
+                K::Role(r) => {
+                    check_value(&Value::Role(r.clone()), item.span, ty, diags);
+                }
+                // References resolve later (a name may become the element's
+                // value downstream) — accepted anywhere, like `$ENV` refs.
+                K::Reference(_) => {}
+            },
+            // Nested collections. A NAMED item's body here is a GROUP whose
+            // entries are the nested list (the workflow grouped-thread
+            // pattern, `- Group:` under `[]step`) — recurse, don't reject.
+            // A scalar item checks against the declared list/set type (an
+            // array value recurses element-wise inside the checker; a bare
+            // scalar gets the type mismatch).
+            FieldTarget::ListOf(ty, _) | FieldTarget::SetOf(ty, _) => match &item.kind {
+                K::Shorthand { value, body } => {
+                    check_value(&value.value, value.span, ty, diags);
+                    if let Some(b) = body {
+                        self.validate_target_instance(elem, b, depth, header, label, diags);
+                    }
+                }
+                K::Named { body, .. } => {
+                    self.validate_target_instance(elem, body, depth, header, label, diags);
+                }
+                K::Role(r) => check_value(&Value::Role(r.clone()), item.span, ty, diags),
+                K::Reference(_) => {}
+            },
+            // Free-form: accepts every shape by definition.
+            FieldTarget::Object => match &item.kind {
+                K::Named { .. } | K::Shorthand { .. } | K::Reference(_) | K::Role(_) => {}
+            },
+            // Arm-set bodies hold arms, not list items; a list item here is
+            // body-shape territory (validate_instance_against_arms reports
+            // non-arm entries) — deliberate skip, not a silent one.
+            FieldTarget::Arms { .. } => match &item.kind {
+                K::Named { .. } | K::Shorthand { .. } | K::Reference(_) | K::Role(_) => {}
             },
         }
     }
@@ -1025,11 +1157,17 @@ impl SchemaValidator {
         header_span: Option<Span>,
         diags: &mut Vec<Diagnostic>,
     ) -> bool {
+        let Some(target) = self.index.resolve_ref(ref_name) else {
+            // Unknown/enum name: a leaf reference with no instance shape to
+            // validate; reference-existence is its own check elsewhere.
+            return false;
+        };
         self.validate_target_instance(
-            &self.index.resolve_ref(ref_name),
+            &target,
             body,
             depth,
             header_span,
+            ElemLabel::array(ref_name),
             diags,
         )
     }
@@ -1164,8 +1302,20 @@ impl SchemaValidator {
         item: &ListItem,
         probe: &Body,
         diags: &mut Vec<Diagnostic>,
-    ) -> FieldTarget<'a> {
+    ) -> Option<FieldTarget<'a>> {
         if let FieldType::Union(variants) = inner {
+            // A pure VALUE item (bare scalar / role) carries no body, so
+            // body-based variant selection is meaningless — it checks
+            // against the whole union, exactly like an inline array element
+            // (the spelling-parity invariant). References are NOT values
+            // here: they can name a union variant instance, so they keep
+            // the RFC 0015 machinery (D2 ambiguity with anchored fixes).
+            if matches!(
+                &item.kind,
+                ListItemKind::Shorthand { body: None, .. } | ListItemKind::Role(_)
+            ) {
+                return Some(FieldTarget::Union(inner));
+            }
             // A Named item anchors the diagnostic AND the fix at its NAME token
             // (`- one` of `- one as modelB:`); reference/shorthand/role items
             // cannot carry `as` in place, so they get no fix anchor and the
@@ -1176,14 +1326,14 @@ impl SchemaValidator {
             };
             let span = anchor.map(|(_, s)| s).unwrap_or(item.span);
             if !self.check_union_annotation(variants, probe, span, anchor, diags) {
-                // A union-level error was reported; `Leaf` skips instance
-                // validation quietly instead of validating a guessed variant.
-                return FieldTarget::Leaf;
+                // A union-level error was reported; skip instance validation
+                // quietly instead of validating a guessed variant.
+                return None;
             }
         } else {
             self.flag_stray_annotation(probe, diags);
         }
-        self.index.resolve_type_in_body(inner, probe)
+        Some(self.index.resolve_type_in_body(inner, probe))
     }
 
     /// RFC 0015: flag an `as <Variant>` annotation on a non-union field or
@@ -1210,6 +1360,7 @@ impl SchemaValidator {
         body: &Body,
         depth: u32,
         header_span: Option<Span>,
+        label: ElemLabel<'_>,
         diags: &mut Vec<Diagnostic>,
     ) -> bool {
         match target {
@@ -1221,15 +1372,15 @@ impl SchemaValidator {
                 self.validate_instance_against_oneof(body, o, depth, header_span, diags);
                 true
             }
-            FieldTarget::ListOf(inner) => {
+            FieldTarget::ListOf(_, inner) => {
                 for entry in &body.entries {
                     if let BodyEntryKind::ListItem(item) = &entry.kind {
-                        self.validate_inline_item(item, inner.as_ref(), depth, diags);
+                        self.validate_inline_item(item, inner.as_ref(), label, depth, diags);
                     }
                 }
                 true
             }
-            FieldTarget::SetOf(inner) => {
+            FieldTarget::SetOf(_, inner) => {
                 // Shape: exactly a list. Then RFC 0032 uniqueness — duplicate
                 // elements are load errors, reported at the SECOND occurrence.
                 // Identity is value-level for scalar items (semantic_eq, span-
@@ -1237,7 +1388,15 @@ impl SchemaValidator {
                 let mut items: Vec<&nml_core::ast::ListItem> = Vec::new();
                 for entry in &body.entries {
                     if let BodyEntryKind::ListItem(item) = &entry.kind {
-                        self.validate_inline_item(item, inner.as_ref(), depth, diags);
+                        // The inline spelling says "in set" here; the dash
+                        // spelling must say it too (prose parity).
+                        self.validate_inline_item(
+                            item,
+                            inner.as_ref(),
+                            label.in_set(),
+                            depth,
+                            diags,
+                        );
                         items.push(item);
                     }
                 }
@@ -1248,7 +1407,7 @@ impl SchemaValidator {
                 self.validate_instance_against_arms(body, key, target, diags);
                 true
             }
-            FieldTarget::Object | FieldTarget::Union | FieldTarget::Leaf => false,
+            FieldTarget::Object | FieldTarget::Union(_) | FieldTarget::Leaf(_) => false,
         }
     }
 
@@ -1451,6 +1610,7 @@ impl SchemaValidator {
                                     &nb.body,
                                     depth + 1,
                                     Some(nb.name.span),
+                                    ElemLabel::for_type(&field_def.name, &field_def.field_type),
                                     diags,
                                 );
                             }
@@ -1486,8 +1646,20 @@ impl SchemaValidator {
                                         ListItemKind::Shorthand { body: Some(b), .. } => b,
                                         _ => &empty,
                                     };
-                                    let elem = self.resolve_elem_checked(inner, item, probe, diags);
-                                    self.validate_inline_item(item, &elem, depth + 1, diags);
+                                    if let Some(elem) =
+                                        self.resolve_elem_checked(inner, item, probe, diags)
+                                    {
+                                        self.validate_inline_item(
+                                            item,
+                                            &elem,
+                                            ElemLabel::for_type(
+                                                &field_def.name,
+                                                &field_def.field_type,
+                                            ),
+                                            depth + 1,
+                                            diags,
+                                        );
+                                    }
                                 }
                             }
                             FieldType::Set(inner) => {
@@ -1506,8 +1678,20 @@ impl SchemaValidator {
                                         ListItemKind::Shorthand { body: Some(b), .. } => b,
                                         _ => &empty,
                                     };
-                                    let elem = self.resolve_elem_checked(inner, item, probe, diags);
-                                    self.validate_inline_item(item, &elem, depth + 1, diags);
+                                    if let Some(elem) =
+                                        self.resolve_elem_checked(inner, item, probe, diags)
+                                    {
+                                        self.validate_inline_item(
+                                            item,
+                                            &elem,
+                                            ElemLabel::for_type(
+                                                &field_def.name,
+                                                &field_def.field_type,
+                                            ),
+                                            depth + 1,
+                                            diags,
+                                        );
+                                    }
                                     items.push(item);
                                 }
                                 // …then RFC 0032 uniqueness: duplicates are
@@ -1577,8 +1761,15 @@ impl SchemaValidator {
                             ListItemKind::Shorthand { body: Some(b), .. } => b,
                             _ => &empty,
                         };
-                        let elem = self.resolve_elem_checked(inner, item, probe, diags);
-                        self.validate_inline_item(item, &elem, depth + 1, diags);
+                        if let Some(elem) = self.resolve_elem_checked(inner, item, probe, diags) {
+                            self.validate_inline_item(
+                                item,
+                                &elem,
+                                ElemLabel::for_type(&field_def.name, &field_def.field_type),
+                                depth + 1,
+                                diags,
+                            );
+                        }
                     }
                 }
                 _ => {}
@@ -1920,12 +2111,15 @@ impl SchemaValidator {
                     // union-arm-blind), so the same value admitted via
                     // different union arms is still one element.
                     for (i, item) in items.iter().enumerate() {
-                        if items[..i].iter().any(|p| p.value.semantic_eq(&item.value)) {
+                        if let Some(earlier) =
+                            items[..i].iter().find(|p| p.value.semantic_eq(&item.value))
+                        {
                             diags.push(
                                 Diagnostic::error(format!(
-                                    "duplicate set element {context} '{field_name}'{} — set \
+                                    "duplicate set element {context} '{field_name}'{}{} — set \
                                      elements must be unique",
-                                    value_label(&item.value)
+                                    value_label(&item.value),
+                                    duplicate_clarifier(&earlier.value, &item.value)
                                 ))
                                 .with_code(codes::DUPLICATE_SET_ELEMENT)
                                 .with_span(item.span),
@@ -2403,10 +2597,17 @@ fn truncation_advisory(body: &Body, header_span: Option<Span>) -> Diagnostic {
 /// identity for scalars, name identity for named items.
 fn push_duplicate_set_items(items: &[&ListItem], diags: &mut Vec<Diagnostic>) {
     for (i, item) in items.iter().enumerate() {
-        if items[..i].iter().any(|p| set_items_equal(p, item)) {
+        if let Some(earlier) = items[..i].iter().find(|p| set_items_equal(p, item)) {
+            let clarifier = match (&earlier.kind, &item.kind) {
+                (
+                    nml_core::ast::ListItemKind::Shorthand { value: a, .. },
+                    nml_core::ast::ListItemKind::Shorthand { value: b, .. },
+                ) => duplicate_clarifier(&a.value, &b.value),
+                _ => String::new(),
+            };
             diags.push(
                 Diagnostic::error(format!(
-                    "duplicate set element{} — set elements must be unique",
+                    "duplicate set element{}{clarifier} — set elements must be unique",
                     set_item_label(item)
                 ))
                 .with_code(codes::DUPLICATE_SET_ELEMENT)
@@ -2533,6 +2734,31 @@ fn set_item_label(item: &nml_core::ast::ListItem) -> String {
     }
 }
 
+/// Why two set elements that LOOK different are the same element.
+///
+/// Set identity is semantic, and since RFC 0016 that includes numeric
+/// cohorts: `8080` and `8080.0` are one value in two spellings. Telling
+/// an author their two visibly-different literals are "duplicate" without
+/// saying why is the kind of diagnostic that costs an afternoon — so when
+/// the two renderings differ, name the earlier spelling explicitly.
+/// Identical spellings need no explanation (the duplication is visible).
+fn duplicate_clarifier(earlier: &Value, current: &Value) -> String {
+    match (earlier, current) {
+        (Value::Number(a), Value::Number(b)) if a.to_string() != b.to_string() => {
+            format!(" (the same number as '{a}' above, written differently)")
+        }
+        // Money is the other cohort type (RFC 0016 §1.8: exact minor
+        // units), so `19.9 USD` and `19.90 USD` collide the same way.
+        (Value::Money(a), Value::Money(b)) if a.format_display() != b.format_display() => {
+            format!(
+                " (the same amount as '{}' above, written differently)",
+                a.format_display()
+            )
+        }
+        _ => String::new(),
+    }
+}
+
 /// A short value rendering for duplicate diagnostics; empty for compound
 /// values (the span carries the location).
 fn value_label(value: &Value) -> String {
@@ -2541,6 +2767,7 @@ fn value_label(value: &Value) -> String {
             format!(" '{s}'")
         }
         Value::Number(n) => format!(" '{n}'"),
+        Value::Money(m) => format!(" '{}'", m.format_display()),
         Value::Bool(b) => format!(" '{b}'"),
         _ => String::new(),
     }
@@ -2593,6 +2820,37 @@ mod tests {
     fn diags(schema: &str, source: &str) -> Vec<Diagnostic> {
         let file = nml_core::cst::parse_to_ast(source).unwrap();
         make_validator(schema).validate(&file)
+    }
+
+    /// RFC 0016 made set identity numeric, so two spellings of one value
+    /// now collide. "Duplicate" is useless when the two literals look
+    /// different — the message must name the earlier spelling.
+    #[test]
+    fn duplicate_set_element_explains_cohort_equal_numbers() {
+        let schema = "model svc:\n    name string+\n    ports set<number>\n";
+        let d = diags(schema, "svc A:\n    ports = [8080, 8080.0]\n");
+        let dup = d
+            .iter()
+            .find(|x| x.rendered_message().contains("duplicate set element"))
+            .unwrap_or_else(|| panic!("expected a duplicate diagnostic, got {d:?}"));
+        let msg = dup.rendered_message();
+        assert!(
+            msg.contains("the same number as '8080' above, written differently"),
+            "must explain the non-obvious equivalence: {msg}"
+        );
+
+        // An identical spelling needs no explanation — the repetition is
+        // visible, and the clarifier would just be noise.
+        let d = diags(schema, "svc A:\n    ports = [8080, 8080]\n");
+        let dup = d
+            .iter()
+            .find(|x| x.rendered_message().contains("duplicate set element"))
+            .expect("duplicate");
+        assert!(
+            !dup.rendered_message().contains("written differently"),
+            "no clarifier for identical spellings: {}",
+            dup.rendered_message()
+        );
     }
 
     // ── RFC 0030: structured suggestions ──
@@ -3530,6 +3788,99 @@ workflow W:
             "expected warning about 'bogus', got: {:?}",
             diags
         );
+    }
+
+    // — Spelling parity + the item-shape decision matrix —
+
+    /// THE parity invariant behind the `FieldTarget` payload redesign: the
+    /// inline-array spelling (`f = [v]`) and the dash-item spelling
+    /// (`f:` + `- v`) of the same field are INDISTINGUISHABLE in what they
+    /// report — code, quick-fix count, message prose, severity, and the
+    /// text the span highlights. A spelling can never silently lose a
+    /// check, a fix, or the words that name the location. (Before the
+    /// redesign the dash spelling skipped ALL leaf/union element
+    /// validation: literal credentials in `[]secret` fields passed
+    /// `nml check`. Two later rounds found prose-only and context-word
+    /// divergences that a codes-only comparison could not see — hence the
+    /// full-payload comparison here.)
+    #[test]
+    fn spelling_parity_is_indistinguishable() {
+        let schema = "enum level:\n    - \"debug\"\n    - \"info\"\n\nmodel box:\n    keys []secret?\n    lv []level?\n    tags []string?\n    mix [](string | number)?\n    st set<string>?\n    who []role?\n";
+        let cases = [
+            ("keys", "\"hardcoded\""),
+            ("lv", "\"deubg\""),
+            ("tags", "42"),
+            ("mix", "true"),
+            ("st", "42"),
+            ("who", "\"notarole\""),
+        ];
+        // EVERYTHING a user perceives must match across spellings: code,
+        // quick-fix count, message prose ("in set 'tags'" must not become
+        // "in array 'tags'"), severity, and the SOURCE TEXT the span points
+        // at — line/column legitimately differ between spellings, the
+        // highlighted text must not.
+        let payload = |ds: &[Diagnostic], src: &str| {
+            let mut v: Vec<(String, usize, String, String, String)> = ds
+                .iter()
+                .map(|d| {
+                    (
+                        d.code.map(|c| c.to_string()).unwrap_or_default(),
+                        d.suggestions.len(),
+                        d.rendered_message(),
+                        d.severity.to_string(),
+                        d.span
+                            .map(|sp| src[sp.start..sp.end].to_string())
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        for (field, value) in cases {
+            let inline_src = format!("box B:\n    {field} = [{value}]\n");
+            let dash_src = format!("box B:\n    {field}:\n        - {value}\n");
+            let inline = payload(&diags_for(schema, &inline_src), &inline_src);
+            let dash = payload(&diags_for(schema, &dash_src), &dash_src);
+            assert!(!inline.is_empty(), "{field}: inline spelling must diagnose");
+            assert_eq!(
+                inline, dash,
+                "{field} = [{value}]: spellings disagree\ninline: {inline:?}\ndash: {dash:?}"
+            );
+        }
+    }
+
+    /// The decision matrix's non-parity cells, one pin per decided outcome
+    /// (sub-shapes included: body presence changes the decision). The
+    /// grouped-thread cell is pinned POSITIVE — a named item's body under
+    /// `[]step`-style elements is a nested group, never a dropped body.
+    #[test]
+    fn item_shape_matrix_decisions() {
+        let schema = "model step:\n    run string?\nmodel box:\n    tags []string?\n    nested [][]string?\n    obj []object?\n    steps [](step | []step)?\n";
+        let codes = |src: &str| -> Vec<String> {
+            diags_for(schema, src)
+                .iter()
+                .filter_map(|d| d.code.map(|c| c.to_string()))
+                .collect()
+        };
+        // Leaf × Named{non-empty body} → dropped body (NML2055).
+        assert!(
+            codes("box B:\n    tags:\n        - foo:\n            k = \"v\"\n")
+                .contains(&"NML2055".to_string())
+        );
+        // Leaf × Named{EMPTY body} → skip (nothing dropped).
+        assert!(codes("box B:\n    tags:\n        - foo:\n").is_empty());
+        // Leaf × Reference → skip (resolves later).
+        assert!(codes("box B:\n    tags:\n        - foo\n").is_empty());
+        // ListOf × scalar → type mismatch (a scalar cannot fill a nested list).
+        assert!(!codes("box B:\n    nested:\n        - \"scalar\"\n").is_empty());
+        // ListOf × Named{body} → grouped thread: recurse, NO NML2055.
+        assert!(
+            !codes("box B:\n    steps:\n        - Group:\n            - Step:\n                run = \"x\"\n")
+                .contains(&"NML2055".to_string())
+        );
+        // Object × anything → free-form skip.
+        assert!(codes("box B:\n    obj:\n        - foo:\n            k = 1\n").is_empty());
     }
 
     // ── RFC 0015 nominal union disambiguation ────────────────────────────────

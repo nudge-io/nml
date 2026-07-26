@@ -672,9 +672,16 @@ impl AstNode for ValueNode {
 }
 
 impl ValueNode {
-    /// Interpret this value node into a semantic value (escapes, money, etc.).
+    /// Interpret this value node into a semantic value (escapes, money, etc.),
+    /// strict view: first error or the value.
     pub fn decode(&self) -> Result<crate::types::SpannedValue, crate::error::NmlError> {
         super::value::decode_value(&self.0)
+    }
+
+    /// The total view: best-effort value plus EVERY collected error (see
+    /// [`super::value::decode_value_all`]) — what lenient surfaces want.
+    pub fn decode_all(&self, sink: &mut super::value::ValueErrors) -> crate::types::SpannedValue {
+        super::value::decode_value_all(&self.0, sink)
     }
 }
 
@@ -830,7 +837,7 @@ mod tests {
         let v = p.value().unwrap().decode().unwrap().value;
         assert_eq!(
             v,
-            crate::types::Value::Number(crate::types::Number::Int(8080))
+            crate::types::Value::Number(crate::types::Number::from(8080))
         );
     }
 

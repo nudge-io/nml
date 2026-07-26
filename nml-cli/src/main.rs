@@ -111,6 +111,8 @@ USAGE:
 
 COMMANDS:
     parse                           Parse an NML file and dump the AST as JSON
+                                    (numbers: JSON number for integer-form
+                                    values within u64, else exact string)
     validate                        Validate an NML file for duplicates and unresolved references
     fmt                             Format NML files in canonical style
     check [--schema <dir>] [--strict] <file>
@@ -123,6 +125,22 @@ COMMANDS:
     );
 }
 
+/// Dump the AST as JSON.
+///
+/// **Number encoding** (the one shape worth knowing before consuming this
+/// output): values are externally tagged, so a number is always
+/// `{"Number": …}` and can never be confused with `{"String": …}`. The
+/// payload is a JSON number when the value was written in **integer
+/// form** and fits `i64`/`u64`; it is the **exact decimal digits as a
+/// string** otherwise. The rule is form-based, not value-based: `8080.0`
+/// is integral and small, yet emits `{"Number": "8080.0"}` because the
+/// written scale is part of the value. Strings therefore cover fraction
+/// forms (scale preserved) and integers beyond `u64`.
+///
+/// Strings appear exactly where a JSON number would be lossy: most
+/// readers silently truncate past 2^53 and cannot represent 128-bit
+/// integers at all, so an exact string is the only encoding that survives
+/// the round trip. `str::parse` recovers every value exactly.
 fn cmd_parse(args: &[String]) -> Result<(), String> {
     let path = require_file_arg(args, "parse")?;
     let source = read_file(&path)?;

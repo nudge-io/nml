@@ -150,3 +150,65 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo +nightly update -Zdirect-minimal-versions
       - run: cargo check --workspace --all-targets
+
+  fuzz-smoke:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # The fuzz crate lives OUTSIDE the workspace (root Cargo.toml
+      # `exclude`) because libFuzzer needs nightly; this job is a smoke
+      # pass over the RFC 0016 targets — a short bounded run per target so
+      # a panic/invariant regression fails CI, while deep fuzzing stays a
+      # scheduled/local activity.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz
+      # Version-pinned like every other tool in this workflow (the repo
+      # posture: SHA-pinned actions, committed lockfiles — including
+      # fuzz/Cargo.lock — and canary-driven bumps).
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # Persistent coverage corpus (first-party actions/cache, SHA
+      # verified against upstream v4.3.0): every run restores the newest
+      # prior corpus via the prefix restore-key and saves its grown copy
+      # under a fresh run-scoped key, so coverage-guided progress
+      # ACCUMULATES across CI runs instead of restarting from the seeds —
+      # the ClusterFuzzLite core idea with zero third-party action
+      # surface. Old entries age out via GitHub's LRU cache eviction.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+      - name: smoke-run fuzz targets
+        working-directory: fuzz
+        # The fixtures corpus gives the coverage-guided mutator a running
+        # start (real documents, boundary literals) instead of starting
+        # from zero bytes each run; the first dir is the writable corpus.
+        run: |
+          for target in number document money format; do
+            mkdir -p "corpus/$target"  # fresh checkouts have no corpus dir; libFuzzer requires it
+            cargo +nightly fuzz run "$target" "corpus/$target" ../tests/fixtures/valid \
+              -- -runs=20000 -max_total_time=60
+          done
+      # actions/cache saves only on job SUCCESS (post-if), so the run that
+      # FINDS a crash would otherwise discard both its grown corpus and the
+      # reproducer libFuzzer writes to fuzz/artifacts — preserve the
+      # reproducer explicitly (first-party action, SHA verified against
+      # upstream v4.6.2).
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        # `always()` (not `failure()`): a job TIMEOUT is a cancellation,
+        # not a failure, and a hang is exactly when the partial corpus and
+        # any reproducer are most worth keeping. On success there is
+        # nothing to upload and `if-no-files-found: ignore` makes that a
+        # no-op.
+        if: always()
+        with:
+          name: fuzz-crash-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

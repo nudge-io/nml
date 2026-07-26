@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Query values
     let port = doc.block("service", "MyApp")
         .property("port")
-        .as_f64()
+        .to_f64()
         .unwrap_or(3000.0);
 
     let host = doc.block("service", "MyApp")
@@ -101,14 +101,14 @@ service MyApp:
 #[derive(Deserialize)]
 struct ServiceConfig {
     host: String,
-    port: f64,
+    port: u16,
     database: DatabaseConfig,
 }
 
 #[derive(Deserialize)]
 struct DatabaseConfig {
     url: String,
-    pool_size: f64,
+    pool_size: u32,
 }
 ```
 
@@ -284,13 +284,13 @@ The `Document` query API provides fluent access without serde:
 let doc = Document::new(&file);
 
 // Block properties
-doc.block("database", "Primary").property("pool_size").as_f64();
+doc.block("database", "Primary").property("pool_size").to_f64();
 
 // Nested blocks
 doc.block("service", "MyApp").nested("database").property("url").as_str();
 
 // Constants
-doc.const_value("MaxRetries").as_f64();
+doc.const_value("MaxRetries").to_f64();
 
 // Template declarations
 doc.template_value("WelcomeMessage").as_str();
@@ -317,8 +317,8 @@ let value = doc.block("service", "MyApp").property("port").value().unwrap();
 
 // Supported conversions
 let s: String    = value.try_into().unwrap();  // String, Secret, Path, Duration, Reference, RoleRef
-let n: f64       = value.try_into().unwrap();  // Number
-let i: i64       = value.try_into().unwrap();  // Number (truncated to integer)
+let n: f64       = value.try_into().unwrap();  // Number (correctly-rounded binary edge)
+let i: i64       = value.try_into().unwrap();  // Number (exact; fractional values error, never truncate)
 let b: bool      = value.try_into().unwrap();  // Bool
 let v: Vec<String> = value.try_into().unwrap(); // Array of strings
 ```
@@ -329,7 +329,8 @@ For quick access without `TryFrom`, use the accessor methods:
 
 ```rust
 value.as_str();    // Option<&str> -- String, Path, Duration, Secret, Reference, RoleRef
-value.as_f64();    // Option<f64>  -- Number
+value.to_f64();    // Option<f64>  -- Number (correctly rounded)
+value.to_i64();    // Option<i64>  -- Number (exact-or-None, never truncates)
 value.as_bool();   // Option<bool> -- Bool
 value.as_array();  // Option<&[SpannedValue]> -- Array
 ```

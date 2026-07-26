@@ -506,9 +506,20 @@ fn scan_format_version(file: &File) -> Option<u64> {
     None
 }
 
+/// `None` means **not a number at all**; a number too large for `u64`
+/// saturates rather than vanishing. Since RFC 0016 made integers exact to
+/// 34 digits, `formatVersion = <huge>` parses instead of failing at
+/// NML0014 — and a `None` here would read downstream as "missing
+/// `formatVersion`" while silently skipping the degradation gate, which
+/// is precisely the wall-of-noise outcome RFC 0030 exists to prevent. A
+/// version beyond `u64` is definitionally newer than anything this build
+/// supports, so saturating keeps the one-precise-error contract intact.
+/// The same reasoning covers negative and fractional values: none is a
+/// version this build knows, and reporting "newer than supported" beats
+/// "missing" for a field that is plainly present.
 fn number_as_u64(v: &SpannedValue) -> Option<u64> {
     match &v.value {
-        Value::Number(n) => n.to_string().parse().ok(),
+        Value::Number(n) => Some(n.to_u64().unwrap_or(u64::MAX)),
         _ => None,
     }
 }
@@ -990,6 +1001,24 @@ model denial:
                 required: 99,
                 supported,
             }) => {
+                assert_eq!(supported, SUPPORTED_FORMAT_VERSION);
+            }
+            other => panic!("expected UnsupportedFormatVersion, got {other:?}"),
+        }
+    }
+
+    /// RFC 0016 made 34-digit integers parse (they used to die at
+    /// NML0014), so a `formatVersion` beyond `u64` now reaches this code.
+    /// It must still hit the degradation gate — not read as "missing
+    /// formatVersion", and not fall through to a meta-validation wall.
+    #[test]
+    fn format_version_beyond_u64_still_hits_the_gate() {
+        let huge = MANIFEST.replace(
+            "formatVersion = 1",
+            "formatVersion = 9999999999999999999999999999999999\n    someFutureField = \"x\"",
+        );
+        match SchemaPackage::from_parts(&huge, resolve) {
+            Err(PackageError::UnsupportedFormatVersion { supported, .. }) => {
                 assert_eq!(supported, SUPPORTED_FORMAT_VERSION);
             }
             other => panic!("expected UnsupportedFormatVersion, got {other:?}"),

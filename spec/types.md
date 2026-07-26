@@ -15,30 +15,32 @@ address = "localhost:8001"
 
 ### `number`
 
-General-purpose numeric type covering both whole numbers and decimals. Use the
-`<integer>` constraint when a field must be a whole number.
+General-purpose **exact decimal** type covering both whole numbers and
+decimals with a single surface type.
 
 ```
 port = 8000
 weight = 0.75
-maxRetries = 3
+taxRate = 0.20
 ```
 
-There is no separate `int` or `float` type. The int/float distinction is an
-implementation detail that does not belong in a configuration language. Constraints
-handle validation:
+There is no separate `int` or `float` type — and no binary floating point
+anywhere in the data model. The int/float distinction is an implementation
+detail that does not belong in a configuration language.
 
-**Precision guarantee:** a literal without a decimal point is an exact 64-bit
-signed integer — every value in `-2^63 .. 2^63 - 1` survives parsing,
-formatting, and deserialization bit-for-bit. Whole-number literals outside
-that range are a parse error (never silently rounded). Literals with a
-decimal point are IEEE 754 double-precision floats.
+**Precision guarantee (RFC 0016):** every `number` is stored exactly. The
+domain is the finite IEEE 754-2019 decimal128 value space: up to **34
+significant digits**, with magnitudes from 10^-6176 up to
+9.999…×10^6144. A literal
+whose value fits parses bit-for-bit — `taxRate = 0.20` *is* 0.20, not
+0.2000000000000000111…, and the written scale is preserved (`2.50` stays
+`2.50` through formatting and serialization). A value that cannot be
+stored exactly is a parse error (`NML0014`), never a silently rounded
+approximation. Trailing zeros beyond the 34-digit budget drop losslessly;
+integers well past `u64` (up to 34 digits) are first-class.
 
-```
-// In a model definition
-port number <integer, min = 1, max = 65535>
-weight number <min = 0.0, max = 1.0>
-```
+Conversion to binary floats happens only at the consumer's edge (an `f64`
+struct field, `to_f64()`), correctly rounded, by explicit request.
 
 ### `money`
 

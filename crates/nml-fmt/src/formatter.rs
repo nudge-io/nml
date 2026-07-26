@@ -604,8 +604,8 @@ fn format_string(out: &mut String, s: &str, depth: usize, escape_braces: bool) {
             // leading space is indistinguishable from indentation on
             // reparse (min-indent would strip it) and a raw trailing space
             // is one editor trim-on-save away from a changed value — so a
-            // line's first and last space render as `\u{20}` (the concern
-            // Java added `\s` for).
+            // line's first and last space render as `\s` (Java's escape,
+            // adopted for exactly these emissions).
             let bytes = line.as_bytes();
             let protect_first = bytes.first() == Some(&b' ');
             let protect_last = line.len() > 1 && bytes.last() == Some(&b' ');
@@ -617,7 +617,7 @@ fn format_string(out: &mut String, s: &str, depth: usize, escape_braces: bool) {
             let mut quote_run = 0usize;
             while let Some((i, ch)) = chars.next() {
                 if (i == 0 && protect_first) || (i == line.len() - 1 && protect_last) {
-                    out.push_str("\\u{20}");
+                    out.push_str("\\s");
                     quote_run = 0;
                     continue;
                 }
@@ -631,7 +631,13 @@ fn format_string(out: &mut String, s: &str, depth: usize, escape_braces: bool) {
                 } else {
                     quote_run = 0;
                 }
-                if escape_braces && ch == '{' && chars.peek().map(|(_, c)| *c) == Some('{') {
+                if ch == '\t' {
+                    // A raw tab at the start of a rendered line would sit in
+                    // the indentation run and fail NML0005 on reparse; escape
+                    // uniformly (matching the single-line branch) so the
+                    // formatter can never emit a document the parser rejects.
+                    out.push_str("\\t");
+                } else if escape_braces && ch == '{' && chars.peek().map(|(_, c)| *c) == Some('{') {
                     out.push_str("\\u{7B}");
                 } else {
                     push_value_char(out, ch);
@@ -705,6 +711,42 @@ mod tests {
         assert_eq!(first, second, "formatting is not idempotent");
     }
 
+    /// RFC 0016 §1.10: the exact-decimal fixed-point table. Every output
+    /// of the pre-decimal formatter re-formats to itself (no save-churn on
+    /// previously formatted files) — with exactly one exception, `-0.0`,
+    /// whose sign was presentation the model no longer fakes.
+    #[test]
+    fn number_formatting_fixed_point_table() {
+        for (source_value, expected) in [
+            // Old-formatter outputs: all fixed points.
+            ("2.5", "2.5"),
+            ("8080.0", "8080.0"),
+            ("8080", "8080"),
+            ("-5", "-5"),
+            ("0.75", "0.75"),
+            ("9007199254740993", "9007199254740993"),
+            // Written scale now survives (the old formatter collapsed it —
+            // a change only where information was previously destroyed).
+            ("2.50", "2.50"),
+            ("0.20", "0.20"),
+            ("8080.000", "8080.000"),
+            // Leading zeros still canonicalize.
+            ("007", "7"),
+            // The one non-fixed-point: −0 is unrepresentable.
+            ("-0.0", "0.0"),
+        ] {
+            let file = parse(&format!("service App:\n    x = {source_value}\n")).unwrap();
+            let formatted = format(&file);
+            assert!(
+                formatted.contains(&format!("x = {expected}")),
+                "{source_value}: got {formatted:?}"
+            );
+            // And the output is itself a fixed point.
+            let again = format(&parse(&formatted).unwrap());
+            assert_eq!(formatted, again, "{source_value} must reach a fixed point");
+        }
+    }
+
     /// The formatter can never emit a document the parser rejects: string
     /// values holding policy-banned characters (reachable only via `\u{…}`
     /// escapes) render back AS escapes. `roundtrip` is the enforcement —
@@ -732,8 +774,21 @@ mod tests {
         roundtrip(source);
         idempotent(source);
         let formatted = format_source(source).unwrap();
-        assert!(formatted.contains("\\u{20}lead"), "{formatted}");
-        assert!(formatted.contains("tail\\u{20}"), "{formatted}");
+        assert!(formatted.contains("\\slead"), "{formatted}");
+        assert!(formatted.contains("tail\\s"), "{formatted}");
+    }
+
+    /// A value line beginning with tab content (writable via `\t`) must
+    /// re-emit the tab AS an escape: raw, it would land inside the rendered
+    /// line's indentation run and fail NML0005 on reparse — the formatter
+    /// may never produce a document the parser rejects.
+    #[test]
+    fn leading_tab_content_renders_escaped() {
+        let source = "service App:\n    x = \"\"\"\n        \\ta\n        b\n        \"\"\"\n";
+        roundtrip(source);
+        idempotent(source);
+        let formatted = format_source(source).unwrap();
+        assert!(formatted.contains("\\ta"), "{formatted}");
     }
 
     /// A multiline value containing `"""` (writable via `\"\"\"`) must not

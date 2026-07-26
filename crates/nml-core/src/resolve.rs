@@ -557,11 +557,14 @@ mod tests {
                 crate::span::Span::new(0, 9),
             )),
             Box::new(SpannedValue::new(
-                Value::number(8080.0),
+                Value::number(crate::num!(8080.0)),
                 crate::span::Span::new(12, 16),
             )),
         );
-        assert_eq!(r.resolve(&fallback).unwrap(), Value::number(8080.0));
+        assert_eq!(
+            r.resolve(&fallback).unwrap(),
+            Value::number(crate::num!(8080.0))
+        );
     }
 
     #[test]
@@ -581,8 +584,8 @@ mod tests {
             Value::String("hello".into())
         );
         assert_eq!(
-            r.resolve(&Value::number(42.0)).unwrap(),
-            Value::number(42.0)
+            r.resolve(&Value::number(crate::num!(42.0))).unwrap(),
+            Value::number(crate::num!(42.0))
         );
         assert_eq!(r.resolve(&Value::Bool(true)).unwrap(), Value::Bool(true));
     }
@@ -622,7 +625,7 @@ mod tests {
                 crate::span::Span::empty(0),
             )),
             Box::new(SpannedValue::new(
-                Value::number(3000.0),
+                Value::number(crate::num!(3000.0)),
                 crate::span::Span::empty(0),
             )),
         );
@@ -638,11 +641,11 @@ mod tests {
                 crate::span::Span::empty(0),
             )),
             Box::new(SpannedValue::new(
-                Value::number(3000.0),
+                Value::number(crate::num!(3000.0)),
                 crate::span::Span::empty(0),
             )),
         );
-        assert_eq!(r.resolve(&val).unwrap(), Value::number(3000.0));
+        assert_eq!(r.resolve(&val).unwrap(), Value::number(crate::num!(3000.0)));
     }
 
     #[test]
@@ -881,7 +884,7 @@ workflow W:
                                 crate::span::Span::empty(0),
                             )),
                             Box::new(SpannedValue::new(
-                                Value::number(42.0),
+                                Value::number(crate::num!(42.0)),
                                 crate::span::Span::empty(0),
                             )),
                         ),
@@ -891,7 +894,7 @@ workflow W:
                 crate::span::Span::empty(0),
             )),
         );
-        assert_eq!(r.resolve(&val).unwrap(), Value::number(42.0));
+        assert_eq!(r.resolve(&val).unwrap(), Value::number(crate::num!(42.0)));
     }
 
     #[test]
@@ -952,7 +955,7 @@ workflow W:
                 _ => None,
             })
             .expect("merged item must keep its own retries property");
-        assert_eq!(*retries, Value::number(10.0));
+        assert_eq!(*retries, Value::number(crate::num!(10.0)));
 
         // The `.defaults:` block shared property is injected as a nested
         // block (scalar shared properties inject as top-level properties;
@@ -1101,7 +1104,7 @@ workflow W:
                     _ => None,
                 });
                 let interval = interval.expect("interval property");
-                assert_eq!(interval.value.value, Value::number(7200.0));
+                assert_eq!(interval.value.value, Value::number(crate::num!(7200.0)));
             }
         } else {
             panic!("expected list item");
@@ -1135,7 +1138,7 @@ workflow W:
                     })
                     .collect();
                 assert_eq!(props.len(), 1);
-                assert_eq!(props[0], Value::number(100.0));
+                assert_eq!(props[0], Value::number(crate::num!(100.0)));
             }
         } else {
             panic!("expected list item");
@@ -1163,7 +1166,7 @@ workflow W:
                     BodyEntryKind::Property(p) if p.name.name == "interval" => Some(&p.value.value),
                     _ => None,
                 });
-                assert_eq!(interval, Some(&Value::number(900.0)));
+                assert_eq!(interval, Some(&Value::number(crate::num!(900.0))));
                 let has_defaults = body.entries.iter().any(|e| {
                     matches!(
                         &e.kind,
@@ -1196,7 +1199,7 @@ workflow W:
                 BodyEntryKind::Property(p) if p.name.name == "interval" => Some(&p.value.value),
                 _ => None,
             });
-            assert_eq!(interval, Some(&Value::number(500.0)));
+            assert_eq!(interval, Some(&Value::number(crate::num!(500.0))));
         } else {
             panic!("expected named item");
         }

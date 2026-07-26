@@ -30,7 +30,7 @@ mod value;
 
 pub use syntax::{NmlLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 pub(crate) use value::KNOWN_NAMESPACES;
-pub use value::decode_value;
+pub use value::{ValueErrors, decode_value, decode_value_all};
 
 use crate::error::NmlError;
 use rowan::GreenNode;
@@ -1167,6 +1167,40 @@ service App is Base:
             .value
     }
 
+    /// RFC 0016 §1.8 regression: the trailing-dot machine fix must target
+    /// the DOT even when trivia separates the dash from the digits
+    /// (`- 1299.` — the reconstructed `-1299.` string is one byte shorter
+    /// than the source region, so start+len span arithmetic would delete
+    /// the final digit instead; found by implementation review).
+    #[test]
+    fn trailing_dot_fix_targets_dot_under_dash_gap_spellings() {
+        for src in [
+            "plan P:\n    price = - 1299. JPY\n",
+            "plan P:\n    price = -1299. JPY\n",
+            "plan P:\n    price = - 1299.\n",
+            "plan P:\n    price = 1299.\n",
+        ] {
+            let err = parse_to_ast(src).expect_err("trailing dot must reject");
+            let dot = src.find('.').unwrap();
+            match err {
+                crate::error::NmlError::Syntax { ref kind, span } => {
+                    assert!(
+                        matches!(kind, crate::error::ParseErrorKind::NumberTrailingDot { .. }),
+                        "{src:?}: expected NumberTrailingDot, got {kind:?}"
+                    );
+                    let (replacement, fix) = kind.suggestion(span).expect("fix exists");
+                    assert_eq!(replacement, "", "{src:?}");
+                    assert_eq!(
+                        (fix.start, fix.end),
+                        (dot, dot + 1),
+                        "{src:?}: fix must delete exactly the dot"
+                    );
+                }
+                other => panic!("{src:?}: expected syntax error, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn value_decode_scalars_correct() {
         use crate::types::{Number, Value};
@@ -1174,9 +1208,9 @@ service App is Base:
             decode_first("\"a\\nb\\t!\""),
             Value::String("a\nb\t!".into())
         );
-        assert_eq!(decode_first("42"), Value::Number(Number::Int(42)));
-        assert_eq!(decode_first("-5"), Value::Number(Number::Int(-5)));
-        assert_eq!(decode_first("2.5"), Value::Number(Number::Float(2.5)));
+        assert_eq!(decode_first("42"), Value::Number(Number::from(42)));
+        assert_eq!(decode_first("-5"), Value::Number(Number::from(-5)));
+        assert_eq!(decode_first("2.5"), Value::Number(crate::num!(2.5)));
         assert_eq!(decode_first("true"), Value::Bool(true));
         assert_eq!(decode_first("false"), Value::Bool(false));
         assert_eq!(
@@ -1264,6 +1298,202 @@ service App is Base:
         let (_, diags) =
             parse_to_ast_all("service App:\n    x = \"\"\"   \n        ok\n        \"\"\"\n");
         assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    /// Fuzz-found (libFuzzer, formatter target): a `- $ENV.KEY` list item
+    /// PARSED but lowered to nothing — the parser bumped the token bare
+    /// instead of routing it through `value()`, so no `Value` node existed,
+    /// lowering's fallthrough emptied the item, and the formatter re-emitted
+    /// an invalid bare `- `. A secret is a scalar like any other in list
+    /// position: it now lowers as `Shorthand`, so decode, `$NS` validation,
+    /// shorthand placement and formatting all apply by construction.
+    #[test]
+    fn secret_list_item_is_a_scalar_item() {
+        use crate::ast::{BodyEntryKind, DeclarationKind, ListItemKind};
+        use crate::types::Value;
+        let (file, diags) = parse_to_ast_all("w s:\n    - $ENV.KEY\n");
+        assert!(diags.is_empty(), "{diags:?}");
+        let DeclarationKind::Block(b) = &file.declarations[0].kind else {
+            panic!("expected a block");
+        };
+        let BodyEntryKind::ListItem(item) = &b.body.entries[0].kind else {
+            panic!("expected a list item, got {:?}", b.body.entries[0].kind);
+        };
+        assert!(
+            matches!(&item.kind, ListItemKind::Shorthand { value, body: None }
+                if matches!(&value.value, Value::Secret(s) if s == "$ENV.KEY")),
+            "{:?}",
+            item.kind
+        );
+        // A malformed reference is diagnosed, never silently dropped —
+        // both shapes: unknown namespace, and the bare `$` (the original
+        // fuzz byte, previously a silent empty item).
+        for bad in ["w s:\n    - $NOPE.KEY\n", "w s:\n    - $\n"] {
+            let (_, diags) = parse_to_ast_all(bad);
+            assert!(
+                diags.iter().any(|d| d.to_string().contains("NML0015")),
+                "{bad:?}: {diags:?}"
+            );
+        }
+        // The shapeless item (`- ` alone) is an error, not a silent empty.
+        let (_, diags) = parse_to_ast_all("w s:\n    - \n");
+        assert!(!diags.is_empty(), "bare '-' must diagnose");
+    }
+
+    /// Fuzz-found (libFuzzer, first corpus run): a comment-only line whose
+    /// column is SHALLOWER than where a partial dedent lands (here: col 0
+    /// between an indent-2 line and an indent-1 line) was deferred past the
+    /// next line's REAL tokens — scrambling byte order and breaking the
+    /// lossless-CST invariant. The `bump()` losslessness floor flushes held
+    /// comments before any non-zero-width token.
+    #[test]
+    fn partial_dedent_comment_stays_byte_ordered() {
+        for src in [
+            " d\n  r\n//\n t",
+            " d\n  r\n// c\n t\nx = 1\n",
+            "a:\n    b:\n        x = 1\n// out\n    y = 2\n",
+        ] {
+            let p = parse(src);
+            assert_eq!(tree_text(&p), src, "lossless on {src:?}");
+        }
+
+        // ATTACHMENT (not just order): the flush lands the comment in the
+        // scope open once the dedent run has closed — i.e. as leading
+        // trivia of the FOLLOWING line, which is where a reader puts it.
+        // Declining to defer instead would emit it before the dedent,
+        // trapping it in the body being closed — the exact failure §4.3's
+        // deferral exists to prevent. This pins the good behavior so a
+        // future "precision" refactor cannot silently regress it.
+        let p = parse(" d\n   r\n// c\n t\n");
+        let owner = p
+            .syntax()
+            .descendants()
+            .find(|n| {
+                n.kind() == SyntaxKind::BlockDecl
+                    && n.children_with_tokens().any(|e| {
+                        e.as_token()
+                            .is_some_and(|t| t.kind() == SyntaxKind::Ident && t.text() == "t")
+                    })
+            })
+            .expect("the block owning `t`");
+        assert!(
+            owner.children_with_tokens().any(|e| {
+                e.as_token()
+                    .is_some_and(|t| t.kind() == SyntaxKind::Comment)
+            }),
+            "the comment must attach to the following line's scope: {owner:?}"
+        );
+    }
+
+    /// The total decoder (rustc-style): EVERY malformed escape in a string
+    /// is reported at once — never whack-a-mole — with U+FFFD recovery, so
+    /// lenient surfaces get a best-effort value AND the full findings list.
+    /// The strict path still returns the first error.
+    #[test]
+    fn total_decode_reports_all_escape_errors_with_recovery() {
+        let mut sink = ValueErrors::default();
+        let p = parse("service App:\n    x = \"a\\q b\\z c\"\n");
+        let node = p
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::Value)
+            .expect("value node");
+        let v = decode_value_all(&node, &mut sink);
+        assert_eq!(sink.errors.len(), 2, "{:?}", sink.errors);
+        assert_eq!(sink.suppressed, 0);
+        assert!(
+            matches!(&v.value, crate::types::Value::String(s) if s == "a\u{FFFD} b\u{FFFD} c"),
+            "{v:?}"
+        );
+        // Strict view: first error only, exactly as before.
+        assert!(decode_value(&node).is_err());
+    }
+
+    /// `\s` is Java's protected space: survives dedent and editor trim.
+    #[test]
+    fn protected_space_escape_decodes() {
+        use crate::types::Value;
+        assert_eq!(decode_first("\"a\\sb\""), Value::String("a b".into()));
+        let v = decode_first("\"\"\"\n    \\sx\n    \\sy\n    \"\"\"");
+        assert_eq!(v, Value::String(" x\n y".into()));
+    }
+
+    /// `\` before a line break joins lines without a newline (Java/Swift),
+    /// with dedent applied first; `\\` stays a literal backslash; a
+    /// dangling continuation on the last content line is an error.
+    #[test]
+    fn line_continuation_joins_without_newline() {
+        use crate::types::Value;
+        let v = decode_first("\"\"\"\n    https://example.com/\\\n    very/long/path\n    \"\"\"");
+        assert_eq!(
+            v,
+            Value::String("https://example.com/very/long/path".into())
+        );
+        // Even run: literal backslash, no continuation.
+        let v = decode_first("\"\"\"\n    a\\\\\n    b\n    \"\"\"");
+        assert_eq!(v, Value::String("a\\\nb".into()));
+        // CRLF transcription joins identically.
+        let v = decode_first("\"\"\"\r\n    a\\\r\n    b\r\n    \"\"\"");
+        assert_eq!(v, Value::String("ab".into()));
+        // Dangling continuation: string ends mid-escape.
+        let e = parse_to_ast("service App:\n    x = \"\"\"\n    a\\\n    \"\"\"\n")
+            .expect_err("dangling continuation");
+        assert!(
+            e.message().contains("end of string inside an escape"),
+            "{}",
+            e.message()
+        );
+    }
+
+    /// NML0020: an own-line closing `"""` must align with the content —
+    /// the geometry where delimiter-anchored and min-indent readings could
+    /// diverge, closed by making them agree. Machine-fixable (whitespace
+    /// replacement renders as a fix, not a did-you-mean).
+    #[test]
+    fn misaligned_closing_delimiter_is_an_error_with_fix() {
+        let (_, diags) =
+            parse_to_ast_all("service App:\n    x = \"\"\"\n        content\n    \"\"\"\n");
+        let m: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+        assert!(m.iter().any(|s| s.contains("NML0020")), "{m:?}");
+        assert!(m.iter().any(|s| s.contains("(fix: `        `)")), "{m:?}");
+        // Closing on the content line: no alignment exists to check.
+        let (_, diags) = parse_to_ast_all("service App:\n    x = \"\"\"\n        content\"\"\"\n");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    /// NML0005's principle extends into multiline bodies: a tab in a body
+    /// line's leading whitespace is the same editor-dependent column
+    /// arithmetic the layout rule bans. Content tabs stay legal.
+    #[test]
+    fn tab_in_multiline_body_indentation_is_an_error() {
+        let (_, diags) = parse_to_ast_all("service App:\n    x = \"\"\"\n    \ta\n    \"\"\"\n");
+        assert!(
+            diags.iter().any(|d| d.to_string().contains("NML0005")),
+            "{diags:?}"
+        );
+        // Mid-line tab is content, not indentation.
+        let (_, diags) = parse_to_ast_all("service App:\n    x = \"\"\"\n    a\tb\n    \"\"\"\n");
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    /// NML0019 recovery keeps the author's text: the opening-line content
+    /// joins the value (excluded from indent arithmetic) instead of
+    /// vanishing into a placeholder.
+    #[test]
+    fn opening_content_recovery_keeps_the_text() {
+        let mut sink = ValueErrors::default();
+        let p = parse("service App:\n    x = \"\"\"abc\n        def\n        \"\"\"\n");
+        let node = p
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::Value)
+            .expect("value node");
+        let v = decode_value_all(&node, &mut sink);
+        assert_eq!(sink.errors.len(), 1, "{:?}", sink.errors);
+        assert!(
+            matches!(&v.value, crate::types::Value::String(s) if s == "abc\ndef"),
+            "{v:?}"
+        );
     }
 
     /// Template detection reads RAW text: `\u{7B}\u{7B}` is a literal `{{`
@@ -1505,7 +1735,7 @@ service App is Base:
         let alphabet = [
             "service", "App", ":", "=", "=>", "->", " ", "    ", "\n", "\r\n", "\"", "\"\"\"",
             "\\", "//c", "x", "1", "12.5", "@role/x", "$ENV.K", "-", "|", ".", "[", "]", "(", ")",
-            ",", "?", "\t", "é", "\0", "\u{1}", "🎉", "\u{2028}", "\u{FEFF}",
+            ",", "?", "\t", "é", "\0", "\u{1}", "🎉", "\u{2028}", "\u{FEFF}", "\\s",
         ];
         let mut state: u64 = 0x2545_F491_4F6C_DD1D;
         let mut next = || {

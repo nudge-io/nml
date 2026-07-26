@@ -15,7 +15,7 @@ service Api:
 ```
 
 ```rust source=docs/guides/examples/cookbook/examples/parse_and_query.rs
-    let port = doc.block("service", "Api").property("port").as_i64();
+    let port = doc.block("service", "Api").property("port").to_i64();
     assert_eq!(port, Some(8080));
 
     // Every block of a keyword, with its name.
@@ -35,7 +35,10 @@ and `Document::new(&file)` for the query view.
 Full program: [`parse_and_query.rs`](examples/cookbook/examples/parse_and_query.rs)
 — run it with `cargo run -p nml-cookbook --example parse_and_query`.
 
-**Numbers are exact.** `as_i64()` on a float value returns `None`; NML
-integers are `i64` end to end (out-of-range literals are parse errors,
-`NML0014`). If you want typed extraction with real error messages, the
+**Numbers are exact.** Every NML number is an exact decimal (RFC 0016) —
+`0.20` is 0.20, integers survive to 34 significant digits, and nothing
+rounds silently (out-of-domain literals are parse errors, `NML0014`).
+`to_i64()` returns `None` for fractional values rather than truncating;
+`to_f64()` is the explicit, correctly-rounded binary edge. If you want
+typed extraction with real error messages, the
 [serde recipe](deserialize-with-serde.md) is the better tool.

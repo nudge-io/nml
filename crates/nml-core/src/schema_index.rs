@@ -19,22 +19,33 @@ use crate::types::PrimitiveType;
 /// variants borrow only from the index; [`FieldTarget::Arms`] borrows the
 /// key/target types from the field type itself (both live in the index's
 /// models in practice).
+/// The rule every variant obeys: **a target carries what it validates
+/// against**. Recursible targets (`Model`, `OneOf`, `Arms`) carry their
+/// definitions; value-checked targets (`Leaf`, `Union`, `ListOf`, `SetOf`)
+/// carry the declared [`FieldType`], so no consumer ever has to re-derive —
+/// or worse, silently lack — the type a value must satisfy. (`Leaf` and
+/// `Union` used to erase it, which made scalar list items unvalidatable in
+/// the dash spelling while the inline-array spelling was checked — a
+/// spelling-dependent security hole for `[]secret` fields.) `Object` alone
+/// is payload-free: free-form is the one target that validates nothing by
+/// definition.
 #[derive(Debug)]
 pub enum FieldTarget<'a> {
     /// A nested model instance — recurse into its body with this model.
     Model(&'a ModelDef),
     /// A discriminated union — resolve the discriminator, then the variant.
     OneOf(&'a OneOfDef),
-    /// A list whose items resolve to the boxed target.
-    ListOf(Box<FieldTarget<'a>>),
-    /// A `set<T>` whose items resolve to the boxed target (RFC 0032). Shape
-    /// validation is exactly `ListOf`; the validator additionally rejects
-    /// duplicate elements (value-level identity) at load.
-    SetOf(Box<FieldTarget<'a>>),
+    /// A list: items resolve to the boxed target; scalar items validate
+    /// against the carried declared type.
+    ListOf(&'a FieldType, Box<FieldTarget<'a>>),
+    /// A `set<T>` (RFC 0032). Shape validation is exactly `ListOf`; the
+    /// validator additionally rejects duplicate elements at load.
+    SetOf(&'a FieldType, Box<FieldTarget<'a>>),
     /// Free-form `object` — accepts arbitrary keys; no schema to recurse into.
     Object,
-    /// A type union — ambiguous without a discriminator; not recursed.
-    Union,
+    /// A type union — ambiguous without a discriminator; not recursed, but
+    /// values check against the carried union type.
+    Union(&'a FieldType),
     /// A typed arm set `(K -> V)` (RFC 0007) — the body holds routing arms;
     /// keys validate against `key`, targets are typed by `target` (reference
     /// targets are consumer-resolved; `target` drives editor intelligence).
@@ -42,8 +53,9 @@ pub enum FieldTarget<'a> {
         key: &'a FieldType,
         target: &'a FieldType,
     },
-    /// A primitive scalar, enum, or unknown reference — a leaf value.
-    Leaf,
+    /// A primitive scalar, enum, or unknown reference — a leaf value,
+    /// checked against the carried declared type.
+    Leaf(&'a FieldType),
 }
 
 /// The shape facts of an instance body — the ONE classification every
@@ -225,13 +237,15 @@ impl SchemaIndex {
                         && !shape.has_list_items
                         && matches!(
                             self.resolve_ref(name),
-                            FieldTarget::Model(_) | FieldTarget::OneOf(_)
+                            Some(FieldTarget::Model(_) | FieldTarget::OneOf(_))
                         )
                 }
                 _ => !shape.has_arms && !shape.has_list_items && !shape.has_keyed,
             })
             .map(|variant| self.resolve_type(variant))
-            .unwrap_or(FieldTarget::Leaf)
+            // No variant matches the body shape: check against the whole
+            // union type (the validator's Union arm reports the mismatch).
+            .unwrap_or(FieldTarget::Union(ty))
     }
 
     /// RFC 0015 nominal variant selection: the union variant whose declared
@@ -254,7 +268,7 @@ impl SchemaIndex {
                 n == name
                     && matches!(
                         self.resolve_ref(n),
-                        FieldTarget::Model(_) | FieldTarget::OneOf(_)
+                        Some(FieldTarget::Model(_) | FieldTarget::OneOf(_))
                     )
             }
             _ => false,
@@ -285,8 +299,8 @@ impl SchemaIndex {
             .iter()
             .filter_map(|v| match v {
                 FieldType::ModelRef(name) => match self.resolve_ref(name) {
-                    FieldTarget::Model(m) => Some(NameableVariant::Model(m)),
-                    FieldTarget::OneOf(o) => Some(NameableVariant::OneOf(o)),
+                    Some(FieldTarget::Model(m)) => Some(NameableVariant::Model(m)),
+                    Some(FieldTarget::OneOf(o)) => Some(NameableVariant::OneOf(o)),
                     _ => None,
                 },
                 _ => None,
@@ -306,7 +320,7 @@ impl SchemaIndex {
                 FieldType::ModelRef(n)
                     if matches!(
                         self.resolve_ref(n),
-                        FieldTarget::Model(_) | FieldTarget::OneOf(_)
+                        Some(FieldTarget::Model(_) | FieldTarget::OneOf(_))
                     ) =>
                 {
                     Some(n.as_str())
@@ -316,30 +330,33 @@ impl SchemaIndex {
             .collect()
     }
 
-    /// Resolve a named type reference (`someModel`) to its target: a model, a
-    /// `oneof`, or a leaf (enum or unknown name). The single definition of
-    /// name→target dispatch, shared by schema validation and defaulting.
-    pub fn resolve_ref(&self, name: &str) -> FieldTarget<'_> {
+    /// Resolve a named type reference (`someModel`) to its **recursible**
+    /// definition — a model or a `oneof` — or `None` (an enum or unknown
+    /// name: a leaf, whose declared type lives at the reference site, not
+    /// here). The single definition of name→definition dispatch, shared by
+    /// schema validation, defaulting, and the LSP.
+    pub fn resolve_ref(&self, name: &str) -> Option<FieldTarget<'_>> {
         if let Some(m) = self.model(name) {
-            FieldTarget::Model(m)
-        } else if let Some(o) = self.oneof(name) {
-            FieldTarget::OneOf(o)
-        } else {
-            FieldTarget::Leaf
+            return Some(FieldTarget::Model(m));
         }
+        self.oneof(name).map(FieldTarget::OneOf)
     }
 
     fn resolve_type<'a>(&'a self, ty: &'a FieldType) -> FieldTarget<'a> {
         match ty {
             FieldType::Primitive(PrimitiveType::Object) => FieldTarget::Object,
-            FieldType::Primitive(_) => FieldTarget::Leaf,
-            FieldType::List(inner) => FieldTarget::ListOf(Box::new(self.resolve_type(inner))),
-            FieldType::Set(inner) => FieldTarget::SetOf(Box::new(self.resolve_type(inner))),
+            FieldType::Primitive(_) => FieldTarget::Leaf(ty),
+            FieldType::List(inner) => FieldTarget::ListOf(ty, Box::new(self.resolve_type(inner))),
+            FieldType::Set(inner) => FieldTarget::SetOf(ty, Box::new(self.resolve_type(inner))),
             // A modifier field carries its declared inner type; classify by it.
             FieldType::Modifier(inner) => self.resolve_type(inner),
-            FieldType::Union(_) => FieldTarget::Union,
+            FieldType::Union(_) => FieldTarget::Union(ty),
             FieldType::Arms { key, target } => FieldTarget::Arms { key, target },
-            FieldType::ModelRef(name) => self.resolve_ref(name),
+            // A name that resolves to a model/oneof recurses into it; an
+            // enum or unknown name is a leaf whose declared type is the
+            // reference itself — the payload constructed HERE, the one place
+            // it exists (a name-lookup miss becomes a typed leaf).
+            FieldType::ModelRef(name) => self.resolve_ref(name).unwrap_or(FieldTarget::Leaf(ty)),
         }
     }
 }
@@ -421,7 +438,7 @@ mod tests {
 
         assert!(matches!(
             idx.resolve_field(&field("x", FieldType::Primitive(PrimitiveType::String))),
-            FieldTarget::Leaf
+            FieldTarget::Leaf(_)
         ));
         assert!(matches!(
             idx.resolve_field(&field("x", FieldType::Primitive(PrimitiveType::Object))),
@@ -433,21 +450,21 @@ mod tests {
         ));
         assert!(matches!(
             idx.resolve_field(&field("x", FieldType::ModelRef("unknown".into()))),
-            FieldTarget::Leaf
+            FieldTarget::Leaf(_)
         ));
         assert!(matches!(
             idx.resolve_field(&field(
                 "x",
                 FieldType::List(Box::new(FieldType::ModelRef("inner".into())))
             )),
-            FieldTarget::ListOf(inner) if matches!(*inner, FieldTarget::Model(_))
+            FieldTarget::ListOf(_, inner) if matches!(*inner, FieldTarget::Model(_))
         ));
         assert!(matches!(
             idx.resolve_field(&field(
                 "x",
                 FieldType::Union(vec![FieldType::Primitive(PrimitiveType::String)])
             )),
-            FieldTarget::Union
+            FieldTarget::Union(_)
         ));
     }
 
@@ -492,7 +509,7 @@ mod tests {
         let list = body_of("x X:\n    - A:\n        k = \"v\"\n");
         assert!(matches!(
             idx.resolve_type_in_body(&union, &list),
-            FieldTarget::ListOf(inner) if matches!(*inner, FieldTarget::Model(_))
+            FieldTarget::ListOf(_, inner) if matches!(*inner, FieldTarget::Model(_))
         ));
 
         // Rule-completion: a KEYED block body under `(string | model)` selects

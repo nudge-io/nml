@@ -1,0 +1,4 @@
+// RFC 0016: a trailing decimal point is a malformed literal — NML0013
+// with a machine-applicable remove-the-dot suggestion.
+service TrailingDot:
+    price = 1299.

@@ -1,0 +1,4 @@
+// RFC 0016: 35 value-significant digits — storing would be inexact, so
+// this is NML0014 (never a silently rounded float).
+service Overflow:
+    id = 99999999999999999999999999999999999

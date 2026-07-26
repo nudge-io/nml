@@ -31,6 +31,7 @@ fn test_check_valid_files() {
         "tests/fixtures/valid/web-server.nml",
         "tests/fixtures/valid/pricing.nml",
         "tests/fixtures/valid/scalar-shared-property.nml",
+        "tests/fixtures/valid/number-boundaries.nml",
     ];
 
     for file in files {
@@ -43,6 +44,38 @@ fn test_check_valid_files() {
             output.status.success(),
             "check should succeed for {file}: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// RFC 0016: numbers outside the exact decimal domain are NML0014 with
+/// the structured reason; trailing-dot literals are NML0013 with the
+/// remove-the-dot suggestion.
+#[test]
+fn test_check_number_boundaries() {
+    let cases = [
+        (
+            "tests/fixtures/invalid/number-too-many-digits.nml",
+            "NML0014",
+            "35 significant digits",
+        ),
+        (
+            "tests/fixtures/invalid/number-trailing-dot.nml",
+            "NML0013",
+            "decimal point",
+        ),
+    ];
+    for (file, code, needle) in cases {
+        let output = nml_bin()
+            .args(["check", file])
+            .output()
+            .expect("failed to run nml");
+        assert!(!output.status.success(), "check should fail for {file}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(code), "{file}: expected {code} in {stderr}");
+        assert!(
+            stderr.contains(needle),
+            "{file}: expected {needle:?} in {stderr}"
         );
     }
 }

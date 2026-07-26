@@ -170,6 +170,9 @@ pub mod codes {
         /// Content on a multi-line string's opening line (content must
         /// begin on a new line — the Swift/Java text-block rule).
         MULTILINE_OPENING_CONTENT = 19;
+        /// An own-line closing `"""` not aligned with the content's
+        /// indentation (machine-fixable: move the delimiter).
+        MULTILINE_CLOSING_MISALIGNED = 20;
 
         /// The same name is declared more than once in one namespace.
         DUPLICATE_DECLARATION = 1000;
@@ -301,6 +304,11 @@ pub mod codes {
         /// A bare scalar item's key was dropped: the element model declares
         /// no positional (`+`) field to receive it.
         DROPPED_ITEM_KEY = 2049;
+
+        /// A list item's BODY has nowhere to go: the element type is a
+        /// scalar/union/collection with no fields to fill — the body-side
+        /// mirror of the dropped-key rule above.
+        DROPPED_ITEM_BODY = 2055;
 
         /// A scalar item cannot fill an arm-set shorthand field — an arm
         /// target is a name or a string, so no arm can be synthesized from

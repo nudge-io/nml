@@ -291,10 +291,28 @@ impl Lower {
                     name: ident(name),
                     body,
                 }
+            } else if name.text() == "true" || name.text() == "false" {
+                // Parity with value position: `true`/`false` are the boolean
+                // literals (decode_scalar's Ident arm), never references —
+                // `- true` must mean what `[true]` means.
+                ListItemKind::Shorthand {
+                    value: SpannedValue::new(Value::Bool(name.text() == "true"), token_span(&name)),
+                    body: None,
+                }
             } else {
                 ListItemKind::Reference(ident(name))
             }
         } else {
+            // No recognizable item shape: an error, never a silent empty
+            // item (an unrendered construct would be data loss downstream).
+            self.push_error(NmlError::syntax(
+                crate::error::ParseErrorKind::Expected {
+                    expected: vec![crate::error::ExpectedItem::Desc("a list item")],
+                    found: None,
+                    context: Some("after '-'"),
+                },
+                span,
+            ));
             ListItemKind::Role(String::new())
         };
         ListItem { kind, span }
@@ -321,18 +339,20 @@ impl Lower {
         }
     }
 
-    /// Decode a value, collecting any semantic error and substituting a
-    /// placeholder so lowering stays total. `decode_value` only returns *semantic*
-    /// errors (structural incompleteness, which the parser already reported,
-    /// decodes to a placeholder), so this never double-counts a syntactic problem.
+    /// Decode a value TOTALLY: every semantic error the value carries is
+    /// collected (all bad escapes at once, rustc-style) and the decoder's
+    /// best-effort recovery value is kept — lenient surfaces get value AND
+    /// findings. The decoder only reports *semantic* errors (structural
+    /// incompleteness, which the parser already reported, decodes to a
+    /// placeholder), so this never double-counts a syntactic problem.
     fn decode(&mut self, v: &ast::ValueNode) -> SpannedValue {
-        match v.decode() {
-            Ok(sv) => sv,
-            Err(e) => {
-                self.push_error(e);
-                empty_value()
-            }
+        let mut sink = super::value::ValueErrors::default();
+        let sv = v.decode_all(&mut sink);
+        for e in sink.errors {
+            self.push_error(e);
         }
+        self.suppressed += sink.suppressed;
+        sv
     }
 
     /// Record a semantic error, bounded at `MAX_ERRORS` so a pathological file

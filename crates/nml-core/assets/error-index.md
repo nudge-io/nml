@@ -201,30 +201,45 @@ scalars and cannot be written.
 
 ## NML0013
 
-**Invalid number.** The literal is not a number any numeric type parses
-— most commonly a second decimal point.
+**Invalid number.** The literal is not a number the grammar parses —
+most commonly a second decimal point, or a trailing decimal point with
+no fraction digits (`1299.`), which gets a machine-applicable
+remove-the-dot suggestion.
 
 ```nml check expect-error='[NML0013]'
 service Api:
     x = 1.2.3
 ```
 
-**Fix:** write one decimal point (`1.23`), or quote it if it is meant as
-a string.
+**Fix:** write one decimal point (`1.23`), drop a trailing dot
+(`1299.` → `1299`), or quote it if it is meant as a string.
 
 ## NML0014
 
-**Integer out of range.** NML integers are exact `i64` values by design
-— a number that does not fit is an error, never a silently rounded
-float.
+**Number out of range.** NML numbers are exact decimals by design —
+every value is stored with up to 34 significant digits in the IEEE
+754-2019 decimal128 range, and a number that cannot be stored exactly
+is an error, never a silently rounded float. This applies to integers
+and decimals alike: `taxRate = 0.20` stores exactly `0.20`, and any
+integer up to 34 digits (well past `u64`) parses exactly.
 
 ```nml check expect-error='[NML0014]'
 service Api:
-    x = 99999999999999999999
+    x = 123456789012345678901234567890123456789
 ```
 
-**Fix:** use a representable value, or a string if it is an identifier
-(account numbers usually are).
+Three things can put a number outside the domain, and the message says
+which: **too many significant digits** (the value cannot be stored
+exactly), **too large** (beyond ~9.999×10^6144), or **too small** (a
+nonzero value closer to zero than 10^-6176). The last two are about
+magnitude, not digit count — `1` followed by 6145 zeros has a single
+significant digit and is still out of range.
+
+**Fix:** use a value with at most 34 significant digits *and* a
+magnitude inside the exact range, or a string if it is an identifier
+(account numbers usually are). The digit-count message carries the exact
+count — trailing zeros beyond the budget
+are dropped losslessly and do not trigger this error.
 
 ## NML0015
 
@@ -322,6 +337,27 @@ service Api:
 **Fix:** move the content to the next line. For a short single-line
 value, use an ordinary `"…"` string. (Whitespace alone after the
 opening quotes is harmless and legal, as is the empty `""""""`.)
+
+## NML0020
+
+**Misaligned closing `"""`.** When the closing quotes stand on their own
+line, they must align with the content's indentation. With alignment
+enforced, the two ways a reader might understand dedent — "strip to the
+closing delimiter" (Swift's model) and "strip the common indent" (NML's)
+— *provably agree on every accepted document*, so neither can be
+misread. The fix is machine-applicable: moving the delimiter is
+value-preserving, because its line is trimmed either way.
+
+```nml check expect-error='[NML0020]'
+service Api:
+    motd = """
+        All systems operational.
+    """
+```
+
+**Fix:** apply the suggestion — indent the closing quotes to the
+content's column (here: 8). A closing delimiter on the last content
+line has no alignment to check and stays legal.
 
 ## NML1000
 
@@ -1192,6 +1228,29 @@ never match first — earlier bindings claim every file it would. Dead
 configuration in the manifest (RFC 0030 meta-validation).
 
 **Fix:** reorder the bindings, or remove the dead one.
+
+## NML2055
+
+**Dropped item body.** A list item carries a body, but the element type
+is a scalar (or a union/collection of scalars) with no fields to fill —
+every entry in the body would be silently discarded. The body-side
+mirror of [NML2049](#nml2049)'s dropped key: content with nowhere to go
+is an error, never leniency, because `nml check` passing is the promise
+that nothing in the file is ignored.
+
+```nml check expect-error='[NML2055]'
+model host:
+    tags []string?
+
+host H:
+    tags:
+        - foo:
+            note = "this body has nowhere to go"
+```
+
+**Fix:** write the item as a scalar (`- "foo"`), or — if the entries
+are real configuration — give the elements a model type that declares
+those fields.
 
 ## NML2013
 

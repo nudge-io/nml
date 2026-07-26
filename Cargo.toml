@@ -16,6 +16,10 @@ members = [
     # example target here (scripts/docs_test.py runs them all).
     "docs/guides/examples/cookbook",
 ]
+# cargo-fuzz targets (RFC 0016 §2): nightly-only tooling, deliberately
+# OUTSIDE the workspace so the MSRV / minimal-versions / package / fmt /
+# clippy gates never see it. Run via `cargo +nightly fuzz` from fuzz/.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

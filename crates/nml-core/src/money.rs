@@ -15,22 +15,16 @@ pub struct Money {
 
 impl Money {
     pub fn format_display(&self) -> String {
-        if self.exponent == 0 {
-            return format!("{} {}", self.amount, self.currency);
-        }
-        let divisor = 10i64.pow(self.exponent as u32);
-        let whole = self.amount / divisor;
-        let frac = (self.amount % divisor).abs();
-        let sign = if self.amount < 0 && whole == 0 {
-            "-"
-        } else {
-            ""
-        };
-        format!(
-            "{sign}{whole}.{frac:0>width$} {currency}",
-            currency = self.currency,
-            width = self.exponent as usize
-        )
+        format!("{} {}", self.to_number(), self.currency)
+    }
+
+    /// The exact decimal amount (RFC 0016 §1.8): minor units at the
+    /// currency exponent *are* a `(coeff, scale)` member of the shared
+    /// numeric core, so display and any exact consumer share one
+    /// formatter with `number`.
+    pub fn to_number(&self) -> crate::decimal::Number {
+        crate::decimal::Number::try_new(self.amount as i128, self.exponent as i16)
+            .expect("i64 minor units at an ISO 4217 exponent are always a valid Number")
     }
 }
 
@@ -50,12 +44,11 @@ pub enum MoneyErrorKind {
         got: usize,
         raw: String,
     },
-    /// The whole-number part does not parse.
+    /// The amount is not a well-formed decimal.
     InvalidAmount { raw: String },
-    /// The fractional part does not parse.
-    InvalidFraction { raw: String },
-    /// The scaled minor-unit amount exceeds `i64` — money is exact by
-    /// design, never floated.
+    /// The scaled minor-unit amount exceeds `i64` (or the amount falls
+    /// outside the exact decimal domain) — money is exact by design,
+    /// never floated.
     OutOfRange { raw: String },
 }
 
@@ -77,9 +70,6 @@ impl MoneyErrorKind {
                 echo(raw)
             ),
             MoneyErrorKind::InvalidAmount { raw } => format!("invalid number: \"{}\"", echo(raw)),
-            MoneyErrorKind::InvalidFraction { raw } => {
-                format!("invalid fractional part: \"{}\"", echo(raw))
-            }
             MoneyErrorKind::OutOfRange { raw } => {
                 format!("amount out of range: \"{}\"", echo(raw))
             }
@@ -92,15 +82,22 @@ impl MoneyErrorKind {
         match self {
             MoneyErrorKind::UnknownCurrency { .. } => codes::UNKNOWN_CURRENCY,
             MoneyErrorKind::Precision { .. } => codes::MONEY_PRECISION,
-            MoneyErrorKind::InvalidAmount { .. } | MoneyErrorKind::InvalidFraction { .. } => {
-                codes::INVALID_MONEY
-            }
+            MoneyErrorKind::InvalidAmount { .. } => codes::INVALID_MONEY,
             MoneyErrorKind::OutOfRange { .. } => codes::AMOUNT_OUT_OF_RANGE,
         }
     }
 }
 
 /// Parse a money literal like "19.99 USD" into a `Money` value.
+///
+/// **Span contract**: `span` must cover exactly `amount ++ separator ++
+/// currency` in the source, with `amount_str` byte-contiguous at
+/// `span.start` and `currency` at `span.end` — the machine-applicable
+/// sub-spans (unknown-currency did-you-mean, trailing-dot fix) are
+/// derived arithmetically from it. The CST decoder honors this by
+/// intercepting trailing-dot amounts on the number token's real range
+/// BEFORE calling here (gap spellings like `- 1299. JPY` would otherwise
+/// break the arithmetic — implementation-review finding).
 pub fn parse_money(amount_str: &str, currency: &str, span: Span) -> Result<Money, NmlError> {
     let exponent = match currency_exponent(currency) {
         Some(e) => e,
@@ -127,68 +124,86 @@ pub fn parse_money(amount_str: &str, currency: &str, span: Span) -> Result<Money
     })
 }
 
+/// Parse the amount through the shared exact-decimal core and rescale to
+/// i64 minor units (RFC 0016 §1.8). The rescale runs in i128 (≤ 34-digit
+/// coefficient × 10^4 max ISO exponent ≈ 10^38, inside i128) with a
+/// checked i64 narrow.
+///
+/// Error-band mapping, pinned: amount-domain failures never surface
+/// syntax-band codes — decimal-core rejections re-wrap as
+/// `MoneyErrorKind` (malformed → `InvalidAmount` NML3000, out-of-domain
+/// → `OutOfRange` NML3003). The one carve-out is the trailing-dot
+/// malformation (`1299. JPY`): a form defect of the literal token, not
+/// of the amount, so it surfaces as NML0013 with the same drop-the-dot
+/// suggestion as bare `1299.`.
 fn parse_minor_units(
     amount_str: &str,
     exponent: u8,
     currency: &str,
     span: Span,
 ) -> Result<i64, NmlError> {
-    let negative = amount_str.starts_with('-');
-    let abs_str = if negative {
-        &amount_str[1..]
-    } else {
-        amount_str
-    };
+    // `span` covers the whole literal (`1299. JPY`); the amount is its
+    // ASCII prefix. The trailing-dot suggestion deletes the literal's
+    // final byte, so it must anchor on the AMOUNT sub-span — anchoring on
+    // `span` would delete the last byte of the currency code instead.
+    let amount_span = Span::new(span.start, span.start + amount_str.len());
+    let n = crate::decimal::Number::parse_literal(amount_str).map_err(|e| match e {
+        crate::decimal::NumberError::TrailingDot => NmlError::syntax(
+            crate::error::ParseErrorKind::NumberTrailingDot {
+                raw: crate::error::echo_capture(amount_str),
+            },
+            amount_span,
+        ),
+        crate::decimal::NumberError::Malformed => NmlError::Money {
+            kind: MoneyErrorKind::InvalidAmount {
+                raw: crate::error::echo_capture(amount_str),
+            },
+            span,
+        },
+        crate::decimal::NumberError::Range(_) => NmlError::Money {
+            kind: MoneyErrorKind::OutOfRange {
+                raw: crate::error::echo_capture(amount_str),
+            },
+            span,
+        },
+    })?;
 
-    let (whole_str, frac_str) = if let Some(dot_pos) = abs_str.find('.') {
-        (&abs_str[..dot_pos], &abs_str[dot_pos + 1..])
-    } else {
-        (abs_str, "")
-    };
-
-    if frac_str.len() > exponent as usize {
+    // The written fraction width against the currency's minor-unit rule.
+    // `got` reports what the author WROTE (the parse clamps scale at 34
+    // significant digits, and an honest count beats a clamped one in the
+    // message); the condition uses the stored scale, which the clamp can
+    // only have reduced — never below a violating width's threshold,
+    // since ISO exponents cap at 4 and the clamp floor for fractions
+    // with a violating written width stays above it.
+    if n.scale() > exponent as i16 {
+        let written = amount_str
+            .split_once('.')
+            .map(|(_, frac)| frac.len())
+            .unwrap_or(0);
         return Err(NmlError::Money {
             kind: MoneyErrorKind::Precision {
                 currency: crate::error::echo_capture(currency),
                 allowed: exponent,
-                got: frac_str.len(),
+                got: written.max(n.scale() as usize),
                 raw: crate::error::echo_capture(amount_str),
             },
             span,
         });
     }
 
-    let whole: i64 = whole_str.parse().map_err(|_| NmlError::Money {
-        kind: MoneyErrorKind::InvalidAmount {
+    // minor units = coeff × 10^(exponent − scale), exact in i128.
+    let shift = (exponent as i32) - (n.scale() as i32);
+    let out_of_range = || NmlError::Money {
+        kind: MoneyErrorKind::OutOfRange {
             raw: crate::error::echo_capture(amount_str),
         },
         span,
-    })?;
-
-    let frac: i64 = if frac_str.is_empty() {
-        0
-    } else {
-        let padded = format!("{:0<width$}", frac_str, width = exponent as usize);
-        padded.parse().map_err(|_| NmlError::Money {
-            kind: MoneyErrorKind::InvalidFraction {
-                raw: crate::error::echo_capture(frac_str),
-            },
-            span,
-        })?
     };
-
-    let multiplier = 10i64.pow(exponent as u32);
-    let abs_amount = whole
-        .checked_mul(multiplier)
-        .and_then(|scaled| scaled.checked_add(frac))
-        .ok_or_else(|| NmlError::Money {
-            kind: MoneyErrorKind::OutOfRange {
-                raw: crate::error::echo_capture(amount_str),
-            },
-            span,
-        })?;
-
-    Ok(if negative { -abs_amount } else { abs_amount })
+    10i128
+        .checked_pow(shift as u32)
+        .and_then(|m| n.coeff().checked_mul(m))
+        .and_then(|units| i64::try_from(units).ok())
+        .ok_or_else(out_of_range)
 }
 
 // ISO 4217 codes grouped by exponent — the single source for both exponent
@@ -442,5 +457,69 @@ mod tests {
         assert_eq!(currency_exponent("CLF"), Some(4));
         assert_eq!(currency_exponent("FAKE"), None);
         assert_eq!(currency_exponent(""), None);
+    }
+
+    // --- RFC 0016 §1.8: the decimal-core rebase boundaries ---
+
+    #[test]
+    fn i64_min_minor_units_now_valid() {
+        // Exactly i64::MIN cents: the old abs-then-negate path rejected
+        // it; the signed i128 rescale accepts it (documented widening).
+        let m = parse_money("-92233720368547758.08", "USD", Span::empty(0)).unwrap();
+        assert_eq!(m.amount, i64::MIN);
+        assert_eq!(m.format_display(), "-92233720368547758.08 USD");
+    }
+
+    #[test]
+    fn twenty_digit_amount_is_out_of_range_not_invalid() {
+        // Boundary shift, documented: dies as NML3003 OutOfRange (the
+        // amount parses exactly but exceeds i64 minor units), where the
+        // old whole_str.parse::<i64>() failed as NML3000.
+        let err = parse_money("99999999999999999999", "JPY", Span::empty(0)).unwrap_err();
+        match err {
+            NmlError::Money {
+                kind: MoneyErrorKind::OutOfRange { .. },
+                ..
+            } => {}
+            other => panic!("expected OutOfRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trailing_dot_money_is_a_literal_layer_rejection() {
+        // `1299. JPY`: a form defect of the token — NML0013 with the
+        // drop-the-dot suggestion, never a money-band code. The literal
+        // spans bytes 0..9 (`1299. JPY`); the amount is bytes 0..5, so
+        // the machine fix must delete byte 4 (the dot) — NOT the last
+        // byte of the currency code.
+        let err = parse_money("1299.", "JPY", Span::new(0, 9)).unwrap_err();
+        match &err {
+            NmlError::Syntax {
+                kind: kind @ crate::error::ParseErrorKind::NumberTrailingDot { .. },
+                span,
+            } => {
+                let (replacement, fix_span) = kind.suggestion(*span).expect("fix exists");
+                assert_eq!(replacement, "");
+                assert_eq!(
+                    (fix_span.start, fix_span.end),
+                    (4, 5),
+                    "must target the dot"
+                );
+            }
+            other => panic!("expected NumberTrailingDot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_number_is_the_exact_amount() {
+        let m = parse_money("29.99", "USD", Span::empty(0)).unwrap();
+        assert_eq!(m.to_number(), crate::num!(29.99));
+        assert_eq!(m.to_number().to_string(), "29.99");
+        let y = parse_money("1299", "JPY", Span::empty(0)).unwrap();
+        assert_eq!(y.to_number(), crate::decimal::Number::from(1299));
+        assert_eq!(y.format_display(), "1299 JPY");
+        // Negative sub-unit amounts keep the old display exactly.
+        let neg = parse_money("-0.50", "USD", Span::empty(0)).unwrap();
+        assert_eq!(neg.format_display(), "-0.50 USD");
     }
 }

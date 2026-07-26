@@ -18,11 +18,11 @@ use serde::Deserialize;
 #[serde(rename_all = "camelCase")]
 struct ServiceConfig {
     host: String,
-    port: f64,
+    port: u16,
     public_url: String,
     log_level: String,
     request_timeout: String,
-    retries: f64,
+    retries: u32,
     tags: Vec<String>,
     api_key: String,
     database: DatabaseConfig,
@@ -33,7 +33,7 @@ struct ServiceConfig {
 #[serde(rename_all = "camelCase")]
 struct DatabaseConfig {
     url: String,
-    pool_size: f64,
+    pool_size: u32,
 }
 
 #[derive(Debug, Deserialize)]

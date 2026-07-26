@@ -59,7 +59,7 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 struct ServiceConfig {
     host: String,
-    port: f64,
+    port: u16,
     #[serde(rename = "apiKey")]
     api_key: String,
 }
@@ -85,7 +85,9 @@ serde = { version = "1", features = ["derive"] }
 
 ## Features
 
-- **9 primitive types** — `string`, `number` (exact `i64` semantics), `money`
+- **9 primitive types** — `string`, `number` (exact decimals, RFC 0016:
+  `0.20` is 0.20, never 0.2000000000000000111; up to 34 significant digits,
+  integers well past `u64`), `money`
   (ISO 4217, integer minor units — `19.99 USD` never becomes `19.990000001`),
   `bool`, `duration`, `path`, `secret`, `object`, `role`
 - **Schemas as part of the language** — `model`, `trait` (composable,

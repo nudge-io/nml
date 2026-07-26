@@ -165,7 +165,11 @@
       "patterns": [
         {
           "name": "constant.character.escape.nml",
-          "match": "\\\\[\"\\\\nt]"
+          "match": "\\\\$"
+        },
+        {
+          "name": "constant.character.escape.nml",
+          "match": "\\\\([\"\\\\ntrs]|u\\{[0-9A-Fa-f]{1,6}\\})"
         },
         { "include": "#template-expression" },
         {
@@ -181,7 +185,7 @@
       "patterns": [
         {
           "name": "constant.character.escape.nml",
-          "match": "\\\\[\"\\\\nt]"
+          "match": "\\\\([\"\\\\ntrs]|u\\{[0-9A-Fa-f]{1,6}\\})"
         },
         { "include": "#template-expression" },
         {

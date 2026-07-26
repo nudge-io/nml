@@ -99,7 +99,7 @@ text-block order, JEP 378):
 - **Dedent is computed on source lines, before escapes are interpreted.**
   An escaped `\n` produces a newline in the *value* without creating a
   line for indentation purposes, and escaped whitespace survives
-  stripping — `\u{20}` at the start of a line is protected content, not
+  stripping — `\s` (or `\u{20}`) at the start of a line is protected content, not
   indentation (the capability Java added `\s` for).
 - **Content must begin on the line after the opening `"""`**
   ([NML0019](../crates/nml-core/assets/error-index.md#nml0019), the
@@ -107,9 +107,17 @@ text-block order, JEP 378):
   indent computation. Whitespace alone there is harmless and legal, as is
   the empty `""""""`; short values use ordinary `"…"` strings.
 - **The formatter protects edge spaces**: when it renders a multiline
-  value, a line's first and last space are emitted as `\u{20}`, so
-  neither reparse dedent nor an editor's trim-on-save can change the
-  value.
+  value, a line's first and last space are emitted as `\s`, so neither
+  reparse dedent nor an editor's trim-on-save can change the value.
+- **An own-line closing `"""` aligns with the content**
+  ([NML0020](../crates/nml-core/assets/error-index.md#nml0020),
+  machine-fixable): with alignment enforced, the delimiter-anchored
+  reading and the min-indent reading provably agree on every accepted
+  document.
+- **Tabs may not appear in a body line's indentation** (NML0005's rule,
+  extended): column arithmetic must not depend on editor settings,
+  inside strings as outside. Tabs as *content* (mid-line, or via `\t`)
+  are unaffected.
 
 Escape sequences (same for single and multiline strings):
 - `\"` -- literal double quote
@@ -117,10 +125,19 @@ Escape sequences (same for single and multiline strings):
 - `\n` -- newline
 - `\t` -- tab
 - `\r` -- carriage return (the only way to put a CR in a value)
+- `\s` -- space (as in Java text blocks): a *protected* space that
+  survives multiline dedent and editor whitespace-trimming. The
+  formatter emits it for a line's leading/trailing spaces.
 - `\u{…}` -- 1–6 hex digits naming a Unicode scalar (as in Rust and
   Swift), e.g. `\u{E9}` é, `\u{1F389}` 🎉. Surrogates and code points
   above `10FFFF` are rejected. This is the sanctioned spelling for every
   character the [Source text](#source-text) policy bans raw.
+- `\` before a line break (multiline strings only) -- line continuation,
+  as in Java and Swift: the two source lines join without a newline in
+  the value. Dedent applies first (each line's indent is stripped), then
+  the join. A `\\` is a literal backslash, never a continuation, and a
+  continuation on the last content line is an error (the string ends
+  mid-escape).
 
 ### Template Expressions
 
@@ -496,7 +513,10 @@ NumberLiteral   <- "-"? [0-9]+ ("." [0-9]+)?
 BoolLiteral     <- "true" / "false"
 StringLiteral   <- '"""' MultilineContent '"""'
                  / '"' StringContent '"'
-StringContent   <- (StringChar / TemplateExpr)*
+StringContent   <- (Escape / TemplateExpr / StringChar)*
+MultilineContent<- (Escape / LineContinuation / TemplateExpr / StringChar / NEWLINE)*
+Escape          <- "\" (["\ntrs] / "u{" [0-9A-Fa-f]{1,6} "}")
+LineContinuation<- "\" NEWLINE
 TemplateExpr    <- "{{" [^}]+ "}}"
 SecretRef       <- "$ENV." Identifier ("." Identifier)*
 ArrayLiteral    <- "[" (Value ("," Value)*)? "]"

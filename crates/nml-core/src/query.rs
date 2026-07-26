@@ -19,8 +19,8 @@
 //!
 //! let port = doc.block("service", "MyApp")
 //!     .property("port")
-//!     .as_f64();
-//! assert_eq!(port, Some(8080.0));
+//!     .to_i64();
+//! assert_eq!(port, Some(8080));
 //!
 //! let name = doc.block("service", "MyApp")
 //!     .property("name")
@@ -211,17 +211,20 @@ impl<'a> ValueQuery<'a> {
         }
     }
 
-    /// Extract as a number.
-    pub fn as_f64(&self) -> Option<f64> {
+    /// Extract as an `f64` via the correctly-rounded conversion (lossy
+    /// above 2^53 and beyond binary64 precision; the stored decimal is
+    /// exact — use [`ValueQuery::to_i64`] or the [`Value::Number`]
+    /// variant when exactness matters).
+    pub fn to_f64(&self) -> Option<f64> {
         match self {
-            ValueQuery::Found(v) => v.as_f64(),
+            ValueQuery::Found(v) => v.to_f64(),
             _ => None,
         }
     }
 
-    /// Extract as an integer. Returns `None` for fractional or
+    /// Extract as an exact integer. Returns `None` for fractional or
     /// out-of-range numbers rather than silently truncating.
-    pub fn as_i64(&self) -> Option<i64> {
+    pub fn to_i64(&self) -> Option<i64> {
         match self {
             ValueQuery::Found(v) => i64::try_from(*v).ok(),
             _ => None,
@@ -289,7 +292,7 @@ mod tests {
         let doc = Document::new(&file);
 
         assert_eq!(
-            doc.block("service", "MyApp").property("port").as_f64(),
+            doc.block("service", "MyApp").property("port").to_f64(),
             Some(8080.0)
         );
         assert_eq!(
@@ -305,7 +308,7 @@ mod tests {
         assert!(
             doc.block("service", "Other")
                 .property("port")
-                .as_f64()
+                .to_f64()
                 .is_none()
         );
     }
@@ -335,8 +338,8 @@ mod tests {
     fn query_const_value() {
         let file = parse_doc("const MaxRetries = 3\n");
         let doc = Document::new(&file);
-        assert_eq!(doc.const_value("MaxRetries").as_f64(), Some(3.0));
-        assert!(doc.const_value("Missing").as_f64().is_none());
+        assert_eq!(doc.const_value("MaxRetries").to_f64(), Some(3.0));
+        assert!(doc.const_value("Missing").to_f64().is_none());
     }
 
     #[test]
@@ -391,7 +394,7 @@ mod tests {
     fn query_nonexistent_block() {
         let file = parse_doc("service App:\n    port = 8080\n");
         let doc = Document::new(&file);
-        let result = doc.block("service", "Missing").property("port").as_f64();
+        let result = doc.block("service", "Missing").property("port").to_f64();
         assert!(result.is_none());
     }
 
@@ -399,7 +402,7 @@ mod tests {
     fn query_nonexistent_keyword() {
         let file = parse_doc("service App:\n    port = 8080\n");
         let doc = Document::new(&file);
-        let result = doc.block("workflow", "App").property("port").as_f64();
+        let result = doc.block("workflow", "App").property("port").to_f64();
         assert!(result.is_none());
     }
 
@@ -436,7 +439,7 @@ mod tests {
         assert!(
             doc.block("service", "App")
                 .property("debug")
-                .as_f64()
+                .to_f64()
                 .is_none()
         );
     }
@@ -474,7 +477,7 @@ mod tests {
                 .nested("db")
                 .nested("pool")
                 .property("size")
-                .as_f64(),
+                .to_f64(),
             Some(10.0)
         );
     }
@@ -506,7 +509,7 @@ mod tests {
         let doc = Document::new(&file);
         let val = doc.block("service", "App").property("port").value();
         assert!(val.is_some());
-        assert!(matches!(val.unwrap(), Value::Number(n) if *n == 8080.0));
+        assert!(matches!(val.unwrap(), Value::Number(n) if *n == 8080));
     }
 
     #[test]
@@ -525,11 +528,11 @@ mod tests {
     }
 
     #[test]
-    fn query_as_i64() {
+    fn query_to_i64() {
         let file = parse_doc("service App:\n    port = 8080\n");
         let doc = Document::new(&file);
         assert_eq!(
-            doc.block("service", "App").property("port").as_i64(),
+            doc.block("service", "App").property("port").to_i64(),
             Some(8080)
         );
     }

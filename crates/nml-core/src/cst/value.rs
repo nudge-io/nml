@@ -15,56 +15,116 @@ use crate::cst::syntax::{
     SyntaxKind, SyntaxNode, SyntaxToken, content_span, node_span, text_offset,
 };
 
-/// Decode a bare string-literal token (`"…"`) to its value — used where the
-/// grammar guarantees a string (oneof discriminator/arm values) so there is no
-/// surrounding `Value` node to go through [`decode_value`].
-pub(super) fn decode_string_token(tok: &SyntaxToken) -> Result<String, NmlError> {
-    decode_string(tok.text(), text_offset(tok.text_range().start()))
-}
 use crate::error::NmlError;
 use crate::span::Span;
 use crate::types::{Number, SpannedValue, Value};
 use crate::{money, template};
 
-/// Variable-reference namespaces recognized after `$`.
-pub(crate) const KNOWN_NAMESPACES: &[&str] = &["ENV"];
-
-/// Decode a value node (`Value`, `ArrayValue`, or `Fallback`) into a
-/// [`SpannedValue`]. Returns the first semantic error encountered.
-pub fn decode_value(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
-    match node.kind() {
-        SyntaxKind::Value => decode_scalar(node),
-        SyntaxKind::ArrayValue => decode_array(node),
-        SyntaxKind::Fallback => decode_fallback(node),
-        other => Err(NmlError::syntax(
-            crate::error::ParseErrorKind::Expected {
-                expected: vec![crate::error::ExpectedItem::Desc("a value node")],
-                found: Some(crate::error::FoundToken {
-                    kind: other,
-                    text: String::new(),
-                }),
-                context: None,
-            },
-            node_span(node),
-        )),
+/// Decode a bare string-literal token (`"…"`) to its value — used where the
+/// grammar guarantees a string (oneof discriminator/arm values) so there is no
+/// surrounding `Value` node to go through [`decode_value`]. Strict view
+/// (first error by source position), derived from the total decoder like
+/// [`decode_value`] is.
+pub(super) fn decode_string_token(tok: &SyntaxToken) -> Result<String, NmlError> {
+    let mut sink = ValueErrors::default();
+    let s = decode_string(tok.text(), text_offset(tok.text_range().start()), &mut sink);
+    match sink.errors.into_iter().min_by_key(|e| e.span().start) {
+        Some(e) => Err(e),
+        None => Ok(s),
     }
 }
 
-fn decode_scalar(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
+/// Variable-reference namespaces recognized after `$`.
+pub(crate) const KNOWN_NAMESPACES: &[&str] = &["ENV"];
+
+/// Bounded error sink for the total value decoders ([`decode_value_all`]).
+/// Collection caps at the parse pipeline's error bound with an exact
+/// suppressed count — the same contract the lexer and lowering apply — so
+/// a pathological value can never amplify memory through its error list.
+#[derive(Debug, Default)]
+pub struct ValueErrors {
+    pub errors: Vec<NmlError>,
+    pub suppressed: usize,
+}
+
+impl ValueErrors {
+    fn push(&mut self, e: NmlError) {
+        if self.errors.len() < crate::cst::MAX_ERRORS {
+            self.errors.push(e);
+        } else {
+            self.suppressed += 1;
+        }
+    }
+}
+
+/// Decode a value node (`Value`, `ArrayValue`, or `Fallback`) into a
+/// [`SpannedValue`], **totally**: every semantic error is collected into
+/// `sink` (all bad escapes in a string at once — rustc-style, not
+/// whack-a-mole) and decoding continues with best-effort recovery (a bad
+/// escape yields U+FFFD; a malformed literal yields a placeholder), so
+/// lenient surfaces (the LSP) get a value *and* the full findings list.
+/// Strict surfaces derive from this — see [`decode_value`]. Errored
+/// documents still fail strict parsing, so no recovered value can reach a
+/// deployment path.
+pub fn decode_value_all(node: &SyntaxNode, sink: &mut ValueErrors) -> SpannedValue {
+    match node.kind() {
+        SyntaxKind::Value => decode_scalar(node, sink),
+        SyntaxKind::ArrayValue => decode_array(node, sink),
+        SyntaxKind::Fallback => decode_fallback(node, sink),
+        other => {
+            sink.push(NmlError::syntax(
+                crate::error::ParseErrorKind::Expected {
+                    expected: vec![crate::error::ExpectedItem::Desc("a value node")],
+                    found: Some(crate::error::FoundToken {
+                        kind: other,
+                        text: String::new(),
+                    }),
+                    context: None,
+                },
+                node_span(node),
+            ));
+            SpannedValue::new(Value::String(String::new()), node_span(node))
+        }
+    }
+}
+
+/// The strict single-error view, derived from [`decode_value_all`] (the
+/// `parse_to_ast` / `parse_to_ast_all` pattern): the error earliest **in
+/// source position** — collection order is close to source order but not
+/// identical (a misaligned closing delimiter is detected before the
+/// per-line scan), so the position-minimum is taken explicitly.
+pub fn decode_value(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
+    let mut sink = ValueErrors::default();
+    let v = decode_value_all(node, &mut sink);
+    match sink.errors.into_iter().min_by_key(|e| e.span().start) {
+        Some(e) => Err(e),
+        None => Ok(v),
+    }
+}
+
+fn decode_scalar(node: &SyntaxNode, sink: &mut ValueErrors) -> SpannedValue {
     let span = content_span(node);
     let toks = sig_tokens(node);
     // Decode is *semantic* validation; an empty value node is a syntactic failure
     // the parser already reported, so it yields a placeholder rather than a
     // (redundant) error.
     let Some(first) = toks.first() else {
-        return Ok(SpannedValue::new(Value::String(String::new()), span));
+        return SpannedValue::new(Value::String(String::new()), span);
+    };
+
+    // A malformed non-string literal recovers to the same empty placeholder
+    // lowering has always substituted — the error, not the placeholder, is
+    // the contract.
+    let placeholder = |sink: &mut ValueErrors, e: NmlError| {
+        sink.push(e);
+        Value::String(String::new())
     };
 
     let value = match first.kind() {
         SyntaxKind::String => {
             // `span.start` is the string token's start (it is the only
             // significant token, so `content_span` begins there).
-            let decoded = decode_string(first.text(), span.start)?;
+            let decoded = decode_string(first.text(), span.start, sink);
             // Template detection reads the RAW token text: templates are
             // syntax, escapes are content, so `\u{7B}\u{7B}` means a
             // literal `{{` — the escape hatch for the collision — and an
@@ -77,8 +137,14 @@ fn decode_scalar(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
                 Value::String(decoded)
             }
         }
-        SyntaxKind::Number => number_or_money(&toks[..], span, false)?,
-        SyntaxKind::Dash => number_or_money(&toks[..], span, true)?,
+        SyntaxKind::Number => match number_or_money(&toks[..], span, false) {
+            Ok(v) => v,
+            Err(e) => placeholder(sink, e),
+        },
+        SyntaxKind::Dash => match number_or_money(&toks[..], span, true) {
+            Ok(v) => v,
+            Err(e) => placeholder(sink, e),
+        },
         SyntaxKind::Role => {
             // RFC 0014: a role-conjunction expression (`Role (& Role)*`)
             // lowers to ONE `Value::Role` carrying the canonical
@@ -94,7 +160,11 @@ fn decode_scalar(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
             Value::Role(text)
         }
         SyntaxKind::Secret => {
-            validate_secret(first.text(), span)?;
+            // A malformed reference still yields its text — better hover UX
+            // than a vanished value, and the error carries the verdict.
+            if let Err(e) = validate_secret(first.text(), span) {
+                sink.push(e);
+            }
             Value::Secret(first.text().to_string())
         }
         SyntaxKind::Ident => match first.text() {
@@ -102,8 +172,9 @@ fn decode_scalar(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
             "false" => Value::Bool(false),
             other => Value::Reference(other.to_string()),
         },
-        other => {
-            return Err(NmlError::syntax(
+        other => placeholder(
+            sink,
+            NmlError::syntax(
                 crate::error::ParseErrorKind::Expected {
                     expected: vec![crate::error::ExpectedItem::Desc("a value")],
                     found: Some(crate::error::FoundToken {
@@ -113,10 +184,10 @@ fn decode_scalar(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
                     context: None,
                 },
                 span,
-            ));
-        }
+            ),
+        ),
     };
-    Ok(SpannedValue::new(value, span))
+    SpannedValue::new(value, span)
 }
 
 /// `Number (currency)?` or, when `negative`, `- Number (currency)?`.
@@ -125,7 +196,7 @@ fn number_or_money(toks: &[SyntaxToken], span: Span, negative: bool) -> Result<V
     // Incomplete (`-` with no number) is a syntactic failure the parser reported;
     // yield a placeholder rather than a redundant decode error.
     let Some(number) = toks.get(num_idx).filter(|t| t.kind() == SyntaxKind::Number) else {
-        return Ok(Value::Number(Number::Int(0)));
+        return Ok(Value::Number(Number::ZERO));
     };
     let raw = if negative {
         format!("-{}", number.text())
@@ -135,29 +206,47 @@ fn number_or_money(toks: &[SyntaxToken], span: Span, negative: bool) -> Result<V
 
     match toks.get(num_idx + 1) {
         Some(cur) if cur.kind() == SyntaxKind::Ident => {
+            // RFC 0016 §1.8: the trailing-dot malformation is a
+            // literal-layer rejection that fires BEFORE money parsing —
+            // anchored on the number token's REAL end. (`raw` is
+            // reconstructed as `-` + digits, but the source may hold
+            // trivia between the dash and the digits — `- 1299. JPY` —
+            // so start+len arithmetic would mis-place the delete-dot fix
+            // onto the last digit.)
+            if raw.ends_with('.') {
+                let num_end = text_offset(number.text_range().end());
+                return Err(NmlError::syntax(
+                    crate::error::ParseErrorKind::NumberTrailingDot {
+                        raw: crate::error::echo_capture(&raw),
+                    },
+                    Span::new(span.start, num_end),
+                ));
+            }
             Ok(Value::Money(money::parse_money(&raw, cur.text(), span)?))
         }
         _ => Ok(Value::Number(parse_number(&raw, span)?)),
     }
 }
 
-fn decode_array(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
+fn decode_array(node: &SyntaxNode, sink: &mut ValueErrors) -> SpannedValue {
+    // Total per element: one bad item no longer hides its siblings' errors
+    // (or their values).
     let items = value_children(node)
-        .map(|c| decode_value(&c))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(SpannedValue::new(Value::Array(items), content_span(node)))
+        .map(|c| decode_value_all(&c, sink))
+        .collect::<Vec<_>>();
+    SpannedValue::new(Value::Array(items), content_span(node))
 }
 
 /// `a | b | c` decodes right-associatively to `Fallback(a, Fallback(b, c))`
 /// — the resolver tries left-to-right, so the chain nests rightward.
-fn decode_fallback(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
+fn decode_fallback(node: &SyntaxNode, sink: &mut ValueErrors) -> SpannedValue {
     let mut values = value_children(node)
-        .map(|c| decode_value(&c))
-        .collect::<Result<Vec<_>, _>>()?
+        .map(|c| decode_value_all(&c, sink))
+        .collect::<Vec<_>>()
         .into_iter()
         .rev();
-    let mut acc = values.next().ok_or_else(|| {
-        NmlError::syntax(
+    let Some(mut acc) = values.next() else {
+        sink.push(NmlError::syntax(
             crate::error::ParseErrorKind::Expected {
                 expected: vec![crate::error::ExpectedItem::Desc("a fallback arm")],
                 found: Some(crate::error::FoundToken {
@@ -167,13 +256,14 @@ fn decode_fallback(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
                 context: None,
             },
             node_span(node),
-        )
-    })?;
+        ));
+        return SpannedValue::new(Value::String(String::new()), node_span(node));
+    };
     for v in values {
         let span = v.span.merge(acc.span);
         acc = SpannedValue::new(Value::Fallback(Box::new(v), Box::new(acc)), span);
     }
-    Ok(acc)
+    acc
 }
 
 // ── scalar decoders (spec: Strings; pinned by cst::tests + the fuzz batteries) ──
@@ -182,30 +272,30 @@ fn decode_fallback(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
 /// the delimiters, process escapes, and (triple-quoted) resolve the body in
 /// the text-block order — see [`decode_multiline`]. `tok_start` is the
 /// token's source offset, so escape errors get char-precise spans.
-fn decode_string(raw: &str, tok_start: usize) -> Result<String, NmlError> {
+fn decode_string(raw: &str, tok_start: usize, sink: &mut ValueErrors) -> String {
     if let Some(body) = raw.strip_prefix("\"\"\"") {
         let body = body.strip_suffix("\"\"\"").unwrap_or(body);
-        decode_multiline(body, tok_start + 3)
+        decode_multiline(body, tok_start + 3, sink)
     } else if let Some(body) = raw.strip_prefix('"') {
         let body = body.strip_suffix('"').unwrap_or(body);
-        decode_escapes(body, tok_start + 1)
+        let mut out = String::with_capacity(body.len());
+        decode_escapes_into(&mut out, body, tok_start + 1, sink);
+        out
     } else {
-        decode_escapes(raw, tok_start)
+        let mut out = String::with_capacity(raw.len());
+        decode_escapes_into(&mut out, raw, tok_start, sink);
+        out
     }
 }
 
-/// [`decode_escapes_into`], collected — for the single-line callers.
-fn decode_escapes(inner: &str, inner_start: usize) -> Result<String, NmlError> {
-    let mut out = String::with_capacity(inner.len());
-    decode_escapes_into(&mut out, inner, inner_start)?;
-    Ok(out)
-}
-
-/// Decode `\" \\ \n \t \r \u{…}` into `out`; `inner_start` is the source
-/// offset of `inner`'s first byte, so errors point at the exact escape.
-/// Content only, by construction: single-line tokens cannot span lines and
-/// the multiline splitter owns line terminators, so none reach this loop.
-fn decode_escapes_into(out: &mut String, inner: &str, inner_start: usize) -> Result<(), NmlError> {
+/// Decode `\" \\ \n \t \r \s \u{…}` into `out`, TOTALLY: every malformed
+/// escape is collected (rustc-style — all at once, never whack-a-mole) and
+/// recovery substitutes U+FFFD so decoding continues. `inner_start` is the
+/// source offset of `inner`'s first byte, so errors point at the exact
+/// escape. Content only, by construction: single-line tokens cannot span
+/// lines and the multiline splitter owns line terminators, so none reach
+/// this loop.
+fn decode_escapes_into(out: &mut String, inner: &str, inner_start: usize, sink: &mut ValueErrors) {
     let mut chars = inner.char_indices();
     while let Some((i, c)) = chars.next() {
         if c != '\\' {
@@ -218,27 +308,37 @@ fn decode_escapes_into(out: &mut String, inner: &str, inner_start: usize) -> Res
             Some((_, 'n')) => out.push('\n'),
             Some((_, 't')) => out.push('\t'),
             Some((_, 'r')) => out.push('\r'),
-            Some((_, 'u')) => out.push(decode_unicode_escape(&mut chars, inner, inner_start, i)?),
+            // Protected space (Java's `\s`): survives multiline dedent and
+            // editor trim — the formatter emits it for edge spaces.
+            Some((_, 's')) => out.push(' '),
+            Some((_, 'u')) => match decode_unicode_escape(&mut chars, inner, inner_start, i) {
+                Ok(ch) => out.push(ch),
+                Err(e) => {
+                    sink.push(e);
+                    out.push('\u{FFFD}');
+                }
+            },
             Some((j, other)) => {
                 // Span the `\` (at `i`) through the escape char (ending at `j + len`).
                 let span = Span::new(inner_start + i, inner_start + j + other.len_utf8());
-                return Err(NmlError::syntax(
+                sink.push(NmlError::syntax(
                     crate::error::ParseErrorKind::InvalidEscape {
                         escape: Some(other),
                     },
                     span,
                 ));
+                out.push('\u{FFFD}');
             }
             None => {
                 let span = Span::new(inner_start + i, inner_start + inner.len());
-                return Err(NmlError::syntax(
+                sink.push(NmlError::syntax(
                     crate::error::ParseErrorKind::InvalidEscape { escape: None },
                     span,
                 ));
+                out.push('\u{FFFD}');
             }
         }
     }
-    Ok(())
 }
 
 /// Decode the braced tail of a `\u{…}` escape (Rust/Swift syntax: 1–6 hex
@@ -302,8 +402,15 @@ fn decode_unicode_escape(
 /// retained line slice at its true source offset, so escape errors span
 /// exact bytes with no remapping. Content therefore can never steer
 /// transport interpretation, and escaped whitespace survives dedent
-/// ("protected space" — the capability Java added `\s` for).
-fn decode_multiline(body: &str, body_start: usize) -> Result<String, NmlError> {
+/// ("protected space", `\s`). Shape rules enforced here, all with
+/// recovery: content on the opening line (NML0019 — the line joins the
+/// value but is excluded from indent arithmetic), tabs in body indentation
+/// (NML0005's principle, extended), a misaligned own-line closing
+/// delimiter (NML0020, machine-fixable — moving it is provably
+/// value-preserving), and `\` before a line break as Java/Swift line
+/// continuation (odd trailing-backslash run; dangling on the last line is
+/// the string-ends-mid-escape error).
+fn decode_multiline(body: &str, body_start: usize, sink: &mut ValueErrors) -> String {
     let bytes = body.as_bytes();
     let mut lines: Vec<(usize, &str)> = Vec::new();
     let mut start = 0;
@@ -320,83 +427,144 @@ fn decode_multiline(body: &str, body_start: usize) -> Result<String, NmlError> {
     lines.push((start, &body[start..]));
 
     let is_blank = |l: &str| l.chars().all(char::is_whitespace);
+    let space_indent = |l: &str| l.chars().take_while(|c| *c == ' ').count();
 
-    // NML0019 (the Swift/Java rule): content begins on a NEW line — the
-    // opening line is the one remaining place raw text could steer
-    // min-indent. Whitespace-only is harmless (blank lines are filtered
-    // from the indent computation) and stays legal, as does `""""""`.
+    // NML0019: content begins on a NEW line. Recovery keeps the author's
+    // text: the opening line joins the value as content (leading padding
+    // dropped — it sits after the quotes, not at a column) but is excluded
+    // from indent arithmetic, so it cannot steer dedent.
+    let mut work: Vec<(usize, &str)> = Vec::new();
     if let Some((off, first)) = lines.first().copied() {
         if !is_blank(first) {
-            let content = off + (first.len() - first.trim_start().len());
-            return Err(NmlError::syntax(
+            let at = off + (first.len() - first.trim_start().len());
+            sink.push(NmlError::syntax(
                 crate::error::ParseErrorKind::MultilineOpeningContent,
-                Span::new(body_start + content, body_start + off + first.len()),
+                Span::new(body_start + at, body_start + off + first.len()),
+            ));
+            work.push((at, &first[at - off..]));
+        }
+    }
+
+    // Edge trim on the remaining raw lines (line 0 is consumed above either
+    // way); remember a trimmed own-line closing for the alignment check.
+    let mut e = lines.len();
+    let mut closing: Option<(usize, &str)> = None;
+    if e > 1 && is_blank(lines[e - 1].1) {
+        closing = Some(lines[e - 1]);
+        e -= 1;
+    }
+    let retained = &lines[1..e.max(1)];
+
+    let min_indent = retained
+        .iter()
+        .filter(|(_, l)| !is_blank(l))
+        .map(|(_, l)| space_indent(l))
+        .min()
+        .unwrap_or(0);
+
+    // NML0020: an own-line closing delimiter must align with the content's
+    // indent — the only geometry where the delimiter-anchored reading and
+    // the min-indent reading could disagree, closed by making them agree.
+    // Machine-fixable: rewriting the closing line's indent is provably
+    // value-preserving (the line is edge-trimmed either way).
+    if let Some((c_off, c_line)) = closing {
+        let found = space_indent(c_line);
+        if !retained.is_empty() && found != min_indent {
+            sink.push(NmlError::syntax(
+                crate::error::ParseErrorKind::MultilineClosingMisaligned {
+                    expected: min_indent,
+                    found,
+                },
+                Span::new(body_start + c_off, body_start + c_off + c_line.len()),
             ));
         }
     }
 
-    let mut s = 0;
-    let mut e = lines.len();
-    if lines.first().is_some_and(|(_, l)| is_blank(l)) {
-        s = 1;
-    }
-    if e > s && is_blank(lines[e - 1].1) {
-        e -= 1;
-    }
-    let lines = &lines[s..e];
-    if lines.is_empty() {
-        return Ok(String::new());
-    }
-
-    let min_indent = lines
-        .iter()
-        .filter(|(_, l)| !is_blank(l))
-        .map(|(_, l)| l.chars().take_while(|c| *c == ' ').count())
-        .min()
-        .unwrap_or(0);
-
-    let mut out = String::new();
-    for (idx, (off, l)) in lines.iter().enumerate() {
-        if idx > 0 {
-            out.push('\n');
+    for (off, l) in retained {
+        // Tabs in body indentation: NML0005's principle — column arithmetic
+        // must not depend on editor settings — applies to dedent too.
+        // Blank lines are exempt, as in layout.
+        if !is_blank(l) {
+            let ws = l.len() - l.trim_start().len();
+            if l[..ws].contains('\t') {
+                sink.push(NmlError::syntax(
+                    crate::error::ParseErrorKind::TabInIndent,
+                    Span::new(body_start + off, body_start + off + ws),
+                ));
+            }
         }
         let stripped = if l.len() >= min_indent && l.chars().take(min_indent).all(|c| c == ' ') {
             min_indent
         } else {
             0
         };
-        decode_escapes_into(&mut out, &l[stripped..], body_start + off + stripped)?;
+        work.push((off + stripped, &l[stripped..]));
     }
-    Ok(out)
+
+    // Emit with line-continuation joins: an odd trailing-backslash run is
+    // an unpaired `\` before the line break — Java/Swift continuation. The
+    // parity rule IS escape pairing, so `\\` stays a literal backslash.
+    let mut out = String::new();
+    let mut join_pending = false;
+    let mut dangling: Option<Span> = None;
+    for (i, (abs, slice)) in work.iter().enumerate() {
+        if i > 0 && join_pending {
+            out.push('\n');
+        }
+        let trailing = slice.bytes().rev().take_while(|b| *b == b'\\').count();
+        let (slice, continued) = if trailing % 2 == 1 {
+            (&slice[..slice.len() - 1], true)
+        } else {
+            (*slice, false)
+        };
+        join_pending = !continued;
+        dangling = continued.then(|| {
+            Span::new(
+                body_start + abs + slice.len(),
+                body_start + abs + slice.len() + 1,
+            )
+        });
+        decode_escapes_into(&mut out, slice, body_start + abs, sink);
+    }
+    if let Some(span) = dangling {
+        // A continuation with nothing to join: the string ends mid-escape.
+        sink.push(NmlError::syntax(
+            crate::error::ParseErrorKind::InvalidEscape { escape: None },
+            span,
+        ));
+    }
+    out
 }
 
-/// Parse a number literal. Integers without a decimal point are exact `i64`
-/// (out-of-range is an error, never a silently rounded float), matching legacy.
+/// Parse a number literal: a thin adapter over the shared exact-decimal
+/// core (RFC 0016 §1.6) — the only place [`crate::decimal::NumberError`]
+/// gains a span and an NML code. Acceptance is value-based: any finite
+/// decimal128 value parses exactly; inexact or out-of-range is an error,
+/// never a silently rounded float.
 fn parse_number(raw: &str, span: Span) -> Result<Number, NmlError> {
-    if raw.contains('.') {
-        raw.parse().map(Number::Float).map_err(|_| {
-            NmlError::syntax(
-                crate::error::ParseErrorKind::InvalidNumber {
+    Number::parse_literal(raw).map_err(|e| {
+        let kind = match e {
+            crate::decimal::NumberError::Malformed => crate::error::ParseErrorKind::InvalidNumber {
+                raw: crate::error::echo_capture(raw),
+            },
+            crate::decimal::NumberError::TrailingDot => {
+                crate::error::ParseErrorKind::NumberTrailingDot {
                     raw: crate::error::echo_capture(raw),
-                },
-                span,
-            )
-        })
-    } else {
-        raw.parse().map(Number::Int).map_err(|_| {
-            NmlError::syntax(
-                crate::error::ParseErrorKind::NumberOutOfRange {
-                    raw: crate::error::echo_capture(raw),
-                },
-                span,
-            )
-        })
-    }
+                }
+            }
+            // Exhaustive in-crate on purpose: a new core variant must pick
+            // its code here before it can ship.
+            crate::decimal::NumberError::Range(issue) => {
+                crate::error::ParseErrorKind::NumberOutOfRange { issue }
+            }
+        };
+        NmlError::syntax(kind, span)
+    })
 }
 
 /// Validate a `$NS.key` reference: the namespace must be known and a key must
 /// follow (relocated from the legacy lexer's `read_secret_ref`).
-fn validate_secret(text: &str, span: Span) -> Result<(), NmlError> {
+pub(super) fn validate_secret(text: &str, span: Span) -> Result<(), NmlError> {
     let body = text.strip_prefix('$').unwrap_or(text);
     let (ns, key) = body.split_once('.').ok_or_else(|| {
         NmlError::syntax(

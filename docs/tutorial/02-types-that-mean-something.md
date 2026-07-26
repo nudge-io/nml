@@ -17,14 +17,19 @@ the rest come into play when a schema types your fields (Chapter 3) and when
 you meet access control (`role`, Chapter 6) and embedded domain bodies
 (`object`, Chapter 8's schema).
 
-Numbers are **exact** — integer semantics, no floating-point drift. Which
-raises the question: how do you write `$29.99`?
+Numbers are **exact** — every `number` is an exact decimal, never a binary
+float, so `taxRate = 0.20` is 0.20 forever (not 0.2000000000000000111…),
+integers survive to 34 significant digits, and the written precision
+(`2.50` vs `2.5`) is preserved. Which raises the question: how do you
+write `$29.99`?
 
 ## Money
 
-Not with a float. A money literal pairs an exact decimal with an ISO 4217
-currency code, and is stored as integer minor units — `29.99 USD` is 2999
-cents, forever:
+You *could* write it exactly as a plain number — exactness isn't the
+problem. What money adds is **currency rules**: a money literal pairs the
+exact decimal with an ISO 4217 currency code, is stored as integer minor
+units — `29.99 USD` is 2999 cents, forever — and the currency's real
+decimal conventions are enforced at parse time:
 
 ```nml check
 plan Pro:

@@ -62,13 +62,10 @@ use crate::types::{Number, Value};
 macro_rules! deserialize_int {
     ($method:ident, $visit:ident, $ty:ty, $name:literal) => {
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-            match coerce_to_number(self.value) {
-                Some(n) => visitor.$visit(number_to_int::<$ty>(n, $name)?),
-                None => Err(Error::De(format!(
-                    "expected number, got {}",
-                    self.value.type_name()
-                ))),
-            }
+            visitor.$visit(number_to_int::<$ty>(
+                coerce_to_number(self.value, $name)?,
+                $name,
+            )?)
         }
     };
 }
@@ -87,6 +84,28 @@ pub enum Error {
 }
 
 impl Error {
+    /// Prefix a `De` message with the failing field, building a key path
+    /// as nested deserializers unwind (`field \`database\`: field
+    /// \`port\`: u8 value out of range`). This is the locator half of
+    /// the redaction posture: messages never echo values, so the path —
+    /// which errors historically lacked entirely — pinpoints the site
+    /// instead. Typed `Resolve` errors pass through untouched: they
+    /// self-describe (the env var name) and callers match the variant.
+    fn with_field(self, key: &str) -> Self {
+        match self {
+            Error::De(msg) => Error::De(format!("field `{key}`: {msg}")),
+            other => other,
+        }
+    }
+
+    /// Element twin of [`Error::with_field`] for array positions.
+    fn with_element(self, index: usize) -> Self {
+        match self {
+            Error::De(msg) => Error::De(format!("element {index}: {msg}")),
+            other => other,
+        }
+    }
+
     /// If this error wraps a denied `$ENV` reference, the referenced variable text (e.g.
     /// `"$ENV.GROQ_API_KEY"`). Delegates to
     /// [`ResolveError::env_disabled_var`](crate::resolve::ResolveError::env_disabled_var) so
@@ -110,9 +129,75 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// serde's provided error constructors interpolate the offending VALUE
+/// into the message (``unknown variant `s3cr3t`…``, ``invalid type:
+/// string "hunter2"…``). In this band a value may be a resolved `$ENV`
+/// secret (the resolver erases provenance — every resolved secret is a
+/// plain `Value::String` by the time serde sees it) and may be
+/// kilobytes long, so the overrides below keep serde's message SHAPE —
+/// value *kind* plus the expectation — and redact content (security
+/// review). Field/variant NAMES keep serde's default formatting: they
+/// are identifiers from the target type or source keys, the locator
+/// half of the UX, and never carry values.
 impl de::Error for Error {
     fn custom<T: fmt::Display>(msg: T) -> Self {
         Error::De(msg.to_string())
+    }
+
+    fn invalid_type(unexp: de::Unexpected, exp: &dyn de::Expected) -> Self {
+        Error::De(format!(
+            "invalid type: {}, expected {exp}",
+            unexpected_kind(&unexp)
+        ))
+    }
+
+    fn invalid_value(unexp: de::Unexpected, exp: &dyn de::Expected) -> Self {
+        Error::De(format!(
+            "invalid value: {}, expected {exp}",
+            unexpected_kind(&unexp)
+        ))
+    }
+
+    fn unknown_variant(_variant: &str, expected: &'static [&'static str]) -> Self {
+        Error::De(if expected.is_empty() {
+            "unknown variant: there are no variants".to_string()
+        } else {
+            format!("unknown variant, expected one of: {}", expected.join(", "))
+        })
+    }
+}
+
+/// The value's KIND for redacted serde errors — never its content.
+///
+/// `Other` needs care: it is nominally a self-description, but serde's
+/// own DEFAULT `Visitor::visit_i128`/`visit_u128` build
+/// ``Other("integer `{v}` as i128")`` with the value already
+/// interpolated — so a >64-bit literal reaching a visitor that doesn't
+/// implement those methods would echo through this arm (found by
+/// implementation review). Those two shapes are recognized and collapsed;
+/// any other `Other` is genuine downstream-author text (`stringify!`d
+/// type names in serde's own impls) and passes through.
+fn unexpected_kind(u: &de::Unexpected) -> String {
+    use de::Unexpected::*;
+    match u {
+        Bool(_) => "a boolean".to_string(),
+        Unsigned(_) | Signed(_) => "an integer".to_string(),
+        Float(_) => "a floating-point number".to_string(),
+        Char(_) => "a character".to_string(),
+        Str(_) => "a string".to_string(),
+        Bytes(_) => "bytes".to_string(),
+        Unit => "a unit value".to_string(),
+        Option => "an optional value".to_string(),
+        NewtypeStruct => "a newtype struct".to_string(),
+        Seq => "a sequence".to_string(),
+        Map => "a map".to_string(),
+        Enum => "an enum".to_string(),
+        UnitVariant => "a unit variant".to_string(),
+        NewtypeVariant => "a newtype variant".to_string(),
+        TupleVariant => "a tuple variant".to_string(),
+        StructVariant => "a struct variant".to_string(),
+        Other(s) if s.starts_with("integer `") => "an integer".to_string(),
+        Other(s) => (*s).to_string(),
     }
 }
 
@@ -125,19 +210,29 @@ impl From<crate::resolve::ResolveError> for Error {
 }
 
 /// Convert a [`Number`] to any Rust integer type, rejecting fractional
-/// and out-of-range values with a precise error. Integers flow through
-/// exactly (no f64 round-trip), so the full `i64` range is preserved.
-fn number_to_int<T: TryFrom<i64>>(n: Number, type_name: &'static str) -> Result<T, Error> {
-    if let Number::Float(f) = n {
-        if f.fract() != 0.0 {
-            return Err(Error::De(format!(
-                "{type_name} value {f} has a fractional part"
-            )));
-        }
+/// and out-of-range values with a precise error — exact or error, never
+/// truncation (RFC 0016 §1.7 tier 1). The magnitude runs through the
+/// exact i128/u128 paths, so `u64`/`u128` targets above `i64::MAX` no
+/// longer funnel through `i64`.
+/// The messages never interpolate the value (security review): the
+/// resolver erases provenance, so `n` may be a coerced `$ENV` secret —
+/// and Display of extreme members is up to ~6 KB, an amplification
+/// lever. The caller's field/span context locates; the reason suffices.
+fn number_to_int<T: TryFrom<i128> + TryFrom<u128>>(
+    n: Number,
+    type_name: &'static str,
+) -> Result<T, Error> {
+    if let Some(i) = n.to_i128() {
+        return T::try_from(i).map_err(|_| Error::De(format!("{type_name} value out of range")));
     }
-    n.as_i64()
-        .and_then(|i| T::try_from(i).ok())
-        .ok_or_else(|| Error::De(format!("{type_name} value {n} out of range")))
+    if let Some(u) = n.to_u128() {
+        return T::try_from(u).map_err(|_| Error::De(format!("{type_name} value out of range")));
+    }
+    Err(Error::De(if n.is_integral() {
+        format!("{type_name} value out of range")
+    } else {
+        format!("{type_name} value has a fractional part")
+    }))
 }
 
 /// Deserialize a struct from an NML block body.
@@ -305,6 +400,11 @@ impl<'de> MapAccess<'de> for BodyMapAccess<'de> {
     ) -> Result<V::Value, Self::Error> {
         let entry = &self.entries[self.index];
         self.index += 1;
+        let key = match entry {
+            BodyMapEntry::Property(p) => p.name.name.as_str(),
+            BodyMapEntry::Block(_, name) => name,
+            BodyMapEntry::SharedScalar { key, .. } => key,
+        };
         match entry {
             BodyMapEntry::Property(prop) => seed.deserialize(ValueDeserializer {
                 value: &prop.value.value,
@@ -314,6 +414,7 @@ impl<'de> MapAccess<'de> for BodyMapAccess<'de> {
                 value: &value.value,
             }),
         }
+        .map_err(|e| e.with_field(key))
     }
 }
 
@@ -517,7 +618,16 @@ impl<'de> SeqAccess<'de> for ListItemSeqAccess<'de> {
             return Ok(None);
         }
         let item = self.items[self.index];
+        let position = self.index;
         self.index += 1;
+
+        // Named items locate by their label (`- Api:` → ``field `Api```),
+        // which reads better than a positional index; anonymous items
+        // locate by position.
+        let locate = |e: Error| match &item.kind {
+            ListItemKind::Named { name, .. } => e.with_field(&name.name),
+            _ => e.with_element(position),
+        };
 
         match &item.kind {
             ListItemKind::Named { name, body } => seed
@@ -545,6 +655,11 @@ impl<'de> SeqAccess<'de> for ListItemSeqAccess<'de> {
                 .deserialize(de::value::StrDeserializer::<Error>::new(s))
                 .map(Some),
         }
+        .map_err(locate)
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.items.len().saturating_sub(self.index))
     }
 }
 
@@ -669,11 +784,21 @@ impl<'de> MapAccess<'de> for NamedItemMapAccess<'de> {
     ) -> Result<V::Value, Self::Error> {
         if self.name_value_pending {
             self.name_value_pending = false;
-            return seed.deserialize(de::value::StrDeserializer::<Error>::new(self.label));
+            // The injected label is a value like any other: if the
+            // target rejects it, the error names the field it landed in
+            // (`name`), same as every sibling arm below.
+            return seed
+                .deserialize(de::value::StrDeserializer::<Error>::new(self.label))
+                .map_err(|e| e.with_field("name"));
         }
 
         let entry = &self.body_entries[self.body_index];
         self.body_index += 1;
+        let key = match entry {
+            BodyMapEntry::Property(p) => p.name.name.as_str(),
+            BodyMapEntry::Block(_, name) => name,
+            BodyMapEntry::SharedScalar { key, .. } => key,
+        };
         match entry {
             BodyMapEntry::Property(prop) => seed.deserialize(ValueDeserializer {
                 value: &prop.value.value,
@@ -683,6 +808,7 @@ impl<'de> MapAccess<'de> for NamedItemMapAccess<'de> {
                 value: &value.value,
             }),
         }
+        .map_err(|e| e.with_field(key))
     }
 }
 
@@ -691,20 +817,31 @@ impl<'de> MapAccess<'de> for NamedItemMapAccess<'de> {
 // ---------------------------------------------------------------------------
 
 /// Coerce a Value to a number. Native numbers pass through; string-typed
-/// values parse as exact integers first, then floats. Env vars resolve to
-/// `Value::String`, so `$ENV.PORT` = "3000" needs to deserialize into
-/// numeric fields -- and `"9007199254740993"` must survive exactly rather
-/// than detouring through f64.
-fn coerce_to_number(value: &Value) -> Option<Number> {
-    match value {
-        Value::Number(n) => Some(*n),
-        Value::String(s) | Value::Secret(s) | Value::Duration(s) | Value::Path(s) => s
-            .parse::<i64>()
-            .map(Number::Int)
-            .ok()
-            .or_else(|| s.parse::<f64>().map(Number::Float).ok()),
-        _ => None,
-    }
+/// values parse via the liberal, **exact** coercion grammar (RFC 0016
+/// §1.4 — Postel for machine-emitted data): env vars resolve to
+/// `Value::String`, so `$ENV.PORT = "9007199254740993"` must survive
+/// exactly, and `$ENV.RATE = "1e-6"` now arrives exact instead of
+/// f64-rounded. Failures embed the numeric core's *reason* but never the
+/// value: the resolver erases provenance (`resolve.rs`: resolved secrets
+/// become plain `Value::String`s), so ANY coerced string could be a
+/// resolved secret — echoing content here would leak credentials into
+/// logs. The span/key context callers attach is the locator; the reason
+/// text is the diagnosis.
+fn coerce_to_number(value: &Value, target: &'static str) -> Result<Number, Error> {
+    let (s, kind) = match value {
+        Value::Number(n) => return Ok(*n),
+        Value::String(s) => (s, "string"),
+        Value::Secret(s) => (s, "secret"),
+        Value::Duration(s) => (s, "duration"),
+        Value::Path(s) => (s, "path"),
+        other => {
+            return Err(Error::De(format!(
+                "expected {target}, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    Number::parse_coercion(s).map_err(|e| Error::De(format!("expected {target}, got {kind} ({e})")))
 }
 
 /// Coerce a string-typed Value to bool if it matches common truthy/falsy strings.
@@ -733,14 +870,42 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
                 let s = template::segments_to_string(segs);
                 visitor.visit_string(s)
             }
-            Value::Number(Number::Int(i)) => visitor.visit_i64(*i),
-            Value::Number(Number::Float(f)) => visitor.visit_f64(*f),
+            // The RFC 0016 §1.7 ladder, form-based: fraction form visits
+            // f64 (the documented-lossy edge for untyped consumers, same
+            // as the old Float arm); integer form climbs i64 → u64 → i128
+            // → u128 exactly and never silently rounds — beyond u128 is a
+            // hard error naming the exact alternatives.
+            Value::Number(n) => {
+                if n.scale() > 0 {
+                    visitor.visit_f64(n.to_f64())
+                } else if let Some(v) = n.to_i64() {
+                    visitor.visit_i64(v)
+                } else if let Some(v) = n.to_u64() {
+                    visitor.visit_u64(v)
+                } else if let Some(v) = n.to_i128() {
+                    visitor.visit_i128(v)
+                } else if let Some(v) = n.to_u128() {
+                    visitor.visit_u128(v)
+                } else {
+                    // No value interpolation: integer-form Display here
+                    // can be ~6 KB (bounded-echo posture, §1.2).
+                    Err(Error::De(
+                        "integer exceeds 128 bits; capture it exactly with an \
+                         `nml_core::types::Number` field or a String"
+                            .to_string(),
+                    ))
+                }
+            }
             Value::Bool(b) => visitor.visit_bool(*b),
             Value::Duration(s) | Value::Path(s) | Value::Secret(s) | Value::Role(s) => {
                 visitor.visit_str(s)
             }
             Value::Reference(s) => visitor.visit_str(s),
             Value::Money(m) => visitor.visit_string(m.format_display()),
+            // `deserialize_any` reaches here only for self-describing
+            // targets (untagged enums, `Value`-like), which consume the
+            // whole sequence; fixed-size targets go through
+            // `deserialize_seq`/`_tuple`, where exhaustion is enforced.
             Value::Array(items) => visitor.visit_seq(ArraySeqAccess { items, index: 0 }),
             Value::Fallback(primary, _) => ValueDeserializer {
                 value: &primary.value,
@@ -762,24 +927,16 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
         }
     }
 
+    /// Tier 2 (RFC 0016 §1.7): the correctly-rounded, documented-lossy
+    /// decimal→binary edge — the only place f64 enters typed targets.
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match coerce_to_number(self.value) {
-            Some(n) => visitor.visit_f64(n.as_f64()),
-            None => Err(Error::De(format!(
-                "expected number, got {}",
-                self.value.type_name()
-            ))),
-        }
+        visitor.visit_f64(coerce_to_number(self.value, "f64")?.to_f64())
     }
 
+    /// Direct single-rounding f32 (never `to_f64() as f32`, which
+    /// double-rounds — the `16777217.0000000001` class).
     fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        match coerce_to_number(self.value) {
-            Some(n) => visitor.visit_f32(n.as_f64() as f32),
-            None => Err(Error::De(format!(
-                "expected number, got {}",
-                self.value.type_name()
-            ))),
-        }
+        visitor.visit_f32(coerce_to_number(self.value, "f32")?.to_f32())
     }
 
     deserialize_int!(deserialize_i64, visit_i64, i64, "i64");
@@ -790,6 +947,8 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     deserialize_int!(deserialize_u32, visit_u32, u32, "u32");
     deserialize_int!(deserialize_u16, visit_u16, u16, "u16");
     deserialize_int!(deserialize_u8, visit_u8, u8, "u8");
+    deserialize_int!(deserialize_i128, visit_i128, i128, "i128");
+    deserialize_int!(deserialize_u128, visit_u128, u128, "u128");
 
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
@@ -811,7 +970,21 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
 
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
-            Value::Array(items) => visitor.visit_seq(ArraySeqAccess { items, index: 0 }),
+            Value::Array(items) => {
+                let mut seq = ArraySeqAccess { items, index: 0 };
+                let out = visitor.visit_seq(&mut seq)?;
+                // Fixed-size targets (tuples, `[T; N]`) stop early; the
+                // leftovers are config the author wrote and the program
+                // would never see. Never silent.
+                if seq.remaining() > 0 {
+                    return Err(Error::De(format!(
+                        "array has {} element(s), but the target accepts only {}",
+                        items.len(),
+                        seq.index
+                    )));
+                }
+                Ok(out)
+            }
             _ => Err(Error::De(format!(
                 "expected array, got {}",
                 self.value.type_name()
@@ -831,8 +1004,9 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     /// string is handed to serde's variant resolver via `visit_enum`,
     /// so `#[serde(rename_all = "...")]` and `#[serde(rename = "...")]`
     /// on the target enum work exactly as they do for JSON/TOML/YAML.
-    /// Unknown variants surface serde's canonical
-    /// `unknown variant ..., expected ...` error at parse time.
+    /// Unknown variants error with the expected-variant list but never
+    /// echo the offending value (this band's redaction rule: the string
+    /// may be a resolved `$ENV` secret — see the `de::Error` overrides).
     fn deserialize_enum<V: Visitor<'de>>(
         self,
         name: &'static str,
@@ -862,9 +1036,55 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
         }
     }
 
+    /// Tier 3 (RFC 0016 §1.7): the exact-capture handshake. [`Number`]'s
+    /// `Deserialize` asks for a newtype struct with the private token
+    /// name; answering with the compact member encoding keeps `Number`
+    /// fields lossless through NML's own bridge (native numbers pass
+    /// through; coercible string kinds follow the §1.4 liberal grammar,
+    /// matching every other numeric target). All other newtype structs
+    /// stay transparent, exactly as the old forward did.
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        if name == crate::decimal::NUMBER_NEWTYPE_TOKEN {
+            let n = coerce_to_number(self.value, "number")?;
+            // Compact member encoding, not the plain form: `{coeff}e{-scale}`
+            // is ≤ ~42 bytes for EVERY member (plain form of extreme-scale
+            // values is ~6 KB — an amplification lever), and it round-trips
+            // the stored cohort member exactly through the visitor's §1.4
+            // coercion-grammar arm (the plain form only preserves the
+            // value for negative-scale members).
+            return visitor.visit_string(format!("{}e{}", n.coeff(), -(n.scale() as i32)));
+        }
+        self.deserialize_any(visitor)
+    }
+
+    /// Fixed-arity targets route through `deserialize_seq` so the
+    /// leftover-element check applies (forwarding these to
+    /// `deserialize_any` would silently discard extra array elements —
+    /// implementation-review finding).
+    fn deserialize_tuple<V: Visitor<'de>>(
+        self,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_seq(visitor)
+    }
+
+    fn deserialize_tuple_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.deserialize_seq(visitor)
+    }
+
     serde::forward_to_deserialize_any! {
-        char bytes byte_buf unit unit_struct newtype_struct
-        tuple tuple_struct map struct identifier
+        char bytes byte_buf unit unit_struct
+        map struct identifier
     }
 }
 
@@ -875,6 +1095,18 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
 struct ArraySeqAccess<'a> {
     items: &'a [crate::types::SpannedValue],
     index: usize,
+}
+
+impl ArraySeqAccess<'_> {
+    /// Elements the target never asked for. A fixed-size target (tuple,
+    /// `[T; N]`) stops seeding early, and silently dropping the rest
+    /// would be exactly the kind of quiet data loss this crate refuses —
+    /// so `deserialize_seq` checks exhaustion after the visitor returns
+    /// (implementation-review finding; serde expects the Deserializer to
+    /// enforce this, as serde_json does).
+    fn remaining(&self) -> usize {
+        self.items.len().saturating_sub(self.index)
+    }
 }
 
 impl<'de> SeqAccess<'de> for ArraySeqAccess<'de> {
@@ -888,9 +1120,15 @@ impl<'de> SeqAccess<'de> for ArraySeqAccess<'de> {
             return Ok(None);
         }
         let item = &self.items[self.index];
+        let position = self.index;
         self.index += 1;
         seed.deserialize(ValueDeserializer { value: &item.value })
             .map(Some)
+            .map_err(|e| e.with_element(position))
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.remaining())
     }
 }
 
@@ -994,7 +1232,7 @@ service MyApp:
 
     #[test]
     fn deserialize_value_directly() {
-        let v = Value::number(42.0);
+        let v = Value::number(crate::num!(42.0));
         let n: f64 = from_value(&v).unwrap();
         assert_eq!(n, 42.0);
     }
@@ -1400,7 +1638,7 @@ auth MyAuth:
 
     #[test]
     fn type_mismatch_number_as_string() {
-        let v = Value::number(42.0);
+        let v = Value::number(crate::num!(42.0));
         let result: Result<String, _> = from_value(&v);
         assert!(result.is_err());
     }
@@ -1550,21 +1788,21 @@ auth MyAuth:
     #[test]
     fn deserialize_f32() {
         // 2.5 is exactly representable in f32, so equality is exact.
-        let v = Value::number(2.5);
+        let v = Value::number(crate::num!(2.5));
         let result: f32 = from_value(&v).unwrap();
         assert_eq!(result, 2.5f32);
     }
 
     #[test]
     fn deserialize_negative_integer() {
-        let v = Value::number(-42.0);
+        let v = Value::number(crate::num!(-42.0));
         let result: i32 = from_value(&v).unwrap();
         assert_eq!(result, -42);
     }
 
     #[test]
     fn deserialize_unsigned_rejects_negative() {
-        let v = Value::number(-1.0);
+        let v = Value::number(crate::num!(-1.0));
         let result: Result<u16, _> = from_value(&v);
         assert!(result.is_err());
     }
@@ -1937,32 +2175,300 @@ workflow W:
     #[test]
     fn test_number_to_int_from_int() {
         assert_eq!(
-            number_to_int::<u16>(Number::Int(3000), "u16").unwrap(),
+            number_to_int::<u16>(Number::from(3000), "u16").unwrap(),
             3000
         );
         assert_eq!(
-            number_to_int::<u16>(Number::Int(65535), "u16").unwrap(),
+            number_to_int::<u16>(Number::from(65535), "u16").unwrap(),
             u16::MAX
         );
-        assert!(number_to_int::<u16>(Number::Int(65536), "u16").is_err());
-        assert!(number_to_int::<u16>(Number::Int(-1), "u16").is_err());
+        assert!(number_to_int::<u16>(Number::from(65536), "u16").is_err());
+        assert!(number_to_int::<u16>(Number::from(-1), "u16").is_err());
         assert_eq!(
-            number_to_int::<i32>(Number::Int(-2147483648), "i32").unwrap(),
+            number_to_int::<i32>(Number::from(-2147483648), "i32").unwrap(),
             i32::MIN
         );
-        assert!(number_to_int::<i32>(Number::Int(2147483648), "i32").is_err());
+        assert!(number_to_int::<i32>(Number::from(2147483648), "i32").is_err());
     }
 
     #[test]
-    fn test_number_to_int_from_float() {
+    fn test_number_to_int_from_fraction_form() {
+        // Value-based integrality: fraction-form members with integral
+        // values convert; real fractions error with the precise reason.
         assert_eq!(
-            number_to_int::<u32>(Number::Float(4294967295.0), "u32").unwrap(),
+            number_to_int::<u32>(crate::num!(4294967295.0), "u32").unwrap(),
             u32::MAX
         );
-        assert!(number_to_int::<u32>(Number::Float(4294967296.0), "u32").is_err());
-        assert!(number_to_int::<u32>(Number::Float(1.1), "u32").is_err());
-        assert!(number_to_int::<u16>(Number::Float(f64::NAN), "u16").is_err());
-        assert!(number_to_int::<u16>(Number::Float(f64::INFINITY), "u16").is_err());
+        assert!(number_to_int::<u32>(crate::num!(4294967296.0), "u32").is_err());
+        let err = number_to_int::<u32>(crate::num!(1.1), "u32").unwrap_err();
+        assert!(err.to_string().contains("fractional part"), "{err}");
+    }
+
+    #[test]
+    fn test_number_to_int_wide_targets() {
+        // u64 above i64::MAX no longer funnels through i64 (RFC 0016).
+        assert_eq!(
+            number_to_int::<u64>("18446744073709551615".parse::<Number>().unwrap(), "u64").unwrap(),
+            u64::MAX
+        );
+        // i128/u128 targets are first-class.
+        assert_eq!(
+            number_to_int::<i128>("18446744073709551617".parse::<Number>().unwrap(), "i128")
+                .unwrap(),
+            18446744073709551617_i128
+        );
+        let two_e38 = format!("2{}", "0".repeat(38)).parse::<Number>().unwrap();
+        assert_eq!(
+            number_to_int::<u128>(two_e38, "u128").unwrap(),
+            2 * 10u128.pow(38)
+        );
+        let err = number_to_int::<u64>(two_e38, "u64").unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+    }
+
+    /// RFC 0016 §1.7 tier 3: the exact-capture handshake through NML's
+    /// own bridge — `Number` fields never detour through f64.
+    #[test]
+    fn test_number_field_exact_capture_handshake() {
+        #[derive(Deserialize)]
+        struct P {
+            rate: crate::types::Number,
+            env_like: crate::types::Number,
+            big: crate::types::Number,
+            neg_scale: crate::types::Number,
+            extreme: crate::types::Number,
+        }
+        // String properties follow the §1.4 liberal coercion grammar,
+        // like every other numeric target.
+        let source = "service App:\n    rate = 2.50\n    env_like = \"1e-6\"\n    big = 18446744073709551617\n    neg_scale = \"2e38\"\n    extreme = \"1e-6176\"\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let p: P = from_body(body).unwrap();
+        assert_eq!(
+            (p.rate.coeff(), p.rate.scale()),
+            (250, 2),
+            "scale preserved"
+        );
+        assert_eq!(
+            (p.env_like.coeff(), p.env_like.scale()),
+            (1, 6),
+            "coercion exact"
+        );
+        assert_eq!(p.big.to_u128(), Some(18446744073709551617), "2^64+1 exact");
+        // The compact member encoding preserves the stored cohort MEMBER,
+        // not just the value — the plain form would degrade (2, −38) to
+        // (2×10^33, −5) — and captures extreme-scale members without
+        // materializing their ~6 KB plain form.
+        assert_eq!(
+            (p.neg_scale.coeff(), p.neg_scale.scale()),
+            (2, -38),
+            "member preserved"
+        );
+        assert_eq!(
+            (p.extreme.coeff(), p.extreme.scale()),
+            (1, 6176),
+            "extreme member exact"
+        );
+    }
+
+    /// RFC 0016 §1.7 tier 3, pinned regression: inside serde's buffering
+    /// containers (`#[serde(untagged)]` — the serde_json#505 class, same
+    /// machinery as tag/flatten) the handshake degrades to the
+    /// foreign-format arms: capture stays VALUE-exact via the f64
+    /// shortest-round-trip rule for in-range decimals, but the stored
+    /// member (written scale) is not guaranteed. The boundary is wider
+    /// than `Number` alone (pre-existing, not RFC 0016 regression):
+    /// buffering bypasses this Deserializer's coercion ladders entirely,
+    /// so e.g. a string `"3000"` or fraction-form `3000.0` into a `u16`
+    /// field also fails inside flatten/untagged where the direct path
+    /// succeeds — serde's `Content` replays only the plain visit calls.
+    /// This test documents the boundary so a future serde change
+    /// surfaces loudly.
+    #[test]
+    fn test_number_field_buffered_container_degrades_to_value_equal() {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Buffered {
+            Num { rate: crate::types::Number },
+        }
+        let source = "service App:\n    rate = 2.50\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let Buffered::Num { rate } = from_body(body).unwrap();
+        assert_eq!(
+            rate,
+            crate::num!(2.5),
+            "value equality must survive buffering"
+        );
+    }
+
+    /// Redacted messages must still LOCATE: the de layer builds a field
+    /// path as nested deserializers unwind, so a failure names its site
+    /// without ever echoing the value (errors previously had neither).
+    #[test]
+    fn test_errors_carry_field_paths() {
+        #[derive(Deserialize, Debug)]
+        struct Db {
+            #[serde(rename = "port")]
+            _port: u8,
+        }
+        #[derive(Deserialize, Debug)]
+        struct Cfg {
+            #[serde(rename = "database")]
+            _database: Db,
+        }
+        let source = "service App:\n    database:\n        port = 70000\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let err = from_body::<Cfg>(body).unwrap_err().to_string();
+        assert!(
+            err.contains("field `database`") && err.contains("field `port`"),
+            "nested path must locate the failure: {err}"
+        );
+        assert!(err.contains("out of range"), "reason survives: {err}");
+        assert!(!err.contains("70000"), "value must not leak: {err}");
+
+        // Array elements locate by position.
+        #[derive(Deserialize, Debug)]
+        struct Ports {
+            #[serde(rename = "ports")]
+            _ports: Vec<u8>,
+        }
+        let source = "service App:\n    ports = [1, 2, 70000]\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let err = from_body::<Ports>(body).unwrap_err().to_string();
+        assert!(
+            err.contains("field `ports`") && err.contains("element 2"),
+            "element position must locate the failure: {err}"
+        );
+
+        // Named list items: the label AND the inner field both appear —
+        // NamedItemMapAccess has its own value path, which the first cut
+        // of this feature missed (caught by probe; pinned here).
+        #[derive(Deserialize, Debug)]
+        struct Ep {
+            #[serde(rename = "port")]
+            _port: u8,
+        }
+        #[derive(Deserialize, Debug)]
+        struct Eps {
+            #[serde(rename = "endpoints")]
+            _e: Vec<Ep>,
+        }
+        let source = "service App:\n    endpoints:\n        - Api:\n            port = 70000\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let err = from_body::<Eps>(body).unwrap_err().to_string();
+        assert!(
+            err.contains("field `endpoints`")
+                && err.contains("field `Api`")
+                && err.contains("field `port`"),
+            "named-item path must be complete: {err}"
+        );
+        assert!(!err.contains("70000"), "value must not leak: {err}");
+    }
+
+    /// Fixed-size targets must never silently swallow config: an array
+    /// longer than the tuple/array target it deserializes into is a
+    /// hard error, not a truncation (implementation-review finding).
+    #[test]
+    fn test_fixed_size_targets_reject_extra_elements() {
+        #[derive(Deserialize, Debug)]
+        struct T {
+            #[serde(rename = "x")]
+            _x: (bool, bool),
+        }
+        let source = "service App:\n    x = [true, false, true]\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let err = from_body::<T>(body).unwrap_err().to_string();
+        assert!(
+            err.contains("3 element(s)") && err.contains("only 2"),
+            "extra elements must be reported, got: {err}"
+        );
+
+        // The exact-arity case still deserializes.
+        let source = "service App:\n    x = [true, false]\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        assert!(from_body::<T>(body).is_ok(), "exact arity must succeed");
+
+        // Vec targets consume everything — unaffected.
+        #[derive(Deserialize, Debug)]
+        struct V {
+            #[serde(rename = "x")]
+            _x: Vec<bool>,
+        }
+        let source = "service App:\n    x = [true, false, true]\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        assert!(from_body::<V>(body).is_ok(), "Vec must accept any length");
+    }
+
+    /// Security posture (implementation review): serde-generated errors
+    /// must never echo values — a resolved `$ENV` secret is a plain
+    /// string by the time serde sees it, and both the unknown-variant
+    /// and invalid-type channels used to interpolate it verbatim.
+    #[test]
+    fn test_serde_errors_never_echo_values() {
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "lowercase")]
+        enum Backend {
+            Memory,
+            Postgres,
+        }
+        #[derive(Deserialize, Debug)]
+        struct C {
+            #[serde(rename = "backend")]
+            _backend: Backend,
+        }
+        let source = "service App:\n    backend = \"s3cr3t-prod-pw\"\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let err = from_body::<C>(body).unwrap_err().to_string();
+        assert!(!err.contains("s3cr3t"), "variant value leaked: {err}");
+        assert!(
+            err.contains("memory") && err.contains("postgres"),
+            "expected-variant list is the actionable half: {err}"
+        );
+
+        // invalid_type channel: a string handed to a char-typed field.
+        #[derive(Deserialize, Debug)]
+        struct D {
+            #[serde(rename = "x")]
+            _x: char,
+        }
+        let source = "service App:\n    x = \"hunter2-XYZZY\"\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let err = from_body::<D>(body).unwrap_err().to_string();
+        assert!(!err.contains("hunter2"), "string value leaked: {err}");
+        assert!(err.contains("a string"), "kind survives redaction: {err}");
+
+        // The 128-bit channel: serde's DEFAULT visit_i128/visit_u128 build
+        // `Unexpected::Other("integer `<value>` as i128")` — the value is
+        // inside the description, so the Other arm must collapse it.
+        let source = "service App:\n    x = 99228162514264337593543950336\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("service", "App").body().unwrap();
+        let err = from_body::<D>(body).unwrap_err().to_string();
+        assert!(
+            !err.contains("99228162514264337593543950336"),
+            "128-bit value leaked via Unexpected::Other: {err}"
+        );
+        assert!(err.contains("an integer"), "kind survives redaction: {err}");
     }
 
     #[test]
@@ -2000,15 +2506,15 @@ workflow W:
         // The entire i64 range survives exactly -- the old f64 round-trip
         // corrupted anything above 2^53.
         assert_eq!(
-            number_to_int::<i64>(Number::Int(i64::MAX), "i64").unwrap(),
+            number_to_int::<i64>(Number::from(i64::MAX), "i64").unwrap(),
             i64::MAX
         );
         assert_eq!(
-            number_to_int::<i64>(Number::Int(i64::MIN), "i64").unwrap(),
+            number_to_int::<i64>(Number::from(i64::MIN), "i64").unwrap(),
             i64::MIN
         );
         assert_eq!(
-            number_to_int::<i64>(Number::Int(9_007_199_254_740_993), "i64").unwrap(),
+            number_to_int::<i64>(Number::from(9_007_199_254_740_993), "i64").unwrap(),
             9_007_199_254_740_993
         );
     }

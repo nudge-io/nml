@@ -2182,7 +2182,7 @@ fn find_candidates_at<'i, 'f>(
     line_index: &LineIndex,
 ) -> Option<DescentTarget<'i, 'f>> {
     let block = enclosing_top_block(file, pos, line_index)?;
-    let FieldTarget::Model(model) = index.resolve_ref(&block.keyword.name) else {
+    let Some(FieldTarget::Model(model)) = index.resolve_ref(&block.keyword.name) else {
         return None;
     };
     descend_to_cursor(model, &block.body, pos, index, line_index, None)
@@ -2236,7 +2236,7 @@ fn find_arm_target_types_at(
         }
         None
     })?;
-    let FieldTarget::Model(model) = index.resolve_ref(&block.keyword.name) else {
+    let Some(FieldTarget::Model(model)) = index.resolve_ref(&block.keyword.name) else {
         return None;
     };
     arm_target_descend(model, &block.body, pos, index, line_index)
@@ -2360,8 +2360,8 @@ fn ambiguous_candidates<'i>(
                 .iter()
                 .filter_map(|v| match v {
                     FieldType::ModelRef(name) => match index.resolve_ref(name) {
-                        FieldTarget::Model(m) => Some(NameableVariant::Model(m)),
-                        FieldTarget::OneOf(o) => Some(NameableVariant::OneOf(o)),
+                        Some(FieldTarget::Model(m)) => Some(NameableVariant::Model(m)),
+                        Some(FieldTarget::OneOf(o)) => Some(NameableVariant::OneOf(o)),
                         _ => None,
                     },
                     _ => None,
@@ -2428,7 +2428,7 @@ fn descend_to_cursor<'i, 'f>(
             // through the canonical body-aware resolver, so `[](modelA |
             // modelB)` items (annotated or shape-selected) complete their
             // variant's fields exactly like `[]model` items.
-            FieldTarget::ListOf(_) | FieldTarget::SetOf(_) => {
+            FieldTarget::ListOf(_, _) | FieldTarget::SetOf(_, _) => {
                 let base = match &field.field_type {
                     FieldType::Modifier(inner) => inner.as_ref(),
                     t => t,
@@ -2511,7 +2511,7 @@ fn descend_to_cursor<'i, 'f>(
             // unknown-annotation limbo) surfaces its candidate set for the
             // union-of-fields completion, anchored at the field header name;
             // a resolved one descends into its variant.
-            FieldTarget::Union => {
+            FieldTarget::Union(_) => {
                 if let Some(variants) = field.field_type.union_variants() {
                     if let Some(candidates) = ambiguous_candidates(index, variants, &nested.body) {
                         return Some(DescentTarget::Ambiguous {
@@ -2824,7 +2824,7 @@ fn resolve_oneof_variant<'i>(
         .or_else(|| oneof.default_discriminator.clone())?;
     let (_, variant_model) = oneof.variants.iter().find(|(v, _)| *v == value)?;
     match index.resolve_ref(variant_model) {
-        FieldTarget::Model(m) => Some(m),
+        Some(FieldTarget::Model(m)) => Some(m),
         _ => None,
     }
 }
@@ -2935,7 +2935,7 @@ fn field_insert_text(index: &SchemaIndex, field: &FieldDef) -> String {
     // sigil-less insert would author an unknown PROPERTY, not the modifier.
     let sigil = if is_modifier_form(field) { "|" } else { "" };
     match index.resolve_field(field) {
-        FieldTarget::Leaf => format!("{sigil}{} = ", field.name),
+        FieldTarget::Leaf(_) => format!("{sigil}{} = ", field.name),
         _ => format!("{sigil}{}:", field.name),
     }
 }
@@ -2984,7 +2984,7 @@ fn find_oneof_discriminator_at<'i>(
     let prop_name = value_position_prop_name(source, pos)?;
     let keyword = find_enclosing_block_keyword(file, pos, line_index)?;
     match index.resolve_ref(&keyword) {
-        FieldTarget::OneOf(oneof) if oneof.discriminator == prop_name => Some(oneof),
+        Some(FieldTarget::OneOf(oneof)) if oneof.discriminator == prop_name => Some(oneof),
         _ => None,
     }
 }
@@ -3219,12 +3219,35 @@ fn is_inside_triple_quote(lines: &[&str], line_idx: usize) -> bool {
         if i >= line_idx {
             break;
         }
-        let count = line.matches("\"\"\"").count();
-        for _ in 0..count {
+        for _ in 0..count_triple_quotes(line) {
             open = !open;
         }
     }
     open
+}
+
+/// Line-local `"""` delimiter count, ESCAPE-AWARE (parity with the lexer's
+/// string scan): a `\X` pair is skipped first, so `\"""` is an escaped
+/// quote followed by two plain quotes — not a delimiter. A naive substring
+/// count would toggle on it and mis-indent every line after. (Outside
+/// strings a backslash is not an escape, but no legal NML has one there —
+/// pair-skipping everywhere is the right cheap approximation for an
+/// indent heuristic.)
+fn count_triple_quotes(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut count = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+        } else if bytes[i..].starts_with(b"\"\"\"") {
+            count += 1;
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    count
 }
 
 /// Compute the desired indentation (in spaces) for a new line inserted after
@@ -4240,7 +4263,7 @@ impl LanguageServer for NmlLanguageServer {
                             .and_then(|(model, _)| model.fields.iter().find(|f| f.name == *name)),
                         AsSlot::Item => {
                             enclosing_top_block(&file, pos, &line_index).and_then(|block| {
-                                let FieldTarget::Model(model) =
+                                let Some(FieldTarget::Model(model)) =
                                     index.resolve_ref(&block.keyword.name)
                                 else {
                                     return None;
@@ -4589,7 +4612,51 @@ impl LanguageServer for NmlLanguageServer {
             }
         }
 
-        // 3. "Explain NML0000" (RFC 0010 tier 2) — negotiation-gated: emitted
+        // 3. "Simplify number" (RFC 0016 §1.10): a value-preserving,
+        //    user-invoked rewrite of a number literal to its minimal
+        //    cohort form (`8080.000` → `8080`, `007` → `7`) — the
+        //    counter-lint for unwanted trailing zeros now that fmt
+        //    preserves written scale. Refactor-kind, never a quickfix:
+        //    authored precision like `2.50` is intent until the author
+        //    says otherwise, so nothing auto-applies.
+        {
+            let start = line_index.offset(params.range.start);
+            let root = nml_core::cst::parse(&source).syntax();
+            let tok = root
+                .token_at_offset((start.min(source.len()) as u32).into())
+                .find(|t| t.kind() == nml_core::cst::SyntaxKind::Number);
+            if let Some(tok) = tok {
+                let raw = tok.text();
+                if let Ok(n) = raw.parse::<nml_core::decimal::Number>() {
+                    // The minimal cohort member with scale ≥ 0 — cohort
+                    // simplification lives in the numeric core, not here
+                    // (leading integer zeros drop via the parse itself).
+                    let simplified = n.simplified().to_string();
+                    if simplified != raw {
+                        let span_start = usize::from(tok.text_range().start());
+                        let span_end = usize::from(tok.text_range().end());
+                        let edit = TextEdit {
+                            range: line_index
+                                .range(nml_core::span::Span::new(span_start, span_end)),
+                            new_text: simplified.clone(),
+                        };
+                        let mut changes = std::collections::HashMap::new();
+                        changes.insert(uri.clone(), vec![edit]);
+                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                            title: format!("Simplify number to `{simplified}`"),
+                            kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                            edit: Some(WorkspaceEdit {
+                                changes: Some(changes),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }));
+                    }
+                }
+            }
+        }
+
+        // 4. "Explain NML0000" (RFC 0010 tier 2) — negotiation-gated: emitted
         //    only when the client declared its command id at initialize, so no
         //    editor ever receives an action it cannot execute. Derived purely
         //    from the round-tripped `context.diagnostics`: only OUR coded
@@ -4791,7 +4858,10 @@ impl LanguageServer for NmlLanguageServer {
             if !is_prop {
                 let builtin_info = match word.as_str() {
                     "string" => Some("**string** -- Quoted text value"),
-                    "number" => Some("**number** -- General-purpose numeric (integer or decimal)"),
+                    "number" => Some(
+                        "**number** -- Exact decimal (up to 34 significant digits); \
+                         integers and decimals never round",
+                    ),
                     "money" => Some(
                         "**money** -- Exact currency value with ISO 4217 code (e.g., `19.99 USD`)",
                     ),
@@ -5225,6 +5295,19 @@ fn rename_word_byte_range(line: &str, byte_col: usize) -> (usize, usize) {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// The on-type indent's delimiter counter is escape-aware (lexer
+    /// parity): `\"""` is an escaped quote plus two plain quotes, never a
+    /// delimiter — a naive substring count would toggle on it and
+    /// mis-indent everything after.
+    #[test]
+    fn triple_quote_counter_is_escape_aware() {
+        assert_eq!(count_triple_quotes(r#"x = """"#), 1);
+        assert_eq!(count_triple_quotes(r#"a\""""#), 0);
+        assert_eq!(count_triple_quotes(r#"say \"\"\" then"#), 0);
+        assert_eq!(count_triple_quotes(r#""""body""""#), 2);
+        assert!(is_inside_triple_quote(&["x = \"\"\"", "  a\\\"\"\""], 2));
+    }
 
     // ── project_file_insertion (RFC 0030 P2 structural writes) ─
 
@@ -7192,7 +7275,7 @@ workflow VoiceAgent:
         let line_index = LineIndex::new(source);
         let pos = Position::new(4, 26);
         let field = enclosing_top_block(&file, pos, &line_index).and_then(|block| {
-            let FieldTarget::Model(model) = idx.resolve_ref(&block.keyword.name) else {
+            let Some(FieldTarget::Model(model)) = idx.resolve_ref(&block.keyword.name) else {
                 return None;
             };
             find_union_list_field_at(model, &block.body, pos, &idx, &line_index)

@@ -53,6 +53,12 @@ pub enum ParseErrorKind {
     /// dedent's min-indent — the one way transport interpretation could
     /// still be steered by where content sits.
     MultilineOpeningContent,
+    /// An own-line closing `"""` whose indentation differs from the
+    /// content's min-indent. Alignment makes the delimiter-anchored reading
+    /// and the min-indent reading provably agree, so neither can be
+    /// misread. Machine-fixable: moving the delimiter is value-preserving
+    /// (its line is edge-trimmed either way).
+    MultilineClosingMisaligned { expected: usize, found: usize },
     /// A dedent to a column matching no enclosing block. `valid` lists the
     /// open indentation levels — the offside rule, taught at the site.
     BadDedent { found: usize, valid: Vec<usize> },
@@ -76,9 +82,19 @@ pub enum ParseErrorKind {
     InvalidUnicodeEscape { issue: UnicodeEscapeIssue },
     /// A numeric literal no number parses from (e.g. `1.2.3`).
     InvalidNumber { raw: String },
-    /// An integer outside `i64` — numbers are exact by design, never
-    /// silently rounded.
-    NumberOutOfRange { raw: String },
+    /// A numeric literal with a trailing decimal point (`1299.`). Shares
+    /// `INVALID_NUMBER`'s code (same malformed-literal class) but carries
+    /// its own signal so the fix — deleting the dot — is machine-applicable.
+    NumberTrailingDot { raw: String },
+    /// A number outside the exact decimal128 domain (RFC 0016): numbers
+    /// are exact by design, never silently rounded, so >34 significant
+    /// digits or an out-of-range magnitude is an error. The structured
+    /// payload carries the counts; deliberately no `raw` echo — the
+    /// offending literals are long by definition, the 32-char echo would
+    /// truncate them into noise, and the span already locates the site.
+    NumberOutOfRange {
+        issue: crate::decimal::NumberRangeIssue,
+    },
     /// A malformed `$NS.key` reference.
     BadSecretRef { reason: SecretRefIssue },
     /// `&&` written for `&` — a C-family habit, never valid NML. Shares
@@ -226,6 +242,10 @@ impl ParseErrorKind {
                                         line after the opening `\"\"\"` (text on the \
                                         opening line would steer indentation stripping)"
                 .to_string(),
+            MultilineClosingMisaligned { expected, found } => format!(
+                "the closing `\"\"\"` must align with the content's indentation \
+                 (content is at column {expected}, the closing quotes at {found})"
+            ),
             BadDedent { found, valid } => {
                 let levels = valid
                     .iter()
@@ -251,7 +271,7 @@ impl ParseErrorKind {
                 "duplicate directive — each directive may appear once per field".to_string()
             }
             InvalidEscape { escape: Some(ch) } => format!(
-                "unknown escape sequence '\\{}' (valid escapes: \\\" \\\\ \\n \\t \\r \\u{{…}})",
+                "unknown escape sequence '\\{}' (valid escapes: \\\" \\\\ \\n \\t \\r \\s \\u{{…}})",
                 echo(&ch.to_string())
             ),
             InvalidEscape { escape: None } => {
@@ -280,9 +300,14 @@ impl ParseErrorKind {
                 ),
             },
             InvalidNumber { raw } => format!("invalid number: \"{}\"", echo(raw)),
-            NumberOutOfRange { raw } => {
-                format!("integer \"{}\" out of range for 64-bit integer", echo(raw))
-            }
+            NumberTrailingDot { raw } => format!(
+                "number \"{}\" ends with a decimal point; remove the \".\" or add \
+                 fraction digits",
+                echo(raw)
+            ),
+            // The normative RFC 0016 texts; counts come from the payload,
+            // never from the (truncated) echo.
+            NumberOutOfRange { issue } => issue.to_string(),
             DoubleAmp => "'&' is the conjunction operator; '&&' is not needed".to_string(),
             BadSecretRef { reason } => match reason {
                 SecretRefIssue::MissingDot => {
@@ -315,6 +340,7 @@ impl ParseErrorKind {
             ForbiddenControlCharacter { .. } => codes::FORBIDDEN_CONTROL,
             InvisibleCharacter { .. } => codes::INVISIBLE_CHARACTER,
             MultilineOpeningContent => codes::MULTILINE_OPENING_CONTENT,
+            MultilineClosingMisaligned { .. } => codes::MULTILINE_CLOSING_MISALIGNED,
             BadDedent { .. } => codes::BAD_DEDENT,
             NestingLimit { .. } => codes::NESTING_LIMIT,
             SetSeparator => codes::SET_SEPARATOR,
@@ -324,6 +350,7 @@ impl ParseErrorKind {
             InvalidEscape { .. } => codes::INVALID_ESCAPE,
             InvalidUnicodeEscape { .. } => codes::INVALID_ESCAPE,
             InvalidNumber { .. } => codes::INVALID_NUMBER,
+            NumberTrailingDot { .. } => codes::INVALID_NUMBER,
             NumberOutOfRange { .. } => codes::NUMBER_OUT_OF_RANGE,
             BadSecretRef { .. } => codes::BAD_SECRET_REF,
             DoubleAmp => codes::REPLACED_SYNTAX,
@@ -345,6 +372,15 @@ impl ParseErrorKind {
             // Deleting the stray CR provably preserves intent: it is never
             // content (that spelling is `\r`) and never a line ending.
             BareCarriageReturn => Some((String::new(), span)),
+            // Rewriting the closing line's indent is provably
+            // value-preserving: the line is edge-trimmed either way.
+            MultilineClosingMisaligned { expected, .. } => Some((" ".repeat(*expected), span)),
+            // Deleting the trailing dot provably preserves the value
+            // (`1299.` → `1299`). The dot is the literal's final byte, so
+            // the fix needs no (possibly truncated) raw text.
+            NumberTrailingDot { .. } if span.end > span.start => {
+                Some((String::new(), Span::new(span.end - 1, span.end)))
+            }
             // The comma becomes the alternative separator, in place.
             SetSeparator => Some(("|".to_string(), span)),
             UnknownTypeConstructor { found } => {
@@ -427,10 +463,13 @@ impl NmlError {
                     None => diag,
                 };
                 let diag = match kind.suggestion(*span) {
-                    // An empty replacement is a deletion — structurally a
-                    // fix ("remove"), never a did-you-mean (there is no
-                    // near-miss spelling of nothing).
-                    Some((replacement, fix_span)) if replacement.is_empty() => {
+                    // Empty or whitespace-only replacements are mechanical
+                    // fixes (deletions, indent rewrites) — structurally a
+                    // fix, never a did-you-mean (there is no near-miss
+                    // *spelling* of nothing or of whitespace).
+                    Some((replacement, fix_span))
+                        if replacement.chars().all(char::is_whitespace) =>
+                    {
                         diag.with_fix(replacement, fix_span)
                     }
                     Some((replacement, fix_span)) => diag.with_suggestion(replacement, fix_span),

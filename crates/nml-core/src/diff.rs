@@ -577,7 +577,7 @@ fn diff_oneof_instance(
             .find(|(v, _)| v == val)
             .map(|(_, m)| m.as_str())?;
         match index.resolve_ref(name) {
-            FieldTarget::Model(m) => Some(m),
+            Some(FieldTarget::Model(m)) => Some(m),
             _ => None,
         }
     };
@@ -1594,8 +1594,23 @@ fn diff_collections(
     // element's native identity supplies the path segment. A body present on
     // only one side diffs against an empty overlay, so an edit that adds or
     // removes an element's sub-block reports precise leaf add/removes.
+    // Each old element pairs at most ONCE. Identity is semantic (RFC 0016
+    // made it numeric, so `8080` and `8080.0` are one identity), which
+    // means a collection can legitimately hold several elements sharing an
+    // identity; a plain `find` would pair every one of them against the
+    // first old match, reporting a wrong baseline for the rest and never
+    // diffing the later old elements at all. Consuming matches in order
+    // keeps pairing stable, total, and 1:1.
+    let mut paired_old = vec![false; old.len()];
     for n in new {
-        let Some(o) = old.iter().find(|o| o.id.eq(&n.id)) else {
+        let matched = old
+            .iter()
+            .enumerate()
+            .find(|(i, o)| !paired_old[*i] && o.id.eq(&n.id));
+        let Some(o) = matched.map(|(i, o)| {
+            paired_old[i] = true;
+            o
+        }) else {
             // A brand-new NAMED element reports as an Added at its element path
             // (unchanged behavior); new scalar elements — bodied or not — fall
             // to the ordered LCS path below as a whole-element Added, so they
@@ -1718,8 +1733,13 @@ fn diff_collections(
             }
         }
         for (i, o) in old.iter().enumerate() {
-            let removed_named =
-                matches!(o.id, ElemId::Name(_)) && !new.iter().any(|n| n.id.eq(&o.id));
+            // Named removal reads the SAME 1:1 pairing the recursion pass
+            // built, not an existence test. With `!new.iter().any(…)`, two
+            // old `- A:` elements against one new `- A:` both saw a match
+            // and neither reported removed — an element vanished from the
+            // config with the differ reporting no change at all, which for
+            // a `#restart`-classified subtree means no reload either.
+            let removed_named = matches!(o.id, ElemId::Name(_)) && !paired_old[i];
             let removed_val =
                 matches!(o.id, ElemId::Val(_)) && !matched.iter().any(|&(a, _)| a == i);
             if removed_named || removed_val {
@@ -3163,7 +3183,7 @@ mod tests {
         assert_eq!(d.len(), 1, "{d:?}");
         assert!(
             matches!(&d[0].kind, ChangeKind::Modified { new, .. }
-                if new.semantic_eq(&Value::Number(crate::types::Number::Int(8080)))),
+                if new.semantic_eq(&Value::Number(crate::types::Number::from(8080)))),
             "{d:?}"
         );
         assert_eq!(d[0].origin, Origin::Default);
@@ -3353,6 +3373,98 @@ mod tests {
     /// scalar-shorthand element body), and role edits all report with
     /// declaration-prefixed paths and their models' directives — no new diff
     /// logic, one uniform walk.
+    /// A duplicate-identity element that DISAPPEARS must be reported.
+    /// Named removal used an existence test, so two old `- A:` against
+    /// one new `- A:` reported nothing at all — silent element loss, and
+    /// no reload for a `#restart` subtree. Both passes now read the same
+    /// 1:1 pairing.
+    #[test]
+    fn removing_one_of_two_same_named_elements_is_reported() {
+        let (sch, errs) = crate::cst::extract_schema(MULTI_SCHEMA);
+        assert!(errs.is_empty(), "{errs:?}");
+        let run = |old_src: &str, new_src: &str| {
+            let (of, nf) = (parse_doc(old_src), parse_doc(new_src));
+            let fields = config_root_fields_from_files(&[&of, &nf]);
+            let root = synthesize_config_root("config", &fields);
+            let mut models = sch.models.clone();
+            models.push(root);
+            let index = SchemaIndex::build(models, sch.enums.clone(), sch.oneofs.clone());
+            let (ob, nb) = (wrap_file_as_body(&of), wrap_file_as_body(&nf));
+            diff_config(
+                &index,
+                "config",
+                &[(PathBuf::from("nudge.nml"), &ob)],
+                &[(PathBuf::from("nudge.nml"), &nb)],
+            )
+        };
+        let two = "[]role roles:\n    - Api:\n        description = \"a\"\n    - Api:\n        description = \"b\"\n";
+        let one = "[]role roles:\n    - Api:\n        description = \"a\"\n";
+        let d = run(two, one);
+        assert!(
+            d.iter()
+                .any(|c| matches!(&c.kind, ChangeKind::Removed { .. })),
+            "dropping one of two same-named elements must report a Removed: {d:?}"
+        );
+        // Both gone still reports both (unchanged behavior).
+        let none = "[]role roles:\n    - Other:\n        description = \"z\"\n";
+        let d = run(two, none);
+        assert_eq!(
+            d.iter()
+                .filter(|c| matches!(&c.kind, ChangeKind::Removed { .. }))
+                .count(),
+            2,
+            "{d:?}"
+        );
+        // No spurious removal when counts match.
+        let d = run(two, two);
+        assert!(
+            !d.iter()
+                .any(|c| matches!(&c.kind, ChangeKind::Removed { .. })),
+            "identical input must report no removal: {d:?}"
+        );
+    }
+
+    /// Element pairing is 1:1 even when several elements share one
+    /// identity. RFC 0016 made numeric identity semantic (`8080` and
+    /// `8080.0` are one identity), widening a latent collision class:
+    /// a plain first-match `find` paired BOTH new elements against
+    /// `old[0]`, reporting a wrong baseline and never diffing `old[1]`.
+    /// (Audit finding; the same hazard pre-existed for textually
+    /// duplicated keys.)
+    #[test]
+    fn cohort_equal_element_identities_pair_one_to_one() {
+        let (sch, errs) = crate::cst::extract_schema(MULTI_SCHEMA);
+        assert!(errs.is_empty(), "{errs:?}");
+        let build = |src: &str| parse_doc(src);
+
+        // Two elements whose keys are the same VALUE in different forms.
+        let old_src = "[]install plugins:\n    - \"8080\":\n        egressRate:\n            rate = 1\n            burst = 1\n    - \"8080.0\":\n        egressRate:\n            rate = 2\n            burst = 1\n";
+        let new_src = "[]install plugins:\n    - \"8080\":\n        egressRate:\n            rate = 1\n            burst = 1\n    - \"8080.0\":\n        egressRate:\n            rate = 99\n            burst = 1\n";
+        let (old_f, new_f) = (build(old_src), build(new_src));
+        let fields = config_root_fields_from_files(&[&old_f, &new_f]);
+        let root = synthesize_config_root("config", &fields);
+        let mut models = sch.models.clone();
+        models.push(root);
+        let index = SchemaIndex::build(models, sch.enums, sch.oneofs);
+        let (ob, nb) = (wrap_file_as_body(&old_f), wrap_file_as_body(&new_f));
+        let d = diff_config(
+            &index,
+            "config",
+            &[(PathBuf::from("nudge.nml"), &ob)],
+            &[(PathBuf::from("nudge.nml"), &nb)],
+        );
+        // Exactly one change, and its baseline is the SECOND element's
+        // old value (2), not the first's (1).
+        let rate: Vec<_> = d.iter().filter(|c| p(c).contains("rate")).collect();
+        assert_eq!(rate.len(), 1, "one rate change expected: {d:?}");
+        assert!(
+            matches!(&rate[0].kind, ChangeKind::Modified { old, .. }
+                if old.semantic_eq(&Value::Number(crate::types::Number::from(2)))),
+            "baseline must be the paired element's own old value: {:?}",
+            rate[0].kind
+        );
+    }
+
     #[test]
     fn multi_root_diffs_blocks_and_arrays_uniformly() {
         let (sch, errs) = crate::cst::extract_schema(MULTI_SCHEMA);

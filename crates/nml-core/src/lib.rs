@@ -20,8 +20,8 @@
 //!
 //! let port = doc.block("service", "MyApp")
 //!     .property("port")
-//!     .as_f64();
-//! assert_eq!(port, Some(8080.0));
+//!     .to_i64();
+//! assert_eq!(port, Some(8080));
 //! ```
 //!
 //! # Serde Integration
@@ -35,7 +35,7 @@
 //!
 //! #[derive(Deserialize)]
 //! struct Config {
-//!     port: f64,
+//!     port: u16,
 //!     host: String,
 //! }
 //!
@@ -56,6 +56,11 @@ pub mod ast;
 /// reads this directly; semantic consumers read the [`ast`] it lowers to.
 pub mod cst;
 pub mod de;
+/// The exact decimal numeric core (RFC 0016): NML's number domain is the
+/// finite decimal128 value space, error-on-inexact. One shared `const`
+/// parse path serves literals, `FromStr`, env-string coercion, and the
+/// compile-time-checked [`num!`](crate::num) macro.
+pub mod decimal;
 pub mod defaults;
 /// The unified diagnostics model (RFC 0008): one `Diagnostic` type — with
 /// stable codes, severities, spans, and machine-applicable suggestions —

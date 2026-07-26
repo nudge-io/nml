@@ -318,7 +318,7 @@ impl Positionalizer<'_> {
             return match self.index.resolve_type_in_body(&field.field_type, body) {
                 FieldTarget::Model(m) => self.model_body(m, body, depth + 1),
                 FieldTarget::OneOf(o) => self.oneof_body(o, body, depth + 1),
-                FieldTarget::ListOf(_) => {
+                FieldTarget::ListOf(_, _) => {
                     match variants.iter().find(|v| matches!(v, FieldType::List(_))) {
                         Some(FieldType::List(inner)) => self.list_body(inner, body, depth + 1),
                         _ => body.clone(),

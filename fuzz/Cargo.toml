@@ -1,0 +1,47 @@
+[package]
+name = "nml-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Excluded from the parent workspace (root Cargo.toml `exclude`): fuzzing
+# is nightly-only and must never gate MSRV / minimal-versions / packaging.
+# Usage:  cargo install cargo-fuzz --locked
+#         cd fuzz && cargo +nightly fuzz run number
+# Corpus seeds: `cargo +nightly fuzz run <target> ../tests/fixtures/valid`
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nml-core = { path = "../crates/nml-core" }
+nml-fmt = { path = "../crates/nml-fmt" }
+
+[[bin]]
+name = "number"
+path = "fuzz_targets/number.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "document"
+path = "fuzz_targets/document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "money"
+path = "fuzz_targets/money.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format"
+path = "fuzz_targets/format.rs"
+test = false
+doc = false
+bench = false
