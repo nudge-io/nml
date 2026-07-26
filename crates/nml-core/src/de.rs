@@ -832,7 +832,6 @@ fn coerce_to_number(value: &Value, target: &'static str) -> Result<Number, Error
         Value::Number(n) => return Ok(*n),
         Value::String(s) => (s, "string"),
         Value::Secret(s) => (s, "secret"),
-        Value::Path(s) => (s, "path"),
         other => {
             return Err(Error::De(format!(
                 "expected {target}, got {}",
@@ -896,7 +895,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
                 }
             }
             Value::Bool(b) => visitor.visit_bool(*b),
-            Value::Path(s) | Value::Secret(s) | Value::Role(s) => visitor.visit_str(s),
+            Value::Secret(s) | Value::Role(s) => visitor.visit_str(s),
             Value::Reference(s) => visitor.visit_str(s),
             Value::Money(m) => visitor.visit_string(m.format_display()),
             // `deserialize_any` reaches here only for self-describing
@@ -951,7 +950,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
         match self.value {
             Value::String(s) => visitor.visit_str(s),
             Value::TemplateString(segs) => visitor.visit_string(template::segments_to_string(segs)),
-            Value::Path(s) | Value::Secret(s) => visitor.visit_str(s),
+            Value::Secret(s) => visitor.visit_str(s),
             Value::Reference(s) | Value::Role(s) => visitor.visit_str(s),
             Value::Money(m) => visitor.visit_string(m.format_display()),
             _ => Err(Error::De(format!(
@@ -1011,11 +1010,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
         match self.value {
-            Value::String(s)
-            | Value::Path(s)
-            | Value::Secret(s)
-            | Value::Role(s)
-            | Value::Reference(s) => {
+            Value::String(s) | Value::Secret(s) | Value::Role(s) | Value::Reference(s) => {
                 visitor.visit_enum(de::value::StrDeserializer::<Error>::new(s))
             }
             Value::TemplateString(segs) => visitor.visit_enum(

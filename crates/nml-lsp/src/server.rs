@@ -2896,7 +2896,7 @@ fn field_detail(field: &FieldDef) -> String {
 /// and is simply omitted from the hint rather than rendered imprecisely.
 fn render_scalar(value: &Value) -> Option<String> {
     Some(match value {
-        Value::String(s) | Value::Path(s) => format!("{s:?}"),
+        Value::String(s) => format!("{s:?}"),
         Value::Number(n) => n.to_string(),
         Value::Money(m) => m.format_display(),
         Value::Bool(b) => b.to_string(),
@@ -3230,7 +3230,6 @@ fn format_value(value: &Value) -> String {
         Value::Reference(r) => r.clone(),
         Value::Secret(s) => s.clone(),
         Value::Role(r) => r.clone(),
-        Value::Path(p) => format!("\"{}\"", p),
         _ => "...".to_string(),
     }
 }

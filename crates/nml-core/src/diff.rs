@@ -233,7 +233,7 @@ impl std::fmt::Display for FieldPath {
 /// text-ish scalars quoted, numbers/bools bare.
 fn render_key(v: &Value) -> String {
     match v {
-        Value::String(s) | Value::Path(s) | Value::Role(s) => {
+        Value::String(s) | Value::Role(s) => {
             format!("{s:?}")
         }
         Value::Number(n) => format!("{n}"),

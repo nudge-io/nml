@@ -2767,7 +2767,7 @@ fn duplicate_clarifier(earlier: &Value, current: &Value) -> String {
 /// is bounded by the written literal's own length.
 fn value_label(value: &Value) -> String {
     match value {
-        Value::String(s) | Value::Path(s) | Value::Role(s) => {
+        Value::String(s) | Value::Role(s) => {
             const MAX_ECHO: usize = 32;
             if s.chars().count() > MAX_ECHO {
                 let head: String = s.chars().take(MAX_ECHO).collect();
@@ -2790,7 +2790,6 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Number(_) => "number",
         Value::Money(_) => "money",
         Value::Bool(_) => "bool",
-        Value::Path(_) => "path",
         Value::Secret(_) => "secret",
         Value::Role(_) => "role reference",
         Value::Reference(_) => "reference",

@@ -4,13 +4,17 @@
 
 ### Changed
 
-- **`Value::Duration` removed** — the variant was unreachable by
-  construction: durations are *quoted* strings in the grammar (spec
-  §Duration Literals), so only schema validation can judge duration-ness,
-  and no code path ever produced the variant. Duration-typed fields keep
-  validating exactly as before (`NML2029` via `parse_duration`, the single
-  source of truth); consumers keep receiving `Value::String`. Dead match
-  arms across the workspace went with it.
+- **`Value::Duration` and `Value::Path` removed** — both variants were
+  unreachable by construction: durations and paths are *quoted* strings in
+  the grammar (spec §Duration Literals, §Path Literals) with no lexeme of
+  their own, so only schema validation can judge duration-ness or
+  path-ness, and no code path ever produced either variant (their
+  `PrimitiveType` docs already said "treated as a string at runtime" —
+  path-typed validation never even accepted `Value::Path`).
+  Duration/path-typed fields keep validating exactly as before (durations:
+  `NML2029` via `parse_duration`; paths: the kind check, as always);
+  consumers keep receiving `Value::String`. Dead match arms across the
+  workspace went with them.
 - **Oneof arm values report every bad escape** — bare string-literal
   positions (oneof discriminator/arm values) now use the total decoder:
   all escape errors surface at once (rustc-style, matching property
@@ -79,6 +83,9 @@
   `T::try_from` (a `u128` consumer uses `Number::to_u128`), so
   nothing funnels through `i64` and falsely rejects the
   `(i64::MAX, u64::MAX]` band; `Value::to_u64` covers the probe flavor.
+  Programmatic `Number::try_new` rejections carry their own raw-pair
+  kinds (`CoefficientTooWide`/`ScaleOutOfRange`/`NegativeScaleZero` —
+  one per invariant, never diagnostics); `Malformed` is grammar-only.
 
 - **Rust edition 2021 → 2024** across the workspace (one inherited line; the
   MSRV stays 1.86, which predates the flip and supports edition 2024). The

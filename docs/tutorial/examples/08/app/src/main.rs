@@ -35,7 +35,7 @@ fn classify(change: &FieldChange) -> &'static str {
 /// `FieldChange::is_secret` short-circuits before values are printed.
 fn render(value: &Value) -> String {
     match value {
-        Value::String(s) | Value::Path(s) => format!("{s:?}"),
+        Value::String(s) => format!("{s:?}"),
         Value::Number(n) => format!("{n}"),
         Value::Bool(b) => format!("{b}"),
         other => format!("{other:?}"),

@@ -123,10 +123,11 @@ pub enum NumberRangeIssue {
     /// (`(1, −6112)` is rejected; the equal value 10^6112 constructs as
     /// `(10, −6111)`). When a pair violates both the coefficient and
     /// scale bounds, `CoefficientTooWide` wins — mirroring the parse
-    /// path's digits-before-window precedence. Checked BEFORE the
-    /// zero-invariant, so a zero at an out-of-window scale reports this
-    /// (truthfully); `Malformed` covers only in-window negative-scale
-    /// zeros.
+    /// path's digits-before-window precedence. The zero-invariant is
+    /// checked before this window, so a NEGATIVE-scale zero never
+    /// reaches here ([`NumberRangeIssue::NegativeScaleZero`] owns that
+    /// case in one step); a zero at a scale above 6176 does report this,
+    /// truthfully.
     ScaleOutOfRange {
         /// The scale as handed in.
         got: i16,

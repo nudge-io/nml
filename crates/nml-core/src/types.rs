@@ -48,7 +48,6 @@ pub enum Value {
     Number(Number),
     Money(Money),
     Bool(bool),
-    Path(String),
     Secret(String),
     Role(String),
     Reference(String),
@@ -265,7 +264,6 @@ impl Value {
             Value::Number(_) => "number",
             Value::Money(_) => "money",
             Value::Bool(_) => "bool",
-            Value::Path(_) => "path",
             Value::Secret(_) => "secret",
             Value::Role(_) => "role",
             Value::Reference(_) => "reference",
@@ -274,14 +272,12 @@ impl Value {
         }
     }
 
-    /// Extract as a string slice (String, Path, Secret, Reference, Role).
+    /// Extract as a string slice (String, Secret, Reference, Role).
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Value::String(s)
-            | Value::Path(s)
-            | Value::Secret(s)
-            | Value::Reference(s)
-            | Value::Role(s) => Some(s.as_str()),
+            Value::String(s) | Value::Secret(s) | Value::Reference(s) | Value::Role(s) => {
+                Some(s.as_str())
+            }
             _ => None,
         }
     }
@@ -342,7 +338,7 @@ impl TryFrom<&Value> for String {
         match value {
             Value::String(s) => Ok(s.clone()),
             Value::TemplateString(segs) => Ok(crate::template::segments_to_string(segs)),
-            Value::Path(s) | Value::Secret(s) => Ok(s.clone()),
+            Value::Secret(s) => Ok(s.clone()),
             Value::Reference(s) | Value::Role(s) => Ok(s.clone()),
             _ => Err(ValueTypeError {
                 expected: "string",
@@ -519,7 +515,6 @@ mod tests {
     #[test]
     fn as_str_accessors() {
         assert_eq!(Value::String("hi".into()).as_str(), Some("hi"));
-        assert_eq!(Value::Path("/tmp".into()).as_str(), Some("/tmp"));
         assert_eq!(Value::Reference("Ref".into()).as_str(), Some("Ref"));
         assert_eq!(Value::number(crate::num!(1.0)).as_str(), None);
     }
@@ -650,12 +645,6 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn try_from_path_to_string() {
-        let v = Value::Path("/usr/local/bin".into());
-        assert_eq!(String::try_from(&v).unwrap(), "/usr/local/bin");
-    }
-
-    #[test]
     fn try_from_secret_to_string() {
         let v = Value::Secret("$ENV.KEY".into());
         assert_eq!(String::try_from(&v).unwrap(), "$ENV.KEY");
@@ -754,7 +743,6 @@ mod tests {
         assert_eq!(Value::TemplateString(vec![]).type_name(), "string");
         assert_eq!(Value::number(crate::num!(0.0)).type_name(), "number");
         assert_eq!(Value::Bool(false).type_name(), "bool");
-        assert_eq!(Value::Path("/x".into()).type_name(), "path");
         assert_eq!(Value::Secret("$ENV.X".into()).type_name(), "secret");
         assert_eq!(Value::Role("admin".into()).type_name(), "role");
         assert_eq!(Value::Reference("Ref".into()).type_name(), "reference");
