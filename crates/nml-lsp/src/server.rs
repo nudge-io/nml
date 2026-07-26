@@ -1955,15 +1955,24 @@ fn find_duration_unit_completions_at(
             col -= 1;
         }
         let before = &line[..col];
+        // A magnitude is a `[0-9_]` run (separators are part of the typed
+        // literal — without `_` here, completion would go dead on exactly
+        // the magnitudes separators make attractive, `timeout = 1_000`).
         let start = before
-            .rfind(|c: char| !c.is_ascii_digit())
+            .rfind(|c: char| !c.is_ascii_digit() && c != '_')
             .map(|i| i + 1)
             .unwrap_or(0);
         let digits = &before[start..];
-        // The digits must START a value token: preceded only by the value
-        // introducers, never mid-word (`x30` is an identifier tail).
+        // The run must START a value token (preceded only by the value
+        // introducers, never mid-word — `x30` is an identifier tail), must
+        // contain a digit, and must not LEAD with `_` (that spelling is an
+        // identifier's, never a magnitude's).
         let prev = before[..start].trim_end().chars().next_back();
-        if digits.is_empty() || !matches!(prev, Some('=' | '[' | ',' | '|') | None) {
+        if digits.is_empty()
+            || digits.starts_with('_')
+            || !digits.bytes().any(|b| b.is_ascii_digit())
+            || !matches!(prev, Some('=' | '[' | ',' | '|') | None)
+        {
             return None;
         }
         let cursor_char = position::byte_to_utf16(line, col);
@@ -3284,7 +3293,11 @@ fn simplify_number_action(source: &str, offset: usize) -> Option<SimplifyNumber>
     // lives in the numeric core, not here (leading integer zeros drop
     // via the parse itself).
     let simplified = n.simplified().to_string();
-    if simplified == raw {
+    // Spelling-equivalence modulo `_` separators: `1_000` is already its
+    // simplified value in the author's chosen grouping — offering
+    // "simplify to `1000`" would nag users into deleting the separators
+    // the language gives them. `007` → `7` still fires.
+    if simplified == raw.replace('_', "") {
         return None;
     }
     // The Number token never carries the sign (`-` lexes as its own
@@ -3320,18 +3333,50 @@ fn format_value(value: &Value) -> String {
     }
 }
 
-/// `30000` → `30,000` — the hover-side thousands grouping for a duration's
-/// normalized total.
+/// `30000` → `30_000` — thousands grouping with the language's own digit
+/// separator, so a grouped total is itself a pasteable NML literal.
 fn group_thousands(n: u128) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, ch) in digits.chars().enumerate() {
         if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push(',');
+            out.push('_');
         }
         out.push(ch);
     }
     out
+}
+
+/// The hover's normalized total for a duration (RFC 0017): the value in
+/// the **coarsest of `ms`/`us`/`ns` that divides it exactly**, grouped and
+/// suffixed — a pasteable literal. `None` when that unit is the authored
+/// one (the echo would restate the literal). Backward-identical for the
+/// coarse units: every `h`/`m`/`s` total is an exact `ms` multiple, so
+/// `30s` still reads `30_000ms`.
+fn normalized_total(d: &nml_core::duration::Duration) -> Option<String> {
+    use nml_core::duration::DurationUnit;
+    let nanos = d.total_nanos();
+    if nanos == 0 {
+        // Every zero is every unit's zero; an echo teaches nothing.
+        return None;
+    }
+    for unit in [
+        DurationUnit::Milliseconds,
+        DurationUnit::Microseconds,
+        DurationUnit::Nanoseconds,
+    ] {
+        if nanos % unit.nanos() as u128 == 0 {
+            if unit == d.unit() {
+                return None;
+            }
+            return Some(format!(
+                "{}{}",
+                group_thousands(nanos / unit.nanos() as u128),
+                unit.suffix()
+            ));
+        }
+    }
+    None
 }
 
 /// Whether a property name suggests credential material.
@@ -4357,17 +4402,23 @@ impl LanguageServer for NmlLanguageServer {
             // labels, because clients filter against the token text (`30`),
             // which a bare suffix label would never match.
             if let Some(ctx) = duration_context {
-                const UNIT_NAMES: [(&str, &str); 4] = [
-                    ("s", "seconds"),
-                    ("ms", "milliseconds"),
-                    ("m", "minutes"),
-                    ("h", "hours"),
+                // Ranking is a UX judgment owned here (most-likely-first,
+                // NOT ladder order); the strings come from the enum's one
+                // vocabulary table, so the list can never lag the unit set.
+                use nml_core::duration::DurationUnit as DU;
+                const UNIT_RANKING: [DU; 6] = [
+                    DU::Seconds,
+                    DU::Milliseconds,
+                    DU::Minutes,
+                    DU::Hours,
+                    DU::Microseconds,
+                    DU::Nanoseconds,
                 ];
-                for (i, (suffix, unit_name)) in UNIT_NAMES.iter().enumerate() {
+                for (i, unit) in UNIT_RANKING.iter().enumerate() {
                     items.push(duration_unit_item(
                         &ctx,
-                        suffix,
-                        unit_name,
+                        unit.suffix(),
+                        unit.name(),
                         format!("0_{i:03}"),
                         insert_replace,
                     ));
@@ -5064,16 +5115,17 @@ impl LanguageServer for NmlLanguageServer {
 
             if !is_prop {
                 // Duration literal hover (RFC 0017): the authored form with
-                // its normalized total (`30s — 30,000ms`), so cross-unit
-                // values compare at a glance. Milliseconds literals skip
-                // the echo — the total IS the authored form.
+                // its normalized total (`30s — 30_000ms`), so cross-unit
+                // values compare at a glance. The total renders in the
+                // coarsest of {ms, us, ns} that divides it exactly, and is
+                // skipped when that would merely restate the literal
+                // (`500us` is its own normalized form). Grouping uses the
+                // language's own `_` separator, so the hover text is
+                // itself a valid literal — copy it, paste it.
                 if let Ok(d) = nml_core::duration::Duration::parse_text(&word) {
                     let mut text = format!("**duration** `{d}`");
-                    if d.unit() != nml_core::duration::DurationUnit::Milliseconds {
-                        text.push_str(&format!(
-                            " — {}ms",
-                            group_thousands(d.total_nanos() / 1_000_000)
-                        ));
+                    if let Some(total) = normalized_total(&d) {
+                        text.push_str(&format!(" — {total}"));
                     }
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
@@ -6762,6 +6814,31 @@ workflow VoiceAgent:
         // No digits typed yet ⇒ nothing to suffix.
         let src = "service Api:\n    timeout = \n";
         assert!(detect(src, 1, 14).is_none());
+    }
+
+    /// RFC 0017: the hover's normalized total — the coarsest of ms/us/ns
+    /// that divides the total exactly, grouped with the language's own
+    /// `_` separator (pasteable NML), skipped when it would restate the
+    /// literal or the value is zero.
+    #[test]
+    fn hover_normalized_total_rule() {
+        let d = |text: &str| nml_core::duration::Duration::parse_text(text).unwrap();
+        // Coarse units render their ms total, `_`-grouped.
+        assert_eq!(normalized_total(&d("30s")).as_deref(), Some("30_000ms"));
+        assert_eq!(normalized_total(&d("90m")).as_deref(), Some("5_400_000ms"));
+        assert_eq!(normalized_total(&d("2h")).as_deref(), Some("7_200_000ms"));
+        // Sub-ms values pick the coarsest EXACT unit — never `0ms`.
+        assert_eq!(normalized_total(&d("1000us")).as_deref(), Some("1ms"));
+        assert_eq!(normalized_total(&d("2000ns")).as_deref(), Some("2us"));
+        // A value that is its own normalized form shows nothing extra.
+        assert_eq!(normalized_total(&d("500ms")), None);
+        assert_eq!(normalized_total(&d("250us")), None);
+        assert_eq!(normalized_total(&d("750ns")), None);
+        // Zero teaches nothing in any unit.
+        assert_eq!(normalized_total(&d("0s")), None);
+        // Grouping delegate: the separator is the language's.
+        assert_eq!(group_thousands(1_234_567), "1_234_567");
+        assert_eq!(group_thousands(999), "999");
     }
 
     /// Round-17 border pins: a modifier-declared field completes WITH its

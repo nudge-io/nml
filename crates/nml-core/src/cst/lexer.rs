@@ -240,12 +240,20 @@ impl<'a> Lexer<'a> {
                 self.pos = end;
             }
             c if c.is_ascii_digit() => {
+                // Digits, dots, and `_` separators (RFC 0017 follow-up):
+                // the lexer takes the whole spelling greedily so a
+                // misplaced separator (`1__0`) stays inside ONE Number
+                // token and gets the teaching NML0013 with its strip fix
+                // at decode — a charset without `_` would shear the token
+                // at the separator and misdiagnose the tail as an unknown
+                // unit suffix. Placement is the value layer's judgment,
+                // shape is the lexer's: same split as everywhere else.
                 let mut end = start;
                 while self
                     .bytes
                     .get(end)
                     .copied()
-                    .is_some_and(|b| b.is_ascii_digit() || b == b'.')
+                    .is_some_and(|b| b.is_ascii_digit() || b == b'.' || b == b'_')
                 {
                     end += 1;
                 }

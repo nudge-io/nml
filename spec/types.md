@@ -97,11 +97,14 @@ timeout = 30s
 pollInterval = 500ms
 ```
 
-Supported units:
+Supported units (the complete set, closed by construction — `ns` is the
+domain's resolution floor, `h` the largest exact unit):
 - `h` -- hours
 - `m` -- minutes
 - `s` -- seconds
 - `ms` -- milliseconds
+- `us` -- microseconds (ASCII spelling; `µ` is not source-legal)
+- `ns` -- nanoseconds
 
 Durations are stored as the authored `(magnitude, unit)` pair — the
 formatter never rescales `72h` — and compare **semantically**: `30s`

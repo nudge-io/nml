@@ -563,11 +563,11 @@ impl SchemaValidator {
                     self.validate_body(&block.body, true, keyword, &mut diagnostics);
                     if matches!(keyword, "model" | "trait") {
                         self.validate_field_defaults(block, &mut diagnostics);
-                        // RFC 0018: facet declarations are checked on the
-                        // AST, where facets survive on EVERY named type
-                        // (the model drops them for refs) and spans are
-                        // authored-source precise.
-                        validate_facet_rules(block, &mut diagnostics);
+                        // RFC 0018 facet definition rules (NML2058) are
+                        // NOT here: they emit once, inside
+                        // `extract_schema` — the API every surface
+                        // constructs schemas through — so both verbs,
+                        // the LSP, and the loader agree by construction.
                     }
                 }
             }
@@ -2172,6 +2172,48 @@ impl SchemaValidator {
                         .with_code(codes::UNION_TYPE_MISMATCH)
                         .with_span(span),
                     );
+                } else {
+                    // RFC 0018: union semantics are ANY-variant-admits.
+                    // Every structurally-matching variant gets a chance;
+                    // the value passes if any accepts it (facets
+                    // included). Only when every matching variant
+                    // rejects do the FIRST one's findings surface —
+                    // deterministic, and authoring order is the natural
+                    // priority. Pre-facet unions keep byte-identical
+                    // behavior: an unfaceted matching variant admits
+                    // unconditionally.
+                    let mut first_rejection: Option<Vec<Diagnostic>> = None;
+                    let mut admitted = false;
+                    for v in variants
+                        .iter()
+                        .filter(|v| self.value_matches_type(value, v))
+                    {
+                        if !type_has_facets(v) {
+                            admitted = true;
+                            break;
+                        }
+                        let mut scratch = Vec::new();
+                        self.validate_value_against_type(
+                            value,
+                            v,
+                            field_name,
+                            context,
+                            span,
+                            &mut scratch,
+                        );
+                        if scratch.is_empty() {
+                            admitted = true;
+                            break;
+                        }
+                        if first_rejection.is_none() {
+                            first_rejection = Some(scratch);
+                        }
+                    }
+                    if !admitted {
+                        if let Some(d) = first_rejection {
+                            diags.extend(d);
+                        }
+                    }
                 }
             }
             FieldType::Modifier(declared) => {
@@ -2765,138 +2807,18 @@ fn set_item_label(item: &nml_core::ast::ListItem) -> String {
 /// saying why is the kind of diagnostic that costs an afternoon — so when
 /// the two renderings differ, name the earlier spelling explicitly.
 /// Identical spellings need no explanation (the duplication is visible).
-/// RFC 0018 definition-side facet rules (NML2058), walked over the
-/// AST type expression so misplaced facets are caught on model refs
-/// and non-number primitives alike. One finding per defect, at the
-/// offending facet's own span.
-fn validate_facet_rules(block: &BlockDecl, diags: &mut Vec<Diagnostic>) {
-    for entry in &block.body.entries {
-        let BodyEntryKind::FieldDefinition(fd) = &entry.kind else {
-            continue;
-        };
-        facet_rules_in_type(
-            &fd.field_type,
-            &fd.name.name,
-            fd.default_value.as_ref(),
-            diags,
-        );
-    }
-}
-
-fn facet_rules_in_type(
-    te: &nml_core::ast::FieldTypeExpr,
-    field_name: &str,
-    default: Option<&nml_core::types::SpannedValue>,
-    diags: &mut Vec<Diagnostic>,
-) {
-    use nml_core::ast::FieldTypeExpr as T;
-    let err = |diags: &mut Vec<Diagnostic>, msg: String, span: Span| {
-        diags.push(
-            Diagnostic::error(msg)
-                .with_code(codes::FACET_DEFINITION)
-                .with_span(span),
-        );
-    };
-    match te {
-        T::Named { name, facets } => {
-            if facets.is_empty() {
-                return;
-            }
-            if name.name != "number" {
-                err(
-                    diags,
-                    format!(
-                        "'{field_name}': facets attach only to `number` — `{}` cannot carry them",
-                        name.name
-                    ),
-                    facets[0].span,
-                );
-                return;
-            }
-            const KNOWN: [&str; 5] = ["min", "max", "exclusiveMin", "exclusiveMax", "multipleOf"];
-            let mut seen: Vec<&str> = Vec::new();
-            for f in facets {
-                let k = f.key.name.as_str();
-                if !KNOWN.contains(&k) {
-                    err(
-                        diags,
-                        format!(
-                            "'{field_name}': unknown facet '{k}' (known: min, max, \
-                             exclusiveMin, exclusiveMax, multipleOf)"
-                        ),
-                        f.span,
-                    );
-                    continue;
-                }
-                if seen.contains(&k) {
-                    err(
-                        diags,
-                        format!("'{field_name}': duplicate facet '{k}'"),
-                        f.span,
-                    );
-                }
-                seen.push(k);
-            }
-            let get = |k: &str| facets.iter().find(|f| f.key.name == k);
-            let num = |f: &nml_core::ast::FacetExpr| match &f.value.value {
-                Value::Number(n) => Some(*n),
-                _ => None,
-            };
-            for (a, b) in [("min", "exclusiveMin"), ("max", "exclusiveMax")] {
-                if let (Some(_), Some(fb)) = (get(a), get(b)) {
-                    err(
-                        diags,
-                        format!("'{field_name}': '{a}' and '{b}' are mutually exclusive"),
-                        fb.span,
-                    );
-                }
-            }
-            let lo = get("min").or_else(|| get("exclusiveMin"));
-            let hi = get("max").or_else(|| get("exclusiveMax"));
-            if let (Some(l), Some(h)) = (lo, hi) {
-                if let (Some(lv), Some(hv)) = (num(l), num(h)) {
-                    let strict =
-                        l.key.name.starts_with("exclusive") || h.key.name.starts_with("exclusive");
-                    if lv > hv || (lv == hv && strict) {
-                        err(
-                            diags,
-                            format!(
-                                "'{field_name}': the declared range is unsatisfiable \
-                                 ({} = {lv} against {} = {hv})",
-                                l.key.name, h.key.name
-                            ),
-                            h.span,
-                        );
-                    }
-                }
-            }
-            if let Some(m) = get("multipleOf") {
-                if let Some(v) = num(m) {
-                    if v <= nml_core::types::Number::ZERO {
-                        err(
-                            diags,
-                            format!("'{field_name}': multipleOf must be positive (got {v})"),
-                            m.span,
-                        );
-                    }
-                }
-            }
-            // Defaults are facet-checked by the shared enforcement pass
-            // (`validate_value_against_type` -> `validate_facets`), so a
-            // violating default reports NML2057 there — nothing to do
-            // here beyond the declaration rules.
-            let _ = default;
+/// Does this type carry RFC 0018 facets anywhere (itself or a nested
+/// element type)? Gates the union arm's variant re-validation so
+/// pre-facet schemas keep byte-identical union behavior.
+fn type_has_facets(t: &FieldType) -> bool {
+    match t {
+        FieldType::Primitive { facets, .. } => !facets.is_none(),
+        FieldType::List(inner) | FieldType::Set(inner) | FieldType::Modifier(inner) => {
+            type_has_facets(inner)
         }
-        T::Array(inner) | T::Set(inner) => facet_rules_in_type(inner, field_name, None, diags),
-        T::Union(vs) => {
-            for v in vs {
-                facet_rules_in_type(v, field_name, None, diags);
-            }
-        }
-        T::Arms { key, target } => {
-            facet_rules_in_type(key, field_name, None, diags);
-            facet_rules_in_type(target, field_name, None, diags);
-        }
+        FieldType::Union(vs) => vs.iter().any(type_has_facets),
+        FieldType::Arms { key, target } => type_has_facets(key) || type_has_facets(target),
+        FieldType::ModelRef(_) => false,
     }
 }
 
@@ -3104,6 +3026,45 @@ mod tests {
             "svc A:\n    ports = [80, 0]\n",
             "below the schema's min = 1",
         );
+
+        // Union variants bind their facets: matching is type-shaped
+        // (0 IS a number, so the union admits it), then the matched
+        // variant's range applies.
+        let schema_u = "model svc:\n    name string+\n    lim (number(min = 1) | string)?\n";
+        let d = diags(schema_u, "svc A:\n    lim = \"unbounded\"\n");
+        assert!(
+            d.iter().all(|x| x.severity != Severity::Error),
+            "string variant must satisfy the union: {d:?}"
+        );
+        let d = diags(schema_u, "svc A:\n    lim = 5\n");
+        assert!(
+            d.iter().all(|x| x.severity != Severity::Error),
+            "in-range number must pass: {d:?}"
+        );
+        // ANY-variant-admits: -5 violates the first variant's min but
+        // satisfies the second's max — the union admits it.
+        let schema_2 =
+            "model svc:\n    name string+\n    lim2 (number(min = 1) | number(max = 0))?\n";
+        let d = diags(schema_2, "svc A:\n    lim2 = -5\n");
+        assert!(
+            d.iter().all(|x| x.severity != Severity::Error),
+            "a variant admits -5; the union must: {d:?}"
+        );
+        let d = diags(schema_2, "svc A:\n    lim2 = 0.5\n");
+        assert!(
+            d.iter()
+                .any(|x| x.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION)),
+            "no variant admits 0.5: {d:?}"
+        );
+
+        let d = diags(schema_u, "svc A:\n    lim = 0\n");
+        assert!(
+            d.iter().any(|x| {
+                x.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION)
+                    && x.rendered_message().contains("below the schema's min = 1")
+            }),
+            "union-matched number must still honor facets: {d:?}"
+        );
     }
 
     /// RFC 0018 §2 definition-side fixtures (NML2058) — plus the
@@ -3111,10 +3072,9 @@ mod tests {
     /// enforcement pass as NML2057.
     #[test]
     fn facet_definitions_are_validated() {
-        let def_diags = |schema: &str| {
-            let file = nml_core::cst::parse_to_ast(schema).unwrap();
-            make_validator(schema).validate_definitions(&file)
-        };
+        // Facet definition rules emit from extract_schema — the single
+        // choke point every surface constructs through.
+        let def_diags = |schema: &str| nml_core::cst::extract_schema(schema).1;
         let bad_def = |schema: &str, needle: &str| {
             let d = def_diags(schema);
             let hit = d.iter().find(|x| {
@@ -3170,8 +3130,13 @@ mod tests {
                 .all(|x| x.code != Some(nml_core::diagnostic::codes::FACET_DEFINITION)),
             "single-point range is legal: {d:?}"
         );
-        // A default violating its own facets: NML2055 via the shared pass.
-        let d = def_diags("model m:\n    x number(min = 0) = -1\n");
+        // A default violating its own facets: NML2057 via the shared
+        // enforcement pass (the definitions verb / validate_field_defaults).
+        let d = {
+            let src = "model m:\n    x number(min = 0) = -1\n";
+            let file = nml_core::cst::parse_to_ast(src).unwrap();
+            make_validator(src).validate_definitions(&file)
+        };
         assert!(
             d.iter().any(|x| {
                 x.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION)

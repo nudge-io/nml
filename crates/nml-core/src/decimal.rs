@@ -72,7 +72,8 @@ pub struct Number {
 /// Span-free parse/construction error for the numeric core (RFC 0016 §1.5).
 ///
 /// The CST layer is the only place these gain spans and NML codes
-/// (`Malformed`/`TrailingDot` → NML0013, `Range` → NML0014); the serde
+/// (`Malformed`/`TrailingDot`/`BadSeparator` → NML0013, `Range` →
+/// NML0014); the serde
 /// layer embeds the `Display` text verbatim in its own error band.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -82,6 +83,12 @@ pub enum NumberError {
     /// Valid digits with a trailing decimal point (`1299.`) — rejected with
     /// a machine-applicable drop-the-dot suggestion at the CST layer.
     TrailingDot,
+    /// A misplaced `_` digit separator (`1__0`, `1_`, `1_.5`). Separators
+    /// are legal only between two digits — one spelling per grouping,
+    /// stricter than Rust. The CST layer attaches a machine-applicable
+    /// strip-the-separators fix (provably value-preserving: separators are
+    /// spelling, never value).
+    BadSeparator,
     /// The value is outside the decimal128 domain.
     Range(NumberRangeIssue),
 }
@@ -158,6 +165,9 @@ impl fmt::Display for NumberError {
             NumberError::TrailingDot => f.write_str(
                 "number ends with a decimal point; remove the \".\" or add fraction digits",
             ),
+            NumberError::BadSeparator => {
+                f.write_str("misplaced digit separator: `_` is allowed only between two digits")
+            }
             NumberError::Range(issue) => issue.fmt(f),
         }
     }
@@ -260,41 +270,173 @@ const fn clamp_i64(v: i64, lo: i64, hi: i64) -> i64 {
     }
 }
 
-/// One digit of the conceptual `int ++ frac` digit sequence without
-/// materializing a joined buffer (const-compatible: no closures, no
-/// range subslicing).
-const fn digit_at(b: &[u8], int_start: usize, int_len: usize, frac_start: usize, i: usize) -> u8 {
-    if i < int_len {
-        b[int_start + i]
-    } else {
-        b[frac_start + (i - int_len)]
+/// The two digit regions of a scanned literal (integer part, then fraction
+/// part), by **physical byte range**. Regions may contain `_` separators
+/// (already placement-validated by [`scan_digit_run`]); the cursor helpers
+/// below iterate the conceptual `int ++ frac` digit sequence while hopping
+/// separators and the inter-region gap — amortized O(1) per digit, so
+/// separator-laden input parses in O(n) (never O(n²): a parse runs on
+/// untrusted input, and quadratic digit access would be a DoS lever).
+/// Const-compatible: no closures, no allocation, no range subslicing.
+#[derive(Copy, Clone)]
+struct DigitRegions {
+    int_start: usize,
+    int_end: usize,
+    frac_start: usize,
+    frac_end: usize,
+}
+
+impl DigitRegions {
+    /// Physical position of the first digit, or `usize::MAX` when empty.
+    const fn first(&self, b: &[u8]) -> usize {
+        self.settle(b, self.int_start)
     }
+
+    /// Normalize a physical position to the next digit at-or-after it:
+    /// hop separators and the inter-region gap. `usize::MAX` = exhausted.
+    const fn settle(&self, b: &[u8], mut p: usize) -> usize {
+        loop {
+            if p >= self.int_start && p < self.int_end {
+                if b[p] == b'_' {
+                    p += 1;
+                    continue;
+                }
+                return p;
+            }
+            if p >= self.int_end && p < self.frac_start {
+                p = self.frac_start;
+                continue;
+            }
+            if p >= self.frac_start && p < self.frac_end {
+                if b[p] == b'_' {
+                    p += 1;
+                    continue;
+                }
+                return p;
+            }
+            return usize::MAX;
+        }
+    }
+
+    /// Physical position of the next digit after the digit at `p`.
+    const fn next(&self, b: &[u8], p: usize) -> usize {
+        self.settle(b, p + 1)
+    }
+
+    /// Physical position of the last digit, or `usize::MAX` when empty.
+    /// The backward mirror of [`Self::first`]/[`Self::next`], used only by
+    /// the trailing-zero trim (which walks strictly backward).
+    const fn last(&self, b: &[u8]) -> usize {
+        let mut p = self.frac_end;
+        loop {
+            if p > self.frac_start {
+                if b[p - 1] == b'_' {
+                    p -= 1;
+                    continue;
+                }
+                return p - 1;
+            }
+            if p <= self.frac_start && p > self.int_end {
+                p = self.int_end;
+                continue;
+            }
+            if p > self.int_start {
+                if b[p - 1] == b'_' {
+                    p -= 1;
+                    continue;
+                }
+                return p - 1;
+            }
+            return usize::MAX;
+        }
+    }
+
+    /// Physical position of the digit before the digit at `p`.
+    const fn prev(&self, b: &[u8], p: usize) -> usize {
+        // Reuse the backward walk with a temporarily clipped view.
+        let clipped = DigitRegions {
+            int_start: self.int_start,
+            int_end: if p <= self.int_end { p } else { self.int_end },
+            frac_start: self.frac_start,
+            frac_end: if p > self.frac_start {
+                p
+            } else {
+                self.frac_start
+            },
+        };
+        clipped.last(b)
+    }
+}
+
+/// Scan a digit run that may contain `_` separators, starting at `i`.
+/// Returns `(end, digit_count)` — `end` is the first byte past the run,
+/// `digit_count` excludes separators. The placement rule is stricter than
+/// Rust's, one spelling per grouping: a separator is legal **iff flanked
+/// by digits on both sides** (never leading, trailing, doubled, or
+/// dot-adjacent — the flanks close all four). A leading `_` is judged by
+/// context (`leading_sep_err`): at a literal's start it terminates the run
+/// (identifiers own `_`-leading spellings, so `_1` is never a number's
+/// problem to diagnose), but after a `.` or an exponent marker no
+/// identifier can follow, so there it is the misplaced-separator error.
+const fn scan_digit_run(
+    b: &[u8],
+    start: usize,
+    leading_sep_err: bool,
+) -> Result<(usize, usize), NumberError> {
+    let mut i = start;
+    let mut digits = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_digit() {
+            digits += 1;
+            i += 1;
+        } else if c == b'_' {
+            if i == start {
+                if leading_sep_err {
+                    return Err(NumberError::BadSeparator);
+                }
+                break;
+            }
+            if i + 1 >= b.len() || !b[i + 1].is_ascii_digit() {
+                return Err(NumberError::BadSeparator);
+            }
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    Ok((i, digits))
 }
 
 /// The storage rule (RFC 0016 §1.1, normative and total), over scanned
 /// source parts. `exp` is the already-accumulated (saturating) exponent for
 /// coercion inputs; 0 for literals. The digit regions contain ASCII digits
-/// only. All counts run in usize/i64 and are validated against the caps
-/// BEFORE narrowing into i128/i16 (§1.2 — the narrowing-wrap bug class).
+/// and placement-valid `_` separators (spelling only — every count below is
+/// digit-only, so separators can never perturb significance, scale, or the
+/// 34-digit acceptance). All counts run in usize/i64 and are validated
+/// against the caps BEFORE narrowing into i128/i16 (§1.2 — the
+/// narrowing-wrap bug class).
 const fn from_scan(
     b: &[u8],
     neg: bool,
-    int_start: usize,
-    int_len: usize,
-    frac_start: usize,
-    frac_len: usize,
+    regions: DigitRegions,
+    int_digits: usize,
+    frac_digits: usize,
     exp: i64,
 ) -> Result<Number, NumberError> {
     // Written scale: fraction-digit count with the exponent folded in
     // (negative for exponent-shifted coercion inputs).
-    let ws: i64 = (frac_len as i64).saturating_sub(exp);
-    let all_len = int_len + frac_len;
+    let ws: i64 = (frac_digits as i64).saturating_sub(exp);
+    let all_len = int_digits + frac_digits;
 
-    let mut first = 0usize;
-    while first < all_len && digit_at(b, int_start, int_len, frac_start, first) == b'0' {
-        first += 1;
+    // Leading-zero trim: forward cursor walk counting zeros.
+    let mut leading = 0usize;
+    let mut first_pos = regions.first(b);
+    while first_pos != usize::MAX && b[first_pos] == b'0' {
+        leading += 1;
+        first_pos = regions.next(b, first_pos);
     }
-    if first == all_len {
+    if leading == all_len {
         // Zero: always accepted; scale = clamp(ws, 0, 6176). The floor is 0
         // (not −6111): negative-scale zeros would render as leading-zero
         // strings, so the invariant forbids them — "0e999999999999" → (0, 0).
@@ -303,12 +445,15 @@ const fn from_scan(
             scale: clamp_i64(ws, 0, SCALE_HI) as i16,
         });
     }
-    let mut last = all_len;
-    while digit_at(b, int_start, int_len, frac_start, last - 1) == b'0' {
-        last -= 1;
+    // Trailing-zero trim: backward cursor walk.
+    let mut trailing_n = 0usize;
+    let mut last_pos = regions.last(b);
+    while b[last_pos] == b'0' {
+        trailing_n += 1;
+        last_pos = regions.prev(b, last_pos);
     }
-    let trailing = (all_len - last) as i64;
-    let d = last - first; // digit count of c_min
+    let trailing = trailing_n as i64;
+    let d = all_len - leading - trailing_n; // digit count of c_min
     let s_min = ws.saturating_sub(trailing);
     let integral = s_min <= 0;
 
@@ -337,12 +482,16 @@ const fn from_scan(
 
     let scale = clamp_i64(ws, w_lo, w_hi);
 
-    // c_min fits i128: d ≤ 34 < 39 digits.
+    // c_min fits i128: d ≤ 34 < 39 digits. Forward cursor from the first
+    // significant digit, consuming exactly `d` digits (interior zeros
+    // included; the trimmed trailing zeros are never visited).
     let mut c: i128 = 0;
-    let mut i = first;
-    while i < last {
-        c = c * 10 + (digit_at(b, int_start, int_len, frac_start, i) - b'0') as i128;
-        i += 1;
+    let mut p = first_pos;
+    let mut consumed = 0usize;
+    while consumed < d {
+        c = c * 10 + (b[p] - b'0') as i128;
+        consumed += 1;
+        p = regions.next(b, p);
     }
     // Append scale − s_min ∈ [0, 34 − d] trailing zeros.
     let mut k = scale - s_min;
@@ -389,23 +538,26 @@ impl Number {
             false
         };
         let int_start = i;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i == int_start {
+        let (int_end, int_digits) = match scan_digit_run(b, i, false) {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
+        if int_digits == 0 {
             return Err(NumberError::Malformed);
         }
-        let int_len = i - int_start;
+        i = int_end;
         let mut frac_start = i;
-        let mut frac_len = 0usize;
+        let mut frac_end = i;
+        let mut frac_digits = 0usize;
         if i < b.len() && b[i] == b'.' {
             i += 1;
             frac_start = i;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
-            }
-            frac_len = i - frac_start;
-            if frac_len == 0 {
+            (frac_end, frac_digits) = match scan_digit_run(b, i, true) {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
+            i = frac_end;
+            if frac_digits == 0 {
                 return if i == b.len() {
                     Err(NumberError::TrailingDot)
                 } else {
@@ -416,7 +568,13 @@ impl Number {
         if i != b.len() {
             return Err(NumberError::Malformed);
         }
-        from_scan(b, neg, int_start, int_len, frac_start, frac_len, 0)
+        let regions = DigitRegions {
+            int_start,
+            int_end,
+            frac_start,
+            frac_end,
+        };
+        from_scan(b, neg, regions, int_digits, frac_digits, 0)
     }
 
     /// Parse the liberal **coercion** grammar for machine-emitted data
@@ -437,25 +595,28 @@ impl Number {
             i += 1;
         }
         let int_start = i;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-        let int_len = i - int_start;
+        let (int_end, int_digits) = match scan_digit_run(b, i, false) {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
+        i = int_end;
         let mut frac_start = i;
-        let mut frac_len = 0usize;
+        let mut frac_end = i;
+        let mut frac_digits = 0usize;
         if i < b.len() && b[i] == b'.' {
             i += 1;
             frac_start = i;
-            while i < b.len() && b[i].is_ascii_digit() {
-                i += 1;
-            }
-            frac_len = i - frac_start;
+            (frac_end, frac_digits) = match scan_digit_run(b, i, true) {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
+            i = frac_end;
             // The `'.' digits` alternative requires fraction digits when the
             // integer part is absent.
-            if int_len == 0 && frac_len == 0 {
+            if int_digits == 0 && frac_digits == 0 {
                 return Err(NumberError::Malformed);
             }
-        } else if int_len == 0 {
+        } else if int_digits == 0 {
             return Err(NumberError::Malformed);
         }
         let mut exp: i64 = 0;
@@ -466,21 +627,32 @@ impl Number {
                 eneg = b[i] == b'-';
                 i += 1;
             }
-            let es = i;
-            let mut acc: i64 = 0;
-            while i < b.len() && b[i].is_ascii_digit() {
-                acc = acc.saturating_mul(10).saturating_add((b[i] - b'0') as i64);
-                i += 1;
-            }
-            if i == es {
+            let (e_end, e_digits) = match scan_digit_run(b, i, true) {
+                Ok(r) => r,
+                Err(e) => return Err(e),
+            };
+            if e_digits == 0 {
                 return Err(NumberError::Malformed);
+            }
+            let mut acc: i64 = 0;
+            while i < e_end {
+                if b[i] != b'_' {
+                    acc = acc.saturating_mul(10).saturating_add((b[i] - b'0') as i64);
+                }
+                i += 1;
             }
             exp = if eneg { acc.saturating_neg() } else { acc };
         }
         if i != b.len() {
             return Err(NumberError::Malformed);
         }
-        from_scan(b, neg, int_start, int_len, frac_start, frac_len, exp)
+        let regions = DigitRegions {
+            int_start,
+            int_end,
+            frac_start,
+            frac_end,
+        };
+        from_scan(b, neg, regions, int_digits, frac_digits, exp)
     }
 
     /// Direct construction from a raw `(coeff, scale)` pair, validating the
@@ -967,7 +1139,13 @@ impl TryFrom<i128> for Number {
     fn try_from(v: i128) -> Result<Self, NumberError> {
         let mag = v.unsigned_abs().to_string();
         let b = mag.as_bytes();
-        from_scan(b, v < 0, 0, b.len(), b.len(), 0, 0)
+        let regions = DigitRegions {
+            int_start: 0,
+            int_end: b.len(),
+            frac_start: b.len(),
+            frac_end: b.len(),
+        };
+        from_scan(b, v < 0, regions, b.len(), 0, 0)
     }
 }
 
@@ -976,7 +1154,13 @@ impl TryFrom<u128> for Number {
     fn try_from(v: u128) -> Result<Self, NumberError> {
         let mag = v.to_string();
         let b = mag.as_bytes();
-        from_scan(b, false, 0, b.len(), b.len(), 0, 0)
+        let regions = DigitRegions {
+            int_start: 0,
+            int_end: b.len(),
+            frac_start: b.len(),
+            frac_end: b.len(),
+        };
+        from_scan(b, false, regions, b.len(), 0, 0)
     }
 }
 
@@ -1379,15 +1563,118 @@ mod tests {
             Number::parse_literal("0.").unwrap_err(),
             NumberError::TrailingDot
         );
-        for s in [
-            "+1", ".5", "1e5", "1.5e3", "", ".", "inf", "nan", "1_000", "1299.x",
-        ] {
+        for s in ["+1", ".5", "1e5", "1.5e3", "", ".", "inf", "nan", "1299.x"] {
             assert_eq!(
                 Number::parse_literal(s).unwrap_err(),
                 NumberError::Malformed,
                 "literal {s:?}"
             );
         }
+    }
+
+    // ---- `_` digit separators (RFC 0017 follow-up) ----------------------
+
+    /// Placement rule, stricter than Rust: `_` legal iff flanked by two
+    /// digits — never leading, trailing, doubled, or dot-adjacent — in
+    /// both grammars and every digit region (int, frac, exponent).
+    #[test]
+    fn separators_accepted_where_digit_flanked() {
+        assert_eq!(lit("1_000"), lit("1000"));
+        assert_eq!(lit("1_000_000"), lit("1000000"));
+        assert_eq!(lit("-1_000.2_5"), lit("-1000.25"));
+        assert_eq!(lit("1_2.5"), lit("12.5"));
+        // Written scale is digit-only: separators never perturb it.
+        assert_eq!(lit("2.5_0").to_string(), "2.50");
+        // Coercion grammar: mantissa and exponent regions alike.
+        assert_eq!(co("1_000e1_0"), co("1000e10"));
+        assert_eq!(co("+9_007_199_254_740_993"), co("9007199254740993"));
+        for s in ["1__000", "1_", "1_.5", "1._5", "1_000_"] {
+            assert_eq!(
+                Number::parse_literal(s).unwrap_err(),
+                NumberError::BadSeparator,
+                "literal {s:?}"
+            );
+            assert_eq!(
+                Number::parse_coercion(s).unwrap_err(),
+                NumberError::BadSeparator,
+                "coercion {s:?}"
+            );
+        }
+        // A LEADING `_` is not a number's problem at all (identifiers own
+        // that spelling) — the run terminates instead, and the caller's
+        // empty-digits rule reports Malformed.
+        assert_eq!(
+            Number::parse_literal("_1").unwrap_err(),
+            NumberError::Malformed
+        );
+        // Exponent-region violations are the same rule.
+        assert_eq!(
+            Number::parse_coercion("1e1__0").unwrap_err(),
+            NumberError::BadSeparator
+        );
+    }
+
+    /// The differential property: for ANY valid literal, inserting
+    /// flank-legal separators anywhere yields the IDENTICAL stored member
+    /// — same coefficient, same scale (separators are spelling, never
+    /// value). Deterministic sweep over a value grid × every legal single
+    /// insertion point, plus an all-positions insertion; hand-rolled in
+    /// the cst fuzz-battery style.
+    #[test]
+    fn separator_transparency_differential() {
+        let grid = [
+            "0",
+            "7",
+            "42",
+            "1000",
+            "9007199254740993",
+            "0.25",
+            "12.50",
+            "123456.789",
+            "-8080",
+            "-0.125",
+            &"9".repeat(34),
+        ];
+        for base in grid {
+            let expected = lit(base);
+            let bytes: Vec<char> = base.chars().collect();
+            // Every legal single insertion point: between two digits.
+            for i in 1..bytes.len() {
+                if bytes[i - 1].is_ascii_digit() && bytes[i].is_ascii_digit() {
+                    let mut s: String = bytes[..i].iter().collect();
+                    s.push('_');
+                    s.extend(&bytes[i..]);
+                    let got = lit(&s);
+                    assert_eq!(got, expected, "{s}");
+                    assert_eq!(
+                        got.total_cmp(&expected),
+                        Ordering::Equal,
+                        "same member, not merely same cohort: {s}"
+                    );
+                }
+            }
+            // Saturated form: a separator at EVERY legal position.
+            let mut sat = String::new();
+            for (i, c) in bytes.iter().enumerate() {
+                sat.push(*c);
+                if c.is_ascii_digit() && bytes.get(i + 1).is_some_and(|n| n.is_ascii_digit()) {
+                    sat.push('_');
+                }
+            }
+            assert_eq!(lit(&sat), expected, "{sat}");
+            assert_eq!(lit(&sat).total_cmp(&expected), Ordering::Equal, "{sat}");
+        }
+    }
+
+    /// `num!` takes Rust's own underscore idiom (stringify! preserves the
+    /// separators, so the const path exercises the transparent core).
+    #[test]
+    fn num_macro_accepts_separators() {
+        const N: Number = crate::num!(1_000_000);
+        assert_eq!(N, lit("1000000"));
+        const F: Number = crate::num!(1_234.5_6);
+        assert_eq!(F, lit("1234.56"));
+        assert_eq!(F.to_string(), "1234.56");
     }
 
     // ---- §1.3 Eq / Ord / Hash / total_cmp -------------------------------

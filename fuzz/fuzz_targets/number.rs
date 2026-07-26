@@ -34,6 +34,19 @@ fuzz_target!(|data: &[u8]| {
                 assert_eq!(Number::from(i), n, "to_i64 exactness for {s:?}");
             }
             let _ = (n.to_u64(), n.to_i128(), n.to_u128(), n.to_f64(), n.to_f32());
+            // Separator transparency (RFC 0017 follow-up): `_` is
+            // spelling, never value — the stripped form of any accepted
+            // literal parses to the IDENTICAL stored member.
+            if s.contains('_') {
+                let stripped: String = s.chars().filter(|c| *c != '_').collect();
+                let b = parse(&stripped)
+                    .unwrap_or_else(|e| panic!("stripped form of {s:?}: {e:?}"));
+                assert_eq!(
+                    n.total_cmp(&b),
+                    std::cmp::Ordering::Equal,
+                    "separator transparency of {s:?}"
+                );
+            }
         }
     }
 });

@@ -578,6 +578,12 @@ pub(super) fn parse_number(raw: &str, span: Span) -> Result<Number, NmlError> {
                     raw: crate::error::echo_capture(raw),
                 }
             }
+            crate::decimal::NumberError::BadSeparator => {
+                crate::error::ParseErrorKind::NumberBadSeparator {
+                    raw: crate::error::echo_capture(raw),
+                    stripped: crate::error::strip_separators_fix(raw),
+                }
+            }
             // Exhaustive in-crate on purpose: a new core variant must pick
             // its code here before it can ship. `issue` here is always one
             // of the three parse-reachable kinds (TooManyDigits/TooLarge/

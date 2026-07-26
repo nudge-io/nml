@@ -2559,12 +2559,14 @@ workflow W:
             label: String,
             opt: Option<std::time::Duration>,
             retries: Vec<std::time::Duration>,
+            fine: std::time::Duration,
+            grouped: std::time::Duration,
         }
         // `resolved` is a plain string — exactly what `resolve.rs` leaves
         // behind for `$ENV.TTL` — and must coerce identically. `retries`
         // exercises the seq × handshake composition: every array element
         // routes through the same `deserialize_struct` path.
-        let source = "service App:\n    timeout = 90m\n    resolved = \"1500ms\"\n    label = 250ms\n    opt = 2h\n    retries = [1s, 1500ms]\n";
+        let source = "service App:\n    timeout = 90m\n    resolved = \"1500ms\"\n    label = 250ms\n    opt = 2h\n    retries = [1s, 1500ms]\n    fine = 750ns\n    grouped = \"1_000_000ns\"\n";
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
@@ -2580,6 +2582,9 @@ workflow W:
                 std::time::Duration::from_millis(1500)
             ]
         );
+        // The closed ladder's tail, and separator-grouped coerced text.
+        assert_eq!(c.fine, std::time::Duration::from_nanos(750));
+        assert_eq!(c.grouped, std::time::Duration::from_millis(1));
     }
 
     /// The coercion inherits the family's never-echo rule: a failed

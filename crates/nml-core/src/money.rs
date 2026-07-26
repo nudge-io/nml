@@ -154,6 +154,17 @@ fn parse_minor_units(
             },
             amount_span,
         ),
+        // A misplaced separator is a form defect of the literal token —
+        // the same literal-layer carve-out as the trailing dot, anchored
+        // on the amount sub-span so the strip fix rewrites the amount and
+        // never touches the currency code.
+        crate::decimal::NumberError::BadSeparator => NmlError::syntax(
+            crate::error::ParseErrorKind::NumberBadSeparator {
+                raw: crate::error::echo_capture(amount_str),
+                stripped: crate::error::strip_separators_fix(amount_str),
+            },
+            amount_span,
+        ),
         crate::decimal::NumberError::Malformed => NmlError::Money {
             kind: MoneyErrorKind::InvalidAmount {
                 raw: crate::error::echo_capture(amount_str),
@@ -197,9 +208,11 @@ fn parse_minor_units(
     // since ISO exponents cap at 4 and the clamp floor for fractions
     // with a violating written width stays above it.
     if n.scale() > exponent as i16 {
+        // Digit count, not byte count: `19.9_9` wrote 2 fraction digits,
+        // and the message must say so (separators are spelling).
         let written = amount_str
             .split_once('.')
-            .map(|(_, frac)| frac.len())
+            .map(|(_, frac)| frac.bytes().filter(|b| b.is_ascii_digit()).count())
             .unwrap_or(0);
         return Err(NmlError::Money {
             kind: MoneyErrorKind::Precision {

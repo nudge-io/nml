@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{Body, BodyEntryKind};
-use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, NumberFacets, OneOfDef};
+use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
 use crate::types::PrimitiveType;
 
 /// What a model field resolves to, for schema-guided traversal.
@@ -376,6 +376,8 @@ fn first_wins<T>(items: &[T], name: impl Fn(&T) -> &str) -> HashMap<String, usiz
 
 #[cfg(test)]
 mod tests {
+    use crate::model::NumberFacets;
+
     use super::*;
     use crate::model::ModelKind;
     use crate::span::Span;

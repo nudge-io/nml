@@ -91,6 +91,19 @@ pub enum ParseErrorKind {
     /// `INVALID_NUMBER`'s code (same malformed-literal class) but carries
     /// its own signal so the fix — deleting the dot — is machine-applicable.
     NumberTrailingDot { raw: String },
+    /// A misplaced `_` digit separator (`1__0`, `1_`, `1_.5`) — separators
+    /// are legal only between two digits (one spelling per grouping,
+    /// stricter than Rust). Shares `INVALID_NUMBER`'s code (same
+    /// malformed-literal class). `stripped` is the producer's whole-anchor
+    /// replacement with separators removed — provably value-preserving
+    /// (separators are spelling, never value) — carried only when the
+    /// literal is short enough to capture completely
+    /// ([`MAX_FIX_CAPTURE`]); a truncated replacement would corrupt the
+    /// file, so a pathological literal gets the message without the fix.
+    NumberBadSeparator {
+        raw: String,
+        stripped: Option<String>,
+    },
     /// A number outside the exact decimal128 domain (RFC 0016): numbers
     /// are exact by design, never silently rounded, so >34 significant
     /// digits or an out-of-range magnitude is an error. The structured
@@ -157,6 +170,20 @@ pub enum SecretRefIssue {
 /// Echoed-source bound: enough to recognize the token, too little to flood
 /// a terminal (long strings render via their kind's description instead).
 pub(crate) const MAX_ECHO: usize = 32;
+
+/// Bound on a machine-fix replacement carried **whole** in an error
+/// payload (the separator-strip fix): unlike an echo, a replacement cannot
+/// be truncated — a partial rewrite would corrupt the file — so past this
+/// bound the fix is omitted rather than clipped. Generous for any literal
+/// a human wrote; a stingy cap on what a hostile file can amplify.
+pub(crate) const MAX_FIX_CAPTURE: usize = 64;
+
+/// The separator-strip machine fix, whole-or-none: the replacement
+/// substitutes the producer's entire anchor span, so it must never be
+/// truncated — past [`MAX_FIX_CAPTURE`] the diagnostic ships without it.
+pub(crate) fn strip_separators_fix(raw: &str) -> Option<String> {
+    (raw.len() <= MAX_FIX_CAPTURE).then(|| raw.chars().filter(|c| *c != '_').collect())
+}
 
 pub(crate) fn echo(text: &str) -> String {
     if text.chars().count() <= MAX_ECHO {
@@ -314,6 +341,11 @@ impl ParseErrorKind {
                  fraction digits",
                 echo(raw)
             ),
+            NumberBadSeparator { raw, .. } => format!(
+                "misplaced digit separator in \"{}\": `_` is allowed only between \
+                 two digits (1_000, never 1__000 or 1_)",
+                echo(raw)
+            ),
             // The normative RFC 0016 texts; counts come from the payload,
             // never from the (truncated) echo.
             NumberOutOfRange { issue } => issue.to_string(),
@@ -361,6 +393,7 @@ impl ParseErrorKind {
             InvalidUnicodeEscape { .. } => codes::INVALID_ESCAPE,
             InvalidNumber { .. } => codes::INVALID_NUMBER,
             NumberTrailingDot { .. } => codes::INVALID_NUMBER,
+            NumberBadSeparator { .. } => codes::INVALID_NUMBER,
             NumberOutOfRange { .. } => codes::NUMBER_OUT_OF_RANGE,
             BadSecretRef { .. } => codes::BAD_SECRET_REF,
             DoubleAmp => codes::REPLACED_SYNTAX,
@@ -391,6 +424,12 @@ impl ParseErrorKind {
             NumberTrailingDot { .. } if span.end > span.start => {
                 Some((String::new(), Span::new(span.end - 1, span.end)))
             }
+            // Stripping separators provably preserves the value (spelling,
+            // never value); the producer captured the whole replacement or
+            // none (MAX_FIX_CAPTURE — a truncated rewrite would corrupt).
+            NumberBadSeparator {
+                stripped: Some(s), ..
+            } => Some((s.clone(), span)),
             // The comma becomes the alternative separator, in place.
             SetSeparator => Some(("|".to_string(), span)),
             UnknownTypeConstructor { found } => {

@@ -200,8 +200,19 @@ fn resolve_field_type(te: &TypeExpr) -> FieldType {
             let name = token_text(te.name());
             match name.parse::<PrimitiveType>() {
                 Ok(prim) => FieldType::Primitive {
+                    // Facets attach to Number ONLY — misplacement is
+                    // reported by `schema::facet_definition_diagnostics`
+                    // (emitted from `extract_schema` itself); dropping
+                    // them here keeps the model claim literal, so
+                    // enforcement can never fire a facet on a
+                    // type-mismatched value. (Field evaluated before
+                    // `ty` because the check borrows `prim`.)
+                    facets: if prim == PrimitiveType::Number {
+                        extract_facets(te)
+                    } else {
+                        crate::model::NumberFacets::NONE
+                    },
                     ty: prim,
-                    facets: extract_facets(te),
                 },
                 // Facets on a model ref are a definition error the
                 // AST-side pass reports (NML2058, where the FacetExprs

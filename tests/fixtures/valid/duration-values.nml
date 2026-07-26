@@ -3,3 +3,5 @@ service Api:
     retryBackoff = 250ms
     sessionTtl = 72h
     pollEvery = 5m
+    spinWait = 250us
+    tick = 1_000ns

@@ -21,16 +21,24 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-/// A duration's unit. Units are wall-clock-exact by design: calendar units
-/// (`d`, `w`, `mo`, `y`) are deliberately absent — a day is not always
-/// 86,400 seconds, and a configuration language that pretends otherwise
-/// ships timezone bugs (RFC 0017 §8; `720h` is exact where `30d` is not).
+/// A duration's unit. **This enum is complete by construction — match it
+/// exhaustively.** It is closed at both ends by design arguments, not by
+/// current scope: below, `ns` is the resolution of the value model itself
+/// (`total_nanos`, `std::time::Duration`) — no finer unit can represent a
+/// value the domain can hold; above, `h` is the largest *exact* unit —
+/// everything coarser (`d`, `w`, `mo`, `y`) is calendar arithmetic,
+/// permanently excluded because a day is not always 86,400 seconds and a
+/// configuration language that pretends otherwise ships timezone bugs
+/// (RFC 0017 §8; `720h` is exact where `30d` is not). No variant will
+/// ever be added, so downstream matches need no defensive wildcard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurationUnit {
     Hours,
     Minutes,
     Seconds,
     Milliseconds,
+    Microseconds,
+    Nanoseconds,
 }
 
 /// Serializes as the unit's source suffix (`"s"`), matching the literal
@@ -43,32 +51,57 @@ impl Serialize for DurationUnit {
 }
 
 impl DurationUnit {
-    /// Every unit, coarsest first — the iteration order behind
-    /// [`DurationUnit::finer`] and the did-you-mean candidate list.
-    pub const ALL: [DurationUnit; 4] = [
+    /// Every unit, **coarsest first** — the one ladder every ordered
+    /// derivation rides: [`DurationUnit::finer`] slices it, the
+    /// did-you-mean candidates iterate it, and the law-grid tests sweep
+    /// it. A second hand-written ordering could drift; this one cannot.
+    pub const ALL: [DurationUnit; 6] = [
         DurationUnit::Hours,
         DurationUnit::Minutes,
         DurationUnit::Seconds,
         DurationUnit::Milliseconds,
+        DurationUnit::Microseconds,
+        DurationUnit::Nanoseconds,
     ];
 
-    /// The unit's source suffix (`"h"`, `"m"`, `"s"`, `"ms"`).
+    /// The unit's source suffix (`"h"`, `"m"`, `"s"`, `"ms"`, `"us"`,
+    /// `"ns"`). ASCII `us`, never `µs`: the source-character policy
+    /// rejects the micro sign raw (as Go's ASCII fallback anticipates),
+    /// so the ASCII spelling is the only one the language can hold.
     pub fn suffix(self) -> &'static str {
         match self {
             DurationUnit::Hours => "h",
             DurationUnit::Minutes => "m",
             DurationUnit::Seconds => "s",
             DurationUnit::Milliseconds => "ms",
+            DurationUnit::Microseconds => "us",
+            DurationUnit::Nanoseconds => "ns",
+        }
+    }
+
+    /// The unit's human name — the single vocabulary the LSP's completion
+    /// details (and any future surface) derive from, beside
+    /// [`DurationUnit::suffix`] and [`DurationUnit::nanos`]: one table,
+    /// impossible to extend partially.
+    pub fn name(self) -> &'static str {
+        match self {
+            DurationUnit::Hours => "hours",
+            DurationUnit::Minutes => "minutes",
+            DurationUnit::Seconds => "seconds",
+            DurationUnit::Milliseconds => "milliseconds",
+            DurationUnit::Microseconds => "microseconds",
+            DurationUnit::Nanoseconds => "nanoseconds",
         }
     }
 
     /// Classify a suffix. **The single authority for what counts as a
     /// duration unit** — the literal decoder, the `de` coercion, and the
     /// LSP's unit completion all route through here, so the grammar cannot
-    /// fork. Case-sensitive by design: `30S` is a rejection with a fix,
-    /// never a case-fold, so `M`/`m` stays unambiguous forever (RFC 0017
-    /// §1 — a language accepting both would owe an answer to "is `30M`
-    /// minutes or months?").
+    /// fork. Exact full-string match, so `ns`/`s` can never
+    /// prefix-collide. Case-sensitive by design: `30S` is a rejection with
+    /// a fix, never a case-fold, so `M`/`m` stays unambiguous forever
+    /// (RFC 0017 §1 — a language accepting both would owe an answer to
+    /// "is `30M` minutes or months?").
     pub fn from_suffix(text: &str) -> Option<DurationUnit> {
         Self::ALL.into_iter().find(|u| u.suffix() == text)
     }
@@ -80,23 +113,39 @@ impl DurationUnit {
             DurationUnit::Minutes => 60_000_000_000,
             DurationUnit::Seconds => 1_000_000_000,
             DurationUnit::Milliseconds => 1_000_000,
+            DurationUnit::Microseconds => 1_000,
+            DurationUnit::Nanoseconds => 1,
         }
     }
 
     /// The units strictly finer than this one, coarsest first — the
     /// candidate order for the fractional-magnitude fix (`30.5s` →
     /// `30500ms` prefers the coarsest unit that makes the value integral).
+    /// A position slice of [`DurationUnit::ALL`], so the ladder exists
+    /// exactly once.
     fn finer(self) -> &'static [DurationUnit] {
-        match self {
-            DurationUnit::Hours => &[
-                DurationUnit::Minutes,
-                DurationUnit::Seconds,
-                DurationUnit::Milliseconds,
-            ],
-            DurationUnit::Minutes => &[DurationUnit::Seconds, DurationUnit::Milliseconds],
-            DurationUnit::Seconds => &[DurationUnit::Milliseconds],
-            DurationUnit::Milliseconds => &[],
+        let i = Self::ALL
+            .iter()
+            .position(|u| *u == self)
+            .expect("ALL is total over the enum by construction");
+        &Self::ALL[i + 1..]
+    }
+
+    /// The suffixes as teaching prose (`"h, m, s, ms, us, or ns"`) — the
+    /// one renderer behind every runtime message that enumerates the unit
+    /// set, so no message can lag the enum.
+    pub(crate) fn suffix_list_prose() -> String {
+        let mut out = String::new();
+        for (i, u) in Self::ALL.iter().enumerate() {
+            if i + 1 == Self::ALL.len() {
+                out.push_str("or ");
+            }
+            out.push_str(u.suffix());
+            if i + 1 < Self::ALL.len() {
+                out.push_str(", ");
+            }
         }
+        out
     }
 }
 
@@ -125,8 +174,8 @@ pub struct Duration {
 impl Duration {
     /// The largest magnitude representable in `unit`: the value domain is
     /// `total_nanos() <= std::time::Duration::MAX`, and the magnitude must
-    /// also fit the `u64` storage (which binds only for `ms`, whose
-    /// domain ceiling exceeds `u64`).
+    /// also fit the `u64` storage (which binds for `ms`/`us`/`ns`, whose
+    /// domain ceilings exceed `u64`; `s` sits exactly at the boundary).
     pub fn max_magnitude(unit: DurationUnit) -> u64 {
         u64::try_from(STD_MAX_NANOS / unit.nanos() as u128).unwrap_or(u64::MAX)
     }
@@ -170,24 +219,47 @@ impl Duration {
     /// (`$ENV` resolution, template output; RFC 0017 §3.1). Postel for
     /// machine-emitted data: outer whitespace and a gap before the unit
     /// are tolerated (`" 30 s "`); the value grammar itself — unsigned
-    /// integer, one unit — is exactly the literal's. The error carries a
-    /// *reason* and **never the input**: any coerced string could be a
+    /// integer with optional digit-flanked `_` separators, one unit — is
+    /// exactly the literal's. A misplaced separator is simply `Malformed`:
+    /// runtime coercion has no fix surface, and the error carries a
+    /// *reason* and **never the input** — any coerced string could be a
     /// resolved secret.
     pub fn parse_text(text: &str) -> Result<Duration, DurationTextError> {
         let trimmed = text.trim_ascii();
         let split = trimmed
             .bytes()
-            .position(|b| !b.is_ascii_digit())
+            .position(|b| !b.is_ascii_digit() && b != b'_')
             .unwrap_or(trimmed.len());
-        let (digits, rest) = trimmed.split_at(split);
+        let (magnitude_text, rest) = trimmed.split_at(split);
         let unit = DurationUnit::from_suffix(rest.trim_ascii_start())
             .ok_or(DurationTextError::Malformed)?;
-        if digits.is_empty() {
+        // Underscore-aware u64 accumulation under the literal's flank rule
+        // (std's `parse` rejects separators, and the number core's scanner
+        // is scale-aware overkill for a bare u64 magnitude).
+        let b = magnitude_text.as_bytes();
+        let mut magnitude: u64 = 0;
+        let mut digits = 0usize;
+        for (i, c) in b.iter().enumerate() {
+            if c.is_ascii_digit() {
+                magnitude = magnitude
+                    .checked_mul(10)
+                    .and_then(|m| m.checked_add((c - b'0') as u64))
+                    .ok_or(DurationTextError::OutOfRange(unit))?;
+                digits += 1;
+            } else {
+                // `_`: legal iff digit-flanked within the magnitude.
+                let flanked = i > 0
+                    && b[i - 1].is_ascii_digit()
+                    && i + 1 < b.len()
+                    && b[i + 1].is_ascii_digit();
+                if !flanked {
+                    return Err(DurationTextError::Malformed);
+                }
+            }
+        }
+        if digits == 0 {
             return Err(DurationTextError::Malformed);
         }
-        let magnitude: u64 = digits
-            .parse()
-            .map_err(|_| DurationTextError::OutOfRange(unit))?;
         Duration::new(magnitude, unit).ok_or(DurationTextError::OutOfRange(unit))
     }
 }
@@ -257,7 +329,8 @@ impl fmt::Display for DurationTextError {
             DurationTextError::Malformed => {
                 write!(
                     f,
-                    "not a duration: expected an integer with unit h, m, s, or ms"
+                    "not a duration: expected an integer with unit {}",
+                    DurationUnit::suffix_list_prose()
                 )
             }
             DurationTextError::OutOfRange(unit) => write!(
@@ -300,9 +373,10 @@ impl DurationErrorKind {
         use crate::error::echo;
         match self {
             DurationErrorKind::UnknownUnit { unit, .. } => format!(
-                "unknown unit `{}` after a number: a duration unit is h, m, s, or ms; \
+                "unknown unit `{}` after a number: a duration unit is {}; \
                  a currency code is 3 uppercase letters",
-                echo(unit)
+                echo(unit),
+                DurationUnit::suffix_list_prose()
             ),
             DurationErrorKind::FractionalMagnitude { raw, .. } => format!(
                 "a duration magnitude is a whole number, but \"{}\" has a fractional \
@@ -375,6 +449,18 @@ pub fn parse_duration_literal(
         // truthfully out of the duration domain. Malformed/TrailingDot
         // degrade to the literal-layer number error rather than panic.
         crate::decimal::NumberError::Range(_) => out_of_range(),
+        // A misplaced separator in the magnitude (`1__0s`) is the
+        // literal-layer teaching diagnostic; the strip fix replaces the
+        // WHOLE literal (this error's anchor), so the replacement carries
+        // the unit suffix back in.
+        crate::decimal::NumberError::BadSeparator => NmlError::syntax(
+            crate::error::ParseErrorKind::NumberBadSeparator {
+                raw: crate::error::echo_capture(digits),
+                stripped: crate::error::strip_separators_fix(digits)
+                    .map(|d| format!("{d}{}", unit.suffix())),
+            },
+            span,
+        ),
         crate::decimal::NumberError::Malformed | crate::decimal::NumberError::TrailingDot => {
             NmlError::syntax(
                 crate::error::ParseErrorKind::InvalidNumber {
@@ -423,6 +509,23 @@ mod tests {
 
     fn dur(magnitude: u64, unit: DurationUnit) -> Duration {
         Duration::new(magnitude, unit).expect("in-domain test value")
+    }
+
+    #[test]
+    fn equality_is_semantic_across_units_full_ladder() {
+        // The new rungs participate in the same semantic identity.
+        assert_eq!(
+            dur(1, DurationUnit::Milliseconds),
+            dur(1_000, DurationUnit::Microseconds)
+        );
+        assert_eq!(
+            dur(1, DurationUnit::Microseconds),
+            dur(1_000, DurationUnit::Nanoseconds)
+        );
+        assert_eq!(
+            dur(1, DurationUnit::Seconds),
+            dur(1_000_000_000, DurationUnit::Nanoseconds)
+        );
     }
 
     #[test]
@@ -506,11 +609,14 @@ mod tests {
         }
         // Seconds: the std ceiling is exactly u64::MAX seconds.
         assert_eq!(Duration::max_magnitude(DurationUnit::Seconds), u64::MAX);
-        // Milliseconds: the u64 storage binds before the std ceiling does.
-        assert_eq!(
-            Duration::max_magnitude(DurationUnit::Milliseconds),
-            u64::MAX
-        );
+        // ms/us/ns: the u64 storage binds before the std ceiling does.
+        for fine in [
+            DurationUnit::Milliseconds,
+            DurationUnit::Microseconds,
+            DurationUnit::Nanoseconds,
+        ] {
+            assert_eq!(Duration::max_magnitude(fine), u64::MAX, "{}", fine.suffix());
+        }
         // Hours/minutes: the std ceiling binds below u64::MAX.
         assert!(Duration::max_magnitude(DurationUnit::Hours) < u64::MAX);
         assert!(Duration::max_magnitude(DurationUnit::Minutes) < u64::MAX);
@@ -556,6 +662,27 @@ mod tests {
             Duration::parse_text("0ms"),
             Ok(dur(0, DurationUnit::Milliseconds))
         );
+        // The closed ladder's tail, and separator support in the text
+        // grammar (flank rule, exactly the literal's).
+        assert_eq!(
+            Duration::parse_text("250us"),
+            Ok(dur(250, DurationUnit::Microseconds))
+        );
+        assert_eq!(
+            Duration::parse_text("750ns"),
+            Ok(dur(750, DurationUnit::Nanoseconds))
+        );
+        assert_eq!(
+            Duration::parse_text("1_000_000ns"),
+            Ok(dur(1_000_000, DurationUnit::Nanoseconds))
+        );
+        for bad_sep in ["1__0s", "1_s", "_1s", "1_000_ms"] {
+            assert_eq!(
+                Duration::parse_text(bad_sep),
+                Err(DurationTextError::Malformed),
+                "{bad_sep:?}"
+            );
+        }
         for bad in [
             "", "30", "s", "30x", "30S", "-30s", "3.5s", "30 sec", "1h30m",
         ] {
@@ -640,11 +767,16 @@ mod tests {
         assert_eq!(equivalent("0.25", "h").as_deref(), Some("15m"));
         assert_eq!(equivalent("1.75", "h").as_deref(), Some("105m"));
         assert_eq!(equivalent("0.001", "s").as_deref(), Some("1ms"));
+        // The closed ladder reaches sub-millisecond respellings (these two
+        // had NO fix when ms was the floor — the us/ns closure is UX).
+        assert_eq!(equivalent("0.5", "ms").as_deref(), Some("500us"));
+        assert_eq!(equivalent("0.0001", "s").as_deref(), Some("100us"));
+        assert_eq!(equivalent("0.5", "us").as_deref(), Some("500ns"));
         // Integral value in fractional form: same unit.
         assert_eq!(equivalent("30.0", "s").as_deref(), Some("30s"));
-        // No finer unit can make it integral.
-        assert_eq!(equivalent("0.5", "ms"), None);
-        assert_eq!(equivalent("0.0001", "s"), None);
+        // ns is the domain's resolution floor: nothing finer exists.
+        assert_eq!(equivalent("0.5", "ns"), None);
+        assert_eq!(equivalent("0.0000000001", "s"), None);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::diagnostic::{Code, Diagnostic, Severity, codes};
-use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, ModelKind, NumberFacets, OneOfDef};
+use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, ModelKind, OneOfDef};
 
 /// Schema definitions (models / enums / oneofs) extracted from a source file.
 /// Produced by [`crate::cst::extract`] over the CST; the validation/inheritance
@@ -714,6 +714,8 @@ pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::NumberFacets;
+
     use super::*;
     use crate::cst::extract_schema;
     use crate::model::MixinRef;
@@ -1613,5 +1615,140 @@ mod composition_tests {
         // Inherited default comes along; the model's own field overrides.
         assert_eq!(default_text("interval"), "60s");
         assert_eq!(default_text("timeout"), "9s");
+    }
+}
+
+/// RFC 0018 facet definition rules (NML2058), context-free over the
+/// semantic AST — the single emission point is [`crate::cst::extract_schema`],
+/// which every schema-consuming surface (both CLI verbs, the LSP, the
+/// nml-validate loader and therefore packages and downstream boots)
+/// funnels through, so the rules cannot be skipped by construction.
+pub fn facet_definition_diagnostics(file: &crate::ast::File) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for decl in &file.declarations {
+        let crate::ast::DeclarationKind::Block(block) = &decl.kind else {
+            continue;
+        };
+        if !matches!(block.keyword.name.as_str(), "model" | "trait") {
+            continue;
+        }
+        for entry in &block.body.entries {
+            let crate::ast::BodyEntryKind::FieldDefinition(fd) = &entry.kind else {
+                continue;
+            };
+            facet_rules_in_type(&fd.field_type, &fd.name.name, &mut diags);
+        }
+    }
+    diags
+}
+
+fn facet_rules_in_type(
+    te: &crate::ast::FieldTypeExpr,
+    field_name: &str,
+    diags: &mut Vec<Diagnostic>,
+) {
+    use crate::ast::FieldTypeExpr as T;
+    let err = |diags: &mut Vec<Diagnostic>, msg: String, span: crate::span::Span| {
+        diags.push(
+            Diagnostic::error(msg)
+                .with_code(crate::diagnostic::codes::FACET_DEFINITION)
+                .with_span(span),
+        );
+    };
+    match te {
+        T::Named { name, facets } => {
+            if facets.is_empty() {
+                return;
+            }
+            if name.name != "number" {
+                err(
+                    diags,
+                    format!(
+                        "'{field_name}': facets attach only to `number` — `{}` cannot carry them",
+                        name.name
+                    ),
+                    facets[0].span,
+                );
+                return;
+            }
+            const KNOWN: [&str; 5] = ["min", "max", "exclusiveMin", "exclusiveMax", "multipleOf"];
+            let mut seen: Vec<&str> = Vec::new();
+            for f in facets {
+                let k = f.key.name.as_str();
+                if !KNOWN.contains(&k) {
+                    err(
+                        diags,
+                        format!(
+                            "'{field_name}': unknown facet '{k}' (known: min, max, \
+                             exclusiveMin, exclusiveMax, multipleOf)"
+                        ),
+                        f.span,
+                    );
+                    continue;
+                }
+                if seen.contains(&k) {
+                    err(
+                        diags,
+                        format!("'{field_name}': duplicate facet '{k}'"),
+                        f.span,
+                    );
+                }
+                seen.push(k);
+            }
+            let get = |k: &str| facets.iter().find(|f| f.key.name == k);
+            let num = |f: &crate::ast::FacetExpr| match &f.value.value {
+                crate::types::Value::Number(n) => Some(*n),
+                _ => None,
+            };
+            for (a, b) in [("min", "exclusiveMin"), ("max", "exclusiveMax")] {
+                if let (Some(_), Some(fb)) = (get(a), get(b)) {
+                    err(
+                        diags,
+                        format!("'{field_name}': '{a}' and '{b}' are mutually exclusive"),
+                        fb.span,
+                    );
+                }
+            }
+            let lo = get("min").or_else(|| get("exclusiveMin"));
+            let hi = get("max").or_else(|| get("exclusiveMax"));
+            if let (Some(l), Some(h)) = (lo, hi) {
+                if let (Some(lv), Some(hv)) = (num(l), num(h)) {
+                    let strict =
+                        l.key.name.starts_with("exclusive") || h.key.name.starts_with("exclusive");
+                    if lv > hv || (lv == hv && strict) {
+                        err(
+                            diags,
+                            format!(
+                                "'{field_name}': the declared range is unsatisfiable \
+                                 ({} = {lv} against {} = {hv})",
+                                l.key.name, h.key.name
+                            ),
+                            h.span,
+                        );
+                    }
+                }
+            }
+            if let Some(m) = get("multipleOf") {
+                if let Some(v) = num(m) {
+                    if v <= crate::types::Number::ZERO {
+                        err(
+                            diags,
+                            format!("'{field_name}': multipleOf must be positive (got {v})"),
+                            m.span,
+                        );
+                    }
+                }
+            }
+        }
+        T::Array(inner) | T::Set(inner) => facet_rules_in_type(inner, field_name, diags),
+        T::Union(vs) => {
+            for v in vs {
+                facet_rules_in_type(v, field_name, diags);
+            }
+        }
+        T::Arms { key, target } => {
+            facet_rules_in_type(key, field_name, diags);
+            facet_rules_in_type(target, field_name, diags);
+        }
     }
 }

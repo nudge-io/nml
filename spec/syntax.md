@@ -176,13 +176,18 @@ chained to arbitrary depth.
 
 ### Number Literals
 
-Numbers are unquoted decimal values:
+Numbers are unquoted decimal values. `_` digit separators are permitted
+between two digits — never leading, trailing, doubled, or dot-adjacent
+(stricter than Rust: one spelling per grouping; violations are `NML0013`
+with a machine-applicable strip fix). Separators are spelling, never
+value: `nml fmt` canonicalizes them away, exactly as `007` → `7`.
 
 ```
 8000        // integer
 3.14        // decimal
 0           // zero
 -1          // negative
+10_000      // separated (canonical form: 10000)
 ```
 
 ### Boolean Literals
@@ -205,7 +210,11 @@ A decimal value followed by a space and an ISO 4217 currency code (3 uppercase l
 ### Duration Literals
 
 A duration is a **literal** (RFC 0017): an **unsigned integer**
-immediately followed by one unit suffix — `h`, `m`, `s`, or `ms`. The
+immediately followed by one unit suffix — `h`, `m`, `s`, `ms`, `us`, or
+`ns`. The unit set is **closed at both ends by construction**: `ns` is
+the resolution of the value domain itself (nothing finer can represent a
+representable value), and `h` is the largest exact unit (everything
+coarser is calendar arithmetic, permanently excluded). The
 canonical form is attached (`30s`; `nml fmt` normalizes a spaced unit).
 No sign (`NML3006`), no decimals (`NML3005` — write the finer unit:
 `30500ms`, not `30.5s`), no compound forms like `1h30m`, and no calendar
@@ -216,15 +225,17 @@ units (`d`, `w`) — a day is not always 86,400 seconds; `720h` is exact:
 30m         // 30 minutes
 5s          // 5 seconds
 500ms       // 500 milliseconds
+250us       // 250 microseconds (ASCII `us`; `µ` is not source-legal)
+1_000ns     // 1000 nanoseconds (digit separators, as in numbers)
 0s          // zero is valid
 ```
 
 Units are lowercase; a currency code is exactly 3 uppercase letters, so
 the two suffix families are disjoint by construction (`30S` and `30x`
 are `NML3004`, with a nearest-unit fix). Comparison is **semantic**:
-`30s` equals `30000ms` — a reload diff between the two spellings is no
-change. The total must fit the runtime duration domain (up to
-`u64::MAX` seconds); beyond it is `NML3006`.
+`30s` equals `30000ms` equals `30_000_000us` — a reload diff between
+spellings is no change. The total must fit the runtime duration domain
+(up to `u64::MAX` seconds); beyond it is `NML3006`.
 
 ### Path Literals
 

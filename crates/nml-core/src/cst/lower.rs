@@ -570,6 +570,52 @@ mod tests {
     /// A domain-rejected facet literal reports the SAME NML0014 surface
     /// as a config literal (one numeric error vocabulary) and recovers
     /// to the zero placeholder.
+    /// F3 (round-21): facet lists never span lines, and a newline can
+    /// never let a facet list swallow the NEXT field. Singular
+    /// findings: the first failed expectation ends the list.
+    #[test]
+    fn facet_lists_do_not_cross_newlines() {
+        // Value on the next line: error, and the next line survives.
+        let (_f, errors) = crate::cst::parse_to_ast_all("model m:\n    a number(min =\n    1)\n");
+        assert!(!errors.is_empty(), "cross-line facet value must error");
+        // List opened on the next line: NOT a facet list at all.
+        let (_f, errors) = crate::cst::parse_to_ast_all("model m:\n    a number\n    (min = 1)\n");
+        assert!(!errors.is_empty(), "next-line paren is not a facet list");
+        // A dangling comma must not absorb the next FIELD.
+        let (file, errors) =
+            crate::cst::parse_to_ast_all("model m:\n    a number(min = 1,\n    b string\n");
+        assert!(!errors.is_empty());
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("expected block");
+        };
+        let fields: Vec<_> = block
+            .body
+            .entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                BodyEntryKind::FieldDefinition(f) => Some(f.name.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fields.contains(&"b"),
+            "the next field must survive: {fields:?}"
+        );
+        // Singular findings on malformed lists.
+        for (src, max) in [
+            ("model m:\n    a number()\n", 2usize),
+            ("model m:\n    a number(min = 1,)\n", 2),
+            ("model m:\n    a number(min)\n", 2),
+        ] {
+            let (_f, errors) = crate::cst::parse_to_ast_all(src);
+            assert!(
+                !errors.is_empty() && errors.len() <= max,
+                "{src:?}: want 1..={max} findings, got {}: {errors:?}",
+                errors.len()
+            );
+        }
+    }
+
     #[test]
     fn facet_literal_out_of_domain_is_nml0014() {
         let src = format!("model m:\n    x number(min = {})\n", "9".repeat(35));

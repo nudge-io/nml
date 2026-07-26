@@ -99,7 +99,17 @@ pub fn compute(
             // collision-checking) them against themselves would be noise.
             let doc_is_registry_source = config.uri_is_registry_source;
             if !doc_is_registry_source {
-                let (own, _) = nml_core::cst::extract_schema(source);
+                let (own, own_diags) = nml_core::cst::extract_schema(source);
+                // RFC 0018: a mixed (self-validating) file's facet
+                // DEFINITION findings surface here — parse_to_ast_all
+                // above already published the parse band, so only the
+                // definition band passes (no double-reporting), and the
+                // editor matches `nml check` exactly.
+                for d in own_diags {
+                    if d.code == Some(nml_core::diagnostic::codes::FACET_DEFINITION) {
+                        push_diagnostic(d, None, uri, &line_index, &mut diagnostics);
+                    }
+                }
                 for m in own.models {
                     if models.iter().any(|k| k.name == m.name) {
                         // CLI parity (RFC 0012): the same collision `nml
@@ -845,6 +855,21 @@ package demo:
             "valid source should produce no diagnostics: {:?}",
             diags
         );
+    }
+
+    /// RFC 0018 (round 22): a mixed self-validating file's facet
+    /// DEFINITION findings reach the editor — exactly once (the parse
+    /// band publishes separately; only the definition band passes the
+    /// extraction filter).
+    #[test]
+    fn mixed_file_facet_definition_errors_publish_once() {
+        let source = "model m:\n    s string(min = 1)\n\nm A:\n    s = \"x\"\n";
+        let diags = compute_registry(source, &[], &[], &[], &default_config());
+        let hits: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("facets attach only to `number`"))
+            .collect();
+        assert_eq!(hits.len(), 1, "exactly one NML2058: {diags:?}");
     }
 
     #[test]

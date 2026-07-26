@@ -268,12 +268,16 @@ pub fn extract_schema(
     // One parse; the canonical lower pass yields every diagnostic, and `extract`
     // reads the same tree for the schema itself. Like `parse_to_ast_all`, the
     // public reporting boundary speaks the unified findings model (RFC 0008).
-    let (parsed, _ast, errors, suppressed) = parse_lowered(source);
+    let (parsed, lowered_ast, errors, suppressed) = parse_lowered(source);
     let root = ast::Root::cast(parsed.syntax()).expect("parse always yields a Root node");
-    (
-        extract::extract(&root),
-        finalize_diagnostics(errors, suppressed),
-    )
+    // RFC 0018: facet definition rules (NML2058) are emitted HERE — the
+    // one API every schema-consuming surface constructs through (both
+    // CLI verbs, the LSP, the nml-validate loader and thus packages) —
+    // so a misdeclared facet cannot load anywhere by construction.
+    let facet_diags = crate::schema::facet_definition_diagnostics(&lowered_ast);
+    let mut diags = finalize_diagnostics(errors, suppressed);
+    diags.extend(facet_diags);
+    (extract::extract(&root), diags)
 }
 
 /// The leading documentation comment of the top-level declaration named `name`
@@ -364,6 +368,19 @@ fn is_own_line(tok: &SyntaxToken) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// RFC 0018: the definition rules emit from THIS wrapper — the one
+    /// API every schema surface constructs through.
+    #[test]
+    fn extract_schema_emits_facet_definition_rules() {
+        let (_s, diags) = extract_schema("model m:\n    s string(min = 1)\n");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(crate::diagnostic::codes::FACET_DEFINITION)),
+            "{diags:?}"
+        );
+    }
+
     use super::*;
 
     /// Minimal typed wrapper used by the structural tests. The full typed-wrapper
@@ -1800,6 +1817,68 @@ service App is Base:
         // Precedence: the trailing-dot malformation fires BEFORE duration
         // decoding, exactly as it does for money (`19. USD`).
         assert_eq!(err_code("30. s"), Some(codes::INVALID_NUMBER.to_string()));
+    }
+
+    /// `_` digit separators end to end (RFC 0017 follow-up): legal
+    /// spellings decode to the identical value across every literal kind
+    /// (number, duration, money); misplaced separators are NML0013 with
+    /// the whole-anchor strip fix.
+    #[test]
+    fn digit_separators_decode_and_teach() {
+        use crate::diagnostic::codes;
+        assert!(matches!(
+            decode_first("1_000_000"),
+            crate::types::Value::Number(n) if n == crate::types::Number::from(1_000_000)
+        ));
+        match decode_first("1_000_000ns") {
+            crate::types::Value::Duration(d) => assert_eq!(d.to_string(), "1000000ns"),
+            other => panic!("expected duration, got {other:?}"),
+        }
+        assert!(matches!(
+            decode_first("1_299 JPY"),
+            crate::types::Value::Money(m) if m.amount == 1299
+        ));
+        // Misplaced separators: NML0013 with the strip fix, per kind.
+        for (expr, fixed) in [("1__000", "1000"), ("1_", "1"), ("1_.5", "1.5")] {
+            let src = wrap(expr);
+            let diag = decode_value(&first_value_node(&parse(&src).syntax()))
+                .expect_err(expr)
+                .to_diagnostic();
+            assert_eq!(
+                diag.code.map(|c| c.to_string()).as_deref(),
+                Some(codes::INVALID_NUMBER.to_string().as_str()),
+                "{expr}"
+            );
+            let sug = diag.suggestions.first().expect("strip fix");
+            assert_eq!(sug.replacement, fixed, "{expr}");
+            let start = src.find(expr).unwrap();
+            assert_eq!(
+                (sug.span.start, sug.span.end),
+                (start, start + expr.len()),
+                "whole-literal anchor: {expr}"
+            );
+        }
+        // Duration magnitude: the strip fix carries the unit back in.
+        let src = wrap("1__0s");
+        let diag = decode_value(&first_value_node(&parse(&src).syntax()))
+            .expect_err("1__0s")
+            .to_diagnostic();
+        assert_eq!(
+            diag.suggestions.first().map(|s| s.replacement.as_str()),
+            Some("10s")
+        );
+        // Money amount: the fix rewrites the amount sub-span only.
+        let src = wrap("1__299 JPY");
+        let diag = decode_value(&first_value_node(&parse(&src).syntax()))
+            .expect_err("1__299 JPY")
+            .to_diagnostic();
+        let sug = diag.suggestions.first().expect("amount strip fix");
+        assert_eq!(sug.replacement, "1299");
+        let start = src.find("1__299").unwrap();
+        assert_eq!(
+            (sug.span.start, sug.span.end),
+            (start, start + "1__299".len())
+        );
     }
 
     /// The `30S` fix is machine-applicable on the suffix's own sub-span.

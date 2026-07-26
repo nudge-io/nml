@@ -87,7 +87,7 @@ serde = { version = "1", features = ["derive"] }
 
 - **9 primitive types** — `string`, `number` (exact decimals, RFC 0016:
   `0.20` is 0.20, never 0.2000000000000000111; up to 34 significant digits,
-  integers well past `u64`), `money`
+  integers well past `u64`; `_` digit separators: `10_000`), `money`
   (ISO 4217, integer minor units — `19.99 USD` never becomes `19.990000001`),
   `bool`, `duration` (typed literals, RFC 0017: `30s` equals `30000ms`
   semantically, deserializes to `std::time::Duration`), `path`, `secret`,

@@ -73,7 +73,7 @@ NML3001` prints the full error-index entry for the code, offline.
 ## Durations
 
 Durations are literals — an integer with a unit suffix attached: `h`,
-`m`, `s`, or `ms`:
+`m`, `s`, `ms`, `us`, or `ns`:
 
 ```nml check
 service Api:

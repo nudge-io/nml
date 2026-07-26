@@ -32,6 +32,7 @@ fn test_check_valid_files() {
         "tests/fixtures/valid/pricing.nml",
         "tests/fixtures/valid/scalar-shared-property.nml",
         "tests/fixtures/valid/number-boundaries.nml",
+        "tests/fixtures/valid/numeric-facets.nml",
     ];
 
     for file in files {
@@ -158,9 +159,11 @@ fn test_parse_duration_values() {
         &serde_json::json!({"Duration": {"magnitude": 30, "unit": "s"}}),
         "wire shape drifted: {value}"
     );
-    for unit in ["\"s\"", "\"ms\"", "\"h\"", "\"m\""] {
+    for unit in ["\"s\"", "\"ms\"", "\"h\"", "\"m\"", "\"us\"", "\"ns\""] {
         assert!(stdout.contains(unit), "missing unit {unit}");
     }
+    // Separators are spelling: the wire carries the value, bare.
+    assert!(stdout.contains("\"magnitude\": 1000"), "{stdout}");
 }
 
 #[test]

@@ -1,0 +1,12 @@
+// RFC 0018: numeric schema facets — exact range and step constraints.
+model server:
+    port number(min = 1, max = 65535)
+    weight number(min = 0, exclusiveMax = 1)?
+    priceStep number(multipleOf = 0.01)?
+    ports set<number(min = 1)>?
+
+server Web:
+    port = 8080
+    weight = 0.25
+    priceStep = 19.99
+    ports = [80, 443, 8080]

@@ -22,7 +22,7 @@ use crate::ast::{
     Arm, ArmSelector, ArmTarget, Body, BodyEntry, BodyEntryKind, Identifier, ListItem,
     ListItemKind, NestedBlock, Property,
 };
-use crate::model::{FieldType, ModelDef, NumberFacets, OneOfDef};
+use crate::model::{FieldType, ModelDef, OneOfDef};
 use crate::schema_index::{FieldTarget, SchemaIndex};
 use crate::span::Span;
 use crate::types::{SpannedValue, Value};
@@ -427,6 +427,8 @@ fn item_body(item: &ListItem) -> Option<&Body> {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::NumberFacets;
+
     use super::*;
     use crate::model::{FieldDef, FieldType, ModelKind};
     use crate::types::PrimitiveType;

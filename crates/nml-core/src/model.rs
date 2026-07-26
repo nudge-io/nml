@@ -135,9 +135,11 @@ pub struct FieldDef {
 pub struct FacetBound {
     pub value: crate::types::Number,
     pub exclusive: bool,
-    /// The facet's `key = value` span in the schema source — config-side
-    /// violations attach it as the related location (RFC 0009), so the
-    /// author sees both halves of the contradiction.
+    /// The facet's `key = value` span in the schema source. Config-side
+    /// violation MESSAGES carry the facet's authored spelling (schema
+    /// and config are usually different files, so a same-file related
+    /// span would point nowhere); the span serves definition-side
+    /// diagnostics.
     pub span: Span,
 }
 
@@ -150,7 +152,7 @@ pub struct FacetMultiple {
 
 /// RFC 0018 numeric facets on a `number` field. Empty (`NONE`) for
 /// every non-number primitive — the loader rejects misplaced facets
-/// (NML2031) before enforcement ever consults them.
+/// (NML2058) before enforcement ever consults them.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct NumberFacets {
     pub min: Option<FacetBound>,

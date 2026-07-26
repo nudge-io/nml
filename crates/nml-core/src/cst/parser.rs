@@ -827,27 +827,87 @@ impl<'a> Parser<'a> {
             // error, so recovery keeps the tree structured and the
             // finding singular. No ambiguity: `(` after a bare type
             // name was previously always a parse error.
-            if self.at(SyntaxKind::LParen) {
+            if self.at(SyntaxKind::LParen) && !self.newline_before() {
                 let fl = self.start();
                 self.bump(); // (
                 loop {
+                    // Facet lists never span lines — the field-type
+                    // rule (a swallowed newline would absorb the NEXT
+                    // field into this type).
+                    if self.newline_before() {
+                        self.expected(
+                            vec![crate::error::ExpectedItem::Desc(
+                                "a facet on the same line — facet lists do not span lines",
+                            )],
+                            None,
+                        );
+                        break;
+                    }
+                    // First failed expectation ends the list (singular
+                    // findings; recovery stays structured).
+                    if !self.at(SyntaxKind::Ident) {
+                        self.expected(
+                            vec![crate::error::ExpectedItem::Desc(
+                                "a facet name (min, max, exclusiveMin, exclusiveMax, multipleOf)",
+                            )],
+                            None,
+                        );
+                        break;
+                    }
                     let f = self.start();
-                    self.expect_desc(
-                        SyntaxKind::Ident,
-                        "a facet name (min, max, exclusiveMin, exclusiveMax, multipleOf)",
-                    );
-                    self.expect(SyntaxKind::Eq);
+                    self.bump(); // facet name
+                    if self.newline_before() {
+                        self.expected(
+                            vec![crate::error::ExpectedItem::Desc(
+                                "`= value` on the same line — facet lists do not span lines",
+                            )],
+                            None,
+                        );
+                        f.complete(self, SyntaxKind::Facet);
+                        break;
+                    }
+                    if !self.eat(SyntaxKind::Eq) {
+                        self.expected(
+                            vec![crate::error::ExpectedItem::Desc("`=` and a number literal")],
+                            None,
+                        );
+                        f.complete(self, SyntaxKind::Facet);
+                        break;
+                    }
+                    if self.newline_before() {
+                        self.expected(
+                            vec![crate::error::ExpectedItem::Desc(
+                                "the facet value on the same line — facet lists do not span lines",
+                            )],
+                            None,
+                        );
+                        f.complete(self, SyntaxKind::Facet);
+                        break;
+                    }
                     // A number literal, optionally signed — the only
                     // facet value type (schemas are contracts, not
                     // programs; no references, no expressions).
                     self.eat(SyntaxKind::Dash);
-                    self.expect_desc(SyntaxKind::Number, "a number literal");
+                    if !self.at(SyntaxKind::Number) {
+                        self.expected(
+                            vec![crate::error::ExpectedItem::Desc("a number literal")],
+                            None,
+                        );
+                        f.complete(self, SyntaxKind::Facet);
+                        break;
+                    }
+                    self.bump(); // number
                     f.complete(self, SyntaxKind::Facet);
                     if !self.eat(SyntaxKind::Comma) {
                         break;
                     }
                 }
-                self.expect(SyntaxKind::RParen);
+                if self.newline_before() {
+                    // Already reported above (or the list simply ends the
+                    // line): never consume a cross-line `)`.
+                } else {
+                    self.expect(SyntaxKind::RParen);
+                }
                 fl.complete(self, SyntaxKind::FacetList);
             }
         }
@@ -1024,7 +1084,7 @@ impl<'a> Parser<'a> {
     /// A number, optionally followed by a **same-line** unit identifier —
     /// a currency code (money) or a duration unit (RFC 0017). The parser
     /// recognizes only the `Number Ident` *shape*; classification (3
-    /// uppercase → currency, `h`/`m`/`s`/`ms` → duration unit, anything
+    /// uppercase → currency, a `DurationUnit` suffix → duration unit, anything
     /// else → `NML3004`) is the value layer's job, so a mistyped suffix
     /// gets a coded diagnostic with a fix instead of a generic parse error.
     fn number_value(&mut self) {

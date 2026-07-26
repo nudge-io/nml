@@ -132,10 +132,10 @@ list item fills that field:
 | Type | Syntax | Example |
 |------|--------|---------|
 | `string` | Quoted text | `"hello world"` |
-| `number` | Unquoted decimal | `8000`, `3.14`, `-1` |
+| `number` | Unquoted decimal | `8000`, `3.14`, `-1`, `10_000` |
 | `money` | Amount + currency code | `19.99 USD`, `1299 JPY` |
 | `bool` | Unquoted | `true`, `false` |
-| `duration` | Unquoted with unit | `72h`, `30s`, `500ms` |
+| `duration` | Unquoted with unit | `72h`, `30s`, `500ms`, `250us` |
 | `path` | Quoted URL path | `"/"`, `"/user/{username}"`, `"/assets/{*}"` |
 | `secret` | Environment reference | `$ENV.API_KEY` |
 
@@ -161,6 +161,8 @@ allows at most 2 decimal places.
 | `m` | minutes |
 | `s` | seconds |
 | `ms` | milliseconds |
+| `us` | microseconds |
+| `ns` | nanoseconds |
 
 Durations are typed literals: an unsigned integer attached to one unit
 (`30s`, never `"30s"`, `1.5h`, or `1h30m`). The authored unit is kept —

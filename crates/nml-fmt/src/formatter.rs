@@ -723,6 +723,12 @@ mod tests {
             ("030s", "30s"),
             ("72h", "72h"),
             ("30000ms", "30000ms"),
+            ("250us", "250us"),
+            ("50ns", "50ns"),
+            // Separators are spelling: fmt canonicalizes them away, the
+            // `007` → `7` doctrine (value and unit survive untouched).
+            ("1_000ms", "1000ms"),
+            ("1_000_000 ns", "1000000ns"),
             ("0s", "0s"),
         ] {
             let file = parse(&format!("service App:\n    x = {source_value}\n")).unwrap();
@@ -757,6 +763,10 @@ mod tests {
             ("8080.000", "8080.000"),
             // Leading zeros still canonicalize.
             ("007", "7"),
+            // Digit separators are spelling and normalize away (the same
+            // doctrine); written scale still survives beside them.
+            ("1_000_000", "1000000"),
+            ("1_234.5_0", "1234.50"),
             // The one non-fixed-point: −0 is unrepresentable.
             ("-0.0", "0.0"),
         ] {

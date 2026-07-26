@@ -42,7 +42,10 @@ model server:
   decimal core, and `multipleOf` is exact decimal divisibility — `0.3`
   is a multiple of `0.1`, boundary values behave like the schema
   reads, and `80.0` satisfies an integer bound because it IS 80.
-  Field defaults are held to the same constraints.
+  Field defaults are held to the same constraints. Union-matched
+  numbers honor the matched variant's facets. `$ENV`-backed values
+  bypass facets like every static schema check (resolution happens
+  after validation).
 
 ### Field Presence Rules
 

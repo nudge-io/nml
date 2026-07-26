@@ -203,17 +203,27 @@ scalars and cannot be written.
 ## NML0013
 
 **Invalid number.** The literal is not a number the grammar parses —
-most commonly a second decimal point, or a trailing decimal point with
-no fraction digits (`1299.`), which gets a machine-applicable
-remove-the-dot suggestion.
+most commonly a second decimal point, a trailing decimal point with no
+fraction digits (`1299.`, machine-applicable remove-the-dot fix), or a
+misplaced `_` digit separator. Separators are legal only **between two
+digits** (`10_000`; never leading, trailing, doubled, or dot-adjacent —
+one spelling per grouping, stricter than Rust), and a misplaced one gets
+a machine-applicable strip-the-separators fix, provably value-preserving
+(separators are spelling, never value).
 
 ```nml check expect-error='[NML0013]'
 service Api:
     x = 1.2.3
 ```
 
+```nml check expect-error='[NML0013]'
+service Api:
+    x = 1__000
+```
+
 **Fix:** write one decimal point (`1.23`), drop a trailing dot
-(`1299.` → `1299`), or quote it if it is meant as a string.
+(`1299.` → `1299`), apply the strip fix (`1__000` → `1000`), or quote it
+if it is meant as a string.
 
 ## NML0014
 
@@ -1309,7 +1319,9 @@ for you.
 (RFC 0018): facets on a non-`number` type, an unknown or duplicate
 facet key, `min`/`exclusiveMin` (or `max`/`exclusiveMax`) together, an
 unsatisfiable range (`min = 2, max = 1`, or an exclusive bound meeting
-its counterpart), or `multipleOf` that is not positive.
+its counterpart), or `multipleOf` that is not positive. (A default
+violating its own facets reports as NML2057 — it is a value breaking a
+constraint, found where values are checked.)
 
 ```nml
 model m:
@@ -1406,7 +1418,8 @@ product Widget:
 
 **Unknown unit.** A number's trailing identifier is neither a currency
 code (exactly 3 uppercase letters, e.g. `USD`) nor a duration unit (`h`,
-`m`, `s`, `ms` — RFC 0017). Case is meaningful: `30S` is a rejection with
+`m`, `s`, `ms`, `us`, `ns` — RFC 0017; ASCII `us`, since `µ` is not
+source-legal). Case is meaningful: `30S` is a rejection with
 a fix, never a case-fold, so one spelling per value holds and `M`/`m`
 stays unambiguous forever. Near-miss units get a machine-applicable
 suggestion on the suffix itself.
@@ -1417,7 +1430,7 @@ service Api:
 ```
 
 **Fix:** apply the suggestion (`30s`), or write one of `h`, `m`, `s`,
-`ms`.
+`ms`, `us`, `ns`.
 
 ## NML3005
 
@@ -1425,7 +1438,8 @@ service Api:
 number — `30.5s` is rejected rather than rounded or multi-unit-parsed
 (one spelling per value, the same error-over-guessing rule exact numbers
 follow). When the value is expressible in a finer unit, the fix respells
-it exactly (`30.5s` → `30500ms`, `1.5h` → `90m`).
+it exactly (`30.5s` → `30500ms`, `1.5h` → `90m`, `0.5ms` → `500us`);
+only past the domain's `ns` resolution floor is there no fix.
 
 ```nml check expect-error='[NML3005]'
 service Api:

@@ -343,8 +343,9 @@ pub mod codes {
         FACET_VIOLATION = 2057;
         /// RFC 0018: an invalid facet declaration — facets on a
         /// non-`number` type, unknown/duplicate/conflicting keys, an
-        /// unsatisfiable range, `multipleOf <= 0`, or a default that
-        /// violates its own facets.
+        /// unsatisfiable range, or `multipleOf <= 0`. (A default that
+        /// violates its own facets reports as the VIOLATION code
+        /// through the shared enforcement pass.)
         FACET_DEFINITION = 2058;
 
         /// A package validator binding is fully shadowed by earlier

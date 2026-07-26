@@ -7,7 +7,11 @@
 - **Durations are literals (RFC 0017)** — `30s` parses to a typed
   `Value::Duration` (magnitude + unit, faithful storage, **semantic**
   equality: `30s == 30000ms`, so sets and reload diffs treat the two
-  spellings as one value). Units are `h`/`m`/`s`/`ms`, unsigned integer
+  spellings as one value). Units are `h`/`m`/`s`/`ms`/`us`/`ns` — the
+  **complete** ladder, closed by construction (`ns` is the value
+  domain's own resolution floor; `h` the largest exact unit; calendar
+  units are permanently excluded), so `DurationUnit` is exhaustively
+  matchable forever. Unsigned integer
   magnitudes only, domain-bounded at decode (`NML3004` unknown unit,
   `NML3005` fractional magnitude, `NML3006` out of domain — all with
   machine-applicable fixes where one exists); `NML2029` is retired to a
@@ -141,7 +145,9 @@
   facet) and `NML2056` (invalid facet declaration). Schema packages
   need no format change — packages carry schema source, and a
   pre-facet parser rejects the new syntax loudly rather than silently
-  under-validating.
+  under-validating. Wire-shape note for external `nml parse` JSON
+  consumers: `Named` and `Primitive` are struct variants now
+  (`{"Primitive": {"ty": "Number", "facets": …}}`).
 
 - **`nml fix` — the batch fixer** (RFC 0017 §4.1): applies
   machine-applicable suggestions in bulk (`nml fix [--schema <dir>]

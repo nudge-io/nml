@@ -196,14 +196,14 @@
       ]
     },
     "money-literal": {
-      "match": "\\b(\\d+\\.?\\d*)\\s+([A-Z]{3})\\b",
+      "match": "\\b(\\d[\\d_]*\\.?[\\d_]*)\\s+([A-Z]{3})\\b",
       "captures": {
         "1": { "name": "constant.numeric.money.nml" },
         "2": { "name": "constant.other.currency.nml" }
       }
     },
     "duration-literal": {
-      "match": "\\b(\\d+)(h|ms|m|s)\\b",
+      "match": "\\b(\\d[\\d_]*)(ms|us|ns|h|m|s)\\b",
       "captures": {
         "1": { "name": "constant.numeric.duration.nml" },
         "2": { "name": "keyword.other.unit.duration.nml" }
@@ -211,7 +211,7 @@
     },
     "number": {
       "name": "constant.numeric.nml",
-      "match": "-?\\b\\d+(\\.\\d+)?\\b"
+      "match": "-?\\b\\d[\\d_]*(\\.[\\d_]*\\d)?\\b"
     },
     "boolean": {
       "name": "constant.language.boolean.nml",
