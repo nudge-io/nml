@@ -160,7 +160,27 @@ fn parse_minor_units(
             },
             span,
         },
-        crate::decimal::NumberError::Range(_) => NmlError::Money {
+        // Explicit arms, no wildcard: a wildcard would silently absorb
+        // future variants into the "amount out of range" voice. The
+        // parse core emits exactly these three:
+        crate::decimal::NumberError::Range(
+            crate::decimal::NumberRangeIssue::TooManyDigits { .. }
+            | crate::decimal::NumberRangeIssue::TooLarge
+            | crate::decimal::NumberRangeIssue::TooSmall,
+        ) => NmlError::Money {
+            kind: MoneyErrorKind::OutOfRange {
+                raw: crate::error::echo_capture(amount_str),
+            },
+            span,
+        },
+        // try_new-only kinds — unreachable from `parse_literal` (raw
+        // pairs never come from a parse). Mapped to the same range error
+        // rather than `unreachable!()` so a future defect degrades to a
+        // wrong-but-safe message, never a parse-path panic.
+        crate::decimal::NumberError::Range(
+            crate::decimal::NumberRangeIssue::CoefficientTooWide { .. }
+            | crate::decimal::NumberRangeIssue::ScaleOutOfRange { .. },
+        ) => NmlError::Money {
             kind: MoneyErrorKind::OutOfRange {
                 raw: crate::error::echo_capture(amount_str),
             },

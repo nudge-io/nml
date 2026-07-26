@@ -2898,6 +2898,7 @@ fn render_scalar(value: &Value) -> Option<String> {
     Some(match value {
         Value::String(s) | Value::Duration(s) | Value::Path(s) => format!("{s:?}"),
         Value::Number(n) => n.to_string(),
+        Value::Money(m) => m.format_display(),
         Value::Bool(b) => b.to_string(),
         Value::Reference(s) | Value::Role(s) | Value::Secret(s) => s.clone(),
         _ => return None,
@@ -3166,10 +3167,65 @@ fn is_property_name_position(line: &str, word: &str, byte_col: usize) -> bool {
     false
 }
 
+/// "Simplify number" (RFC 0016 §1.10), decided as a pure function so the
+/// action's edge cases are unit-testable without LSP plumbing.
+struct SimplifyNumber {
+    title: String,
+    span: nml_core::span::Span,
+    new_text: String,
+}
+
+fn simplify_number_action(source: &str, offset: usize) -> Option<SimplifyNumber> {
+    let root = nml_core::cst::parse(source).syntax();
+    let tok = root
+        .token_at_offset((offset.min(source.len()) as u32).into())
+        .find(|t| t.kind() == nml_core::cst::SyntaxKind::Number)?;
+    // Money literals (`19.90 USD`) are Number + currency Ident inside one
+    // Value node (cst/mod.rs). Simplifying the number half would fight
+    // `nml fmt`, which re-renders money at the currency's canonical
+    // exponent — the edit reverts on the next format and the action
+    // reappears forever. Skip: money has no author-controlled scale.
+    let in_money = tok.parent().is_some_and(|p| {
+        p.children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| t.kind() == nml_core::cst::SyntaxKind::Ident)
+    });
+    if in_money {
+        return None;
+    }
+    let raw = tok.text();
+    let n: nml_core::decimal::Number = raw.parse().ok()?;
+    // The minimal cohort member with scale ≥ 0 — cohort simplification
+    // lives in the numeric core, not here (leading integer zeros drop
+    // via the parse itself).
+    let simplified = n.simplified().to_string();
+    if simplified == raw {
+        return None;
+    }
+    // The Number token never carries the sign (`-` lexes as its own
+    // adjacent token), so spell the sign back into the TITLE — the edit
+    // itself only replaces the digits, which is already correct.
+    let signed = tok.prev_token().is_some_and(|prev| prev.text() == "-");
+    let display = if signed {
+        format!("-{simplified}")
+    } else {
+        simplified.clone()
+    };
+    Some(SimplifyNumber {
+        title: format!("Simplify number to `{display}`"),
+        span: nml_core::span::Span::new(
+            usize::from(tok.text_range().start()),
+            usize::from(tok.text_range().end()),
+        ),
+        new_text: simplified,
+    })
+}
+
 fn format_value(value: &Value) -> String {
     match value {
         Value::String(s) => format!("\"{}\"", s),
         Value::Number(n) => n.to_string(),
+        Value::Money(m) => m.format_display(),
         Value::Bool(b) => b.to_string(),
         Value::Reference(r) => r.clone(),
         Value::Secret(s) => s.clone(),
@@ -4619,41 +4675,23 @@ impl LanguageServer for NmlLanguageServer {
         //    preserves written scale. Refactor-kind, never a quickfix:
         //    authored precision like `2.50` is intent until the author
         //    says otherwise, so nothing auto-applies.
+        if let Some(action) = simplify_number_action(&source, line_index.offset(params.range.start))
         {
-            let start = line_index.offset(params.range.start);
-            let root = nml_core::cst::parse(&source).syntax();
-            let tok = root
-                .token_at_offset((start.min(source.len()) as u32).into())
-                .find(|t| t.kind() == nml_core::cst::SyntaxKind::Number);
-            if let Some(tok) = tok {
-                let raw = tok.text();
-                if let Ok(n) = raw.parse::<nml_core::decimal::Number>() {
-                    // The minimal cohort member with scale ≥ 0 — cohort
-                    // simplification lives in the numeric core, not here
-                    // (leading integer zeros drop via the parse itself).
-                    let simplified = n.simplified().to_string();
-                    if simplified != raw {
-                        let span_start = usize::from(tok.text_range().start());
-                        let span_end = usize::from(tok.text_range().end());
-                        let edit = TextEdit {
-                            range: line_index
-                                .range(nml_core::span::Span::new(span_start, span_end)),
-                            new_text: simplified.clone(),
-                        };
-                        let mut changes = std::collections::HashMap::new();
-                        changes.insert(uri.clone(), vec![edit]);
-                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                            title: format!("Simplify number to `{simplified}`"),
-                            kind: Some(CodeActionKind::REFACTOR_REWRITE),
-                            edit: Some(WorkspaceEdit {
-                                changes: Some(changes),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        }));
-                    }
-                }
-            }
+            let edit = TextEdit {
+                range: line_index.range(action.span),
+                new_text: action.new_text,
+            };
+            let mut changes = std::collections::HashMap::new();
+            changes.insert(uri.clone(), vec![edit]);
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: action.title,
+                kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
         }
 
         // 4. "Explain NML0000" (RFC 0010 tier 2) — negotiation-gated: emitted
@@ -5293,6 +5331,47 @@ fn rename_word_byte_range(line: &str, byte_col: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
+    /// The "Simplify number" decision function (RFC 0016 §1.10): offers
+    /// the minimal cohort member for plain numbers, never for money
+    /// (fmt re-canonicalizes money — the edit would revert on save),
+    /// spells the sign into the title (the `-` is a separate token),
+    /// and stays silent when the literal is already minimal.
+    #[test]
+    fn simplify_number_action_edges() {
+        let src = "service App:\n    x = 8080.000\n";
+        let off = src.find("8080").unwrap();
+        let a = super::simplify_number_action(src, off).expect("action");
+        assert_eq!(a.title, "Simplify number to `8080`");
+        assert_eq!(a.new_text, "8080");
+        assert_eq!(&src[a.span.start..a.span.end], "8080.000");
+
+        // Money: skipped entirely.
+        let src = "service App:\n    price = 19.90 USD\n";
+        let off = src.find("19.90").unwrap();
+        assert!(
+            super::simplify_number_action(src, off).is_none(),
+            "money literals must not offer simplify — fmt would revert it"
+        );
+
+        // Negative literal: edit replaces digits only, title shows sign.
+        let src = "service App:\n    x = -8080.000\n";
+        let off = src.find("8080").unwrap();
+        let a = super::simplify_number_action(src, off).expect("action");
+        assert_eq!(a.title, "Simplify number to `-8080`");
+        assert_eq!(a.new_text, "8080");
+
+        // A list marker's dash is NOT a sign (space-separated token).
+        let src = "service App:\n    ports:\n        - 8080.0\n";
+        let off = src.find("8080").unwrap();
+        let a = super::simplify_number_action(src, off).expect("action");
+        assert_eq!(a.title, "Simplify number to `8080`");
+
+        // Already minimal: no action.
+        let src = "service App:\n    x = 2.5\n";
+        let off = src.find("2.5").unwrap();
+        assert!(super::simplify_number_action(src, off).is_none());
+    }
+
     use super::*;
     use std::collections::HashMap;
 

@@ -226,7 +226,7 @@ impl<'a> ValueQuery<'a> {
     /// out-of-range numbers rather than silently truncating.
     pub fn to_i64(&self) -> Option<i64> {
         match self {
-            ValueQuery::Found(v) => i64::try_from(*v).ok(),
+            ValueQuery::Found(v) => v.to_i64(),
             _ => None,
         }
     }

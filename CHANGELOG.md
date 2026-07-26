@@ -55,7 +55,12 @@
   now `NML0013` with a machine-applicable fix. Money parses through the
   same decimal core (`Money::to_number()` is new; exactly-`i64::MIN`
   minor units are now accepted; >`i64` amounts error as `NML3003` rather
-  than `NML3000`).
+  than `NML3000`). The typed-error integer extraction is now the single
+  wide rung `TryFrom<&Value> for i128` (replacing the `i64` impl):
+  every integer target through `u64` narrows exactly from it via
+  `T::try_from` (a `u128` consumer uses `Number::to_u128`), so
+  nothing funnels through `i64` and falsely rejects the
+  `(i64::MAX, u64::MAX]` band; `Value::to_u64` covers the probe flavor.
 
 - **Rust edition 2021 → 2024** across the workspace (one inherited line; the
   MSRV stays 1.86, which predates the flip and supports edition 2024). The
@@ -389,7 +394,7 @@
   - `BlockQuery` and `ValueQuery` with `as_str`, `as_f64`, `as_bool` accessors
 
 - **Value type conversions** (`nml_core::types`):
-  - `TryFrom<&Value>` for `String`, `f64`, `i64`, `bool`, `Vec<String>`
+  - `TryFrom<&Value>` for `String`, `f64`, `i128`, `bool`, `Vec<String>`
   - Handles `Reference`, `RoleRef`, `Path`, `Duration`, `Secret` as string
   - `Value::as_str()`, `as_f64()`, `as_bool()`, `as_array()` accessors
 

@@ -1296,6 +1296,39 @@ server App:
         assert!(config.db.map(|db| db.url).is_none());
     }
 
+    /// RFC §2 pinned fixture: an integer-form value beyond u128 through
+    /// an UNTYPED target (`deserialize_any`) is a hard error naming the
+    /// typed alternatives — never a silent f64 for an integer-form
+    /// value. (Typed `Number` fields capture it exactly; this pins the
+    /// self-describing path's refusal.)
+    #[test]
+    fn beyond_u128_integer_form_is_a_hard_error_for_untyped_targets() {
+        #[derive(Deserialize, Debug)]
+        struct AnyCfg {
+            big: serde_json::Value,
+        }
+        let source = format!("cfg C:\n    big = 1{}\n", "0".repeat(100));
+        let file = parse_to_ast(&source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("cfg", "C").body().unwrap();
+        let err = from_body::<AnyCfg>(body).expect_err("10^100 must not reach an untyped target");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds 128 bits") && msg.contains("Number"),
+            "must name the typed alternatives: {msg}"
+        );
+        // And the value never leaks into the message (redaction posture).
+        assert!(!msg.contains("100000"), "no value echo: {msg}");
+
+        // Control: the same shape within u64 deserializes as a JSON number.
+        let source = "cfg C:\n    big = 8080\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("cfg", "C").body().unwrap();
+        let cfg: AnyCfg = from_body(body).unwrap();
+        assert_eq!(cfg.big, serde_json::json!(8080));
+    }
+
     #[test]
     fn deserialize_named_list_items() {
         #[derive(Deserialize, Debug)]

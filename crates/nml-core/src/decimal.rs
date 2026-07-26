@@ -94,12 +94,39 @@ pub enum NumberRangeIssue {
     /// coefficient's count — sign, leading zeros, and strippable trailing
     /// zeros excluded): storing the value would be inexact. Takes
     /// precedence when a value also violates the exponent range.
+    /// Parse-path only; a raw pair rejected by [`Number::try_new`] is
+    /// [`NumberRangeIssue::CoefficientTooWide`] instead.
     TooManyDigits {
         /// Value-significant digit count (`digits(c_min)`).
         got: usize,
         /// The **value** is integral (`s_min ≤ 0`) — selects the
         /// quote-it-as-a-string hint for identifier-like integers.
         integral: bool,
+    },
+    /// [`Number::try_new`] only: the coefficient of the pair *as handed
+    /// in* has more than 34 digits. Distinct from `TooManyDigits`
+    /// because the two counts diverge — `try_new(10^34, 0)` is rejected
+    /// (35-digit coefficient) even though its VALUE has one significant
+    /// digit and constructs fine as `(10^33, −1)`; `try_new` validates
+    /// the raw pair, never normalizes (see its contract). The parse
+    /// path cannot produce this: its clamp already stores every
+    /// representable value.
+    CoefficientTooWide {
+        /// Digit count of `|coeff|` as handed in.
+        got: usize,
+    },
+    /// [`Number::try_new`] only: the pair's scale is outside
+    /// `[−6111, 6176]` as handed in. Distinct from `TooLarge`/`TooSmall`
+    /// for the same reason `CoefficientTooWide` is distinct from
+    /// `TooManyDigits` — those speak about the VALUE domain, and a raw
+    /// pair can be invalid while its value is representable
+    /// (`(1, −6112)` is rejected; the equal value 10^6112 constructs as
+    /// `(10, −6111)`). When a pair violates both the coefficient and
+    /// scale bounds, `CoefficientTooWide` wins — mirroring the parse
+    /// path's digits-before-window precedence.
+    ScaleOutOfRange {
+        /// The scale as handed in.
+        got: i16,
     },
     /// Magnitude above the decimal128 maximum, ≈ 9.999×10^6144.
     TooLarge,
@@ -137,6 +164,17 @@ impl fmt::Display for NumberRangeIssue {
                 }
                 Ok(())
             }
+            NumberRangeIssue::CoefficientTooWide { got } => write!(
+                f,
+                "coefficient has {got} digits; NML coefficients hold at most 34 \
+                 (fold trailing zeros into the scale -- the value itself may be \
+                 representable)"
+            ),
+            NumberRangeIssue::ScaleOutOfRange { got } => write!(
+                f,
+                "scale {got} is outside NML's scale range [-6111, 6176] \
+                 (renormalize the pair -- the value itself may be representable)"
+            ),
             NumberRangeIssue::TooLarge => f.write_str(
                 "number exceeds 9999999999999999999999999999999999 x 10^6111, \
                  the largest exact NML number",
@@ -399,26 +437,24 @@ impl Number {
     /// (`(1, −100)` is legal; parsing `10^100` stores `(10^33, −67)`).
     pub const fn try_new(coeff: i128, scale: i16) -> Result<Number, NumberError> {
         if coeff.unsigned_abs() > COEFF_ABS_MAX {
-            // RAW digit count, deliberately. `try_new` validates the pair
-            // it was handed (no clamping, no normalization — see the
-            // contract above), so the coefficient's own width is what
-            // justifies the rejection and what the caller must change.
-            // Normalizing here produced a self-contradictory message —
-            // `try_new(10^34, 0)` reporting "1 significant digit … at
-            // most 34" — because the normalized VALUE is representable
-            // (as `(10^33, −1)`) even though the raw pair is not. §1.5's
-            // value-significant rule governs the PARSE path, where the
-            // clamp has already accepted every such value.
-            return Err(NumberError::Range(NumberRangeIssue::TooManyDigits {
+            // The RAW pair is what failed (no clamping, no
+            // normalization — see the contract above), so the error
+            // names the coefficient's own width, not the value's
+            // significant digits; the variant doc has the worked case.
+            return Err(NumberError::Range(NumberRangeIssue::CoefficientTooWide {
                 got: digit_count_u128(coeff.unsigned_abs()) as usize,
-                integral: scale <= 0,
             }));
         }
-        if (scale as i64) < SCALE_LO {
-            return Err(NumberError::Range(NumberRangeIssue::TooLarge));
-        }
-        if (scale as i64) > SCALE_HI {
-            return Err(NumberError::Range(NumberRangeIssue::TooSmall));
+        // Scale bounds are raw-pair rejections too: `(1, −6112)` is an
+        // invalid PAIR while its value 10^6112 is representable (as
+        // `(10, −6111)`), so borrowing TooLarge/TooSmall's value-domain
+        // wording ("exceeds the largest exact NML number") would be
+        // false — the same honesty rule that separates
+        // CoefficientTooWide from TooManyDigits.
+        if (scale as i64) < SCALE_LO || (scale as i64) > SCALE_HI {
+            return Err(NumberError::Range(NumberRangeIssue::ScaleOutOfRange {
+                got: scale,
+            }));
         }
         // coeff == 0 ⇒ scale ∈ [0, 6176] (no negative-scale zeros). This
         // is a representation defect, not a magnitude one — neither
@@ -1423,9 +1459,33 @@ mod tests {
         // produces are still legal.
         assert_eq!(parts(Number::try_new(1, -100).unwrap()), (1, -100));
         assert_eq!(Number::try_new(1, -100).unwrap(), lit(&pow10_str(100)));
-        assert!(Number::try_new((COEFF_ABS_MAX as i128) + 1, 0).is_err());
-        assert!(Number::try_new(1, -6112).is_err());
-        assert!(Number::try_new(1, 6177).is_err());
+        // A wide RAW pair reports the coefficient's own width — never
+        // "significant digits", which would be self-contradictory here:
+        // 10^34 has one significant digit and its VALUE constructs fine
+        // from the normalized pair.
+        assert_eq!(
+            Number::try_new((COEFF_ABS_MAX as i128) + 1, 0).unwrap_err(),
+            NumberError::Range(NumberRangeIssue::CoefficientTooWide { got: 35 })
+        );
+        assert_eq!(
+            parts(Number::try_new(10i128.pow(33), -1).unwrap()),
+            (10i128.pow(33), -1)
+        );
+        // Scale-side raw rejections carry the honest kind — never the
+        // value-domain TooLarge/TooSmall (10^6112 IS representable).
+        assert_eq!(
+            Number::try_new(1, -6112).unwrap_err(),
+            NumberError::Range(NumberRangeIssue::ScaleOutOfRange { got: -6112 })
+        );
+        assert_eq!(
+            Number::try_new(1, 6177).unwrap_err(),
+            NumberError::Range(NumberRangeIssue::ScaleOutOfRange { got: 6177 })
+        );
+        // Both violated: the coefficient wins (parse-path precedence).
+        assert_eq!(
+            Number::try_new(10i128.pow(34), 6177).unwrap_err(),
+            NumberError::Range(NumberRangeIssue::CoefficientTooWide { got: 35 })
+        );
         assert_eq!(parts(Number::try_new(-5, 3).unwrap()), (-5, 3));
         assert_eq!(Number::try_new(-5, 3).unwrap().to_string(), "-0.005");
     }
@@ -1792,6 +1852,34 @@ mod tests {
                 "round {round}: member-exact handshake round-trip of {s:?}"
             );
 
+            // Conversion round-trip theorems (RFC §2): every exact
+            // extraction reconstructs the same VALUE, and the binary
+            // edge is shortest-round-trip stable.
+            if let Some(i) = n.to_i64() {
+                assert_eq!(
+                    Number::from(i),
+                    n,
+                    "round {round}: to_i64 round-trip of {s:?}"
+                );
+            }
+            if let Some(u) = n.to_u128() {
+                assert_eq!(
+                    Number::try_from(u).unwrap(),
+                    n,
+                    "round {round}: to_u128 round-trip of {s:?}"
+                );
+            }
+            let f = n.to_f64();
+            if f.is_finite() {
+                let back = Number::try_from_f64(f)
+                    .unwrap_or_else(|e| panic!("round {round}: try_from_f64({f}): {e:?}"));
+                assert_eq!(
+                    back.to_f64(),
+                    f,
+                    "round {round}: shortest-round-trip stability of {s:?}"
+                );
+            }
+
             // Pairwise properties against a rolling pool.
             for m in pool.iter().take(24) {
                 let c = n.cmp(m);
@@ -1880,6 +1968,17 @@ mod tests {
         }
         .to_string();
         assert!(mi.contains("quote it as a string"), "{mi}");
+        assert_eq!(
+            NumberRangeIssue::CoefficientTooWide { got: 35 }.to_string(),
+            "coefficient has 35 digits; NML coefficients hold at most 34 \
+             (fold trailing zeros into the scale -- the value itself may be \
+             representable)"
+        );
+        assert_eq!(
+            NumberRangeIssue::ScaleOutOfRange { got: -6112 }.to_string(),
+            "scale -6112 is outside NML's scale range [-6111, 6176] \
+             (renormalize the pair -- the value itself may be representable)"
+        );
         assert_eq!(
             NumberError::TrailingDot.to_string(),
             "number ends with a decimal point; remove the \".\" or add fraction digits"

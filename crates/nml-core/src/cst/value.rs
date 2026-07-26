@@ -553,7 +553,11 @@ fn parse_number(raw: &str, span: Span) -> Result<Number, NmlError> {
                 }
             }
             // Exhaustive in-crate on purpose: a new core variant must pick
-            // its code here before it can ship.
+            // its code here before it can ship. `issue` here is always one
+            // of the three parse-reachable kinds (TooManyDigits/TooLarge/
+            // TooSmall) — the error-index NML0014 entry enumerates exactly
+            // those; the try_new-only kinds (CoefficientTooWide/
+            // ScaleOutOfRange) never flow through a parse.
             crate::decimal::NumberError::Range(issue) => {
                 crate::error::ParseErrorKind::NumberOutOfRange { issue }
             }

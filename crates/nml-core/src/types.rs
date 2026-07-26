@@ -26,6 +26,21 @@ pub enum TemplateSegment {
 pub use crate::decimal::Number;
 
 /// A parsed value in NML.
+///
+/// # Extracting typed data
+///
+/// Two flavors, one rule. The `to_*`/`as_*` methods are `Option` probes
+/// for the common 64-bit tier ([`Value::to_i64`], [`Value::to_u64`],
+/// [`Value::to_f64`]); the `TryFrom<&Value>` impls are the typed-error
+/// flavor for config extraction. Integer `TryFrom` has exactly one rung —
+/// `i128`, the width every Rust integer type through `u64` narrows from
+/// exactly via `T::try_from` (a `u128` consumer needs
+/// [`Number::to_u128`]: values in `(i128::MAX, u128::MAX]` exist) — so
+/// no such target ever funnels through a narrower width
+/// and silently loses range (the `(i64::MAX, u64::MAX]` band is the
+/// classic casualty). Wider and narrower conversions live on [`Number`],
+/// the single conversion home: extend the ladder there, never this
+/// family.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Value {
     String(String),
@@ -340,6 +355,9 @@ impl TryFrom<&Value> for String {
     }
 }
 
+/// Correctly-rounded, hence lossy for integers above 2^53 and precision
+/// beyond binary64 — same contract as [`Value::to_f64`]. For exact
+/// integer extraction use the `i128` impl below.
 impl TryFrom<&Value> for f64 {
     type Error = ValueTypeError;
 
@@ -354,23 +372,32 @@ impl TryFrom<&Value> for f64 {
     }
 }
 
-/// **Handle the `Err`.** Since RFC 0016 every number ≤ 34 significant
-/// digits parses, so a value outside `i64` no longer dies at parse — it
-/// arrives here and fails *this* conversion instead. Config code that
-/// writes `if let Ok(n) = i64::try_from(&v) { limit = Some(n) }` with no
-/// `else` therefore skips silently and leaves the limit **unset**: a
-/// guard disarmed by an out-of-range value. (An audit of a downstream
-/// consumer found exactly this in five proxy guards, one of them a
-/// connection cap.) Convert with an explicit error, and narrow with
-/// `T::try_from` rather than `as` — `4294967296 as u32` is `0`.
-impl TryFrom<&Value> for i64 {
+/// The one typed-error integer rung. **Handle the `Err`.** Since RFC 0016
+/// every number ≤ 34 significant digits parses, so a value outside the
+/// target range no longer dies at parse — it arrives here and fails a
+/// conversion instead. Config code that writes
+/// `if let Ok(n) = i128::try_from(&v) { limit = Some(n) }` with no `else`
+/// therefore skips silently and leaves the limit **unset**: a guard
+/// disarmed by an out-of-range value. (An audit of a downstream consumer
+/// found exactly this in five proxy guards, one of them a connection
+/// cap.) Convert with an explicit error, and narrow with `T::try_from`
+/// rather than `as` — `4294967296 as u32` is `0`.
+///
+/// Why `i128` and not `i64`: it is the convergence width. Every Rust
+/// integer type through `u64` narrows from it exactly via std
+/// `T::try_from`, so one rung serves every target with no band gap —
+/// an `i64` rung would reject the `(i64::MAX, u64::MAX]` values RFC 0016
+/// made expressible, with an error claiming they are out of 64-bit
+/// range when they are not.
+impl TryFrom<&Value> for i128 {
     type Error = ValueTypeError;
 
-    fn try_from(value: &Value) -> Result<i64, Self::Error> {
+    fn try_from(value: &Value) -> Result<i128, Self::Error> {
         match value {
             // Reject fractional and out-of-range numbers rather than
-            // silently truncating (e.g. 3.7 must not become 3).
-            Value::Number(n) => n.to_i64().ok_or(ValueTypeError {
+            // silently truncating (e.g. 3.7 must not become 3);
+            // value-based, so the integer written `512.0` converts.
+            Value::Number(n) => n.to_i128().ok_or(ValueTypeError {
                 expected: "integer",
                 actual: "fractional or out-of-range number",
             }),
@@ -441,7 +468,31 @@ mod tests {
     fn try_from_number() {
         let v = Value::number(crate::num!(42.0));
         assert_eq!(f64::try_from(&v).unwrap(), 42.0);
-        assert_eq!(i64::try_from(&v).unwrap(), 42);
+        assert_eq!(i128::try_from(&v).unwrap(), 42);
+    }
+
+    /// The i128 rung is total over every band a config integer can
+    /// occupy — including `(i64::MAX, u64::MAX]`, the band an i64 rung
+    /// would falsely reject — and is value-based (`512.0` IS 512),
+    /// while fractions and beyond-i128 magnitudes error rather than
+    /// truncate.
+    #[test]
+    fn try_from_i128_covers_every_integer_band() {
+        let num = |s: &str| Value::Number(s.parse().unwrap());
+        assert_eq!(
+            i128::try_from(&num("9223372036854775808")).unwrap(),
+            1i128 << 63
+        );
+        assert_eq!(
+            i128::try_from(&num("18446744073709551615")).unwrap(),
+            u64::MAX as i128
+        );
+        assert_eq!(i128::try_from(&num("512.0")).unwrap(), 512);
+        assert_eq!(i128::try_from(&num("-100.0")).unwrap(), -100);
+        assert!(i128::try_from(&num("3.7")).is_err());
+        let beyond_i128 = format!("1{}", "0".repeat(39));
+        assert!(i128::try_from(&num(&beyond_i128)).is_err());
+        assert!(i128::try_from(&Value::String("42".into())).is_err());
     }
 
     #[test]
@@ -591,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn value_as_i64_accessor() {
+    fn value_to_i64_accessor() {
         assert_eq!(Value::number(42).to_i64(), Some(42));
         assert_eq!(Value::number(crate::num!(2.5)).to_i64(), None);
         assert_eq!(Value::String("42".into()).to_i64(), None);
@@ -656,19 +707,6 @@ mod tests {
         let v = Value::number(crate::num!(1.0));
         let result = bool::try_from(&v);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn i64_rejects_fractional() {
-        // 3.7 is not an integer; conversion must fail rather than truncate.
-        let v = Value::number(crate::num!(3.7));
-        assert!(i64::try_from(&v).is_err());
-    }
-
-    #[test]
-    fn i64_negative() {
-        let v = Value::number(crate::num!(-100.0));
-        assert_eq!(i64::try_from(&v).unwrap(), -100);
     }
 
     #[test]

@@ -27,10 +27,13 @@ const MaxRetries = 5
         .property("host")
         .as_str()
         .expect("missing host");
+    // Exact integer extraction (RFC 0016): `to_i64` is Some iff the
+    // value is exactly this integer — `to_f64` is the lossy binary
+    // edge, wrong for ports and counts.
     let port = doc
         .block("service", "WebApp")
         .property("port")
-        .to_f64()
+        .to_i64()
         .expect("missing port");
     let debug = doc
         .block("service", "WebApp")
@@ -56,7 +59,7 @@ const MaxRetries = 5
         .expect("missing database url");
     println!("DB:    {db_url}");
 
-    let retries = doc.const_value("MaxRetries").to_f64().unwrap_or(3.0);
+    let retries = doc.const_value("MaxRetries").to_i64().unwrap_or(3);
     println!("Max retries: {retries}");
 
     println!("\nAll declarations:");

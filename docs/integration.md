@@ -318,7 +318,10 @@ let value = doc.block("service", "MyApp").property("port").value().unwrap();
 // Supported conversions
 let s: String    = value.try_into().unwrap();  // String, Secret, Path, Duration, Reference, RoleRef
 let n: f64       = value.try_into().unwrap();  // Number (correctly-rounded binary edge)
-let i: i64       = value.try_into().unwrap();  // Number (exact; fractional values error, never truncate)
+let i: i128      = value.try_into().unwrap();  // Number (exact; fractional values error, never
+                                               // truncate). The one integer rung: narrow with
+                                               // `u16::try_from(i)?` etc. — every target through
+                                               // u64 converts exactly, no band gaps.
 let b: bool      = value.try_into().unwrap();  // Bool
 let v: Vec<String> = value.try_into().unwrap(); // Array of strings
 ```

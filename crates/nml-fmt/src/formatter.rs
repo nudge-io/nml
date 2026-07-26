@@ -527,8 +527,9 @@ fn format_value(out: &mut String, value: &Value, depth: usize) {
             let s = template::segments_to_string(segments);
             format_string(out, &s, depth, false);
         }
-        // Number's Display is exact: integers print all 64 bits, floats
-        // print the shortest representation that round-trips.
+        // Number's Display is exact and scale-preserving (RFC 0016):
+        // the stored decimal renders with its own written scale, so
+        // `2.50` survives formatting.
         Value::Number(n) => out.push_str(&n.to_string()),
         Value::Money(m) => {
             out.push_str(&m.format_display());
@@ -738,12 +739,73 @@ mod tests {
             let file = parse(&format!("service App:\n    x = {source_value}\n")).unwrap();
             let formatted = format(&file);
             assert!(
-                formatted.contains(&format!("x = {expected}")),
+                formatted.contains(&format!("x = {expected}\n")),
                 "{source_value}: got {formatted:?}"
             );
             // And the output is itself a fixed point.
             let again = format(&parse(&formatted).unwrap());
             assert_eq!(formatted, again, "{source_value} must reach a fixed point");
+        }
+    }
+
+    /// Every extreme literal the language accepts survives formatting:
+    /// the boundaries fixture (34-digit integers, clamped 10^34, the
+    /// subnormal band, 6176-scale zeros) formats idempotently and
+    /// value-preservingly — fmt is Display-driven, so this pins the
+    /// scale-preservation contract at the domain's edges.
+    #[test]
+    fn number_boundaries_fixture_formats_losslessly() {
+        let src = include_str!("../../../tests/fixtures/valid/number-boundaries.nml");
+        let once = format(&parse(src).unwrap());
+        let twice = format(&parse(&once).unwrap());
+        assert_eq!(once, twice, "fmt must be idempotent on boundary literals");
+        // Value preservation: reparse and compare every number
+        // semantically (numeric Eq — cosmetic moves allowed, value
+        // drift not).
+        let a = nml_core::cst::parse_to_ast(src).unwrap();
+        let b = nml_core::cst::parse_to_ast(&once).unwrap();
+        let nums = |f: &nml_core::ast::File| {
+            let mut out = Vec::new();
+            fn walk_body(b: &nml_core::ast::Body, out: &mut Vec<nml_core::types::Number>) {
+                for e in &b.entries {
+                    match &e.kind {
+                        nml_core::ast::BodyEntryKind::Property(p) => {
+                            walk_value(&p.value.value, out)
+                        }
+                        nml_core::ast::BodyEntryKind::NestedBlock(n) => walk_body(&n.body, out),
+                        nml_core::ast::BodyEntryKind::ListItem(i) => {
+                            if let nml_core::ast::ListItemKind::Named { body, .. } = &i.kind {
+                                walk_body(body, out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            fn walk_value(v: &nml_core::types::Value, out: &mut Vec<nml_core::types::Number>) {
+                match v {
+                    nml_core::types::Value::Number(n) => out.push(*n),
+                    nml_core::types::Value::Array(items) => {
+                        for it in items {
+                            walk_value(&it.value, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for d in &f.declarations {
+                if let nml_core::ast::DeclarationKind::Block(blk) = &d.kind {
+                    walk_body(&blk.body, &mut out);
+                }
+            }
+            out
+        };
+        let (na, nb) = (nums(&a), nums(&b));
+        assert_eq!(na.len(), nb.len(), "number count must survive fmt");
+        assert!(!na.is_empty(), "fixture must actually contain numbers");
+        for (x, y) in na.iter().zip(&nb) {
+            assert_eq!(x, y, "value drift through fmt");
+            assert_eq!(x.scale(), y.scale(), "scale drift through fmt");
         }
     }
 

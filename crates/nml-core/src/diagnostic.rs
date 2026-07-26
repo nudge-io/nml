@@ -153,7 +153,7 @@ pub mod codes {
         INVALID_ESCAPE = 12;
         /// A numeric literal no number parses from.
         INVALID_NUMBER = 13;
-        /// An integer outside `i64` (numbers are exact by design).
+        /// A number outside the exact decimal domain (RFC 0016) (numbers are exact by design).
         NUMBER_OUT_OF_RANGE = 14;
         /// A malformed `$NS.key` variable reference.
         BAD_SECRET_REF = 15;

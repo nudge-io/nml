@@ -2747,14 +2747,13 @@ fn duplicate_clarifier(earlier: &Value, current: &Value) -> String {
         (Value::Number(a), Value::Number(b)) if a.to_string() != b.to_string() => {
             format!(" (the same number as '{a}' above, written differently)")
         }
-        // Money is the other cohort type (RFC 0016 §1.8: exact minor
-        // units), so `19.9 USD` and `19.90 USD` collide the same way.
-        (Value::Money(a), Value::Money(b)) if a.format_display() != b.format_display() => {
-            format!(
-                " (the same amount as '{}' above, written differently)",
-                a.format_display()
-            )
-        }
+        // No money arm, deliberately: money canonicalizes at parse
+        // (`19.9 USD` and `19.90 USD` both store 1990 minor units and
+        // display `19.90 USD`), so two *equal* amounts can never render
+        // differently — the label already shows the one canonical form,
+        // and this guard could never fire. Number is different: it
+        // preserves the written scale, so equal values really do
+        // display differently.
         _ => String::new(),
     }
 }
@@ -2849,6 +2848,46 @@ mod tests {
         assert!(
             !dup.rendered_message().contains("written differently"),
             "no clarifier for identical spellings: {}",
+            dup.rendered_message()
+        );
+    }
+
+    /// Money duplicates get a value label but never a clarifier: money
+    /// canonicalizes at parse (both spellings below store 1990 minor
+    /// units and display `19.90 USD`), so the label alone shows the
+    /// collision and a "written differently" note has nothing to add.
+    #[test]
+    fn duplicate_set_element_labels_money_canonically() {
+        let schema = "model svc:\n    name string+\n    prices set<money>\n";
+        let d = diags(schema, "svc A:\n    prices = [19.90 USD, 19.9 USD]\n");
+        let dup = d
+            .iter()
+            .find(|x| x.rendered_message().contains("duplicate set element"))
+            .unwrap_or_else(|| panic!("expected a duplicate diagnostic, got {d:?}"));
+        let msg = dup.rendered_message();
+        assert!(
+            msg.contains("'19.90 USD'"),
+            "must name the canonical amount: {msg}"
+        );
+        assert!(
+            !msg.contains("written differently"),
+            "money has no distinct spellings to clarify: {msg}"
+        );
+
+        // Body form routes through the OTHER emitter
+        // (push_duplicate_set_items -> set_item_label) — same label,
+        // same posture.
+        let d = diags(
+            schema,
+            "svc A:\n    prices:\n        - 19.90 USD\n        - 19.9 USD\n",
+        );
+        let dup = d
+            .iter()
+            .find(|x| x.rendered_message().contains("duplicate set element"))
+            .unwrap_or_else(|| panic!("body-form duplicate expected, got {d:?}"));
+        assert!(
+            dup.rendered_message().contains("'19.90 USD'"),
+            "body form must label canonically: {}",
             dup.rendered_message()
         );
     }

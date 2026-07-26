@@ -485,7 +485,14 @@ pub fn parse_manifest(text: &str) -> Result<PackageManifest, PackageError> {
 fn scan_format_version_text(text: &str) -> Option<u64> {
     text.lines().find_map(|line| {
         let rest = line.trim().strip_prefix("formatVersion")?.trim_start();
-        rest.strip_prefix('=')?.trim().parse().ok()
+        let digits = rest.strip_prefix('=')?.trim();
+        digits.parse().ok().or_else(|| {
+            // Saturate like `number_as_u64` below: a formatVersion too
+            // wide for u64 IS newer than anything supported, so the
+            // degradation gate must fire — not the parse-error wall
+            // this fallback exists to preempt.
+            (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(u64::MAX)
+        })
     })
 }
 

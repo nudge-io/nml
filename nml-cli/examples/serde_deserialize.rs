@@ -9,7 +9,10 @@ use serde::Deserialize;
 #[derive(Deserialize, Debug)]
 struct ServiceConfig {
     host: String,
-    port: f64,
+    // Integer fields deserialize EXACTLY (RFC 0016): out-of-range or
+    // fractional values error — nothing rounds. f64 is only for values
+    // that are genuinely binary floating point.
+    port: u16,
     debug: bool,
     tags: Vec<String>,
 }
