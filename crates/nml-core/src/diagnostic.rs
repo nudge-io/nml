@@ -153,7 +153,7 @@ pub mod codes {
         INVALID_ESCAPE = 12;
         /// A numeric literal no number parses from.
         INVALID_NUMBER = 13;
-        /// A number outside the exact decimal domain (RFC 0016) (numbers are exact by design).
+        /// A number outside the exact decimal domain (RFC 0016; numbers are exact by design).
         NUMBER_OUT_OF_RANGE = 14;
         /// A malformed `$NS.key` variable reference.
         BAD_SECRET_REF = 15;
@@ -173,6 +173,10 @@ pub mod codes {
         /// An own-line closing `"""` not aligned with the content's
         /// indentation (machine-fixable: move the delimiter).
         MULTILINE_CLOSING_MISALIGNED = 20;
+        /// A fallback chain (`a | b`) in a list position — elements are
+        /// single values (chains live at properties or behind `const`
+        /// names).
+        FALLBACK_IN_LIST_ITEM = 21;
 
         /// The same name is declared more than once in one namespace.
         DUPLICATE_DECLARATION = 1000;

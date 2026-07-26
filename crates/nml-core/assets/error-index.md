@@ -359,6 +359,30 @@ service Api:
 content's column (here: 8). A closing delimiter on the last content
 line has no alignment to check and stays legal.
 
+## NML0021
+
+**Fallback chain in a list position.** A fallback chain (`a | b`)
+resolves to *one* value, but a list element's written form is also its
+*identity* — set uniqueness and reload diffing key on it — and an
+anonymous chain has no stable identity across environments. Elements are
+therefore single values. (The `|` here is also easy to confuse with the
+`|modifier` line syntax; this error names the actual mistake.)
+
+```nml check expect-error='[NML0021]'
+service Api:
+    keys:
+        - $ENV.A | $ENV.B
+```
+
+**Fix:** name the chain and reference it — `const PrimaryKey = $ENV.A |
+$ENV.B`, then `keys = [PrimaryKey]` (the name is the element's identity;
+the chain resolves at the definition). Write separate items (`- $ENV.A`
+/ `- $ENV.B`) if you want *both* values, or use a property (`key =
+$ENV.A | $ENV.B`) if you want one value with a fallback. Note: in the
+dash spelling a bare name is a reference to a *declared item*, not a
+`const` — use the inline spelling (`keys = [PrimaryKey]`) for `const`
+references.
+
 ## NML1000
 
 **Duplicate declaration.** Two top-level declarations share one name; names

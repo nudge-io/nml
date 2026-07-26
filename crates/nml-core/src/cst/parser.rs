@@ -722,6 +722,7 @@ impl<'a> Parser<'a> {
                 Some("after '-'"),
             ),
         }
+        self.reject_fallback_tail(true);
         m.complete(self, SyntaxKind::ListItem);
     }
 
@@ -857,6 +858,53 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// NML0021: a fallback chain in a list position. Emitted ONCE per
+    /// chain — spanning the first `|` through the last consumed leg — with
+    /// recovery that consumes the legs (and, for dash items, a trailing
+    /// `: body` exactly like the legal scalar path), so one mistake yields
+    /// one diagnostic, later lines parse, and the tree stays lossless. The
+    /// same-line guard (`at_fallback_pipe`) keeps next-line `|modifier`
+    /// entries untouched. If chains ever become legal here, this site is
+    /// the grammar hook (design parked: identity-is-syntactic, no body on
+    /// chains — see the stability notes).
+    fn reject_fallback_tail(&mut self, allow_body: bool) {
+        if !self.at_fallback_pipe() {
+            return;
+        }
+        let start = self.current_span();
+        while self.at_fallback_pipe() {
+            self.bump(); // |
+            // Mirror `value_or_fallback`'s leg shape (fuzz-proven to
+            // terminate); on garbage after `|`, stop — the error below
+            // already covers the dangling pipe.
+            if matches!(
+                self.current(),
+                SyntaxKind::Role
+                    | SyntaxKind::String
+                    | SyntaxKind::Secret
+                    | SyntaxKind::Ident
+                    | SyntaxKind::Number
+                    | SyntaxKind::Dash
+                    | SyntaxKind::LBracket
+            ) {
+                self.value();
+            } else {
+                break;
+            }
+        }
+        let end = self
+            .toks
+            .get(self.pos.saturating_sub(1))
+            .map_or(start.end, |t| t.offset + t.text.len());
+        self.error_kind_at(
+            crate::error::ParseErrorKind::FallbackInListItem,
+            Span::new(start.start, end),
+        );
+        if allow_body && self.eat(SyntaxKind::Colon) {
+            self.body();
+        }
+    }
+
     fn at_fallback_pipe(&self) -> bool {
         self.at(SyntaxKind::Pipe) && !self.newline_before()
     }
@@ -953,6 +1001,7 @@ impl<'a> Parser<'a> {
                 _ => {
                     let before = self.pos;
                     self.value();
+                    self.reject_fallback_tail(false);
                     if !self.eat(SyntaxKind::Comma) && !self.at(SyntaxKind::RBracket) {
                         self.expected(
                             vec![

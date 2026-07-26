@@ -5370,6 +5370,22 @@ mod tests {
         let src = "service App:\n    x = 2.5\n";
         let off = src.find("2.5").unwrap();
         assert!(super::simplify_number_action(src, off).is_none());
+
+        // Inline arrays: elements are their own nodes, so an Ident
+        // NEIGHBOR (a reference) must not trip the money check — while
+        // genuine money inside an array still suppresses.
+        let src = "service App:\n    ports = [8080.000, OtherRef]\n";
+        let off = src.find("8080").unwrap();
+        assert!(
+            super::simplify_number_action(src, off).is_some(),
+            "reference neighbor must not suppress simplify"
+        );
+        let src = "service App:\n    prices = [19.90 USD, 20.00 USD]\n";
+        let off = src.find("19.90").unwrap();
+        assert!(
+            super::simplify_number_action(src, off).is_none(),
+            "array money must suppress"
+        );
     }
 
     use super::*;

@@ -995,6 +995,46 @@ model denial:
         );
     }
 
+    /// The TEXT-SCAN fallback (manifests that fail to parse): the
+    /// degradation gate must still fire precisely — including
+    /// saturation for a formatVersion beyond u64 — instead of the
+    /// parse-error wall.
+    #[test]
+    fn format_version_text_scan_gates_unparseable_manifests() {
+        // Future syntax the current parser rejects, plus a readable version.
+        let future = MANIFEST.replace(
+            "formatVersion = 1",
+            "formatVersion = 99\n    someFutureField ::= <<future-syntax>>",
+        );
+        match SchemaPackage::from_parts(&future, resolve) {
+            Err(PackageError::UnsupportedFormatVersion {
+                required: 99,
+                supported,
+            }) => {
+                assert_eq!(supported, SUPPORTED_FORMAT_VERSION);
+            }
+            other => panic!("expected the precise gate, got {other:?}"),
+        }
+        // Beyond u64: the text scan saturates like the value path.
+        let huge = MANIFEST.replace(
+            "formatVersion = 1",
+            &format!(
+                "formatVersion = {}\n    someFutureField ::= <<future-syntax>>",
+                "9".repeat(35)
+            ),
+        );
+        match SchemaPackage::from_parts(&huge, resolve) {
+            Err(PackageError::UnsupportedFormatVersion {
+                required,
+                supported,
+            }) => {
+                assert_eq!(required, u64::MAX);
+                assert_eq!(supported, SUPPORTED_FORMAT_VERSION);
+            }
+            other => panic!("expected saturated gate, got {other:?}"),
+        }
+    }
+
     #[test]
     fn format_version_gate_precedes_meta_validation() {
         // Newer formatVersion + an unknown key that would meta-fail: the gate

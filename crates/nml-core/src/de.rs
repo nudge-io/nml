@@ -1320,13 +1320,28 @@ server App:
         // And the value never leaks into the message (redaction posture).
         assert!(!msg.contains("100000"), "no value echo: {msg}");
 
-        // Control: the same shape within u64 deserializes as a JSON number.
-        let source = "cfg C:\n    big = 8080\n";
+        // Controls: the i64 and u64 rungs arrive as JSON numbers.
+        for (literal, expected) in [
+            ("8080", serde_json::json!(8080u64)),
+            ("18446744073709551615", serde_json::json!(u64::MAX)),
+        ] {
+            let source = format!("cfg C:\n    big = {literal}\n");
+            let file = parse_to_ast(&source).unwrap();
+            let doc = Document::new(&file);
+            let body = doc.block("cfg", "C").body().unwrap();
+            let cfg: AnyCfg = from_body(body).unwrap();
+            assert_eq!(cfg.big, expected, "{literal}");
+        }
+        // The (u64::MAX, 2^128) band errors too — but via serde_json's
+        // own visitor limit (no 128-bit rungs in its Value), so the
+        // message is the foreign "out of range", without our typed
+        // hint. Documented §1.7 posture (serde #1717): errors, never
+        // rounds — pinned here so a serde_json change is noticed.
+        let source = "cfg C:\n    big = 18446744073709551616\n";
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("cfg", "C").body().unwrap();
-        let cfg: AnyCfg = from_body(body).unwrap();
-        assert_eq!(cfg.big, serde_json::json!(8080));
+        assert!(from_body::<AnyCfg>(body).is_err(), "2^64 must not round");
     }
 
     #[test]

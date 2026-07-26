@@ -53,6 +53,11 @@ pub enum ParseErrorKind {
     /// dedent's min-indent — the one way transport interpretation could
     /// still be steered by where content sits.
     MultilineOpeningContent,
+    /// A fallback chain (`a | b`) in a list position. Elements are single
+    /// values: an anonymous chain has no stable identity for set
+    /// uniqueness or reload diffing. The chain belongs at a property, or
+    /// behind a `const` name referenced from the list.
+    FallbackInListItem,
     /// An own-line closing `"""` whose indentation differs from the
     /// content's min-indent. Alignment makes the delimiter-anchored reading
     /// and the min-indent reading provably agree, so neither can be
@@ -242,6 +247,10 @@ impl ParseErrorKind {
                                         line after the opening `\"\"\"` (text on the \
                                         opening line would steer indentation stripping)"
                 .to_string(),
+            FallbackInListItem => "a fallback chain cannot be a list element — each \
+                                    element is a single value (name the chain with a \
+                                    `const` and reference it, or use a property)"
+                .to_string(),
             MultilineClosingMisaligned { expected, found } => format!(
                 "the closing `\"\"\"` must align with the content's indentation \
                  (content is at column {expected}, the closing quotes at {found})"
@@ -340,6 +349,7 @@ impl ParseErrorKind {
             ForbiddenControlCharacter { .. } => codes::FORBIDDEN_CONTROL,
             InvisibleCharacter { .. } => codes::INVISIBLE_CHARACTER,
             MultilineOpeningContent => codes::MULTILINE_OPENING_CONTENT,
+            FallbackInListItem => codes::FALLBACK_IN_LIST_ITEM,
             MultilineClosingMisaligned { .. } => codes::MULTILINE_CLOSING_MISALIGNED,
             BadDedent { .. } => codes::BAD_DEDENT,
             NestingLimit { .. } => codes::NESTING_LIMIT,

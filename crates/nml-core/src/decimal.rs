@@ -123,7 +123,10 @@ pub enum NumberRangeIssue {
     /// (`(1, −6112)` is rejected; the equal value 10^6112 constructs as
     /// `(10, −6111)`). When a pair violates both the coefficient and
     /// scale bounds, `CoefficientTooWide` wins — mirroring the parse
-    /// path's digits-before-window precedence.
+    /// path's digits-before-window precedence. Checked BEFORE the
+    /// zero-invariant, so a zero at an out-of-window scale reports this
+    /// (truthfully); `Malformed` covers only in-window negative-scale
+    /// zeros.
     ScaleOutOfRange {
         /// The scale as handed in.
         got: i16,
@@ -1486,6 +1489,19 @@ mod tests {
             Number::try_new(10i128.pow(34), 6177).unwrap_err(),
             NumberError::Range(NumberRangeIssue::CoefficientTooWide { got: 35 })
         );
+        // Zero lattice: the scale bounds are checked BEFORE the
+        // zero-invariant, so an out-of-window scale reports
+        // ScaleOutOfRange even for zero (the message stays true);
+        // Malformed is reserved for IN-window negative-scale zeros.
+        assert_eq!(
+            Number::try_new(0, 6177).unwrap_err(),
+            NumberError::Range(NumberRangeIssue::ScaleOutOfRange { got: 6177 })
+        );
+        assert_eq!(
+            Number::try_new(0, -6112).unwrap_err(),
+            NumberError::Range(NumberRangeIssue::ScaleOutOfRange { got: -6112 })
+        );
+        assert_eq!(Number::try_new(0, -5).unwrap_err(), NumberError::Malformed);
         assert_eq!(parts(Number::try_new(-5, 3).unwrap()), (-5, 3));
         assert_eq!(Number::try_new(-5, 3).unwrap().to_string(), "-0.005");
     }

@@ -2760,10 +2760,21 @@ fn duplicate_clarifier(earlier: &Value, current: &Value) -> String {
 
 /// A short value rendering for duplicate diagnostics; empty for compound
 /// values (the span carries the location).
+/// Labels echo AUTHORED literals only (validation runs on the raw AST;
+/// `$ENV` refs fall to the empty arm as `Value::Secret`) — and strings,
+/// the one unbounded kind, truncate like nml-core's `echo_capture` so a
+/// multi-KB literal cannot balloon a diagnostic. Number/Money Display
+/// is bounded by the written literal's own length.
 fn value_label(value: &Value) -> String {
     match value {
         Value::String(s) | Value::Path(s) | Value::Duration(s) | Value::Role(s) => {
-            format!(" '{s}'")
+            const MAX_ECHO: usize = 32;
+            if s.chars().count() > MAX_ECHO {
+                let head: String = s.chars().take(MAX_ECHO).collect();
+                format!(" '{head}…'")
+            } else {
+                format!(" '{s}'")
+            }
         }
         Value::Number(n) => format!(" '{n}'"),
         Value::Money(m) => format!(" '{}'", m.format_display()),

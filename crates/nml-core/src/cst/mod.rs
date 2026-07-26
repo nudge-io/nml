@@ -1496,6 +1496,70 @@ service App is Base:
         );
     }
 
+    /// NML0021: a fallback chain in a list position gets a TEACHING error
+    /// naming the actual mistake — never the old mis-parse into pipe-
+    /// modifier syntax ("expected a modifier name"). One diagnostic per
+    /// chain, both list spellings, all item shapes; recovery keeps later
+    /// lines parsing and the tree lossless.
+    #[test]
+    fn fallback_chain_in_list_position_teaches() {
+        // Every item shape that can precede a chain, dash spelling.
+        for src in [
+            "w s:\n    keys:\n        - $ENV.A | $ENV.B\n",
+            "w s:\n    keys:\n        - \"a\" | \"b\"\n",
+            "w s:\n    keys:\n        - 1 | 2\n",
+            "w s:\n    keys:\n        - foo | bar\n",
+            "w s:\n    keys:\n        - @role/a | @role/b\n",
+        ] {
+            let (_, diags) = parse_to_ast_all(src);
+            let rendered: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+            assert!(
+                rendered.iter().any(|m| m.contains("NML0021")),
+                "{src:?}: {rendered:?}"
+            );
+            assert!(
+                !rendered.iter().any(|m| m.contains("modifier name")),
+                "the old mis-parse must be gone: {src:?}: {rendered:?}"
+            );
+            let p = parse(src);
+            assert_eq!(tree_text(&p), src, "lossless under recovery: {src:?}");
+        }
+
+        // Inline-array spelling: same code, same message prose.
+        let (_, dash) = parse_to_ast_all("w s:\n    keys:\n        - $ENV.A | $ENV.B\n");
+        let (_, inline) = parse_to_ast_all("w s:\n    keys = [$ENV.A | $ENV.B]\n");
+        let msg = |ds: &[crate::diagnostic::Diagnostic]| {
+            ds.iter()
+                .map(|d| d.rendered_message())
+                .find(|m| m.contains("fallback chain"))
+                .unwrap_or_default()
+        };
+        assert_eq!(msg(&dash), msg(&inline), "prose parity across spellings");
+        assert!(!msg(&inline).is_empty());
+
+        // Trailing `: body` after the chain: ONE diagnostic, body consumed.
+        let (_, diags) =
+            parse_to_ast_all("w s:\n    keys:\n        - \"a\" | \"b\":\n            k = 1\n");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(diags[0].to_string().contains("NML0021"));
+
+        // Recovery: content AFTER the chain still parses.
+        let (file, diags) =
+            parse_to_ast_all("w s:\n    keys:\n        - $ENV.A | $ENV.B\n    port = 1\n");
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(!file.declarations.is_empty());
+
+        // NON-regression: a next-line `|modifier` entry is NOT a chain (the
+        // same-line rule) — nudge's `|grant` syntax depends on this.
+        let (_, diags) = parse_to_ast_all(
+            "model t:\n    hosts:\n        - \"api.example.com\"\n    |grant []string?\n",
+        );
+        assert!(
+            !diags.iter().any(|d| d.to_string().contains("NML0021")),
+            "{diags:?}"
+        );
+    }
+
     /// Template detection reads RAW text: `\u{7B}\u{7B}` is a literal `{{`
     /// (the escape hatch — previously inexpressible), never a template, so
     /// an escape can't smuggle a template expression past review; written

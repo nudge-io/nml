@@ -380,7 +380,11 @@ urlRoutes:
 
 ### Lists
 
-List items are prefixed with `- ` (dash-space):
+List items are prefixed with `- ` (dash-space). Each element is a
+**single value**: fallback chains (`a | b`) are property-position only
+([NML0021](../crates/nml-core/assets/error-index.md#nml0021) — name a
+chain with a `const` and reference it to use one as an element).
+
 
 ```
 domains:

@@ -749,13 +749,23 @@ mod tests {
     }
 
     /// Every extreme literal the language accepts survives formatting:
-    /// the boundaries fixture (34-digit integers, clamped 10^34, the
-    /// subnormal band, 6176-scale zeros) formats idempotently and
-    /// value-preservingly — fmt is Display-driven, so this pins the
-    /// scale-preservation contract at the domain's edges.
+    /// the boundaries fixture (34-digit integers, clamped 10^34, scale
+    /// preservation) formats idempotently and value-preservingly, and
+    /// synthesized subnormal-band / 6176-scale-zero literals — too long
+    /// to live readably in a fixture file — are appended in-test. fmt
+    /// is Display-driven, so this pins the scale-preservation contract
+    /// at the domain's edges.
     #[test]
     fn number_boundaries_fixture_formats_losslessly() {
-        let src = include_str!("../../../tests/fixtures/valid/number-boundaries.nml");
+        let fixture = include_str!("../../../tests/fixtures/valid/number-boundaries.nml");
+        // Extremes the fixture omits (a 6178-char line is not a readable
+        // fixture): the subnormal band and the deepest zero scale.
+        let src = format!(
+            "{fixture}\nextremes Edge:\n    subnormal = 0.{}5\n    deepZero = 0.{}\n",
+            "0".repeat(6150),
+            "0".repeat(6176),
+        );
+        let src = src.as_str();
         let once = format(&parse(src).unwrap());
         let twice = format(&parse(&once).unwrap());
         assert_eq!(once, twice, "fmt must be idempotent on boundary literals");
