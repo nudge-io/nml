@@ -1592,9 +1592,7 @@ mod composition_tests {
         let endpoint = schema.models.iter().find(|m| m.name == "endpoint").unwrap();
         let field = |n: &str| endpoint.fields.iter().find(|f| f.name == n).unwrap();
         let default_text = |n: &str| match field(n).default_value.as_ref().map(|sv| &sv.value) {
-            Some(crate::types::Value::String(s)) | Some(crate::types::Value::Duration(s)) => {
-                s.clone()
-            }
+            Some(crate::types::Value::String(s)) => s.clone(),
             other => panic!("expected a textual default for '{n}', got {other:?}"),
         };
         // Inherited default comes along; the model's own field overrides.

@@ -2240,7 +2240,7 @@ impl SchemaValidator {
             // "parses at runtime" cannot drift. Template strings resolve
             // later and are skipped, like every deferred reference.
             if *prim == PrimitiveType::Duration {
-                if let Value::String(text) | Value::Duration(text) = value {
+                if let Value::String(text) = value {
                     if nml_core::types::parse_duration(text).is_none() {
                         diags.push(
                             Diagnostic::error(format!(
@@ -2626,10 +2626,9 @@ fn value_matches_primitive(value: &Value, prim: &PrimitiveType) -> bool {
         PrimitiveType::Number => matches!(value, Value::Number(_)),
         PrimitiveType::Bool => matches!(value, Value::Bool(_)),
         PrimitiveType::Money => matches!(value, Value::Money(_)),
-        PrimitiveType::Duration => matches!(
-            value,
-            Value::String(_) | Value::TemplateString(_) | Value::Duration(_)
-        ),
+        PrimitiveType::Duration => {
+            matches!(value, Value::String(_) | Value::TemplateString(_))
+        }
         PrimitiveType::Path => matches!(value, Value::String(_) | Value::TemplateString(_)),
         PrimitiveType::Secret => false,
         PrimitiveType::Object => false,
@@ -2762,12 +2761,13 @@ fn duplicate_clarifier(earlier: &Value, current: &Value) -> String {
 /// values (the span carries the location).
 /// Labels echo AUTHORED literals only (validation runs on the raw AST;
 /// `$ENV` refs fall to the empty arm as `Value::Secret`) — and strings,
-/// the one unbounded kind, truncate like nml-core's `echo_capture` so a
+/// the one unbounded kind, truncate like nml-core's `echo` (32 chars +
+/// `…`) so a
 /// multi-KB literal cannot balloon a diagnostic. Number/Money Display
 /// is bounded by the written literal's own length.
 fn value_label(value: &Value) -> String {
     match value {
-        Value::String(s) | Value::Path(s) | Value::Duration(s) | Value::Role(s) => {
+        Value::String(s) | Value::Path(s) | Value::Role(s) => {
             const MAX_ECHO: usize = 32;
             if s.chars().count() > MAX_ECHO {
                 let head: String = s.chars().take(MAX_ECHO).collect();
@@ -2790,7 +2790,6 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Number(_) => "number",
         Value::Money(_) => "money",
         Value::Bool(_) => "bool",
-        Value::Duration(_) => "duration",
         Value::Path(_) => "path",
         Value::Secret(_) => "secret",
         Value::Role(_) => "role reference",

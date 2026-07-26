@@ -22,5 +22,9 @@ fuzz_target!(|data: &[u8]| {
     // continuation) must never panic, and the findings list stays bounded
     // (RFC 0009 exact-count honesty caps every collection site).
     let (_file, diags) = nml_core::cst::parse_to_ast_all(s);
-    assert!(diags.len() <= 512, "diagnostics not bounded: {}", diags.len());
+    assert!(
+        diags.len() <= 512,
+        "diagnostics not bounded: {}",
+        diags.len()
+    );
 });

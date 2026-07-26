@@ -179,7 +179,8 @@ fn parse_minor_units(
         // wrong-but-safe message, never a parse-path panic.
         crate::decimal::NumberError::Range(
             crate::decimal::NumberRangeIssue::CoefficientTooWide { .. }
-            | crate::decimal::NumberRangeIssue::ScaleOutOfRange { .. },
+            | crate::decimal::NumberRangeIssue::ScaleOutOfRange { .. }
+            | crate::decimal::NumberRangeIssue::NegativeScaleZero { .. },
         ) => NmlError::Money {
             kind: MoneyErrorKind::OutOfRange {
                 raw: crate::error::echo_capture(amount_str),

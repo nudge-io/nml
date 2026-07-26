@@ -20,14 +20,20 @@ use crate::span::Span;
 use crate::types::{Number, SpannedValue, Value};
 use crate::{money, template};
 
-/// Decode a bare string-literal token (`"…"`) to its value — used where the
+/// Decode a bare string-literal token (`"…"`) **totally** — used where the
 /// grammar guarantees a string (oneof discriminator/arm values) so there is no
-/// surrounding `Value` node to go through [`decode_value`]. Strict view
-/// (first error by source position), derived from the total decoder like
-/// [`decode_value`] is.
+/// surrounding `Value` node to go through [`decode_value_all`]. Every bad
+/// escape lands in `sink` and decoding recovers with U+FFFD, mirroring the
+/// value decoders' rustc-style all-errors contract.
+pub(super) fn decode_string_token_all(tok: &SyntaxToken, sink: &mut ValueErrors) -> String {
+    decode_string(tok.text(), text_offset(tok.text_range().start()), sink)
+}
+
+/// Strict view of [`decode_string_token_all`] (first error by source
+/// position), derived from the total decoder like [`decode_value`] is.
 pub(super) fn decode_string_token(tok: &SyntaxToken) -> Result<String, NmlError> {
     let mut sink = ValueErrors::default();
-    let s = decode_string(tok.text(), text_offset(tok.text_range().start()), &mut sink);
+    let s = decode_string_token_all(tok, &mut sink);
     match sink.errors.into_iter().min_by_key(|e| e.span().start) {
         Some(e) => Err(e),
         None => Ok(s),

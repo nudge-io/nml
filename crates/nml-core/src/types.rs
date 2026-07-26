@@ -48,7 +48,6 @@ pub enum Value {
     Number(Number),
     Money(Money),
     Bool(bool),
-    Duration(String),
     Path(String),
     Secret(String),
     Role(String),
@@ -266,7 +265,6 @@ impl Value {
             Value::Number(_) => "number",
             Value::Money(_) => "money",
             Value::Bool(_) => "bool",
-            Value::Duration(_) => "duration",
             Value::Path(_) => "path",
             Value::Secret(_) => "secret",
             Value::Role(_) => "role",
@@ -276,12 +274,11 @@ impl Value {
         }
     }
 
-    /// Extract as a string slice (String, Path, Duration, Secret, Reference, Role).
+    /// Extract as a string slice (String, Path, Secret, Reference, Role).
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(s)
             | Value::Path(s)
-            | Value::Duration(s)
             | Value::Secret(s)
             | Value::Reference(s)
             | Value::Role(s) => Some(s.as_str()),
@@ -345,7 +342,7 @@ impl TryFrom<&Value> for String {
         match value {
             Value::String(s) => Ok(s.clone()),
             Value::TemplateString(segs) => Ok(crate::template::segments_to_string(segs)),
-            Value::Path(s) | Value::Duration(s) | Value::Secret(s) => Ok(s.clone()),
+            Value::Path(s) | Value::Secret(s) => Ok(s.clone()),
             Value::Reference(s) | Value::Role(s) => Ok(s.clone()),
             _ => Err(ValueTypeError {
                 expected: "string",
@@ -659,12 +656,6 @@ mod tests {
     }
 
     #[test]
-    fn try_from_duration_to_string() {
-        let v = Value::Duration("30s".into());
-        assert_eq!(String::try_from(&v).unwrap(), "30s");
-    }
-
-    #[test]
     fn try_from_secret_to_string() {
         let v = Value::Secret("$ENV.KEY".into());
         assert_eq!(String::try_from(&v).unwrap(), "$ENV.KEY");
@@ -763,7 +754,6 @@ mod tests {
         assert_eq!(Value::TemplateString(vec![]).type_name(), "string");
         assert_eq!(Value::number(crate::num!(0.0)).type_name(), "number");
         assert_eq!(Value::Bool(false).type_name(), "bool");
-        assert_eq!(Value::Duration("1s".into()).type_name(), "duration");
         assert_eq!(Value::Path("/x".into()).type_name(), "path");
         assert_eq!(Value::Secret("$ENV.X".into()).type_name(), "secret");
         assert_eq!(Value::Role("admin".into()).type_name(), "role");

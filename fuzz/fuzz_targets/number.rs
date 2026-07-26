@@ -24,8 +24,7 @@ fuzz_target!(|data: &[u8]| {
             // Display output reparses to an Eq-equal value with an equal
             // hash, and comparison is reflexive.
             let d = n.to_string();
-            let r = Number::parse_literal(&d)
-                .unwrap_or_else(|e| panic!("reparse of {d:?}: {e:?}"));
+            let r = Number::parse_literal(&d).unwrap_or_else(|e| panic!("reparse of {d:?}: {e:?}"));
             assert_eq!(n, r, "round-trip of {s:?}");
             assert_eq!(h(&n), h(&r), "hash round-trip of {s:?}");
             assert_eq!(n.cmp(&r), std::cmp::Ordering::Equal);

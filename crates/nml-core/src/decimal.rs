@@ -131,6 +131,19 @@ pub enum NumberRangeIssue {
         /// The scale as handed in.
         got: i16,
     },
+    /// [`Number::try_new`] only: `coeff == 0` with a negative scale —
+    /// the third invariant, and the third raw-pair kind (the VALUE,
+    /// zero, is representable at every scale in `[0, 6176]`; the PAIR
+    /// is not, because a negative-scale zero would render as
+    /// leading-zero digits). Checked before the scale window so that
+    /// every negative-scale zero — `(0, −5)` and `(0, −6112)` alike —
+    /// gets the zero rule in ONE step, never a "renormalize" detour
+    /// through the window bounds. Completes the 1:1 invariant↔kind
+    /// taxonomy; `Malformed` is grammar-only again.
+    NegativeScaleZero {
+        /// The scale as handed in.
+        got: i16,
+    },
     /// Magnitude above the decimal128 maximum, ≈ 9.999×10^6144.
     TooLarge,
     /// Nonzero magnitude below 10^−6176.
@@ -177,6 +190,12 @@ impl fmt::Display for NumberRangeIssue {
                 f,
                 "scale {got} is outside NML's scale range [-6111, 6176] \
                  (renormalize the pair -- the value itself may be representable)"
+            ),
+            NumberRangeIssue::NegativeScaleZero { got } => write!(
+                f,
+                "zero cannot carry negative scale {got} (it would render as \
+                 leading-zero digits); zero stores at any scale in [0, 6176] \
+                 -- scale 0 is canonical"
             ),
             NumberRangeIssue::TooLarge => f.write_str(
                 "number exceeds 9999999999999999999999999999999999 x 10^6111, \
@@ -448,6 +467,15 @@ impl Number {
                 got: digit_count_u128(coeff.unsigned_abs()) as usize,
             }));
         }
+        // Zero first, most-specific-diagnosis-first: a negative-scale
+        // zero's root cause is the zero rule, and routing it through the
+        // window check sent authors on a two-step detour ((0, −6112) →
+        // "renormalize" → (0, −6111) → rejected again).
+        if coeff == 0 && scale < 0 {
+            return Err(NumberError::Range(NumberRangeIssue::NegativeScaleZero {
+                got: scale,
+            }));
+        }
         // Scale bounds are raw-pair rejections too: `(1, −6112)` is an
         // invalid PAIR while its value 10^6112 is representable (as
         // `(10, −6111)`), so borrowing TooLarge/TooSmall's value-domain
@@ -458,13 +486,6 @@ impl Number {
             return Err(NumberError::Range(NumberRangeIssue::ScaleOutOfRange {
                 got: scale,
             }));
-        }
-        // coeff == 0 ⇒ scale ∈ [0, 6176] (no negative-scale zeros). This
-        // is a representation defect, not a magnitude one — neither
-        // TooLarge nor TooSmall would be true of zero — so it rejects as
-        // Malformed.
-        if coeff == 0 && scale < 0 {
-            return Err(NumberError::Malformed);
         }
         Ok(Number { coeff, scale })
     }
@@ -1489,19 +1510,26 @@ mod tests {
             Number::try_new(10i128.pow(34), 6177).unwrap_err(),
             NumberError::Range(NumberRangeIssue::CoefficientTooWide { got: 35 })
         );
-        // Zero lattice: the scale bounds are checked BEFORE the
-        // zero-invariant, so an out-of-window scale reports
-        // ScaleOutOfRange even for zero (the message stays true);
-        // Malformed is reserved for IN-window negative-scale zeros.
+        // Zero lattice: EVERY negative-scale zero reports the zero rule
+        // in one step (most-specific-diagnosis-first — the window check
+        // would send authors on a renormalize detour); a positive
+        // out-of-window scale on zero stays ScaleOutOfRange (truthful).
         assert_eq!(
             Number::try_new(0, 6177).unwrap_err(),
             NumberError::Range(NumberRangeIssue::ScaleOutOfRange { got: 6177 })
         );
-        assert_eq!(
-            Number::try_new(0, -6112).unwrap_err(),
-            NumberError::Range(NumberRangeIssue::ScaleOutOfRange { got: -6112 })
-        );
-        assert_eq!(Number::try_new(0, -5).unwrap_err(), NumberError::Malformed);
+        for z in [-5i16, -6111, -6112] {
+            assert_eq!(
+                Number::try_new(0, z).unwrap_err(),
+                NumberError::Range(NumberRangeIssue::NegativeScaleZero { got: z }),
+                "zero at scale {z}"
+            );
+        }
+        // In-window edges — pinned so a one-off narrowing of either
+        // bound cannot pass silently.
+        assert!(Number::try_new(0, 6176).is_ok());
+        assert!(Number::try_new(0, 0).is_ok());
+        assert!(Number::try_new(1, -6111).is_ok());
         assert_eq!(parts(Number::try_new(-5, 3).unwrap()), (-5, 3));
         assert_eq!(Number::try_new(-5, 3).unwrap().to_string(), "-0.005");
     }
@@ -1994,6 +2022,12 @@ mod tests {
             NumberRangeIssue::ScaleOutOfRange { got: -6112 }.to_string(),
             "scale -6112 is outside NML's scale range [-6111, 6176] \
              (renormalize the pair -- the value itself may be representable)"
+        );
+        assert_eq!(
+            NumberRangeIssue::NegativeScaleZero { got: -5 }.to_string(),
+            "zero cannot carry negative scale -5 (it would render as \
+             leading-zero digits); zero stores at any scale in [0, 6176] \
+             -- scale 0 is canonical"
         );
         assert_eq!(
             NumberError::TrailingDot.to_string(),

@@ -537,11 +537,6 @@ fn format_value(out: &mut String, value: &Value, depth: usize) {
         Value::Bool(b) => {
             out.push_str(if *b { "true" } else { "false" });
         }
-        Value::Duration(d) => {
-            out.push('"');
-            out.push_str(d);
-            out.push('"');
-        }
         Value::Path(p) => {
             out.push('"');
             out.push_str(p);

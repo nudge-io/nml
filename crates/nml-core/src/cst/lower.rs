@@ -10,7 +10,7 @@
 use crate::ast::*;
 use crate::cst::ast::{self, AstNode};
 use crate::cst::syntax::{SyntaxToken, content_span, token_span};
-use crate::cst::value::decode_string_token;
+use crate::cst::value::{ValueErrors, decode_string_token_all};
 use crate::error::NmlError;
 use crate::span::Span;
 use crate::types::{SpannedValue, Value};
@@ -346,7 +346,7 @@ impl Lower {
     /// incompleteness, which the parser already reported, decodes to a
     /// placeholder), so this never double-counts a syntactic problem.
     fn decode(&mut self, v: &ast::ValueNode) -> SpannedValue {
-        let mut sink = super::value::ValueErrors::default();
+        let mut sink = ValueErrors::default();
         let sv = v.decode_all(&mut sink);
         for e in sink.errors {
             self.push_error(e);
@@ -369,15 +369,18 @@ impl Lower {
         v.map(|v| self.decode(&v)).unwrap_or_else(empty_value)
     }
 
-    /// Decode a bare string-literal token (oneof values), collecting errors.
+    /// Decode a bare string-literal token (oneof values) **totally**: every
+    /// bad escape is reported (not just the first) and the U+FFFD-recovered
+    /// text is kept, so lenient surfaces keep the arm's identity — the same
+    /// contract property values get from `decode_value_all`.
     fn string_token(&mut self, tok: &SyntaxToken) -> String {
-        match decode_string_token(tok) {
-            Ok(s) => s,
-            Err(e) => {
-                self.push_error(e);
-                String::new()
-            }
+        let mut sink = ValueErrors::default();
+        let s = decode_string_token_all(tok, &mut sink);
+        for e in sink.errors {
+            self.push_error(e);
         }
+        self.suppressed += sink.suppressed;
+        s
     }
 }
 

@@ -4,6 +4,19 @@
 
 ### Changed
 
+- **`Value::Duration` removed** — the variant was unreachable by
+  construction: durations are *quoted* strings in the grammar (spec
+  §Duration Literals), so only schema validation can judge duration-ness,
+  and no code path ever produced the variant. Duration-typed fields keep
+  validating exactly as before (`NML2029` via `parse_duration`, the single
+  source of truth); consumers keep receiving `Value::String`. Dead match
+  arms across the workspace went with it.
+- **Oneof arm values report every bad escape** — bare string-literal
+  positions (oneof discriminator/arm values) now use the total decoder:
+  all escape errors surface at once (rustc-style, matching property
+  values) and the U+FFFD-recovered text is kept, so lenient surfaces
+  retain the arm's identity instead of an empty string.
+
 - **List validation: spelling parity & the item-shape matrix** — the two
   spellings of a list field (`f = [v]` and `f:` + `- v`) now validate
   identically, by construction and by CI-enforced test. — one contract,

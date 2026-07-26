@@ -450,6 +450,42 @@ mod tests {
         }
     }
 
+    /// A oneof arm value carrying several bad escapes reports EVERY one
+    /// (rustc-style — parity with what property values get from
+    /// `decode_value_all`) and lowers to the U+FFFD-recovered text rather
+    /// than going empty, so lenient surfaces keep the arm's identity.
+    #[test]
+    fn oneof_arm_string_reports_every_escape_error() {
+        let src = "oneof email by provider:\n    \"l\\qo\\pg\" -> emailLog\n    \"postmark\" -> emailPostmark\n";
+        let (file, errors) = parse_to_ast_all(src);
+        let escape_spans: Vec<_> = errors
+            .iter()
+            .filter(|d| d.message.contains("escape"))
+            .map(|d| d.span)
+            .collect();
+        assert_eq!(
+            escape_spans.len(),
+            2,
+            "both bad escapes reported: {errors:?}"
+        );
+        assert_ne!(
+            escape_spans[0], escape_spans[1],
+            "each error points at its own escape"
+        );
+        let arm = file
+            .declarations
+            .iter()
+            .find_map(|d| match &d.kind {
+                crate::ast::DeclarationKind::OneOf(o) => o.arms.first(),
+                _ => None,
+            })
+            .expect("oneof lowered");
+        assert_eq!(
+            arm.value, "l\u{FFFD}o\u{FFFD}g",
+            "recovered text keeps the arm's identity"
+        );
+    }
+
     /// First Comment token whose text matches.
     fn comment_with(root: &SyntaxNode, needle: &str) -> SyntaxToken {
         root.descendants_with_tokens()
@@ -1549,14 +1585,20 @@ service App is Base:
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert!(!file.declarations.is_empty());
 
-        // Inside brackets there is no modifier syntax and arrays span
-        // lines, so a NEXT-LINE pipe is still a chain there (unlike the
-        // dash spelling below).
+        // A newline inside brackets already breaks layout today (multi-
+        // line arrays are not offside-legal), so a cross-line chain sits
+        // among pre-existing layout errors — but the chain must STILL be
+        // named (any-pipe rule in brackets) with a healthy span (the
+        // entry/loop predicate mismatch once consumed zero legs here and
+        // computed an INVERTED span).
         let (_, diags) = parse_to_ast_all("w s:\n    keys = [$ENV.A\n        | $ENV.B]\n");
-        assert!(
-            diags.iter().any(|d| d.to_string().contains("NML0021")),
-            "cross-line array chain must still teach: {diags:?}"
-        );
+        let chain: Vec<_> = diags
+            .iter()
+            .filter(|d| d.to_string().contains("NML0021"))
+            .collect();
+        assert_eq!(chain.len(), 1, "{diags:?}");
+        let sp = chain[0].span.expect("spanned");
+        assert!(sp.end > sp.start, "inverted span: {sp:?}");
 
         // NON-regression: a next-line `|modifier` entry is NOT a chain (the
         // same-line rule) — nudge's `|grant` syntax depends on this.

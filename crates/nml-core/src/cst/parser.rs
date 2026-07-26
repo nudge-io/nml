@@ -878,19 +878,25 @@ impl<'a> Parser<'a> {
     /// the grammar hook (design parked: identity-is-syntactic, no body on
     /// chains — see the stability notes).
     fn reject_fallback_tail(&mut self, ctx: FallbackTailCtx) {
-        let at_chain = match ctx {
+        // ONE pipe-detection rule per context, shared by the entry check
+        // and the consumption loop (they diverged once: the loop kept the
+        // same-line rule while ArrayElement entry accepted any pipe — zero
+        // legs consumed and an inverted span for cross-line array chains).
+        let at_chain = |p: &Self| match ctx {
             // In body position a NEXT-LINE `|` is modifier syntax
             // (`|grant`), so only a same-line pipe is a chain.
-            FallbackTailCtx::DashItem => self.at_fallback_pipe(),
-            // Inside brackets no modifier syntax exists and arrays may
-            // span lines — ANY pipe is a chain.
-            FallbackTailCtx::ArrayElement => self.at(SyntaxKind::Pipe),
+            FallbackTailCtx::DashItem => p.at_fallback_pipe(),
+            // Inside brackets no modifier syntax exists, so ANY pipe is
+            // a chain. (Newlines in brackets are layout errors today —
+            // the any-pipe rule still names the chain amid that noise,
+            // and stays correct if brackets ever suppress layout.)
+            FallbackTailCtx::ArrayElement => p.at(SyntaxKind::Pipe),
         };
-        if !at_chain {
+        if !at_chain(self) {
             return;
         }
         let start = self.current_span();
-        while self.at_fallback_pipe() {
+        while at_chain(self) {
             self.bump(); // |
             // Mirror `value_or_fallback`'s leg shape (fuzz-proven to
             // terminate); on garbage after `|`, stop — the error below
