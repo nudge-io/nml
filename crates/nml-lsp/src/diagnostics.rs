@@ -63,6 +63,17 @@ pub fn compute(
         push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
     }
 
+    // RFC 0018 facet DEFINITION rules (NML2058). Context-free over the
+    // lowered AST, so they publish here — off the parse band every
+    // document already gets — rather than from a mode-gated
+    // re-extraction: `.model.nml` files (where facets are actually
+    // authored) are registry sources and skip the merge branch below,
+    // and the covered-schema pass reaches only package-bound files.
+    // One call, every document, no second parse.
+    for diag in nml_core::schema::facet_definition_diagnostics(&file) {
+        push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
+    }
+
     let mut symbols = nml_core::symbols::SymbolTable::new();
     symbols.register_file(&file);
 
@@ -99,17 +110,7 @@ pub fn compute(
             // collision-checking) them against themselves would be noise.
             let doc_is_registry_source = config.uri_is_registry_source;
             if !doc_is_registry_source {
-                let (own, own_diags) = nml_core::cst::extract_schema(source);
-                // RFC 0018: a mixed (self-validating) file's facet
-                // DEFINITION findings surface here — parse_to_ast_all
-                // above already published the parse band, so only the
-                // definition band passes (no double-reporting), and the
-                // editor matches `nml check` exactly.
-                for d in own_diags {
-                    if d.code == Some(nml_core::diagnostic::codes::FACET_DEFINITION) {
-                        push_diagnostic(d, None, uri, &line_index, &mut diagnostics);
-                    }
-                }
+                let (own, _) = nml_core::cst::extract_schema(source);
                 for m in own.models {
                     if models.iter().any(|k| k.name == m.name) {
                         // CLI parity (RFC 0012): the same collision `nml
@@ -857,19 +858,76 @@ package demo:
         );
     }
 
-    /// RFC 0018 (round 22): a mixed self-validating file's facet
-    /// DEFINITION findings reach the editor — exactly once (the parse
-    /// band publishes separately; only the definition band passes the
-    /// extraction filter).
+    /// Round 22: a COVERED `.model.nml` file is validated by BOTH
+    /// `compute` (parse band, this RFC) and `schema_source_pass`
+    /// (RFC 0030, which re-derives extraction errors) — and the
+    /// server's duplicate suppression collapses them to one squiggle.
+    /// This pins the invariant that suppression depends on: the two
+    /// paths must emit byte-identical range/message/severity, or a
+    /// covered schema author sees the same error twice.
     #[test]
-    fn mixed_file_facet_definition_errors_publish_once() {
-        let source = "model m:\n    s string(min = 1)\n\nm A:\n    s = \"x\"\n";
-        let diags = compute_registry(source, &[], &[], &[], &default_config());
-        let hits: Vec<_> = diags
-            .iter()
-            .filter(|d| d.message.contains("facets attach only to `number`"))
-            .collect();
-        assert_eq!(hits.len(), 1, "exactly one NML2058: {diags:?}");
+    fn covered_model_file_facet_error_is_not_double_squiggled() {
+        let source = "model m:\n    s string(min = 1)\n";
+        let mut cfg = default_config();
+        cfg.uri_is_registry_source = true;
+        let from_compute = compute_registry(source, &[], &[], &[], &cfg);
+        let from_schema_pass = schema_source_pass(source, &demo_vocab(false), None);
+
+        let facet_of = |v: &[Diagnostic]| -> Vec<Diagnostic> {
+            v.iter()
+                .filter(|d| d.message.contains("facets attach only to `number`"))
+                .cloned()
+                .collect()
+        };
+        let a = facet_of(&from_compute);
+        let b = facet_of(&from_schema_pass);
+        assert_eq!(a.len(), 1, "compute must emit it once: {from_compute:?}");
+        assert_eq!(
+            b.len(),
+            1,
+            "schema_source_pass re-derives it once: {from_schema_pass:?}"
+        );
+        // The server's suppression predicate, verbatim.
+        assert!(
+            a[0].range == b[0].range
+                && a[0].message == b[0].message
+                && a[0].severity == b[0].severity,
+            "the two paths must be exact duplicates or the server \
+             double-squiggles:\n  compute: {:?}\n  schema:  {:?}",
+            a[0],
+            b[0]
+        );
+    }
+
+    /// RFC 0018 (round 22): facet DEFINITION findings reach the editor
+    /// for BOTH document shapes — exactly once each. The pure
+    /// `.model.nml` case is the one that matters most (facets are
+    /// authored there) and is precisely the one a mode-gated
+    /// publication missed: registry sources skip the merge branch, and
+    /// the covered-schema pass has no production caller.
+    #[test]
+    fn facet_definition_errors_publish_once_for_every_document_shape() {
+        let mut model_cfg = default_config();
+        model_cfg.uri_is_registry_source = true;
+        for (label, source, cfg) in [
+            (
+                "pure .model.nml",
+                "model m:\n    s string(min = 1)\n",
+                &model_cfg,
+            ),
+            (
+                "mixed self-validating",
+                "model m:\n    s string(min = 1)\n\nm A:\n    s = \"x\"\n",
+                &default_config(),
+            ),
+        ] {
+            let diags = compute_registry(source, &[], &[], &[], cfg);
+            let hits = diags
+                .iter()
+                .filter(|d| d.message.contains("facets attach only to `number`"))
+                .count();
+            assert_eq!(hits, 1, "{label}: want exactly one NML2058, got {diags:?}");
+        }
     }
 
     #[test]

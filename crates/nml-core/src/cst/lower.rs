@@ -563,13 +563,63 @@ mod tests {
             fields[2].field_type.to_string(),
             "set<number(multipleOf = 0.01)>"
         );
-        // Model refs keep the facet evidence for the NML2031 pass.
+        // Model refs keep the facet evidence for the NML2058 pass.
         assert_eq!(fields[3].field_type.to_string(), "denial(min = 2)");
     }
 
     /// A domain-rejected facet literal reports the SAME NML0014 surface
     /// as a config literal (one numeric error vocabulary) and recovers
     /// to the zero placeholder.
+    /// Round 22: facets compose with every other field suffix —
+    /// optional `?`, a `= default`, trailing `#directives`, and the
+    /// positional `+` — since the facet list sits between the type
+    /// name and all of them. Space before the paren does NOT attach
+    /// (an attached list is part of the type name, like a call).
+    #[test]
+    fn facets_compose_with_field_suffixes() {
+        let file = cst_ast(
+            "model m:\n    a number(min = 1)?\n    b number(min = 0) = 5\n    c number(max = 9) #live\n    d number(min = 1)+\n",
+        );
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("expected block");
+        };
+        let fields: Vec<_> = block
+            .body
+            .entries
+            .iter()
+            .filter_map(|e| match &e.kind {
+                BodyEntryKind::FieldDefinition(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+        assert!(fields[0].optional, "`?` binds to the field, not the facets");
+        assert_eq!(fields[0].field_type.to_string(), "number(min = 1)");
+        assert!(fields[1].default_value.is_some(), "`= default` survives");
+        assert_eq!(fields[1].field_type.to_string(), "number(min = 0)");
+        assert_eq!(fields[2].directives.len(), 1, "directives survive");
+        assert_eq!(fields[2].field_type.to_string(), "number(max = 9)");
+        assert!(fields[3].shorthand, "`+` binds to the field");
+
+        // Whitespace before the paren attaches, like whitespace
+        // anywhere else within a line; fmt canonicalizes the spelling.
+        // No ambiguity with union types: a `(` at type-START is the
+        // union branch, a different path — this one runs only after a
+        // type NAME was consumed, where a paren was previously always
+        // a parse error.
+        let (file, errors) = crate::cst::parse_to_ast_all("model m:\n    a number (min = 1)\n");
+        assert!(
+            errors.is_empty(),
+            "space before the paren attaches: {errors:?}"
+        );
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("expected block");
+        };
+        let BodyEntryKind::FieldDefinition(f) = &block.body.entries[0].kind else {
+            panic!("expected field");
+        };
+        assert_eq!(f.field_type.to_string(), "number(min = 1)");
+    }
+
     /// F3 (round-21): facet lists never span lines, and a newline can
     /// never let a facet list swallow the NEXT field. Singular
     /// findings: the first failed expectation ends the list.
