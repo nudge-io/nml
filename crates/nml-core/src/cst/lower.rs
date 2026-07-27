@@ -426,9 +426,14 @@ fn facets_of(te: &ast::TypeExpr, errors: &mut Vec<NmlError>) -> Vec<FacetExpr> {
                         usize::from(n.text_range().end()),
                     ),
                 ),
-                // Parser already errored (expected a number literal);
-                // recover structured.
-                _ => (String::from("0"), span),
+                // Parser already errored (expected a number literal).
+                // DROP the facet rather than invent `= 0`: a fabricated
+                // bound makes every later rule measure against
+                // something nobody wrote (`multipleOf = )` reported
+                // "must be positive (got 0)", and a default then got a
+                // VALUE diagnostic against that phantom). Matches
+                // extraction, which also drops it.
+                _ => return None,
             };
             // A facet whose literal does not decode is DROPPED, not
             // recovered to zero — matching extraction (cst/extract.rs),

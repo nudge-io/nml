@@ -1,0 +1,8 @@
+trait a:
+    x string?
+
+model b is a:
+    y number = 1
+
+b B:
+    y = 2

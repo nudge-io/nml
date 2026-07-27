@@ -43,8 +43,9 @@
 "exclusiveMax = "
 "multipleOf = "
 
+# (dict escapes are AFL-style: \\, \", \xNN — no \n shorthand)
 # ── structure & operators ───────────────────────────────────────────────
-":\n"
+":\x0a"
 " = "
 "- "
 "->"

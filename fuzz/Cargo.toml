@@ -17,6 +17,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 nml-core = { path = "../crates/nml-core" }
 nml-fmt = { path = "../crates/nml-fmt" }
+nml-validate = { path = "../crates/nml-validate" }
 
 [[bin]]
 name = "number"
@@ -49,6 +50,13 @@ bench = false
 [[bin]]
 name = "duration"
 path = "fuzz_targets/duration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validate"
+path = "fuzz_targets/validate.rs"
 test = false
 doc = false
 bench = false

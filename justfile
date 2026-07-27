@@ -109,9 +109,13 @@ fuzz target='number' time='60':
     # seed directory, so a target with no landmarks yet would otherwise
     # fail to start rather than simply fuzz unseeded.
     mkdir -p fuzz/corpus/{{target}} fuzz/seeds/{{target}}
+    # `-dict` hands the fuzzer the language's own tokens so it splices
+    # whole keywords/operators instead of spelling them byte by byte —
+    # standard practice for grammar targets, and libFuzzer asks for it in
+    # every run's "Recommended dictionary" section.
     cargo +nightly fuzz run {{target}} \
         fuzz/corpus/{{target}} fuzz/seeds/{{target}} \
-        -- -max_total_time={{time}}
+        -- -max_total_time={{time}} -dict=fuzz/nml.dict
 
 # Clean build artifacts
 clean:

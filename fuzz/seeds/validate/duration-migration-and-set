@@ -1,0 +1,7 @@
+model k:
+    t duration
+    r set<duration>
+
+k K:
+    t = "30s"
+    r = [1s, 1000ms]

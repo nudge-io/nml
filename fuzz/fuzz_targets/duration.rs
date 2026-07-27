@@ -66,15 +66,13 @@ fuzz_target!(|data: &[u8]| {
         // and unit alone, so it cannot vary with the input at all. Adding
         // an input interpolation to that message fails this immediately.
         Err(e) => {
-            let permitted: Vec<String> = std::iter::once(
-                DurationTextError::Malformed.to_string(),
-            )
-            .chain(
-                DurationUnit::ALL
-                    .into_iter()
-                    .map(|u| DurationTextError::OutOfRange(u).to_string()),
-            )
-            .collect();
+            let permitted: Vec<String> = std::iter::once(DurationTextError::Malformed.to_string())
+                .chain(
+                    DurationUnit::ALL
+                        .into_iter()
+                        .map(|u| DurationTextError::OutOfRange(u).to_string()),
+                )
+                .collect();
             let text = e.to_string();
             assert!(
                 permitted.contains(&text),

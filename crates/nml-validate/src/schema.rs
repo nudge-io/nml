@@ -3092,6 +3092,60 @@ mod tests {
         }
     }
 
+    /// **The parity invariant.** A declared default and the same
+    /// literal written as a config value face the SAME type, so they
+    /// must produce the SAME number of facet violations. Two separate
+    /// traversals decide that today — the definition-side walk in
+    /// nml-core and enforcement's walk here — and every facet defect
+    /// found in rounds 24-26 was those two disagreeing about which
+    /// sub-type a value faces (scalar unions, unions of collections,
+    /// fallback legs). This sweeps the shapes so a divergence fails
+    /// here instead of shipping silently.
+    #[test]
+    fn default_checking_and_value_checking_agree() {
+        // (type, literal) — every shape the two walks must agree on.
+        let corpus = [
+            ("number(min = 10)", "5"),
+            ("number(min = 10)", "50"),
+            ("number(min = 10, max = 20)", "25"),
+            ("number(multipleOf = 0.1)", "0.25"),
+            ("number(multipleOf = 0.1)", "0.3"),
+            ("(number(min = 10) | string)", "5"),
+            ("(string | number(min = 10))", "5"),
+            ("(number(min = 10) | string)", "50"),
+            ("(number(min = 10) | number(max = 0))", "5"),
+            ("(number(min = 10) | number(max = 0))", "-5"),
+            ("[]number(min = 10)", "[5]"),
+            ("[]number(min = 10)", "[5, 3]"),
+            ("[]number(min = 10)", "[50]"),
+            ("([]number(min = 10) | []string)", "[5]"),
+            ("([]string | []number(min = 10))", "[5]"),
+            ("set<number(min = 10)>", "[5]"),
+            ("(set<number(min = 10)> | set<string>)", "[5]"),
+            ("number(min = 10)", "3 | 5"),
+            ("number(min = 10)", "3 | 50"),
+            ("number(min = 10)", "50 | 60"),
+            ("(number(min = 10) | string)", "3 | 5"),
+        ];
+        let facet_errs = |ds: &[Diagnostic]| -> usize {
+            ds.iter()
+                .filter(|d| d.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION))
+                .count()
+        };
+        for (ty, lit) in corpus {
+            // A: the literal as a declared DEFAULT.
+            let as_default = format!("model m:\n    p {ty} = {lit}\n");
+            let a = facet_errs(&nml_core::cst::extract_schema(&as_default).1);
+            // B: the same literal as a config VALUE.
+            let schema = format!("model m:\n    p {ty}?\n");
+            let b = facet_errs(&diags(&schema, &format!("m X:\n    p = {lit}\n")));
+            assert_eq!(
+                a, b,
+                "parity broken for `{ty}` = `{lit}`: default reported {a}, value reported {b}"
+            );
+        }
+    }
+
     /// RFC 0018 §1.2's by-construction promise, pinned at the path
     /// that actually broke it: `load_schema` — what packages, the
     /// loader and downstream boots use. A violating DEFAULT used to

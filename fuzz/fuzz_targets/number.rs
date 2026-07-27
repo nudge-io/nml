@@ -39,8 +39,8 @@ fuzz_target!(|data: &[u8]| {
             // literal parses to the IDENTICAL stored member.
             if s.contains('_') {
                 let stripped: String = s.chars().filter(|c| *c != '_').collect();
-                let b = parse(&stripped)
-                    .unwrap_or_else(|e| panic!("stripped form of {s:?}: {e:?}"));
+                let b =
+                    parse(&stripped).unwrap_or_else(|e| panic!("stripped form of {s:?}: {e:?}"));
                 assert_eq!(
                     n.total_cmp(&b),
                     std::cmp::Ordering::Equal,

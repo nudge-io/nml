@@ -1835,8 +1835,18 @@ fn facet_type_applies(te: &crate::ast::FieldTypeExpr, value: &crate::types::Valu
     use crate::ast::FieldTypeExpr as T;
     match (te, value) {
         (T::Named { name, .. }, crate::types::Value::Number(_)) => name.name == "number",
-        (T::Array(_) | T::Set(_), crate::types::Value::Array(_)) => true,
+        // Every element must face the element type — `[]string` must
+        // NOT claim `[5]`. Mirrors enforcement's `value_matches_type`,
+        // which requires all items to match `inner`; without it a
+        // non-numeric collection variant vacuously admits a numeric
+        // array, the union bug one level down.
+        (T::Array(inner) | T::Set(inner), crate::types::Value::Array(items)) => {
+            items.iter().all(|i| facet_type_applies(inner, &i.value))
+        }
         (T::Union(vs), v) => vs.iter().any(|x| facet_type_applies(x, v)),
+        (_, crate::types::Value::Fallback(p, f)) => {
+            facet_type_applies(te, &p.value) || facet_type_applies(te, &f.value)
+        }
         _ => false,
     }
 }
@@ -1852,6 +1862,13 @@ fn facet_default_violations(
     diags: &mut Vec<Diagnostic>,
 ) {
     use crate::ast::FieldTypeExpr as T;
+    // A fallback default (`= 3 | 5`) faces the type on BOTH legs, like
+    // enforcement — either leg can be the value that materializes.
+    if let crate::types::Value::Fallback(primary, fallback) = value {
+        facet_default_violations(te, &primary.value, field_name, primary.span, diags);
+        facet_default_violations(te, &fallback.value, field_name, fallback.span, diags);
+        return;
+    }
     match te {
         T::Named { name, facets } if name.name == "number" && !facets.is_empty() => {
             let crate::types::Value::Number(n) = value else {

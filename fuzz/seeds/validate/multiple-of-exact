@@ -1,0 +1,5 @@
+model j:
+    step number(multipleOf = 0.1)
+
+j J:
+    step = 0.3
