@@ -373,3 +373,82 @@ impl std::fmt::Display for FieldType {
         }
     }
 }
+
+#[cfg(test)]
+mod facet_tests {
+    use super::*;
+    use crate::types::Number;
+
+    fn n(s: &str) -> Number {
+        s.parse().unwrap()
+    }
+
+    /// `admits` is the non-emitting twin of `violations` and the union
+    /// fast path trusts it. If the two ever disagree, a value is
+    /// admitted by one path and reported by the other — a silent
+    /// inconsistency no test elsewhere would catch. Swept over every
+    /// facet combination against a value grid spanning the boundaries.
+    #[test]
+    fn admits_agrees_with_violations_exhaustively() {
+        let bound = |v: &str, exclusive: bool| FacetBound {
+            value: n(v),
+            exclusive,
+            span: Span::empty(0),
+        };
+        let mins = [
+            None,
+            Some(bound("0", false)),
+            Some(bound("0", true)),
+            Some(bound("-2.5", false)),
+            Some(bound("10", true)),
+        ];
+        let maxs = [
+            None,
+            Some(bound("10", false)),
+            Some(bound("10", true)),
+            Some(bound("0", false)),
+            Some(bound("2.5", true)),
+        ];
+        let muls = [
+            None,
+            Some(FacetMultiple {
+                value: n("0.1"),
+                span: Span::empty(0),
+            }),
+            Some(FacetMultiple {
+                value: n("1"),
+                span: Span::empty(0),
+            }),
+            Some(FacetMultiple {
+                value: n("2.5"),
+                span: Span::empty(0),
+            }),
+        ];
+        let values = [
+            "-10", "-2.5", "-0.1", "0", "0.0", "0.1", "0.3", "1", "2.5", "5", "9.9", "10", "10.0",
+            "10.1", "1e3", "0.05",
+        ];
+        let mut checked = 0usize;
+        for min in &mins {
+            for max in &maxs {
+                for mul in &muls {
+                    let f = NumberFacets {
+                        min: min.clone(),
+                        max: max.clone(),
+                        multiple_of: mul.clone(),
+                    };
+                    for v in values {
+                        let num = n(v);
+                        assert_eq!(
+                            f.admits(&num),
+                            f.violations(&num).is_empty(),
+                            "admits/violations disagree on {v} against {f:?}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, mins.len() * maxs.len() * muls.len() * values.len());
+    }
+}

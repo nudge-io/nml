@@ -3215,19 +3215,36 @@ mod tests {
                 .all(|x| x.code != Some(nml_core::diagnostic::codes::FACET_DEFINITION)),
             "single-point range is legal: {d:?}"
         );
-        // A default violating its own facets: NML2057 via the shared
-        // enforcement pass (the definitions verb / validate_field_defaults).
-        let d = {
-            let src = "model m:\n    x number(min = 0) = -1\n";
-            let file = nml_core::cst::parse_to_ast(src).unwrap();
-            make_validator(src).validate_definitions(&file)
-        };
+        // A default violating its own facets reports as NML2057 —
+        // ONCE. It is owned by the by-construction pass
+        // (`facet_definition_diagnostics`, which every consumer gets);
+        // the definitions verb deliberately drops its own facet
+        // findings on defaults so one defect is not printed twice with
+        // two phrasings.
+        let src = "model m:\n    x number(min = 0) = -1\n";
+        let by_construction: Vec<_> = nml_core::cst::extract_schema(src)
+            .1
+            .into_iter()
+            .filter(|x| x.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION))
+            .collect();
+        assert_eq!(
+            by_construction.len(),
+            1,
+            "the choke point owns it: {by_construction:?}"
+        );
         assert!(
-            d.iter().any(|x| {
-                x.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION)
-                    && x.rendered_message().contains("below the schema's min = 0")
-            }),
-            "default must satisfy facets: {d:?}"
+            by_construction[0]
+                .rendered_message()
+                .contains("default for 'x' is -1, below the schema's min = 0"),
+            "{by_construction:?}"
+        );
+        let file = nml_core::cst::parse_to_ast(src).unwrap();
+        let from_verb = make_validator(src).validate_definitions(&file);
+        assert!(
+            from_verb
+                .iter()
+                .all(|x| x.code != Some(nml_core::diagnostic::codes::FACET_VIOLATION)),
+            "the verb must not duplicate the by-construction finding: {from_verb:?}"
         );
     }
 
