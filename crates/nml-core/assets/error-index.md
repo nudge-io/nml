@@ -7,9 +7,15 @@ never reused; a retired code keeps its section as a tombstone (see the
 by `just docs-test`: a code without a section — or a section without a code —
 fails CI, and most examples below run through the real CLI.
 
+**Sections are in ascending code order** — this is a lookup table, so a new
+section goes beside its numeric neighbours rather than at the end (also
+CI-enforced; the constants in `diagnostic.rs` carry the same rule at compile
+time, and the ordering is what makes `nml explain --list` scannable).
+
 Bands (allocation convenience, not API): 0001–0999 lex/parse ·
 1000–1999 symbols & resolution · 2000–2999 schema loading & validation ·
-3000–3999 values & money · 4000–4999 packages & store · 5000–5999 editor/LSP.
+3000–3999 values, money & durations · 4000–4999 packages & store ·
+5000–5999 editor/LSP.
 
 ## NML0001
 
@@ -606,6 +612,35 @@ oneof thing by kind:
 ```
 
 **Fix:** declare the model, or correct the arm's target name.
+
+## NML2013
+
+**Inheritance cycle.** `is` chains must be acyclic.
+
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2013]'
+model cycleA is cycleB:
+    x string?
+model cycleB is cycleA:
+    y string?
+```
+
+**Fix:** break the cycle; extract shared fields into a trait both compose.
+
+## NML2014
+
+**Model-reference cycle (advisory).** Model fields reference each other in a
+loop. Legal — recursive configs exist — but often an unintended
+self-reference, so it warns.
+
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2014]'
+model node:
+    next otherNode?
+model otherNode:
+    back node?
+```
+
+**Fix:** if intended, ignore (it is only a warning); otherwise break the
+loop.
 
 ## NML2015
 
@@ -1253,14 +1288,6 @@ collide; a modifier-form field (`|kind`) is distinct authoring and does not
 shadow.
 
 
-## NML4000
-
-**Fully shadowed validator.** A package validator binding's globs can
-never match first — earlier bindings claim every file it would. Dead
-configuration in the manifest (RFC 0030 meta-validation).
-
-**Fix:** reorder the bindings, or remove the dead one.
-
 ## NML2055
 
 **Dropped item body.** A list item carries a body, but the element type
@@ -1290,7 +1317,7 @@ those fields.
 declares (RFC 0018): `min`/`max` (inclusive), `exclusiveMin`/
 `exclusiveMax`, or `multipleOf`.
 
-```nml
+```nml check expect-error='[NML2057]'
 model server:
     port number(min = 1, max = 65535)
 
@@ -1298,9 +1325,8 @@ server Web:
     port = 70000
 ```
 
-```text
-error[NML2057]: 'port' is 70000, above the schema's max = 65535
-```
+The message names the field, its value, and the facet as authored:
+`'port' is 70000, above the schema's max = 65535`.
 
 Enforcement is **exact**: bounds compare through the RFC 0016 decimal
 core, and `multipleOf` is decided by exact decimal divisibility — so
@@ -1323,46 +1349,16 @@ its counterpart), or `multipleOf` that is not positive. (A default
 violating its own facets reports as NML2057 — it is a value breaking a
 constraint, found where values are checked.)
 
-```nml
+```nml check expect-error='[NML2058]'
 model m:
     name string(min = 1)
 ```
 
-```text
-error[NML2058]: 'name': facets attach only to `number` — `string` cannot carry them
-```
+The message names the field and the rule: ``'name': facets attach only
+to `number` — `string` cannot carry them``.
 
 **Fix:** move range constraints to `number` fields; string/collection
 length constraints are deliberately not spelled with these keys.
-
-## NML2013
-
-**Inheritance cycle.** `is` chains must be acyclic.
-
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2013]'
-model cycleA is cycleB:
-    x string?
-model cycleB is cycleA:
-    y string?
-```
-
-**Fix:** break the cycle; extract shared fields into a trait both compose.
-
-## NML2014
-
-**Model-reference cycle (advisory).** Model fields reference each other in a
-loop. Legal — recursive configs exist — but often an unintended
-self-reference, so it warns.
-
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2014]'
-model node:
-    next otherNode?
-model otherNode:
-    back node?
-```
-
-**Fix:** if intended, ignore (it is only a warning); otherwise break the
-loop.
 
 ## NML3000
 
@@ -1375,6 +1371,18 @@ product Widget:
 ```
 
 **Fix:** write a plain decimal amount (`1.2 USD`).
+
+## NML3001
+
+**Unknown currency code.** The trailing code is not in the ISO 4217 table;
+near-misses get a machine-applicable suggestion.
+
+```nml check expect-error='[NML3001]'
+product Widget:
+    price = 19.99 USE
+```
+
+**Fix:** apply the suggestion (`USD`), or use any ISO 4217 code.
 
 ## NML3002
 
@@ -1401,18 +1409,6 @@ product Widget:
 ```
 
 **Fix:** use a representable amount (the bound is ~92 quadrillion cents).
-
-## NML3001
-
-**Unknown currency code.** The trailing code is not in the ISO 4217 table;
-near-misses get a machine-applicable suggestion.
-
-```nml check expect-error='[NML3001]'
-product Widget:
-    price = 19.99 USE
-```
-
-**Fix:** apply the suggestion (`USD`), or use any ISO 4217 code.
 
 ## NML3004
 
@@ -1465,6 +1461,14 @@ service Api:
 ```
 
 **Fix:** use a non-negative magnitude within the unit's stated maximum.
+
+## NML4000
+
+**Fully shadowed validator.** A package validator binding's globs can
+never match first — earlier bindings claim every file it would. Dead
+configuration in the manifest (RFC 0030 meta-validation).
+
+**Fix:** reorder the bindings, or remove the dead one.
 
 ## NML5000
 

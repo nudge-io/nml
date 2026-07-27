@@ -498,7 +498,14 @@ def check_error_index() -> list[tuple[str, str]]:
     """Bidirectional drift guard: every code constant has a `## NML####`
     section in the error index, and every section corresponds to a declared
     constant. A new code cannot ship without its documentation (and a page
-    cannot outlive its code without a visible failure)."""
+    cannot outlive its code without a visible failure).
+
+    Also enforces **ascending section order** — the reader-facing half of
+    the rule `diagnostic.rs` enforces at compile time for the declarations
+    themselves. This index is a lookup table: someone who hit `NML3001`
+    scans for it, and a section filed after `NML3003` is a section they
+    walk past. Ordering is the affordance that makes scanning work, so it
+    is checked rather than hoped for."""
     declared = {
         f"NML{int(m):04}"
         for m in re.findall(r"^\s+[A-Z_]+ = (\d+);", (REPO / CODES_SOURCE).read_text(encoding="utf-8"), re.M)
@@ -506,12 +513,65 @@ def check_error_index() -> list[tuple[str, str]]:
     index_path = REPO / ERROR_INDEX
     if not index_path.is_file():
         return [(ERROR_INDEX, "error index missing — every code needs a section")]
-    documented = set(re.findall(r"^## (NML\d{4})", index_path.read_text(encoding="utf-8"), re.M))
+    index_text = index_path.read_text(encoding="utf-8")
+    order = [int(m) for m in re.findall(r"^## NML(\d{4})", index_text, re.M)]
+    documented = {f"NML{n:04}" for n in order}
     failures = []
     if undocumented := sorted(declared - documented):
         failures.append((ERROR_INDEX, f"codes missing a section: {', '.join(undocumented)}"))
     if orphaned := sorted(documented - declared):
         failures.append((ERROR_INDEX, f"sections for undeclared codes: {', '.join(orphaned)}"))
+    # The band table is stated twice — once as rustdoc for library
+    # consumers, once in the index preamble for people reading the error
+    # pages. Both are the right audience for it, so the duplication stays;
+    # what does not stay is the drift (RFC 0017 widened band 3000 to
+    # "durations" in the rustdoc and the index kept saying "values &
+    # money" for a release cycle). Compare the parsed band→label maps, so
+    # wording and line-wrapping may differ but the meaning cannot.
+    def bands(text: str) -> dict[str, str]:
+        # Collapse to one line and drop rustdoc continuation markers, so a
+        # doc comment and a markdown paragraph normalize identically.
+        flat = " ".join(text.replace("///", " ").split())
+        return {
+            lo: " ".join(label.split())
+            for lo, label in re.findall(r"(\d{4})[–-]\d{4} ([^·.]+)", flat)
+        }
+
+    code_bands = bands(
+        re.search(
+            r"The stable code space.*?editor/LSP",
+            (REPO / CODES_SOURCE).read_text(encoding="utf-8"),
+            re.S,
+        ).group(0)
+    )
+    index_bands = bands(
+        re.search(r"^Bands \(.*?editor/LSP", index_text, re.S | re.M).group(0)
+    )
+    if code_bands != index_bands:
+        differing = sorted(
+            b for b in set(code_bands) | set(index_bands)
+            if code_bands.get(b) != index_bands.get(b)
+        )
+        failures.append(
+            (
+                ERROR_INDEX,
+                "band table disagrees with the rustdoc in "
+                f"{CODES_SOURCE} for band(s) {', '.join(differing)}: "
+                f"{ {b: (code_bands.get(b), index_bands.get(b)) for b in differing} }",
+            )
+        )
+    if misordered := [
+        f"NML{order[i + 1]:04} after NML{order[i]:04}"
+        for i in range(len(order) - 1)
+        if order[i] > order[i + 1]
+    ]:
+        failures.append(
+            (
+                ERROR_INDEX,
+                "sections must be in ascending code order (readers scan this "
+                f"index by number): {', '.join(misordered)}",
+            )
+        )
     failures.extend(check_relative_links(index_path))
     return failures
 

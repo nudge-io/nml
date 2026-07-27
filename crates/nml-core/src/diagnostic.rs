@@ -99,11 +99,17 @@ impl fmt::Display for Code {
     }
 }
 
-/// Declares the code constants and (in tests) the `ALL` list from one
-/// source, so the uniqueness test can never drift from the declarations.
+/// Declares the code constants plus the two derived lists — the numbers
+/// (always, for the compile-time allocation guard) and the named pairs (in
+/// tests, for coverage sweeps) — from one source, so neither can drift
+/// from the declarations.
 macro_rules! codes {
     ($($(#[$doc:meta])* $name:ident = $num:literal;)+) => {
         $($(#[$doc])* pub const $name: Code = Code($num);)+
+        /// Declaration order, numbers only — the guard's input. Names live
+        /// in the test-only `ALL`; a `u16` slice keeps the release binary
+        /// free of 95 constant names it would never read.
+        const DECLARED: &[u16] = &[$($num),+];
         #[cfg(test)]
         pub(crate) const ALL: &[(&str, Code)] = &[$((stringify!($name), $name)),+];
     };
@@ -212,6 +218,11 @@ pub mod codes {
         MULTIPLE_POSITIONAL_FIELDS = 2011;
         /// A `oneof` arm references a model that is not declared.
         ONEOF_INTEGRITY = 2012;
+        /// Model `extends` chains form a cycle.
+        EXTENDS_CYCLE = 2013;
+        /// Model references form a cycle (advisory: legal, but often a sign
+        /// of an unintended self-reference).
+        MODEL_REFERENCE_CYCLE = 2014;
         /// A `oneof` declares the same discriminator value twice.
         DUPLICATE_DISCRIMINANT = 2015;
         /// A `oneof` name collides with a model or enum name.
@@ -312,12 +323,6 @@ pub mod codes {
         /// A bare scalar item's key was dropped: the element model declares
         /// no positional (`+`) field to receive it.
         DROPPED_ITEM_KEY = 2049;
-
-        /// A list item's BODY has nowhere to go: the element type is a
-        /// scalar/union/collection with no fields to fill — the body-side
-        /// mirror of the dropped-key rule above.
-        DROPPED_ITEM_BODY = 2055;
-
         /// A scalar item cannot fill an arm-set shorthand field — an arm
         /// target is a name or a string, so no arm can be synthesized from
         /// this value (RFC 0005 §10).
@@ -337,6 +342,10 @@ pub mod codes {
         /// discriminator — unreachable, the property is always claimed as
         /// the discriminator (advisory).
         SHADOWED_DISCRIMINATOR = 2054;
+        /// A list item's BODY has nowhere to go: the element type is a
+        /// scalar/union/collection with no fields to fill — the body-side
+        /// mirror of the dropped-key rule above.
+        DROPPED_ITEM_BODY = 2055;
         /// RFC 0018: a number violates a declared facet (`min`/`max`/
         /// `exclusiveMin`/`exclusiveMax`/`multipleOf`). Exact
         /// comparisons — no epsilon, no float rounding.
@@ -347,15 +356,6 @@ pub mod codes {
         /// violates its own facets reports as the VIOLATION code
         /// through the shared enforcement pass.)
         FACET_DEFINITION = 2058;
-
-        /// A package validator binding is fully shadowed by earlier
-        /// bindings — its globs can never match first (RFC 0030).
-        SHADOWED_VALIDATOR = 4000;
-        /// Model `extends` chains form a cycle.
-        EXTENDS_CYCLE = 2013;
-        /// Model references form a cycle (advisory: legal, but often a sign
-        /// of an unintended self-reference).
-        MODEL_REFERENCE_CYCLE = 2014;
 
         /// A money literal is malformed (unparseable amount or fraction).
         INVALID_MONEY = 3000;
@@ -380,6 +380,10 @@ pub mod codes {
         /// infallibly by construction — RFC 0017).
         DURATION_OUT_OF_RANGE = 3006;
 
+        /// A package validator binding is fully shadowed by earlier
+        /// bindings — its globs can never match first (RFC 0030).
+        SHADOWED_VALIDATOR = 4000;
+
         /// A directive name is not in the covering package's vocabulary.
         UNKNOWN_DIRECTIVE = 5000;
         /// A directive's argument does not match its declared arity.
@@ -391,6 +395,46 @@ pub mod codes {
         /// A template expression uses a namespace the project does not configure.
         UNKNOWN_TEMPLATE_NAMESPACE = 5004;
     }
+
+    /// **The allocation guard, enforced at compile time.** Declarations are
+    /// strictly ascending — one invariant that buys three properties, and
+    /// the reason it is ordering rather than mere uniqueness:
+    ///
+    /// * **Reuse is impossible.** Strictly increasing implies distinct, so
+    ///   the "never reused" half of the stability contract is a compile
+    ///   error rather than a test failure — the code cannot be built, let
+    ///   alone shipped.
+    /// * **The next free code is readable.** It is one past a band's last
+    ///   entry, visible at a glance. Three consecutive allocation
+    ///   collisions (a proposed pair already taken, then a second pair
+    ///   whose lower half was taken by an out-of-order entry) all traced to
+    ///   the same cause: the list was unordered, so "what is free?" meant
+    ///   scanning 200 lines, and scanning misses.
+    /// * **Insertion is self-locating.** A new code goes beside its
+    ///   numeric neighbours, so a mistake is visible on the line being
+    ///   typed rather than in a distant summary.
+    ///
+    /// Gaps are fine and expected (`2056` is one — a retired allocation
+    /// from a corrected collision): bands are allocation convenience, not
+    /// API, and nothing enumerates a contiguous range. Closing a gap would
+    /// mean renumbering, which the contract forbids.
+    const _: () = {
+        let mut i = 0;
+        while i < DECLARED.len() {
+            assert!(
+                DECLARED[i] >= 1 && DECLARED[i] <= 5999,
+                "diagnostic code is outside the allocated space (1..=5999)"
+            );
+            assert!(
+                i == 0 || DECLARED[i - 1] < DECLARED[i],
+                "diagnostic codes must be declared in strictly ascending order \
+                 (this also proves none is reused) — move the new code beside \
+                 its numeric neighbours; the next free code in a band is one \
+                 past that band's last entry"
+            );
+            i += 1;
+        }
+    };
 }
 
 /// The error index source (`## NML0000` sections) — embedded so explanations
@@ -468,12 +512,15 @@ fn compose_document(head: &str, body: &str) -> String {
     doc
 }
 
-/// Every `(code, summary)` pair in the index, in index order — the
+/// Every `(code, summary)` pair **in ascending code order** — the
 /// discoverability surface behind the editor's `nml/explainIndex` (the
 /// explain-a-code palette) and the CLI's `nml explain --list`. Derived from
 /// the index itself rather than [`codes`], so it needs no runtime code
 /// enumeration and can never disagree with what [`explain`] serves; the
-/// docs-test guard keeps index↔codes bidirectionally complete.
+/// docs-test guard keeps index↔codes bidirectionally complete **and the
+/// index's sections ascending**, which is what makes the order here a
+/// guarantee callers may rely on rather than an accident of file layout
+/// (a palette listing codes out of order is a palette people scroll past).
 pub fn explain_index() -> Vec<(&'static str, String)> {
     sections()
         .filter_map(|(head, body)| Some((head, summary_of(body)?)))
@@ -745,23 +792,9 @@ impl fmt::Display for Diagnostic {
 mod tests {
     use super::*;
 
-    #[test]
-    fn code_constants_are_unique_and_in_band() {
-        let mut seen = std::collections::HashMap::new();
-        for (name, code) in codes::ALL {
-            if let Some(prev) = seen.insert(code.0, name) {
-                panic!("code {} reused by {prev} and {name}", code);
-            }
-            // The allocated code space (bands are contiguous — see the
-            // `codes` module doc — so the space bound is the checkable
-            // invariant; per-band placement is a review concern).
-            assert!(
-                matches!(code.0, 1..=5999),
-                "{name} = {} is outside the allocated code space",
-                code
-            );
-        }
-    }
+    // Allocation invariants (uniqueness, band, ordering) are proven at
+    // COMPILE time by the guard in `codes` — a runtime test could only
+    // re-assert what already failed to build, so none exists.
 
     #[test]
     fn code_display_is_zero_padded() {
@@ -919,9 +952,18 @@ mod tests {
             assert!(!summary.is_empty(), "{head} has an empty summary");
             assert_eq!(explain_summary(head).as_deref(), Some(summary.as_str()));
         }
-        let mut heads: Vec<_> = index.iter().map(|(h, _)| *h).collect();
-        heads.dedup();
-        assert_eq!(heads.len(), index.len(), "duplicate section heads");
+        // Strictly ascending — the documented API guarantee. One assertion
+        // for two properties: ordering (the palette/`--list` contract) and
+        // uniqueness (strictly increasing implies distinct), the same
+        // subsumption the compile-time allocation guard uses. `dedup` alone
+        // caught only *adjacent* repeats, so this strengthens the old check
+        // rather than restating it.
+        let heads: Vec<&str> = index.iter().map(|(h, _)| *h).collect();
+        assert!(
+            heads.windows(2).all(|w| w[0] < w[1]),
+            "index order must be strictly ascending (docs-test enforces the \
+             same rule on the file): {heads:?}"
+        );
     }
 
     #[test]

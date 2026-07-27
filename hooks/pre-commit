@@ -30,6 +30,16 @@ if [ -d docs/rfcs ]; then
             echo "pre-commit: docs/rfcs/README.md has no row for $(basename "$f")" >&2
             exit 1
         fi
+        # The README calls itself the authoritative status list and asks
+        # that it and each RFC's own Status header stay in sync — which
+        # presumes the header exists, in one greppable form. (A survey
+        # using a narrower pattern miscounted these twice; one shape
+        # makes the convention checkable instead of eyeballed.)
+        if ! grep -qE '^- \*\*Status:\*\* ' "$f"; then
+            echo "pre-commit: $(basename "$f") has no '- **Status:** …' header" >&2
+            echo "  (the README index is authoritative; the header keeps the RFC in sync with it)" >&2
+            exit 1
+        fi
     done
 fi
 
