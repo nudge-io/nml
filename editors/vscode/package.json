@@ -10,7 +10,7 @@
     "url": "https://github.com/nudge-io/nml.git"
   },
   "engines": {
-    "vscode": "^1.78.0"
+    "vscode": "^1.91.0"
   },
   "extensionDependencies": [
     "ms-vscode.wasm-wasi-core"

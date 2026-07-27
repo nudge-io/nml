@@ -1002,14 +1002,22 @@ impl SchemaValidator {
             let Some(field) = model.fields.iter().find(|f| f.name == fd.name.name) else {
                 continue;
             };
+            // TYPE checking only. Facet violations on defaults are
+            // reported by `facet_definition_diagnostics`, which every
+            // consumer gets by construction (loader, packages, boot —
+            // not just this verb), so re-reporting them here would
+            // print one defect twice with two different phrasings.
+            let mut scratch = Vec::new();
             self.validate_value_against_type(
                 &default.value,
                 &field.field_type,
                 &field.name,
                 "as the default for",
                 default.span,
-                diags,
+                &mut scratch,
             );
+            scratch.retain(|d| d.code != Some(codes::FACET_VIOLATION));
+            diags.extend(scratch);
         }
     }
 
@@ -3049,6 +3057,39 @@ mod tests {
             }),
             "union-matched number must still honor facets: {d:?}"
         );
+    }
+
+    /// The union fast path (`NumberFacets::admits`) short-circuits on
+    /// the first ADMITTING variant and skips diagnostic construction
+    /// for later rejections. The regression it must never introduce:
+    /// a variant that admits must still be reached when earlier ones
+    /// rejected — otherwise faceted unions silently reject valid
+    /// config. Exercised at every position, including last.
+    #[test]
+    fn union_fast_path_reaches_a_late_admitting_variant() {
+        // Four disjoint faceted bands; only one admits each probe.
+        let schema = "model svc:\n    name string+\n    v (number(min = 100) | number(min = 30, max = 39) | number(min = 20, max = 29) | number(min = 10, max = 19))?\n";
+        // 15 admits only the LAST variant — the position the
+        // short-circuit would break if it stopped early.
+        for (value, want_ok) in [
+            ("150", true), // first
+            ("35", true),  // second
+            ("25", true),  // third
+            ("15", true),  // LAST
+            ("5", false),  // none
+        ] {
+            let d = diags(schema, &format!("svc A:\n    v = {value}\n"));
+            let errs: Vec<_> = d.iter().filter(|x| x.severity == Severity::Error).collect();
+            if want_ok {
+                assert!(errs.is_empty(), "v = {value} must be admitted: {errs:?}");
+            } else {
+                assert!(
+                    errs.iter()
+                        .any(|x| x.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION)),
+                    "v = {value} matches no band: {d:?}"
+                );
+            }
+        }
     }
 
     /// RFC 0018 §1.2's by-construction promise, pinned at the path

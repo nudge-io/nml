@@ -403,39 +403,31 @@ def check_tutorial_files() -> tuple[int, int, list[tuple[str, str]]]:
 COOKBOOK_DIR = "docs/guides/examples/cookbook"
 
 
-def run_cookbook() -> tuple[int, int, list[tuple[str, str]]]:
-    """Run EVERY cookbook example (auto-enumerated — a new recipe can't be
-    forgotten) plus the crate's tests (the TOML-equivalence and schema-test
-    recipes). Each example must print `recipe OK`; stdin is closed so the
-    embed-lsp recipe's server exits on EOF. Returns (checked, passed,
-    failures).
+def cargo_binaries(
+    args: list[str], timeout: int
+) -> tuple[dict[tuple[str, str], str], str | None]:
+    """Build with cargo **once** and return `{(kind, name): executable}` from
+    cargo's own JSON artifact stream, plus an error string on failure.
 
-    **One build, then plain binaries.** Cargo holds an exclusive lock on the
-    build directory for the whole of every invocation, so a `cargo run` per
-    recipe meant a dozen lock acquisitions that serialize behind any other
-    cargo on the machine — turning a seconds-long check into a 300s timeout
-    that looked like a hung recipe (it was not; it never got the lock).
-    Building once and executing the produced binaries directly takes cargo
-    out of the hot loop: one lock acquisition total, no per-recipe cargo
-    overhead, and each recipe's timeout finally measures the recipe rather
-    than the machine's build queue. Executable paths come from cargo's own
-    JSON artifact messages, so nothing here guesses at target layout."""
-    checked = passed = 0
-    failures: list[tuple[str, str]] = []
-    examples_dir = REPO / COOKBOOK_DIR / "examples"
-    examples = sorted(p.stem for p in examples_dir.glob("*.rs"))
-    if not examples:
-        return 1, 0, [(COOKBOOK_DIR, "no cookbook examples found — wiring broken?")]
+    Every runner here used to invoke `cargo run` per program. Cargo holds an
+    **exclusive lock on the build directory** for the whole of each
+    invocation, so those loops serialized behind any other cargo on the
+    machine (a parallel test run, rust-analyzer) — which is how a
+    seconds-long recipe check hit a 300s timeout and reported as a hung
+    recipe when it had simply never been given the lock. Building once and
+    executing the produced binaries directly removes cargo from the hot
+    loop: one lock acquisition per runner, no per-program cargo overhead,
+    and each program's timeout finally measures the program.
 
-    code, output = run_cmd(
-        ["cargo", "test", "--no-run", "-p", "nml-cookbook", "--message-format=json"],
-        timeout=900,
-    )
+    Paths come from cargo's artifact messages rather than an assumed
+    `target/debug/...` layout, so profile, target-dir, and cross-compile
+    changes cannot silently break the lookup. `kind` is cargo's own target
+    kind (`bin`, `example`) or `test` for test harnesses, so callers ask for
+    exactly the artifact class they mean."""
+    code, output = run_cmd(args + ["--message-format=json"], timeout=timeout)
     if code != 0:
-        # One build failure is one finding, not a dozen identical ones.
-        return len(examples) + 1, 0, [("cookbook:build", output.strip())]
-    binaries: dict[str, str] = {}
-    test_binaries: list[tuple[str, str]] = []
+        return {}, output.strip()
+    binaries: dict[tuple[str, str], str] = {}
     for line in output.splitlines():
         if not line.startswith("{"):
             continue
@@ -443,17 +435,50 @@ def run_cookbook() -> tuple[int, int, list[tuple[str, str]]]:
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
-        target = msg.get("target") or {}
-        if not msg.get("executable"):
+        exe, target = msg.get("executable"), msg.get("target") or {}
+        if not exe:
             continue
-        if "example" in (target.get("kind") or []):
-            binaries[target.get("name", "")] = msg["executable"]
-        elif (msg.get("profile") or {}).get("test"):
-            test_binaries.append((target.get("name", "?"), msg["executable"]))
+        name = target.get("name", "")
+        # A test harness is flagged by profile, not kind (its kind stays
+        # `lib`/`test`), so it is classified first.
+        if (msg.get("profile") or {}).get("test"):
+            binaries[("test", name)] = exe
+        else:
+            for kind in target.get("kind") or []:
+                binaries[(kind, name)] = exe
+    return binaries, None
+
+
+def run_cookbook() -> tuple[int, int, list[tuple[str, str]]]:
+    """Run EVERY cookbook example (auto-enumerated — a new recipe can't be
+    forgotten) plus the crate's tests (the TOML-equivalence and schema-test
+    recipes). Each example must print `recipe OK`; stdin is closed so the
+    embed-lsp recipe's server exits on EOF. Returns (checked, passed,
+    failures).
+
+    `--no-run` builds the examples *and* the crate's test harnesses in the
+    single cargo invocation [`cargo_binaries`] documents, so the whole
+    cookbook check costs one build-directory lock."""
+    checked = passed = 0
+    failures: list[tuple[str, str]] = []
+    examples_dir = REPO / COOKBOOK_DIR / "examples"
+    examples = sorted(p.stem for p in examples_dir.glob("*.rs"))
+    if not examples:
+        return 1, 0, [(COOKBOOK_DIR, "no cookbook examples found — wiring broken?")]
+
+    binaries, error = cargo_binaries(
+        ["cargo", "test", "--no-run", "-p", "nml-cookbook"], timeout=900
+    )
+    if error is not None:
+        # One build failure is one finding, not a dozen identical ones.
+        return len(examples) + 1, 0, [("cookbook:build", error)]
+    test_binaries = [
+        (name, exe) for (kind, name), exe in binaries.items() if kind == "test"
+    ]
 
     for name in examples:
         checked += 1
-        exe = binaries.get(name)
+        exe = binaries.get(("example", name))
         if exe is None:
             failures.append(
                 (f"cookbook:{name}", "cargo built no executable for this example")
@@ -486,18 +511,27 @@ def run_cookbook() -> tuple[int, int, list[tuple[str, str]]]:
 
 def run_tutorial_apps() -> tuple[int, int, list[tuple[str, str]]]:
     """Compile AND run each tutorial chapter program, asserting the output its
-    page claims. Returns (checked, passed, failures)."""
+    page claims. Returns (checked, passed, failures).
+
+    One build for every chapter (see [`cargo_binaries`]), then each program
+    runs as a plain binary **from its own chapter directory** — the programs
+    read their `.nml` files by relative path, so the cwd is part of what is
+    being tested."""
     checked = passed = 0
     failures: list[tuple[str, str]] = []
+    binaries, error = cargo_binaries(
+        ["cargo", "build"] + [arg for pkg, _, _ in TUTORIAL_APPS for arg in ("-p", pkg)],
+        timeout=900,
+    )
+    if error is not None:
+        return len(TUTORIAL_APPS), 0, [("tutorial-apps:build", error)]
     for package, chapter, expect in TUTORIAL_APPS:
         checked += 1
-        # Generous timeout: the first run compiles the crate (CI shares the
-        # workspace target dir with the nml-cli build, so deps are warm).
-        code, output = run_cmd(
-            ["cargo", "run", "--quiet", "-p", package],
-            timeout=300,
-            cwd=REPO / chapter,
-        )
+        exe = binaries.get(("bin", package))
+        if exe is None:
+            failures.append((package, "cargo built no binary for this package"))
+            continue
+        code, output = run_cmd([exe], timeout=120, cwd=REPO / chapter)
         if code != 0:
             failures.append((package, output.strip()))
         elif expect not in output:

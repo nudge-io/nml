@@ -69,7 +69,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: env.VSCE_PAT != '' || env.OVSX_PAT != ''
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Publish to the VS Code Marketplace
         if: env.VSCE_PAT != ''
