@@ -358,11 +358,47 @@ model service:
 |--------|---------|
 | `name type` | Required field |
 | `name type?` | Optional field |
+| `name type+` | Positional field — a bare scalar list item fills it |
 | `name type = value` | Field with default value |
 | `name []type` | List-typed field |
+| `name set<type>` | Set-typed field — unordered, unique elements |
+| `name (a \| b)` | Union-typed field — one of several types |
+| `name (k -> v)` | Arm-set field — ordered, first-match `selector -> target` |
+| `name number(...)` | Numeric facets — see below |
 
 Field definitions produce `FieldDefinition` nodes in the AST. Note that `:` after
 a field name would start a nested block, not a type annotation.
+
+The union pipe and the arm arrow are only ever consumed **inside** parentheses.
+A bare `k -> v` at type position is a parse error, which is what keeps the
+field suffixes (`?`, `+`) unambiguous — they always bind to the field, never to
+the last type inside the parens.
+
+### Numeric Facets (RFC 0018)
+
+A facet list may follow a type **name**, constraining the values that type
+admits. It is part of the type, so it travels wherever the name appears —
+inside `[]`, inside `set<>`, and in union variants:
+
+```nml check
+model server:
+    port number(min = 1, max = 65535)
+    weight number(min = 0, exclusiveMax = 1)?
+    priceStep number(multipleOf = 0.01)?
+    ports set<number(min = 1)>?
+```
+
+The keys are `min` and `max` (inclusive), `exclusiveMin` and `exclusiveMax`,
+and `multipleOf`. Values are number literals only — no references, no
+expressions. A facet list never spans lines: a swallowed newline would absorb
+the following field into the type, so the parser stops at the line break and
+says so.
+
+Parse-level, a facet list is accepted after *any* type name. "Facets attach
+only to `number`" is a schema-load rule with its own diagnostic (`NML2058`),
+not a parse error — recovery keeps the tree structured and the finding
+singular. Enforcement of a declared range against a value is `NML2057`, exact
+through the decimal core.
 
 ### Top-Level Declarations
 
@@ -518,8 +554,13 @@ BlockDecl       <- Keyword Identifier ":" NEWLINE INDENT Body DEDENT
 Body            <- (FieldDef / Property / NestedBlock / Modifier / SharedProp
                    / ListItem / Comment / NEWLINE)*
 ArrayBody       <- (ListItem / Modifier / SharedProp / Property / Comment / NEWLINE)*
-FieldDef        <- Identifier FieldType "?"? ("=" ValueOrFallback)? NEWLINE
-FieldType       <- "[]" Identifier / Identifier
+FieldDef        <- Identifier FieldType ("?" / "+")? ("=" ValueOrFallback)? NEWLINE
+FieldType       <- "[]" FieldType
+                 / "(" FieldType ("->" FieldType / ("|" FieldType)*) ")"
+                 / "set" "<" FieldType ("|" FieldType)* ">"
+                 / Identifier FacetList?
+FacetList       <- "(" Facet ("," Facet)* ")"      # no trailing comma
+Facet           <- Identifier "=" NumberLiteral    # key set checked at schema load
 ListItem        <- "-" (NamedItem / ShorthandItem / ReferenceItem / RoleExpr)
 NamedItem       <- Identifier ":" NEWLINE INDENT Body DEDENT
 ShorthandItem   <- StringLiteral NEWLINE
@@ -532,10 +573,13 @@ Modifier        <- "|" Identifier "=" ValueOrFallback NEWLINE
 SharedProp      <- "." Identifier ":" NEWLINE INDENT Body DEDENT
 ListBody        <- (ListItem / Comment / NEWLINE)*
 ValueOrFallback <- Value ("|" Value)*
-Value           <- MoneyLiteral / NumberLiteral / BoolLiteral / StringLiteral
-                 / SecretRef / ArrayLiteral / RoleExpr / Identifier
+Value           <- MoneyLiteral / DurationLiteral / NumberLiteral / BoolLiteral
+                 / StringLiteral / SecretRef / ArrayLiteral / RoleExpr / Identifier
 MoneyLiteral    <- Decimal CurrencyCode
-NumberLiteral   <- "-"? [0-9]+ ("." [0-9]+)?
+DurationLiteral <- Digits DurationUnit
+DurationUnit    <- "ms" / "us" / "ns" / "h" / "m" / "s"
+NumberLiteral   <- "-"? Digits ("." Digits)?
+Digits          <- [0-9] ([0-9_]* [0-9])?          # `_` only between two digits
 BoolLiteral     <- "true" / "false"
 StringLiteral   <- '"""' MultilineContent '"""'
                  / '"' StringContent '"'
@@ -547,7 +591,7 @@ TemplateExpr    <- "{{" [^}]+ "}}"
 SecretRef       <- "$ENV." Identifier ("." Identifier)*
 ArrayLiteral    <- "[" (Value ("," Value)*)? "]"
 CurrencyCode    <- [A-Z]{3}
-Decimal         <- "-"? [0-9]+ ("." [0-9]+)?
+Decimal         <- "-"? Digits ("." Digits)?
 Identifier      <- [a-zA-Z_][a-zA-Z0-9_-]*
 RoleExpr        <- RoleRef ("&" RoleRef)*
 RoleRef         <- "@" RolePath

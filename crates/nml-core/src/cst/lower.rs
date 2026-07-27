@@ -405,7 +405,7 @@ fn facets_of(te: &ast::TypeExpr, errors: &mut Vec<NmlError>) -> Vec<FacetExpr> {
         return Vec::new();
     };
     list.facets()
-        .map(|f| {
+        .filter_map(|f| {
             let span = super::syntax::node_span(f.syntax());
             let key = f.name().map(ident).unwrap_or_else(|| Identifier {
                 name: String::new(),
@@ -430,18 +430,27 @@ fn facets_of(te: &ast::TypeExpr, errors: &mut Vec<NmlError>) -> Vec<FacetExpr> {
                 // recover structured.
                 _ => (String::from("0"), span),
             };
+            // A facet whose literal does not decode is DROPPED, not
+            // recovered to zero — matching extraction (cst/extract.rs),
+            // so the two facet builders can never disagree. A recovered
+            // zero invented a bound nobody wrote: `min = <45 digits>`
+            // became `min = 0`, and every later rule then measured
+            // against a phantom (a violating-default report naming a
+            // bound absent from the source). The NML0014/NML0013 error
+            // is the finding; a fabricated facet on top is noise. Safe
+            // for fmt, which refuses to format an errored document.
             let value = match super::value::parse_number(&text, vspan) {
                 Ok(n) => n,
                 Err(e) => {
                     errors.push(e);
-                    crate::types::Number::ZERO
+                    return None;
                 }
             };
-            FacetExpr {
+            Some(FacetExpr {
                 key,
                 value: SpannedValue::new(crate::types::Value::Number(value), vspan),
                 span,
-            }
+            })
         })
         .collect()
 }
@@ -664,6 +673,44 @@ mod tests {
                 errors.len()
             );
         }
+    }
+
+    /// A facet whose literal is out of the exact domain is DROPPED,
+    /// never recovered to zero — otherwise the AST carries a bound the
+    /// author never wrote and later rules measure against a phantom
+    /// (the lowerer and extraction would also disagree about the same
+    /// source). The NML0014 stands alone.
+    #[test]
+    fn undecodable_facet_is_dropped_not_zeroed() {
+        let src = format!("model m:\n    x number(min = {}) = -5\n", "9".repeat(45));
+        let (file, errors) = crate::cst::parse_to_ast_all(&src);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_string().contains("significant digits")),
+            "the literal error still reports: {errors:?}"
+        );
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("expected block");
+        };
+        let BodyEntryKind::FieldDefinition(fd) = &block.body.entries[0].kind else {
+            panic!("expected field");
+        };
+        let FieldTypeExpr::Named { facets, .. } = &fd.field_type else {
+            panic!("expected named");
+        };
+        assert!(
+            facets.is_empty(),
+            "the bad facet must be dropped: {facets:?}"
+        );
+        // And no phantom violation is invented for the default.
+        let (_s, diags) = crate::cst::extract_schema(&src);
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.code != Some(crate::diagnostic::codes::FACET_VIOLATION)),
+            "no phantom min = 0: {diags:?}"
+        );
     }
 
     #[test]

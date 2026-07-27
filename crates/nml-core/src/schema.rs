@@ -714,6 +714,77 @@ pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
+    /// A facet-violating default inside a UNION must be reported.
+    /// The regression this guards: variants that cannot hold the value
+    /// (a `string` beside a faceted `number`) have no facets to check,
+    /// so treating their silence as admission made every faceted-union
+    /// default unreportable on every surface.
+    #[test]
+    fn union_defaults_are_measured_against_applicable_variants_only() {
+        let reports = |src: &str| {
+            crate::cst::extract_schema(src)
+                .1
+                .iter()
+                .filter(|d| d.code == Some(crate::diagnostic::codes::FACET_VIOLATION))
+                .count()
+        };
+        for (src, want) in [
+            // Non-numeric variants must not vacuously admit, either order.
+            (
+                "model m:\n    port (number(min = 1, max = 65535) | string) = 0\n",
+                1,
+            ),
+            ("model m:\n    x (string | number(min = 10)) = 5\n", 1),
+            ("model m:\n    x (number(min = 10) | bool) = 5\n", 1),
+            // Collections report ELEMENT-WISE, like enforcement.
+            (
+                "model m:\n    x [](number(min = 10) | string) = [5, 3]\n",
+                2,
+            ),
+            ("model m:\n    x set<number(min = 10) | string> = [5]\n", 1),
+            // Traits get the same treatment as models.
+            ("trait t:\n    x (number(min = 10) | string) = 5\n", 1),
+            // Control: all-numeric union, every band rejecting.
+            (
+                "model m:\n    x (number(min = 10) | number(max = 0)) = 5\n",
+                1,
+            ),
+        ] {
+            assert_eq!(reports(src), want, "wrong NML2057 count for {src:?}");
+        }
+        // A variant that genuinely admits keeps it clean — including
+        // the value landing on the NON-numeric side.
+        for src in [
+            "model m:\n    x (number(min = 10) | string) = \"free\"\n",
+            "model m:\n    x (number(min = 10) | number(max = 0)) = -5\n",
+            "model m:\n    x (number(min = 10) | string) = 50\n",
+        ] {
+            assert_eq!(reports(src), 0, "must stay clean: {src:?}");
+        }
+    }
+
+    /// Cross-RFC interaction: RFC 0017 landed `duration` as a
+    /// first-class type in the same cycle as facets. A faceted
+    /// duration is a definition error (RFC 0018 §3 defers the family),
+    /// and the message must name the actual type rather than say
+    /// something generic — the author needs to know WHICH type refused.
+    #[test]
+    fn facets_on_other_primitives_name_the_type() {
+        for ty in ["duration", "string", "bool", "path", "secret", "money"] {
+            let src = format!("model m:\n    x {ty}(min = 1)\n");
+            let (_s, diags) = crate::cst::extract_schema(&src);
+            let msg = diags
+                .iter()
+                .find(|d| d.code == Some(crate::diagnostic::codes::FACET_DEFINITION))
+                .map(|d| d.rendered_message())
+                .unwrap_or_else(|| panic!("{ty} facets must be rejected: {diags:?}"));
+            assert!(
+                msg.contains(&format!("`{ty}` cannot carry them")),
+                "message must name the type: {msg}"
+            );
+        }
+    }
+
     /// RFC 0016 makes −0 unrepresentable, so every spelling of a
     /// zero bound IS zero — `min = -0.0` must normalize, never error,
     /// and must behave identically to `min = 0`.
@@ -1756,6 +1827,20 @@ fn facets_of_ast(facets: &[crate::ast::FacetExpr]) -> crate::model::NumberFacets
     out
 }
 
+/// Could this type hold `value` at all? The facet domain only needs
+/// the coarse question — a `number` literal cannot land in a `string`,
+/// `bool`, enum or model-ref variant — which is exactly what keeps a
+/// non-numeric union variant from vacuously admitting a number.
+fn facet_type_applies(te: &crate::ast::FieldTypeExpr, value: &crate::types::Value) -> bool {
+    use crate::ast::FieldTypeExpr as T;
+    match (te, value) {
+        (T::Named { name, .. }, crate::types::Value::Number(_)) => name.name == "number",
+        (T::Array(_) | T::Set(_), crate::types::Value::Array(_)) => true,
+        (T::Union(vs), v) => vs.iter().any(|x| facet_type_applies(x, v)),
+        _ => false,
+    }
+}
+
 /// A declared default measured against its own facets (NML2057 — it is
 /// a VALUE breaking a constraint, reported where values are). Walks
 /// collection types element-wise, matching enforcement.
@@ -1788,17 +1873,26 @@ fn facet_default_violations(
             }
         }
         T::Union(vs) => {
-            // Any-variant-admits, like enforcement: only complain when
-            // no variant accepts the default.
-            let admitted = vs.iter().any(|v| {
+            // Only variants that could HOLD this value get a vote.
+            // Without that filter a `string` variant "admitted" a
+            // number vacuously (it simply has no facets to check), so
+            // EVERY faceted-number union default became unreportable —
+            // enforcement avoids this by filtering on `value_matches_
+            // type` before asking about facets.
+            let applicable: Vec<&crate::ast::FieldTypeExpr> =
+                vs.iter().filter(|v| facet_type_applies(v, value)).collect();
+            if applicable.is_empty() {
+                // Nothing in the union can hold this value: a TYPE
+                // error, reported by the type checker, not here.
+                return;
+            }
+            let admitted = applicable.iter().any(|v| {
                 let mut probe = Vec::new();
                 facet_default_violations(v, value, field_name, span, &mut probe);
                 probe.is_empty()
             });
             if !admitted {
-                if let Some(first) = vs.first() {
-                    facet_default_violations(first, value, field_name, span, diags);
-                }
+                facet_default_violations(applicable[0], value, field_name, span, diags);
             }
         }
         _ => {}

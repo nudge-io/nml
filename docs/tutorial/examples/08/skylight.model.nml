@@ -50,11 +50,11 @@ oneof notifier by kind = "log":
 
 model service is accessControlled:
     host string #restart
-    port number #restart
+    port number(min = 1, max = 65535) #restart
     publicUrl string
     logLevel logLevel = "info" #live
     requestTimeout duration = 30s #live
-    retries number = 3 #live
+    retries number(min = 0, max = 10) = 3 #live
     banner string? #live
     welcome string? #live
     tags []string

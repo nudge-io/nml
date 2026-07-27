@@ -1,0 +1,106 @@
+# libFuzzer token dictionary for the NML grammar.
+#
+# Mutation alone reaches deep grammar states slowly: it must rediscover
+# multi-byte tokens (`"""`, `->`, `$ENV.`) one lucky byte at a time. Handing
+# the fuzzer the language's own vocabulary lets it splice whole tokens, so
+# runs spend their budget on STRUCTURE (nesting, arms, unions, fallbacks)
+# instead of on spelling keywords. libFuzzer asked for this directly — every
+# run prints a "Recommended dictionary" section derived from what it had to
+# discover the hard way.
+#
+# Keep in step with spec/syntax.md; a token that leaves the language should
+# leave here too (it costs nothing but noise).
+
+# ── declaration keywords ────────────────────────────────────────────────
+"model "
+"trait "
+"enum "
+"oneof "
+"role "
+"const "
+"template "
+"service "
+"is "
+"by "
+"as "
+
+# ── type names ──────────────────────────────────────────────────────────
+"string"
+"number"
+"money"
+"bool"
+"duration"
+"path"
+"secret"
+"object"
+"set<"
+"[]"
+
+# ── numeric facets (RFC 0018) ───────────────────────────────────────────
+"min = "
+"max = "
+"exclusiveMin = "
+"exclusiveMax = "
+"multipleOf = "
+
+# ── structure & operators ───────────────────────────────────────────────
+":\n"
+" = "
+"- "
+"->"
+" | "
+" & "
+"?"
+"+"
+"#"
+"("
+")"
+"<"
+">"
+","
+
+# ── literals: strings, templates, references ────────────────────────────
+"\"\"\""
+"\""
+"{{"
+"}}"
+"$ENV."
+"@role/"
+"@user/"
+"@public"
+"true"
+"false"
+
+# ── escapes (the source-character policy's sanctioned spellings) ─────────
+"\\n"
+"\\t"
+"\\r"
+"\\s"
+"\\u{"
+"\\\""
+
+# ── duration units (RFC 0017 — the closed ladder) ───────────────────────
+"h"
+"m"
+"s"
+"ms"
+"us"
+"ns"
+
+# ── digit separators & numeric shapes (RFC 0016) ────────────────────────
+"_"
+"0."
+"1_000"
+"e-"
+"e+"
+
+# ── currency codes (ISO 4217 — a representative spread of exponents) ────
+"USD"
+"JPY"
+"BHD"
+"CLF"
+
+# ── comments & directives ───────────────────────────────────────────────
+"// "
+"#live"
+"#restart"

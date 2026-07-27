@@ -1,15 +1,17 @@
-// The schema behind the README's 30-second demo. The docs-test harness
-// validates the README's config blocks against this directory, so the demo
-// can never drift from the real validator.
+// The schema behind the README's 30-second demo — kept byte-identical to the
+// schema block shown there, so the demo can never drift from the real
+// validator. The docs-test harness validates the README's config block
+// against this directory.
 
-enum logLevel:
-    - "debug"
-    - "info"
-    - "warn"
-    - "error"
+model endpoint:
+    url string+                        // a bare string in a list fills this
+    timeout duration = 5s              // a typed literal, not a string
+    regions set<string>?               // unordered; duplicates are an error
 
 model service:
-    host string
-    port number
-    logLevel logLevel = "info"
-    apiKey secret
+    port number(min = 1, max = 65535)  // the valid range IS the type
+    price money                        // exact minor units, never a float
+    apiKey secret                      // holds a reference, never a literal
+    contact (string | []string)?       // one address or many
+    landing (role -> string)?          // the value depends on who is asking
+    endpoints []endpoint

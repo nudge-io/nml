@@ -449,6 +449,8 @@ mod facet_tests {
                 }
             }
         }
-        assert_eq!(checked, mins.len() * maxs.len() * muls.len() * values.len());
+        // A fixed expected total — recomputing the product from the
+        // same lengths would be a tautology that can never fail.
+        assert_eq!(checked, 1_600, "grid size changed; update deliberately");
     }
 }

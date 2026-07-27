@@ -1,0 +1,18 @@
+// The schema the error index's NML2000-series examples validate against.
+//
+// Deliberately small and stable: each entry in the index wants the *one*
+// diagnostic it documents and no incidental noise, so this schema stays
+// minimal and does not track the README demo (which is free to grow to show
+// the language off). Changing a field here changes several index entries.
+
+enum logLevel:
+    - "debug"
+    - "info"
+    - "warn"
+    - "error"
+
+model service:
+    host string
+    port number
+    logLevel logLevel = "info"
+    apiKey secret

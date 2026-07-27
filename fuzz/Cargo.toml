@@ -45,3 +45,10 @@ path = "fuzz_targets/format.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "duration"
+path = "fuzz_targets/duration.rs"
+test = false
+doc = false
+bench = false

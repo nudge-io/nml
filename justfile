@@ -82,6 +82,37 @@ msrv:
     RUSTUP_TOOLCHAIN="$version" cargo check -p nml-lsp --target wasm32-wasip1 --locked
     RUSTUP_TOOLCHAIN="$version" cargo test --doc --workspace --locked
 
+# Fuzz one target (nightly; `cargo install cargo-fuzz` first), seeding it
+# with the tracked landmarks in fuzz/seeds/<target>/.
+#
+# Two corpora, deliberately: libFuzzer writes new finds to the FIRST
+# directory and treats the rest as read-only inputs. `fuzz/corpus/` is
+# machine-generated and gitignored — it is 14k files and tens of MB, which
+# is exactly why it must not be committed. `fuzz/seeds/` is hand-written,
+# tiny, and tracked: each file is a grammar landmark (a separator spelling,
+# a 34-digit coefficient, the smallest magnitude) that a fresh clone should
+# explore in its first seconds instead of rediscovering by mutation.
+# Passing both is what makes the seeds do anything, so it lives here rather
+# than in someone's shell history.
+#
+# **If a run finds a crash**, cargo-fuzz writes the reproducer to
+# `fuzz/artifacts/<target>/` — which is gitignored, so it disappears on the
+# next clean and can never fail again. Copy it into `fuzz/seeds/<target>/`
+# with a name that says what it broke. That is what turns a one-time find
+# into a permanent regression: every future run replays it in its first
+# seconds, on every machine.
+fuzz target='number' time='60':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Both directories must exist before libFuzzer opens them: the corpus
+    # is gitignored (absent on a fresh clone) and git cannot track an empty
+    # seed directory, so a target with no landmarks yet would otherwise
+    # fail to start rather than simply fuzz unseeded.
+    mkdir -p fuzz/corpus/{{target}} fuzz/seeds/{{target}}
+    cargo +nightly fuzz run {{target}} \
+        fuzz/corpus/{{target}} fuzz/seeds/{{target}} \
+        -- -max_total_time={{time}}
+
 # Clean build artifacts
 clean:
     cargo clean

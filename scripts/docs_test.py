@@ -34,9 +34,10 @@ Beyond fenced blocks, more passes run:
   `nml check`, with `--schema <chapter dir>` once the chapter has a model.
   Each chapter's final config state is therefore CI-verified.
 - Tutorial programs (`TUTORIAL_APPS`): the chapter app crates are workspace
-  members; this script `cargo run`s each from its chapter directory and
-  asserts the output the tutorial page claims — the pages' "what you'll see"
-  is tested, not trusted.
+  members; this script builds them in one cargo invocation (see
+  `cargo_binaries`) and runs each binary from its chapter directory,
+  asserting the output the tutorial page claims — the pages' "what you'll
+  see" is tested, not trusted.
 - Rust source sync: a ```rust block tagged `source=<repo-rel-file>` must be a
   verbatim substring of that file, so a page's full-program listing cannot
   drift from the compiled crate.
@@ -402,6 +403,15 @@ def check_tutorial_files() -> tuple[int, int, list[tuple[str, str]]]:
 
 COOKBOOK_DIR = "docs/guides/examples/cookbook"
 
+# Execution budget for an already-built program. Deliberately generous: the
+# recipes and chapter apps run in well under a second each, so this is not a
+# performance bound — it exists to catch a genuine hang. A developer machine
+# runs this alongside its own compiles (and an editor's rust-analyzer), where
+# a sub-second process can starve for minutes; a tight budget there reports a
+# busy machine as a broken recipe, which is the misdiagnosis this file has
+# already paid for twice. CI runs alone and never approaches it.
+PROGRAM_TIMEOUT = 300
+
 
 def cargo_binaries(
     args: list[str], timeout: int
@@ -484,7 +494,7 @@ def run_cookbook() -> tuple[int, int, list[tuple[str, str]]]:
                 (f"cookbook:{name}", "cargo built no executable for this example")
             )
             continue
-        code, output = run_cmd([exe], timeout=120, stdin=subprocess.DEVNULL)
+        code, output = run_cmd([exe], timeout=PROGRAM_TIMEOUT, stdin=subprocess.DEVNULL)
         if code != 0:
             failures.append((f"cookbook:{name}", output.strip()))
         elif "recipe OK" not in output:
@@ -505,7 +515,10 @@ def run_cookbook() -> tuple[int, int, list[tuple[str, str]]]:
         # hang. `cargo run` does not relocate cwd, so the example binaries
         # above correctly stay at the repo root.
         code, output = run_cmd(
-            [exe], timeout=120, cwd=REPO / COOKBOOK_DIR, stdin=subprocess.DEVNULL
+            [exe],
+            timeout=PROGRAM_TIMEOUT,
+            cwd=REPO / COOKBOOK_DIR,
+            stdin=subprocess.DEVNULL,
         )
         if code != 0:
             test_failures.append(f"{name}: {output.strip()}")
@@ -540,7 +553,7 @@ def run_tutorial_apps() -> tuple[int, int, list[tuple[str, str]]]:
         if exe is None:
             failures.append((package, "cargo built no binary for this package"))
             continue
-        code, output = run_cmd([exe], timeout=120, cwd=REPO / chapter)
+        code, output = run_cmd([exe], timeout=PROGRAM_TIMEOUT, cwd=REPO / chapter)
         if code != 0:
             failures.append((package, output.strip()))
         elif expect not in output:

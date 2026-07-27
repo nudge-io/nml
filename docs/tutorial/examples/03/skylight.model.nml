@@ -13,11 +13,11 @@ model database:
 
 model service:
     host string
-    port number
+    port number(min = 1, max = 65535)
     publicUrl string
     logLevel logLevel = "info"
     requestTimeout duration = 30s
-    retries number = 3
+    retries number(min = 0, max = 10) = 3
     banner string?
     welcome string?
     tags []string

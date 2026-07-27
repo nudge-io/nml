@@ -22,7 +22,7 @@ model modelName:
 A `number` field may constrain its value range, first-class in the
 type:
 
-```
+```nml check
 model server:
     port number(min = 1, max = 65535)
     weight number(min = 0, exclusiveMax = 1)

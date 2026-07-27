@@ -1,0 +1,4 @@
+service Api:
+    timeout = 30s
+    price = 19.99 USD
+    max = 10_000

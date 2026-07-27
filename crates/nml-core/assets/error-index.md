@@ -447,7 +447,7 @@ const B = A
 **Invalid enum value.** The value is not one of the enum's declared variants
 (matching is exact; a near-miss gets a machine-applicable suggestion).
 
-```nml check schema=docs/examples/readme expect-error='[NML2000]'
+```nml check schema=docs/examples/errors expect-error='[NML2000]'
 service Api:
     host = "0.0.0.0"
     port = 8080
@@ -462,7 +462,7 @@ service Api:
 **Unknown property.** The property is not defined by the governing model — a
 warning by default (unknown data is skippable), an error under `--strict`.
 
-```nml check schema=docs/examples/readme expect-output='[NML2001]'
+```nml check schema=docs/examples/errors expect-output='[NML2001]'
 service Api:
     host = "0.0.0.0"
     hots = "typo"
@@ -498,7 +498,7 @@ email Notifier:
 **Unknown block keyword (strict).** Under `--strict`, a block keyword with no
 model or `oneof` definition is an error instead of being silently skipped.
 
-```nml check strict schema=docs/examples/readme expect-error='[NML2004]'
+```nml check strict schema=docs/examples/errors expect-error='[NML2004]'
 servce Api:
     port = 8080
 ```
@@ -510,7 +510,7 @@ servce Api:
 **Unknown array keyword (strict).** The array's item keyword names no model
 or `oneof`, and its items carry bodies that would go unvalidated.
 
-```nml check strict schema=docs/examples/readme expect-error='[NML2005]'
+```nml check strict schema=docs/examples/errors expect-error='[NML2005]'
 []widget Widgets:
     - first:
         size = 1
@@ -525,7 +525,7 @@ or `oneof`, and its items carry bodies that would go unvalidated.
 contain the secret value (see the [stability policy](../../../docs/stability.md)'s
 security notes and the README's secrets section).
 
-```nml check schema=docs/examples/readme expect-error='[NML2006]'
+```nml check schema=docs/examples/errors expect-error='[NML2006]'
 service Api:
     host = "0.0.0.0"
     port = 8080
@@ -541,7 +541,7 @@ if literals are genuinely intended.
 **Missing required field.** Fields are required unless marked `?` or given a
 default; the instance omits one.
 
-```nml check schema=docs/examples/readme expect-error='[NML2007]'
+```nml check schema=docs/examples/errors expect-error='[NML2007]'
 service Api:
     port = 8080
     apiKey = $ENV.API_KEY
@@ -553,7 +553,7 @@ service Api:
 
 **Type mismatch.** The value's type does not match the field's declared type.
 
-```nml check schema=docs/examples/readme expect-error='[NML2008]'
+```nml check schema=docs/examples/errors expect-error='[NML2008]'
 service Api:
     host = "0.0.0.0"
     port = "eight thousand"

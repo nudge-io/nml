@@ -1,0 +1,3 @@
+model job:
+    t duration = 5s
+    p number(min = 1, max = 65_535)

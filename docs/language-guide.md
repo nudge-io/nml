@@ -239,8 +239,22 @@ references.
 
 | Syntax | Meaning |
 |--------|---------|
-| `[]T` | List of type `T` |
+| `[]T` | List of type `T` — ordered, duplicates allowed |
+| `set<T>` | Set of type `T` — unordered, duplicates rejected at load |
 | `T?` | Optional field (may be omitted) |
+| `T+` | Positional field — a bare scalar list item fills it |
+| `(A \| B)` | Union — the value may be either type |
+| `(K -> V)` | Arm set — ordered, first-match `selector -> target` |
+| `number(...)` | Numeric facets — see [Constraining Values](#constraining-values-numeric-facets) |
+
+`[]T` and `set<T>` differ in meaning, not just in checking: list order is
+content (it survives diffs), set order is incidental (diffs are
+order-insensitive, and the authored order is preserved in source but carries
+no meaning).
+
+The union pipe and the arm arrow live **inside** their parentheses. That is
+what keeps the field suffixes unambiguous — in `landing (string | (role ->
+string))?`, the `?` can only be describing the field.
 
 ### Reference Types
 
@@ -293,6 +307,51 @@ model webProfile:
     description string?           // optional
     sessionDuration duration = 24h  // has default
 ```
+
+### Constraining Values (Numeric Facets)
+
+A `number` field can carry its own valid range, written into the type rather
+than checked later in your code:
+
+```nml check
+model server:
+    port number(min = 1, max = 65535)
+    weight number(min = 0, exclusiveMax = 1)?
+    priceStep number(multipleOf = 0.01)?
+    ports set<number(min = 1)>?
+```
+
+| Facet | Meaning |
+|-------|---------|
+| `min` | Value must be greater than or equal |
+| `max` | Value must be less than or equal |
+| `exclusiveMin` | Value must be strictly greater |
+| `exclusiveMax` | Value must be strictly less |
+| `multipleOf` | Value must be an exact multiple |
+
+Facets belong to the type, so they follow the type name everywhere it appears
+— `[]number(min = 0)`, `set<number(min = 1)>`, and union variants all
+constrain each element. Field defaults are held to the same rule: a default
+that violates its own facets is an error at schema load, not a surprise at
+runtime.
+
+Enforcement is **exact**, through the same decimal core that stores your
+numbers. `0.3` is a multiple of `0.1` here (float-based validators famously
+disagree), boundary values behave the way the schema reads, and `80.0`
+satisfies an integer bound because it *is* 80.
+
+Values must be number literals — no references, no expressions. A schema is a
+contract, not a program. A facet list also never spans lines.
+
+Two diagnostics come with them: `NML2057` when a value violates a declared
+facet, and `NML2058` when the declaration itself is invalid — facets on a
+non-`number` type, an unknown or duplicate key, `min` and `exclusiveMin` (or
+the `max` pair) together, an unsatisfiable range, or a `multipleOf` that is
+not positive.
+
+One thing facets deliberately do not cover: `$ENV`-backed values bypass them,
+exactly as they bypass every other static schema check, because resolution
+happens after validation.
 
 ### Traits
 

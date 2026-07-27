@@ -141,8 +141,8 @@
   `Number::is_multiple_of` predicate (modular arithmetic, no bignum,
   no rounding). Facets apply element-wise to `[]number`/`set<number>`,
   hold field defaults to the same rule, render canonically in fmt and
-  hover, and come with two diagnostics: `NML2055` (value violates a
-  facet) and `NML2056` (invalid facet declaration). Schema packages
+  hover, and come with two diagnostics: `NML2057` (value violates a
+  facet) and `NML2058` (invalid facet declaration). Schema packages
   need no format change — packages carry schema source, and a
   pre-facet parser rejects the new syntax loudly rather than silently
   under-validating. Wire-shape note for external `nml parse` JSON

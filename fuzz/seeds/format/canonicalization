@@ -1,0 +1,4 @@
+service A:
+    x = 030s
+    y = 1_000
+    z = 19.9 USD

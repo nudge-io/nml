@@ -12,42 +12,74 @@ and tell you what to write instead.
 
 ## The 30-second demo
 
-A schema:
+The schema is the interesting part — every line below says something about the
+config that YAML has no way to say about itself:
 
 ```nml check
-enum logLevel:
-    - "debug"
-    - "info"
-    - "warn"
-    - "error"
+model endpoint:
+    url string+                        // a bare string in a list fills this
+    timeout duration = 5s              // a typed literal, not a string
+    regions set<string>?               // unordered; duplicates are an error
 
 model service:
-    host string
-    port number
-    logLevel logLevel = "info"
-    apiKey secret
+    port number(min = 1, max = 65535)  // the valid range IS the type
+    price money                        // exact minor units, never a float
+    apiKey secret                      // holds a reference, never a literal
+    contact (string | []string)?       // one address or many
+    landing (role -> string)?          // the value depends on who is asking
+    endpoints []endpoint
 ```
 
-A config file that typos an enum value:
+The config that satisfies it still reads like config:
 
-```nml check schema=docs/examples/readme expect-error='invalid value "wran"'
+```nml check schema=docs/examples/readme
 service Api:
-    host = "0.0.0.0"
     port = 8080
-    logLevel = "wran"
-    apiKey = $ENV.API_KEY
+    price = 19.99 USD
+    apiKey = $ENV.API_KEY | $ENV.API_KEY_DEV   // try, then fall back
+
+    contact = "oncall@example.com"             // ...or a list, same field
+
+    landing:
+        @role/admin -> "ops"                   // first match wins
+        else        -> "status"
+
+    endpoints:
+        .timeout = 10s                         // shared by every item below
+
+        - "https://api.example.com"            // fills `url`, the `+` field
+
+        - Docs:
+            url = "https://docs.example.com"
+            regions = ["us-east", "eu-west"]
 ```
 
-What you get (real output, verified in CI):
+Get a value wrong and the schema catches it — here in a single self-contained
+file, no flags and no separate schema document:
+
+```nml check expect-error='[NML2057]'
+model server:
+    port number(min = 1, max = 65535)
+
+server Web:
+    port = 70000
+```
+
+Real output, verified in CI:
 
 ```text
-app.nml:4:16: error[NML2000]: invalid value "wran" for 'logLevel': expected one of "debug", "info", "warn", "error" (did you mean "warn"?)
+app.nml:5:12: error[NML2057]: 'port' is 70000, above the schema's max = 65535
 ```
 
-In the editor, the same diagnostic arrives with a machine-applicable
-did-you-mean quick fix (`"wran"` → `"warn"`), schema-driven completion, and
-hover docs — from the NML language server, which also builds to WASM and
-ships inside the VS Code extension.
+To cover the same ground in YAML you would need a JSON Schema beside it for
+the range, a convention for secrets, a custom coercion for the one-or-many
+field, application code for the role routing, and a comment asking people not
+to write money as a float. Here it is one file, and the editor already
+understands it.
+
+In the editor these diagnostics arrive with machine-applicable quick fixes,
+schema-driven completion, and hover docs — from the NML language server, which
+also builds to WASM and ships inside the VS Code extension.
 
 ## Embed it in Rust
 
@@ -58,8 +90,8 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct ServiceConfig {
-    host: String,
     port: u16,
+    contact: Option<String>,
     #[serde(rename = "apiKey")]
     api_key: String,
 }
@@ -72,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Resolves $ENV secrets + fallback chains, then deserializes into your struct.
     let config: ServiceConfig = from_body_resolved(body, &ValueResolver::env())?;
-    println!("listening on {}:{}", config.host, config.port);
+    println!("listening on port {}", config.port);
     Ok(())
 }
 ```
@@ -96,6 +128,10 @@ serde = { version = "1", features = ["derive"] }
   non-instantiable mixins), `enum`,
   `oneof` discriminated unions, typed arm maps `(K -> V)`, `set<T>`,
   defaults, optional `?` and positional `+` markers
+- **Constraints in the type** — numeric facets (RFC 0018) put the valid range
+  in the schema: `port number(min = 1, max = 65535)`, plus `exclusiveMin`/
+  `exclusiveMax` and `multipleOf`. Enforced exactly through the decimal core,
+  so `0.3` really is a multiple of `0.1` and boundaries cannot lie
 - **Secrets done right** — `secret` fields hold *references* (`$ENV.API_KEY`,
   with reference fallback chains like `$ENV.API_KEY | $ENV.API_KEY_DEV`),
   resolved by a pluggable `ValueResolver` (env, vault, your lookup). Literal

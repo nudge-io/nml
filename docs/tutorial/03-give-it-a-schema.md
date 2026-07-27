@@ -50,6 +50,34 @@ enum logLevel:
 
 A field then uses the enum as its type: `logLevel logLevel = "info"`.
 
+## Constrain the numbers
+
+An enum narrows a string down to four choices. Numbers get the same treatment,
+written into the type as **facets**:
+
+```nml check
+model service:
+    port number(min = 1, max = 65535)
+    retries number(min = 0, max = 10) = 3
+```
+
+`port` is now the set of real TCP ports, not "any number at all". Nobody has
+to remember the rule, and nobody has to write the check in Rust — `70000` is
+rejected where it is written, by the same validator that catches a missing
+field.
+
+There are five facet keys: `min` and `max` (inclusive), `exclusiveMin` and
+`exclusiveMax`, and `multipleOf`. They compose with everything else a field
+can have — note that `retries` carries both a range and a default. A default
+that violated its own range would be an error at schema load, so the schema
+cannot contradict itself.
+
+One thing to know now rather than discover later: a `$ENV`-backed value skips
+facets, exactly as it skips every other schema check, because it isn't
+resolved until after validation runs. Your own `port = $ENV.PORT | 8080` below
+is checked against the range where it falls back to the literal `8080`, not
+where the environment supplies it.
+
 ## The full schema
 
 Assemble `skylight.model.nml`:
@@ -67,11 +95,11 @@ model database:
 
 model service:
     host string
-    port number
+    port number(min = 1, max = 65535)
     publicUrl string
     logLevel logLevel = "info"
     requestTimeout duration = 30s
-    retries number = 3
+    retries number(min = 0, max = 10) = 3
     banner string?
     welcome string?
     tags []string
