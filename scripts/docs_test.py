@@ -506,9 +506,9 @@ def check_error_index() -> list[tuple[str, str]]:
     scans for it, and a section filed after `NML3003` is a section they
     walk past. Ordering is the affordance that makes scanning work, so it
     is checked rather than hoped for."""
+    codes_text = (REPO / CODES_SOURCE).read_text(encoding="utf-8")
     declared = {
-        f"NML{int(m):04}"
-        for m in re.findall(r"^\s+[A-Z_]+ = (\d+);", (REPO / CODES_SOURCE).read_text(encoding="utf-8"), re.M)
+        f"NML{int(m):04}" for m in re.findall(r"^\s+[A-Z_]+ = (\d+);", codes_text, re.M)
     }
     index_path = REPO / ERROR_INDEX
     if not index_path.is_file():
@@ -528,26 +528,37 @@ def check_error_index() -> list[tuple[str, str]]:
     # "durations" in the rustdoc and the index kept saying "values &
     # money" for a release cycle). Compare the parsed band→label maps, so
     # wording and line-wrapping may differ but the meaning cannot.
-    def bands(text: str) -> dict[str, str]:
+    def bands(text: str, anchor: str) -> dict[str, str] | None:
+        """The band→label map under `anchor`, or `None` when the anchor is
+        gone. `None` is reported as an ordinary failure below rather than
+        crashing on `.group()`: a guard whose own footing moved must say so
+        in the language of the other findings, not as a traceback that
+        sends the reader hunting the wrong defect."""
+        located = re.search(anchor, text, re.S | re.M)
+        if located is None:
+            return None
         # Collapse to one line and drop rustdoc continuation markers, so a
         # doc comment and a markdown paragraph normalize identically.
-        flat = " ".join(text.replace("///", " ").split())
+        flat = " ".join(located.group(0).replace("///", " ").split())
         return {
             lo: " ".join(label.split())
             for lo, label in re.findall(r"(\d{4})[–-]\d{4} ([^·.]+)", flat)
         }
 
-    code_bands = bands(
-        re.search(
-            r"The stable code space.*?editor/LSP",
-            (REPO / CODES_SOURCE).read_text(encoding="utf-8"),
-            re.S,
-        ).group(0)
-    )
-    index_bands = bands(
-        re.search(r"^Bands \(.*?editor/LSP", index_text, re.S | re.M).group(0)
-    )
-    if code_bands != index_bands:
+    code_bands = bands(codes_text, r"The stable code space.*?editor/LSP")
+    index_bands = bands(index_text, r"^Bands \(.*?editor/LSP")
+    if code_bands is None or index_bands is None:
+        for where, table in ((CODES_SOURCE, code_bands), (ERROR_INDEX, index_bands)):
+            if table is None:
+                failures.append(
+                    (
+                        where,
+                        "band table not found — either it was removed (restore "
+                        "it: both audiences need it) or its wording moved and "
+                        "`check_error_index`'s anchor needs updating",
+                    )
+                )
+    elif code_bands != index_bands:
         differing = sorted(
             b for b in set(code_bands) | set(index_bands)
             if code_bands.get(b) != index_bands.get(b)

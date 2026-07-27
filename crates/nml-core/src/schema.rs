@@ -714,6 +714,42 @@ pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
+    /// RFC 0018 §1.1 claims facets attach to MODIFIER fields, and
+    /// enforcement honors them (extraction lowers `|cap number(...)` to
+    /// `FieldType::Modifier(inner)`; validation recurses through it).
+    /// The declaration rules must reach them too — otherwise an
+    /// unsatisfiable range on a modifier loads clean and then rejects
+    /// every value with contradictory violations, the exact trap §1.2
+    /// promises cannot exist.
+    #[test]
+    fn facet_rules_reach_typed_modifiers() {
+        let src = "model m:\n    |allow string(min = 1)\n    |cap number(min = 2, max = 1)\n";
+        let (_schema, diags) = crate::cst::extract_schema(src);
+        let msgs: Vec<String> = diags
+            .iter()
+            .filter(|d| d.code == Some(crate::diagnostic::codes::FACET_DEFINITION))
+            .map(|d| d.rendered_message())
+            .collect();
+        assert_eq!(
+            msgs.len(),
+            2,
+            "typed modifiers must face the rules: {diags:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("facets attach only to `number`")),
+            "{msgs:?}"
+        );
+        assert!(msgs.iter().any(|m| m.contains("unsatisfiable")), "{msgs:?}");
+        // A well-formed faceted modifier stays clean.
+        let (_s, ok) = crate::cst::extract_schema("model m:\n    |cap number(min = 1)\n");
+        assert!(
+            ok.iter()
+                .all(|d| d.code != Some(crate::diagnostic::codes::FACET_DEFINITION)),
+            "{ok:?}"
+        );
+    }
+
     use crate::model::NumberFacets;
 
     use super::*;
@@ -1633,10 +1669,23 @@ pub fn facet_definition_diagnostics(file: &crate::ast::File) -> Vec<Diagnostic> 
             continue;
         }
         for entry in &block.body.entries {
-            let crate::ast::BodyEntryKind::FieldDefinition(fd) = &entry.kind else {
-                continue;
-            };
-            facet_rules_in_type(&fd.field_type, &fd.name.name, &mut diags);
+            // A typed modifier (`|cap number(min = 1)`) declares a field
+            // too — extraction lowers it to `FieldType::Modifier(inner)`
+            // and enforcement recurses through it, so its facets bind
+            // real values. It must face the same declaration rules, or
+            // an unsatisfiable range on a modifier loads clean and then
+            // rejects every value (the trap §1.2 promises cannot exist).
+            match &entry.kind {
+                crate::ast::BodyEntryKind::FieldDefinition(fd) => {
+                    facet_rules_in_type(&fd.field_type, &fd.name.name, &mut diags);
+                }
+                crate::ast::BodyEntryKind::Modifier(m) => {
+                    if let crate::ast::ModifierValue::TypeAnnotation { field_type, .. } = &m.value {
+                        facet_rules_in_type(field_type, &m.name.name, &mut diags);
+                    }
+                }
+                _ => {}
+            }
         }
     }
     diags

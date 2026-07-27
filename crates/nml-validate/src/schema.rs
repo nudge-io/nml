@@ -2959,6 +2959,17 @@ fn string_content_span(span: Span) -> Span {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn probe_modifier_facet_enforcement() {
+        let schema = "model svc:\n    name string+\n    |cap number(min = 1)?\n";
+        let d = diags(schema, "svc A:\n    |cap = 0\n");
+        assert!(
+            d.iter()
+                .any(|x| x.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION)),
+            "MODIFIER FACET NOT ENFORCED: {d:?}"
+        );
+    }
+
     use super::*;
     use nml_core::diagnostic::Severity;
 
