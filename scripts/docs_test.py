@@ -428,16 +428,14 @@ def run_cookbook() -> tuple[int, int, list[tuple[str, str]]]:
         return 1, 0, [(COOKBOOK_DIR, "no cookbook examples found — wiring broken?")]
 
     code, output = run_cmd(
-        [
-            "cargo", "build", "-p", "nml-cookbook", "--examples",
-            "--message-format=json",
-        ],
-        timeout=600,
+        ["cargo", "test", "--no-run", "-p", "nml-cookbook", "--message-format=json"],
+        timeout=900,
     )
     if code != 0:
         # One build failure is one finding, not a dozen identical ones.
         return len(examples) + 1, 0, [("cookbook:build", output.strip())]
     binaries: dict[str, str] = {}
+    test_binaries: list[tuple[str, str]] = []
     for line in output.splitlines():
         if not line.startswith("{"):
             continue
@@ -446,8 +444,12 @@ def run_cookbook() -> tuple[int, int, list[tuple[str, str]]]:
         except json.JSONDecodeError:
             continue
         target = msg.get("target") or {}
-        if msg.get("executable") and "example" in (target.get("kind") or []):
+        if not msg.get("executable"):
+            continue
+        if "example" in (target.get("kind") or []):
             binaries[target.get("name", "")] = msg["executable"]
+        elif (msg.get("profile") or {}).get("test"):
+            test_binaries.append((target.get("name", "?"), msg["executable"]))
 
     for name in examples:
         checked += 1
@@ -464,12 +466,19 @@ def run_cookbook() -> tuple[int, int, list[tuple[str, str]]]:
             failures.append((f"cookbook:{name}", f"missing 'recipe OK' marker; got:\n{output.strip()}"))
         else:
             passed += 1
+    # The crate's own tests (TOML-equivalence, schema-test recipes) ride the
+    # same single build above and run as plain binaries too — counted as one
+    # check, but any failing binary is named.
     checked += 1
-    code, output = run_cmd(
-        ["cargo", "test", "--quiet", "-p", "nml-cookbook"], timeout=300
-    )
-    if code != 0:
-        failures.append(("cookbook:tests", output.strip()))
+    test_failures = []
+    for name, exe in sorted(test_binaries):
+        code, output = run_cmd([exe], timeout=120, stdin=subprocess.DEVNULL)
+        if code != 0:
+            test_failures.append(f"{name}: {output.strip()}")
+    if test_failures:
+        failures.append(("cookbook:tests", "\n".join(test_failures)))
+    elif not test_binaries:
+        failures.append(("cookbook:tests", "cargo built no test binaries — wiring broken?"))
     else:
         passed += 1
     return checked, passed, failures

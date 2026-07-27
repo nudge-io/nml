@@ -3051,6 +3051,43 @@ mod tests {
         );
     }
 
+    /// RFC 0018 §1.2's by-construction promise, pinned at the path
+    /// that actually broke it: `load_schema` — what packages, the
+    /// loader and downstream boots use. A violating DEFAULT used to
+    /// load clean here (only the `validate` verb caught it) and then
+    /// materialize into runtime config silently.
+    #[test]
+    fn violating_defaults_are_caught_by_the_loader_not_just_the_cli() {
+        let src = "model root:\n    retries number(min = 0) = -1\n";
+        let (_schema, diags) = crate::loader::load_schema(&[("s.nml", src)]);
+        assert!(
+            diags.iter().any(|d| {
+                d.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION)
+                    && d.rendered_message().contains("below the schema's min = 0")
+            }),
+            "load_schema must reject a facet-violating default: {diags:?}"
+        );
+        // Element-wise for collections, and a satisfying default is clean.
+        let (_s, arr) = crate::loader::load_schema(&[(
+            "s.nml",
+            "model root:\n    ports []number(min = 1) = [1, 0]\n",
+        )]);
+        assert!(
+            arr.iter()
+                .any(|d| d.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION)),
+            "collection defaults are checked element-wise: {arr:?}"
+        );
+        let (_s, ok) = crate::loader::load_schema(&[(
+            "s.nml",
+            "model root:\n    retries number(min = 0) = 3\n",
+        )]);
+        assert!(
+            ok.iter()
+                .all(|d| d.code != Some(nml_core::diagnostic::codes::FACET_VIOLATION)),
+            "a satisfying default stays clean: {ok:?}"
+        );
+    }
+
     /// RFC 0018 §1.1 lists modifier fields as a facet position, and a
     /// typed modifier lowers to `FieldType::Modifier(inner)` — so
     /// enforcement must recurse into it. Pinned beside the nml-core pin

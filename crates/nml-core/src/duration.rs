@@ -2,13 +2,15 @@
 //! authored unit, compared semantically.
 //!
 //! Storage is **faithful** — never rescaled — so `fmt` renders `72h` as
-//! `72h`; comparison is **semantic** via [`Duration::total_nanos`], so
+//! `72h`; comparison is **semantic** via
+//! [`Duration::total_nanos`](crate::duration::Duration::total_nanos), so
 //! `30s == 30000ms`. That split is the type's whole point: the reload
 //! differ must classify `30s` → `30000ms` as no change (nudge's RFC 0032),
 //! while the formatter must never rewrite the author's unit.
 //!
 //! The value domain is bounded at construction
-//! ([`Duration::new`]), so [`Duration::as_std`] is infallible: every
+//! ([`Duration::new`](crate::duration::Duration::new)), so
+//! [`Duration::as_std`](crate::duration::Duration::as_std) is infallible: every
 //! constructed value converts to a [`std::time::Duration`] without a
 //! fallible edge leaking into consumers — the same
 //! reject-at-decode posture money takes for amounts beyond `i64` minor
@@ -52,7 +54,7 @@ impl Serialize for DurationUnit {
 
 impl DurationUnit {
     /// Every unit, **coarsest first** — the one ladder every ordered
-    /// derivation rides: [`DurationUnit::finer`] slices it, the
+    /// derivation rides: `DurationUnit::finer` slices it, the
     /// did-you-mean candidates iterate it, and the law-grid tests sweep
     /// it. A second hand-written ordering could drift; this one cannot.
     pub const ALL: [DurationUnit; 6] = [

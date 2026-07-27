@@ -296,7 +296,7 @@ fn test_check_schema_reports_duplicate_model_names() {
 fn test_fmt_produces_output() {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let source = workspace_root.join("tests/fixtures/valid/minimal-service.nml");
-    let temp = std::env::temp_dir().join("nml_fmt_test.nml");
+    let temp = std::env::temp_dir().join(format!("nml_fmt_test_{}.nml", std::process::id()));
     std::fs::copy(&source, &temp).expect("failed to copy test file");
 
     let output = nml_bin()

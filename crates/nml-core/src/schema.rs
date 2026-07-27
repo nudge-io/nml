@@ -714,6 +714,21 @@ pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
+    /// RFC 0016 makes −0 unrepresentable, so every spelling of a
+    /// zero bound IS zero — `min = -0.0` must normalize, never error,
+    /// and must behave identically to `min = 0`.
+    #[test]
+    fn negative_zero_facet_spellings_normalize() {
+        for spelling in ["0", "-0", "0.0", "-0.0"] {
+            let src = format!("model m:\n    x number(min = {spelling})\n");
+            let (_s, diags) = crate::cst::extract_schema(&src);
+            assert!(
+                diags.is_empty(),
+                "min = {spelling} must load clean: {diags:?}"
+            );
+        }
+    }
+
     /// RFC 0018 §1.1 claims facets attach to MODIFIER fields, and
     /// enforcement honors them (extraction lowers `|cap number(...)` to
     /// `FieldType::Modifier(inner)`; validation recurses through it).

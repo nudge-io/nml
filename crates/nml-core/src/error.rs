@@ -98,7 +98,7 @@ pub enum ParseErrorKind {
     /// replacement with separators removed — provably value-preserving
     /// (separators are spelling, never value) — carried only when the
     /// literal is short enough to capture completely
-    /// ([`MAX_FIX_CAPTURE`]); a truncated replacement would corrupt the
+    /// (64 bytes); a truncated replacement would corrupt the
     /// file, so a pathological literal gets the message without the fix.
     NumberBadSeparator {
         raw: String,
