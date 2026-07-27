@@ -497,7 +497,16 @@ def run_cookbook() -> tuple[int, int, list[tuple[str, str]]]:
     checked += 1
     test_failures = []
     for name, exe in sorted(test_binaries):
-        code, output = run_cmd([exe], timeout=120, stdin=subprocess.DEVNULL)
+        # cwd is part of the contract: `cargo test` runs a harness from its
+        # PACKAGE root, and these tests resolve fixtures relative to it.
+        # Running them from the repo root instead still passes, but makes
+        # them walk the whole tree (`target/` included) — 0.0s becomes
+        # ~15s, and under load that crossed the timeout and looked like a
+        # hang. `cargo run` does not relocate cwd, so the example binaries
+        # above correctly stay at the repo root.
+        code, output = run_cmd(
+            [exe], timeout=120, cwd=REPO / COOKBOOK_DIR, stdin=subprocess.DEVNULL
+        )
         if code != 0:
             test_failures.append(f"{name}: {output.strip()}")
     if test_failures:
