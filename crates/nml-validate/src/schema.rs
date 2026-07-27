@@ -2192,6 +2192,27 @@ impl SchemaValidator {
                             admitted = true;
                             break;
                         }
+                        // Non-emitting admission first: a variant that
+                        // accepts the value needs no diagnostics at
+                        // all, and speculatively formatting messages we
+                        // then discard cost ~193ns each (a 16x constant
+                        // on faceted unions).
+                        if let (
+                            FieldType::Primitive {
+                                ty: PrimitiveType::Number,
+                                facets,
+                            },
+                            Value::Number(n),
+                        ) = (v, value)
+                        {
+                            if facets.admits(n) {
+                                admitted = true;
+                                break;
+                            }
+                            if first_rejection.is_some() {
+                                continue;
+                            }
+                        }
                         let mut scratch = Vec::new();
                         self.validate_value_against_type(
                             value,
@@ -2834,49 +2855,12 @@ fn validate_facets(
     span: Span,
     diags: &mut Vec<Diagnostic>,
 ) {
-    let mut push = |msg: String| {
+    for tail in facets.violations(n) {
         diags.push(
-            Diagnostic::error(msg)
+            Diagnostic::error(format!("'{field_name}' {tail}"))
                 .with_code(codes::FACET_VIOLATION)
                 .with_span(span),
         );
-    };
-    if let Some(b) = &facets.min {
-        let fails = if b.exclusive {
-            *n <= b.value
-        } else {
-            *n < b.value
-        };
-        if fails {
-            push(format!(
-                "'{field_name}' is {n}, below the schema's {} = {}",
-                if b.exclusive { "exclusiveMin" } else { "min" },
-                b.value
-            ));
-        }
-    }
-    if let Some(b) = &facets.max {
-        let fails = if b.exclusive {
-            *n >= b.value
-        } else {
-            *n > b.value
-        };
-        if fails {
-            push(format!(
-                "'{field_name}' is {n}, above the schema's {} = {}",
-                if b.exclusive { "exclusiveMax" } else { "max" },
-                b.value
-            ));
-        }
-    }
-    if let Some(m) = &facets.multiple_of {
-        if !n.is_multiple_of(&m.value) {
-            push(format!(
-                "'{field_name}' is {n}, not a multiple of the schema's multipleOf = {} \
-                 (checked exactly -- no float rounding)",
-                m.value
-            ));
-        }
     }
 }
 
@@ -2959,17 +2943,6 @@ fn string_content_span(span: Span) -> Span {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn probe_modifier_facet_enforcement() {
-        let schema = "model svc:\n    name string+\n    |cap number(min = 1)?\n";
-        let d = diags(schema, "svc A:\n    |cap = 0\n");
-        assert!(
-            d.iter()
-                .any(|x| x.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION)),
-            "MODIFIER FACET NOT ENFORCED: {d:?}"
-        );
-    }
-
     use super::*;
     use nml_core::diagnostic::Severity;
 
@@ -3075,6 +3048,29 @@ mod tests {
                     && x.rendered_message().contains("below the schema's min = 1")
             }),
             "union-matched number must still honor facets: {d:?}"
+        );
+    }
+
+    /// RFC 0018 §1.1 lists modifier fields as a facet position, and a
+    /// typed modifier lowers to `FieldType::Modifier(inner)` — so
+    /// enforcement must recurse into it. Pinned beside the nml-core pin
+    /// for the DECLARATION rules on the same construct: the two halves
+    /// have to agree, or a modifier is checked by one and not the other.
+    #[test]
+    fn modifier_facets_are_enforced() {
+        let schema = "model svc:\n    name string+\n    |cap number(min = 1)?\n";
+        let d = diags(schema, "svc A:\n    |cap = 0\n");
+        assert!(
+            d.iter().any(|x| {
+                x.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION)
+                    && x.rendered_message().contains("below the schema's min = 1")
+            }),
+            "modifier facets must bind values: {d:?}"
+        );
+        let ok = diags(schema, "svc A:\n    |cap = 5\n");
+        assert!(
+            ok.iter().all(|x| x.severity != Severity::Error),
+            "in-range modifier value must pass: {ok:?}"
         );
     }
 

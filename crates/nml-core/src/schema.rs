@@ -1678,6 +1678,23 @@ pub fn facet_definition_diagnostics(file: &crate::ast::File) -> Vec<Diagnostic> 
             match &entry.kind {
                 crate::ast::BodyEntryKind::FieldDefinition(fd) => {
                     facet_rules_in_type(&fd.field_type, &fd.name.name, &mut diags);
+                    // RFC 0018: "a declared default must itself satisfy
+                    // the facets". Checked HERE, not in the validate
+                    // verb, or the promise that the rules cannot be
+                    // skipped by construction is false for this one
+                    // rule — `load_schema`, packages and downstream
+                    // boots never call that verb, so a violating
+                    // default would load clean and then MATERIALIZE
+                    // into runtime config silently.
+                    if let Some(default) = &fd.default_value {
+                        facet_default_violations(
+                            &fd.field_type,
+                            &default.value,
+                            &fd.name.name,
+                            default.span,
+                            &mut diags,
+                        );
+                    }
                 }
                 crate::ast::BodyEntryKind::Modifier(m) => {
                     if let crate::ast::ModifierValue::TypeAnnotation { field_type, .. } = &m.value {
@@ -1689,6 +1706,88 @@ pub fn facet_definition_diagnostics(file: &crate::ast::File) -> Vec<Diagnostic> 
         }
     }
     diags
+}
+
+/// The AST facet list as a [`crate::model::NumberFacets`] — the shape
+/// the shared comparison home speaks. Mirrors extraction's CST-side
+/// builder at the AST layer; unknown/duplicate keys are the
+/// declaration rules' business, so last-writer-wins here is harmless
+/// (an invalid declaration never loads).
+fn facets_of_ast(facets: &[crate::ast::FacetExpr]) -> crate::model::NumberFacets {
+    let mut out = crate::model::NumberFacets::NONE;
+    for f in facets {
+        let crate::types::Value::Number(value) = &f.value.value else {
+            continue;
+        };
+        let bound = |exclusive| crate::model::FacetBound {
+            value: *value,
+            exclusive,
+            span: f.span,
+        };
+        match f.key.name.as_str() {
+            "min" => out.min = Some(bound(false)),
+            "exclusiveMin" => out.min = Some(bound(true)),
+            "max" => out.max = Some(bound(false)),
+            "exclusiveMax" => out.max = Some(bound(true)),
+            "multipleOf" => {
+                out.multiple_of = Some(crate::model::FacetMultiple {
+                    value: *value,
+                    span: f.span,
+                })
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A declared default measured against its own facets (NML2057 — it is
+/// a VALUE breaking a constraint, reported where values are). Walks
+/// collection types element-wise, matching enforcement.
+fn facet_default_violations(
+    te: &crate::ast::FieldTypeExpr,
+    value: &crate::types::Value,
+    field_name: &str,
+    span: crate::span::Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    use crate::ast::FieldTypeExpr as T;
+    match te {
+        T::Named { name, facets } if name.name == "number" && !facets.is_empty() => {
+            let crate::types::Value::Number(n) = value else {
+                return;
+            };
+            for tail in facets_of_ast(facets).violations(n) {
+                diags.push(
+                    Diagnostic::error(format!("default for '{field_name}' {tail}"))
+                        .with_code(codes::FACET_VIOLATION)
+                        .with_span(span),
+                );
+            }
+        }
+        T::Array(inner) | T::Set(inner) => {
+            if let crate::types::Value::Array(items) = value {
+                for item in items {
+                    facet_default_violations(inner, &item.value, field_name, item.span, diags);
+                }
+            }
+        }
+        T::Union(vs) => {
+            // Any-variant-admits, like enforcement: only complain when
+            // no variant accepts the default.
+            let admitted = vs.iter().any(|v| {
+                let mut probe = Vec::new();
+                facet_default_violations(v, value, field_name, span, &mut probe);
+                probe.is_empty()
+            });
+            if !admitted {
+                if let Some(first) = vs.first() {
+                    facet_default_violations(first, value, field_name, span, diags);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn facet_rules_in_type(

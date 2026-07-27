@@ -56,6 +56,7 @@ doc-tests (`cargo test`).
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -298,7 +299,24 @@ def run_cmd(
             env=env,
             stdin=stdin,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as expired:
+        # Cargo takes an EXCLUSIVE lock on the build directory, so any other
+        # cargo on the machine (a parallel `cargo test`, rust-analyzer's
+        # `cargo check`) makes this invocation wait rather than run. That
+        # wait counts against the wall-clock timeout, so a step that does
+        # seconds of real work can trip it — reported as "did not finish",
+        # which reads as a hang and sends the reader hunting a defect that
+        # is not there. Name the real cause when cargo told us about it.
+        partial = "".join(
+            part for part in (expired.stdout, expired.stderr) if isinstance(part, str)
+        )
+        if "waiting for file lock" in partial:
+            return None, (
+                f"{cmd[0]} spent its whole {timeout}s budget blocked on cargo's "
+                "build-directory lock — another cargo (parallel test run, "
+                "rust-analyzer) held it. This step did not hang; re-run with "
+                "the workspace idle."
+            )
         return None, f"{cmd[0]} did not finish within {timeout}s"
     return proc.returncode, proc.stdout + proc.stderr
 
@@ -390,20 +408,56 @@ def run_cookbook() -> tuple[int, int, list[tuple[str, str]]]:
     forgotten) plus the crate's tests (the TOML-equivalence and schema-test
     recipes). Each example must print `recipe OK`; stdin is closed so the
     embed-lsp recipe's server exits on EOF. Returns (checked, passed,
-    failures)."""
+    failures).
+
+    **One build, then plain binaries.** Cargo holds an exclusive lock on the
+    build directory for the whole of every invocation, so a `cargo run` per
+    recipe meant a dozen lock acquisitions that serialize behind any other
+    cargo on the machine — turning a seconds-long check into a 300s timeout
+    that looked like a hung recipe (it was not; it never got the lock).
+    Building once and executing the produced binaries directly takes cargo
+    out of the hot loop: one lock acquisition total, no per-recipe cargo
+    overhead, and each recipe's timeout finally measures the recipe rather
+    than the machine's build queue. Executable paths come from cargo's own
+    JSON artifact messages, so nothing here guesses at target layout."""
     checked = passed = 0
     failures: list[tuple[str, str]] = []
     examples_dir = REPO / COOKBOOK_DIR / "examples"
     examples = sorted(p.stem for p in examples_dir.glob("*.rs"))
     if not examples:
         return 1, 0, [(COOKBOOK_DIR, "no cookbook examples found — wiring broken?")]
+
+    code, output = run_cmd(
+        [
+            "cargo", "build", "-p", "nml-cookbook", "--examples",
+            "--message-format=json",
+        ],
+        timeout=600,
+    )
+    if code != 0:
+        # One build failure is one finding, not a dozen identical ones.
+        return len(examples) + 1, 0, [("cookbook:build", output.strip())]
+    binaries: dict[str, str] = {}
+    for line in output.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        target = msg.get("target") or {}
+        if msg.get("executable") and "example" in (target.get("kind") or []):
+            binaries[target.get("name", "")] = msg["executable"]
+
     for name in examples:
         checked += 1
-        code, output = run_cmd(
-            ["cargo", "run", "--quiet", "-p", "nml-cookbook", "--example", name],
-            timeout=300,
-            stdin=subprocess.DEVNULL,
-        )
+        exe = binaries.get(name)
+        if exe is None:
+            failures.append(
+                (f"cookbook:{name}", "cargo built no executable for this example")
+            )
+            continue
+        code, output = run_cmd([exe], timeout=120, stdin=subprocess.DEVNULL)
         if code != 0:
             failures.append((f"cookbook:{name}", output.strip()))
         elif "recipe OK" not in output:
