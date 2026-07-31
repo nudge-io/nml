@@ -47,11 +47,18 @@ jobs:
 
       # `npm test` runs the pretest (bundle:wasm + bundle:js + compile), then
       # drives a real headless VS Code (downloading it + `ms-vscode.wasm-wasi-core`)
-      # over the single-root and multi-root E2E suites. `xvfb` gives Electron a
-      # virtual display.
+      # over the single-root and multi-root E2E suites. Xvfb gives Electron a
+      # virtual display — started EXPLICITLY, not via `xvfb-run`: the wrapper's
+      # exit trap races Xvfb's teardown over its temp dir and dies with its own
+      # exit 5 ("problem while cleaning up temporary directory") AFTER a fully
+      # green suite, failing the job on cleanup the ephemeral runner would do
+      # anyway. With an explicit server there is no wrapper cleanup to race:
+      # the step's exit code is the test runner's, nothing else's.
       - name: End-to-end tests (headless VS Code)
         working-directory: editors/vscode
-        run: xvfb-run -a npm test
+        run: |
+          Xvfb :99 -screen 0 1280x800x24 > /dev/null 2>&1 &
+          DISPLAY=:99 npm test
 
       - name: Package the VSIX
         working-directory: editors/vscode

@@ -32,8 +32,13 @@ jobs:
           pinned="$(grep -m1 '^channel' rust-toolchain.toml | cut -d '"' -f 2)"
           # The release channel manifest's [pkg.rust] version line, e.g.
           # `version = "1.97.1 (8bab26f4f 2026-07-14)"` — take the number.
+          # awk clears the flag instead of `exit`-ing: an early exit closes
+          # the pipe while curl is still writing the (large) manifest, and
+          # under pipefail curl's EPIPE (exit 23) fails the step — a timing
+          # flake that only bites when awk wins the race. Reading to EOF
+          # costs milliseconds and can never EPIPE.
           latest="$(curl -fsSL --retry 3 https://static.rust-lang.org/dist/channel-rust-stable.toml \
-            | awk '/^\[pkg.rust\]/{f=1;next} f && /^version = /{print; exit}' \
+            | awk '/^\[pkg.rust\]/{f=1;next} f && /^version = /{print; f=0}' \
             | cut -d '"' -f 2 | cut -d ' ' -f 1)"
           if [ -z "$latest" ]; then
             echo "::error::could not read the latest stable version"
