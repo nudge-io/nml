@@ -427,10 +427,8 @@ fn item_body(item: &ListItem) -> Option<&Body> {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::NumberFacets;
-
     use super::*;
-    use crate::model::{FieldDef, FieldType, ModelKind};
+    use crate::model::{FieldDef, FieldType, ModelKind, PrimitiveFacets};
     use crate::types::PrimitiveType;
 
     fn s() -> Span {
@@ -442,7 +440,7 @@ mod tests {
             name: name.to_string(),
             field_type: FieldType::Primitive {
                 ty: PrimitiveType::String,
-                facets: NumberFacets::NONE,
+                facets: PrimitiveFacets::None,
             },
             optional: false,
             shorthand,
@@ -552,11 +550,11 @@ mod tests {
         arm_field.field_type = FieldType::Arms {
             key: Box::new(FieldType::Primitive {
                 ty: PrimitiveType::Role,
-                facets: NumberFacets::NONE,
+                facets: PrimitiveFacets::None,
             }),
             target: Box::new(FieldType::Primitive {
                 ty: PrimitiveType::Path,
-                facets: NumberFacets::NONE,
+                facets: PrimitiveFacets::None,
             }),
         };
         let m = model(vec![fd("name", false), arm_field]);

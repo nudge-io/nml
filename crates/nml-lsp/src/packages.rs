@@ -114,6 +114,34 @@ pub struct VocabularyMatch {
     /// being in its `[]schema` — the forgot-the-manifest trap, surfaced as
     /// an info diagnostic instead of staying silent.
     pub undeclared_sibling: bool,
+    /// Where the covered file's schema-validation universe comes from.
+    pub universe: SchemaUniverse,
+}
+
+/// The validation universe a covered `.model.nml` file loads against —
+/// one variant per provenance, so "both representations populated" is
+/// unrepresentable rather than merely unobserved.
+#[derive(Debug, Clone)]
+pub enum SchemaUniverse {
+    /// Workspace `[]schema` entries as PATHS (manifest-dir joins, in
+    /// DECLARATION order — merge order decides which duplicate
+    /// definition is "second" and so carries the error). Paths, not
+    /// texts, deliberately: assembly reads them buffer-first so live
+    /// editor text wins over disk.
+    Declared(Vec<std::path::PathBuf>),
+    /// A store package's source snapshot — `(logical name, text)` in
+    /// declaration order, shared (`Arc`) not cloned, and hash-verified
+    /// at store load, so the editor validates against the package's
+    /// PUBLISHED sources, not whatever sits nearby on disk. Nothing
+    /// live exists to prefer: store slots are written exactly once.
+    /// (A store source file OPENED directly is outside workspace
+    /// roots, resolves as uncovered, and its directory-mates are the
+    /// slot's own siblings — the correct universe emerges from the
+    /// fallback.)
+    Snapshot(std::sync::Arc<nml_validate::package::SchemaPackage>),
+    /// No usable declaration — assembly falls back to the buffer's
+    /// directory-mates.
+    None,
 }
 
 /// The answer [`PackageResolver::vocabulary_for`] gives — three-state on
@@ -503,6 +531,14 @@ impl PackageResolver {
                         package_name: package.manifest.name.clone(),
                         directives: package.manifest.directives.clone(),
                         undeclared_sibling: false,
+                        universe: SchemaUniverse::Declared(
+                            package
+                                .manifest
+                                .schemas
+                                .iter()
+                                .map(|entry| dir.join(&entry.file))
+                                .collect(),
+                        ),
                     });
                 }
             }
@@ -535,6 +571,25 @@ impl PackageResolver {
                         package_name: def.package.manifest.name.clone(),
                         directives: def.package.manifest.directives.clone(),
                         undeclared_sibling,
+                        universe: match &def.source {
+                            DefinitionSource::WorkspaceManifest(mp) => mp
+                                .parent()
+                                .map(|dir| {
+                                    SchemaUniverse::Declared(
+                                        def.package
+                                            .manifest
+                                            .schemas
+                                            .iter()
+                                            .map(|entry| dir.join(&entry.file))
+                                            .collect(),
+                                    )
+                                })
+                                .unwrap_or(SchemaUniverse::None),
+                            // Store (and in-binary) coverage has no
+                            // workspace directory — the package's own
+                            // hash-verified sources ARE the universe.
+                            _ => SchemaUniverse::Snapshot(def.package.clone()),
+                        },
                     });
                     if covering.len() == 2 {
                         // Two coverers already means ambiguity ⇒ opaque (D8);
@@ -1871,6 +1926,18 @@ mod tests {
         assert_eq!(vocab.package_name, "demo");
         let names: Vec<&str> = vocab.directives.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["live", "restart", "key"]);
+        // The schema LOAD pass builds its validation universe from this
+        // set: entries resolve against the MANIFEST's directory, in
+        // declaration order — a wrong join here silently degrades every
+        // covered file to the directory-mates fallback.
+        match &vocab.universe {
+            SchemaUniverse::Declared(files) => assert_eq!(
+                files,
+                &vec![project.join("core.model.nml")],
+                "declared []schema entries resolve against the manifest dir"
+            ),
+            other => panic!("workspace coverage must declare paths, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -1907,6 +1974,17 @@ mod tests {
         );
         assert!(!vocab.undeclared_sibling, "store coverage is not a sibling");
         assert_eq!(vocab.package_name, "demo");
+        // Store-sourced coverage has no workspace manifest dir to resolve
+        // `[]schema` entries against — the load pass falls back to the
+        // buffer's directory-mates.
+        match &vocab.universe {
+            SchemaUniverse::Snapshot(pkg) => assert_eq!(
+                pkg.sources.len(),
+                1,
+                "store coverage carries the package's hash-verified sources"
+            ),
+            other => panic!("store coverage must snapshot the package, got {other:?}"),
+        }
 
         // Workspace variant: an undeclared model file NEXT TO the manifest is
         // covered by the root rule and flagged as an undeclared sibling.
@@ -1934,6 +2012,18 @@ mod tests {
             "sibling is covered by the root rule",
         );
         assert!(vocab.undeclared_sibling);
+        // Root-rule coverage through a WORKSPACE manifest still knows the
+        // declared set (manifest-dir joins) — the load pass validates the
+        // undeclared sibling against the package's real universe, with the
+        // sibling itself appended last by the assembler.
+        match &vocab.universe {
+            SchemaUniverse::Declared(files) => assert_eq!(
+                files,
+                &vec![wsproj.join("core.model.nml")],
+                "workspace root-coverage resolves []schema against the manifest dir"
+            ),
+            other => panic!("workspace root-coverage must declare paths, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&ws);
     }
 

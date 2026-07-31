@@ -714,6 +714,7 @@ pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
+
     /// A facet-violating default inside a UNION must be reported.
     /// The regression this guards: variants that cannot hold the value
     /// (a `string` beside a faceted `number`) have no facets to check,
@@ -763,14 +764,15 @@ mod tests {
         }
     }
 
-    /// Cross-RFC interaction: RFC 0017 landed `duration` as a
-    /// first-class type in the same cycle as facets. A faceted
-    /// duration is a definition error (RFC 0018 §3 defers the family),
-    /// and the message must name the actual type rather than say
-    /// something generic — the author needs to know WHICH type refused.
+    /// Facets attach to `number` and `duration` ONLY; every other
+    /// primitive refuses with a message naming the actual type — the
+    /// author needs to know WHICH type refused. A `duration` field
+    /// with a UNITLESS bound is the domain-agreement error instead
+    /// (durations became legal carriers when RFC 0018 §3's deferral
+    /// closed): the message teaches the literal shape.
     #[test]
     fn facets_on_other_primitives_name_the_type() {
-        for ty in ["duration", "string", "bool", "path", "secret", "money"] {
+        for ty in ["string", "bool", "path", "secret", "money"] {
             let src = format!("model m:\n    x {ty}(min = 1)\n");
             let (_s, diags) = crate::cst::extract_schema(&src);
             let msg = diags
@@ -783,6 +785,67 @@ mod tests {
                 "message must name the type: {msg}"
             );
         }
+        let (_s, diags) = crate::cst::extract_schema("model m:\n    x duration(min = 1)\n");
+        let msg = diags
+            .iter()
+            .find(|d| d.code == Some(crate::diagnostic::codes::FACET_DEFINITION))
+            .map(|d| d.rendered_message())
+            .unwrap_or_else(|| panic!("unitless duration bound must be rejected: {diags:?}"));
+        assert!(
+            msg.contains("has no unit") && msg.contains("min = 1s"),
+            "message must teach the duration-literal shape: {msg}"
+        );
+    }
+
+    /// Duration facets (RFC 0017 literals under the RFC 0018 grammar):
+    /// a well-formed declaration loads clean; the declaration rules
+    /// judge ranges SEMANTICALLY (nanos), so `min = 1000ms` against
+    /// `max = 1s` is satisfiable (equal) while the exclusive spelling
+    /// of the same pair is not; `multipleOf = 0s` is rejected like its
+    /// numeric zero sibling; and a violating duration DEFAULT is
+    /// NML2057 at the declaration, mixed units included.
+    #[test]
+    fn duration_facet_declarations_and_defaults() {
+        let clean = "model m:\n    t duration(min = 1s, max = 2h, multipleOf = 250ms) = 1500ms\n";
+        let (_s, diags) = crate::cst::extract_schema(clean);
+        assert!(diags.is_empty(), "well-formed must load clean: {diags:?}");
+
+        let equal = "model m:\n    t duration(min = 1000ms, max = 1s)\n";
+        let (_s, diags) = crate::cst::extract_schema(equal);
+        assert!(diags.is_empty(), "1000ms == 1s is satisfiable: {diags:?}");
+
+        let strict = "model m:\n    t duration(exclusiveMin = 1000ms, max = 1s)\n";
+        let (_s, diags) = crate::cst::extract_schema(strict);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unsatisfiable")),
+            "exclusive equal bounds are empty: {diags:?}"
+        );
+
+        let zero = "model m:\n    t duration(multipleOf = 0s)\n";
+        let (_s, diags) = crate::cst::extract_schema(zero);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("positive duration")),
+            "multipleOf = 0s must be rejected: {diags:?}"
+        );
+
+        let bad_default = "model m:\n    t duration(min = 1s) = 500ms\n";
+        let (_s, diags) = crate::cst::extract_schema(bad_default);
+        assert!(
+            diags.iter().any(
+                |d| d.code == Some(crate::diagnostic::codes::FACET_VIOLATION)
+                    && d.message.contains("below")
+            ),
+            "500ms breaks min = 1s at the declaration: {diags:?}"
+        );
+
+        // Cross-domain, both directions: each names its fix.
+        let (_s, diags) = crate::cst::extract_schema("model m:\n    x number(min = 5s)\n");
+        assert!(
+            diags.iter().any(|d| d.message.contains("is a duration")),
+            "duration bound on a number field: {diags:?}"
+        );
     }
 
     /// RFC 0016 makes −0 unrepresentable, so every spelling of a
@@ -836,7 +899,7 @@ mod tests {
         );
     }
 
-    use crate::model::NumberFacets;
+    use crate::model::PrimitiveFacets;
 
     use super::*;
     use crate::cst::extract_schema;
@@ -963,7 +1026,7 @@ mod tests {
                 name: f.to_string(),
                 field_type: FieldType::Primitive {
                     ty: PrimitiveType::String,
-                    facets: NumberFacets::NONE,
+                    facets: PrimitiveFacets::None,
                 },
                 optional: false,
                 shorthand: false,
@@ -997,7 +1060,7 @@ mod tests {
             name: name.to_string(),
             field_type: FieldType::Primitive {
                 ty: PrimitiveType::String,
-                facets: NumberFacets::NONE,
+                facets: PrimitiveFacets::None,
             },
             optional: false,
             shorthand: false,
@@ -1794,19 +1857,24 @@ pub fn facet_definition_diagnostics(file: &crate::ast::File) -> Vec<Diagnostic> 
     diags
 }
 
-/// The AST facet list as a [`crate::model::NumberFacets`] — the shape
-/// the shared comparison home speaks. Mirrors extraction's CST-side
+/// The AST facet list as a [`crate::model::Facets`] over one domain —
+/// the shape the shared comparison home speaks; `pick` selects the
+/// domain's values (cross-domain values are the declaration rules'
+/// findings and never load as bounds). Mirrors extraction's CST-side
 /// builder at the AST layer; unknown/duplicate keys are the
 /// declaration rules' business, so last-writer-wins here is harmless
 /// (an invalid declaration never loads).
-fn facets_of_ast(facets: &[crate::ast::FacetExpr]) -> crate::model::NumberFacets {
-    let mut out = crate::model::NumberFacets::NONE;
+fn facets_of_ast_as<T: Clone>(
+    facets: &[crate::ast::FacetExpr],
+    pick: impl Fn(&crate::types::Value) -> Option<T>,
+) -> crate::model::Facets<T> {
+    let mut out = crate::model::Facets::NONE;
     for f in facets {
-        let crate::types::Value::Number(value) = &f.value.value else {
+        let Some(value) = pick(&f.value.value) else {
             continue;
         };
-        let bound = |exclusive| crate::model::FacetBound {
-            value: *value,
+        let bound = |exclusive| crate::model::FacetBoundOf {
+            value: value.clone(),
             exclusive,
             span: f.span,
         };
@@ -1816,8 +1884,8 @@ fn facets_of_ast(facets: &[crate::ast::FacetExpr]) -> crate::model::NumberFacets
             "max" => out.max = Some(bound(false)),
             "exclusiveMax" => out.max = Some(bound(true)),
             "multipleOf" => {
-                out.multiple_of = Some(crate::model::FacetMultiple {
-                    value: *value,
+                out.multiple_of = Some(crate::model::FacetMultipleOf {
+                    value,
                     span: f.span,
                 })
             }
@@ -1825,6 +1893,20 @@ fn facets_of_ast(facets: &[crate::ast::FacetExpr]) -> crate::model::NumberFacets
         }
     }
     out
+}
+
+fn pick_number(v: &crate::types::Value) -> Option<crate::types::Number> {
+    match v {
+        crate::types::Value::Number(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn pick_duration(v: &crate::types::Value) -> Option<crate::duration::Duration> {
+    match v {
+        crate::types::Value::Duration(d) => Some(*d),
+        _ => None,
+    }
 }
 
 /// Could this type hold `value` at all? The facet domain only needs
@@ -1835,6 +1917,7 @@ fn facet_type_applies(te: &crate::ast::FieldTypeExpr, value: &crate::types::Valu
     use crate::ast::FieldTypeExpr as T;
     match (te, value) {
         (T::Named { name, .. }, crate::types::Value::Number(_)) => name.name == "number",
+        (T::Named { name, .. }, crate::types::Value::Duration(_)) => name.name == "duration",
         // Every element must face the element type — `[]string` must
         // NOT claim `[5]`. Mirrors enforcement's `value_matches_type`,
         // which requires all items to match `inner`; without it a
@@ -1874,7 +1957,19 @@ fn facet_default_violations(
             let crate::types::Value::Number(n) = value else {
                 return;
             };
-            for tail in facets_of_ast(facets).violations(n) {
+            for tail in facets_of_ast_as(facets, pick_number).violations(n) {
+                diags.push(
+                    Diagnostic::error(format!("default for '{field_name}' {tail}"))
+                        .with_code(codes::FACET_VIOLATION)
+                        .with_span(span),
+                );
+            }
+        }
+        T::Named { name, facets } if name.name == "duration" && !facets.is_empty() => {
+            let crate::types::Value::Duration(d) = value else {
+                return;
+            };
+            for tail in facets_of_ast_as(facets, pick_duration).violations(d) {
                 diags.push(
                     Diagnostic::error(format!("default for '{field_name}' {tail}"))
                         .with_code(codes::FACET_VIOLATION)
@@ -1934,16 +2029,44 @@ fn facet_rules_in_type(
             if facets.is_empty() {
                 return;
             }
-            if name.name != "number" {
+            let domain = name.name.as_str();
+            if domain != "number" && domain != "duration" {
                 err(
                     diags,
                     format!(
-                        "'{field_name}': facets attach only to `number` — `{}` cannot carry them",
+                        "'{field_name}': facets attach only to `number` and `duration` — \
+                         `{}` cannot carry them",
                         name.name
                     ),
                     facets[0].span,
                 );
                 return;
+            }
+            // Domain agreement: a `number` field's bounds are numbers, a
+            // `duration` field's are duration literals. A cross-domain
+            // value never loads as a bound (extraction drops it), so the
+            // mismatch must be SAID here or the facet silently vanishes.
+            for f in facets {
+                match (&f.value.value, domain) {
+                    (crate::types::Value::Duration(d), "number") => err(
+                        diags,
+                        format!(
+                            "'{field_name}': `number` facets take number values — \
+                             `{d}` is a duration"
+                        ),
+                        f.span,
+                    ),
+                    (crate::types::Value::Number(n), "duration") => err(
+                        diags,
+                        format!(
+                            "'{field_name}': `duration` facets take duration literals \
+                             (`{} = {n}s`, `{} = {n}ms`, ...) — `{n}` has no unit",
+                            f.key.name, f.key.name
+                        ),
+                        f.span,
+                    ),
+                    _ => {}
+                }
             }
             const KNOWN: [&str; 5] = ["min", "max", "exclusiveMin", "exclusiveMax", "multipleOf"];
             let mut seen: Vec<&str> = Vec::new();
@@ -1970,9 +2093,29 @@ fn facet_rules_in_type(
                 seen.push(k);
             }
             let get = |k: &str| facets.iter().find(|f| f.key.name == k);
-            let num = |f: &crate::ast::FacetExpr| match &f.value.value {
-                crate::types::Value::Number(n) => Some(*n),
-                _ => None,
+            // In-domain ordering; `None` when either side is
+            // cross-domain (already reported above) or undecoded.
+            let ord = |a: &crate::ast::FacetExpr,
+                       b: &crate::ast::FacetExpr|
+             -> Option<std::cmp::Ordering> {
+                match (&a.value.value, &b.value.value) {
+                    (crate::types::Value::Number(x), crate::types::Value::Number(y))
+                        if domain == "number" =>
+                    {
+                        Some(x.cmp(y))
+                    }
+                    (crate::types::Value::Duration(x), crate::types::Value::Duration(y))
+                        if domain == "duration" =>
+                    {
+                        Some(x.cmp(y))
+                    }
+                    _ => None,
+                }
+            };
+            let shown = |f: &crate::ast::FacetExpr| match &f.value.value {
+                crate::types::Value::Number(n) => n.to_string(),
+                crate::types::Value::Duration(d) => d.to_string(),
+                _ => String::new(),
             };
             for (a, b) in [("min", "exclusiveMin"), ("max", "exclusiveMax")] {
                 if let (Some(_), Some(fb)) = (get(a), get(b)) {
@@ -1986,16 +2129,21 @@ fn facet_rules_in_type(
             let lo = get("min").or_else(|| get("exclusiveMin"));
             let hi = get("max").or_else(|| get("exclusiveMax"));
             if let (Some(l), Some(h)) = (lo, hi) {
-                if let (Some(lv), Some(hv)) = (num(l), num(h)) {
+                if let Some(o) = ord(l, h) {
                     let strict =
                         l.key.name.starts_with("exclusive") || h.key.name.starts_with("exclusive");
-                    if lv > hv || (lv == hv && strict) {
+                    if o == std::cmp::Ordering::Greater
+                        || (o == std::cmp::Ordering::Equal && strict)
+                    {
                         err(
                             diags,
                             format!(
                                 "'{field_name}': the declared range is unsatisfiable \
-                                 ({} = {lv} against {} = {hv})",
-                                l.key.name, h.key.name
+                                 ({} = {} against {} = {})",
+                                l.key.name,
+                                shown(l),
+                                h.key.name,
+                                shown(h)
                             ),
                             h.span,
                         );
@@ -2003,14 +2151,29 @@ fn facet_rules_in_type(
                 }
             }
             if let Some(m) = get("multipleOf") {
-                if let Some(v) = num(m) {
-                    if v <= crate::types::Number::ZERO {
+                match &m.value.value {
+                    crate::types::Value::Number(v) if domain == "number" => {
+                        if *v <= crate::types::Number::ZERO {
+                            err(
+                                diags,
+                                format!("'{field_name}': multipleOf must be positive (got {v})"),
+                                m.span,
+                            );
+                        }
+                    }
+                    crate::types::Value::Duration(d)
+                        if domain == "duration" && d.total_nanos() == 0 =>
+                    {
                         err(
                             diags,
-                            format!("'{field_name}': multipleOf must be positive (got {v})"),
+                            format!(
+                                "'{field_name}': multipleOf must be a positive duration \
+                                 (got {d})"
+                            ),
                             m.span,
                         );
                     }
+                    _ => {}
                 }
             }
         }

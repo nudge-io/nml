@@ -376,7 +376,7 @@ fn first_wins<T>(items: &[T], name: impl Fn(&T) -> &str) -> HashMap<String, usiz
 
 #[cfg(test)]
 mod tests {
-    use crate::model::NumberFacets;
+    use crate::model::PrimitiveFacets;
 
     use super::*;
     use crate::model::ModelKind;
@@ -416,7 +416,7 @@ mod tests {
                         "a",
                         FieldType::Primitive {
                             ty: PrimitiveType::String,
-                            facets: NumberFacets::NONE,
+                            facets: PrimitiveFacets::None,
                         },
                     )],
                 ),
@@ -426,7 +426,7 @@ mod tests {
                         "b",
                         FieldType::Primitive {
                             ty: PrimitiveType::String,
-                            facets: NumberFacets::NONE,
+                            facets: PrimitiveFacets::None,
                         },
                     )],
                 ),
@@ -458,7 +458,7 @@ mod tests {
                 "x",
                 FieldType::Primitive {
                     ty: PrimitiveType::String,
-                    facets: NumberFacets::NONE
+                    facets: PrimitiveFacets::None
                 }
             )),
             FieldTarget::Leaf(_)
@@ -468,7 +468,7 @@ mod tests {
                 "x",
                 FieldType::Primitive {
                     ty: PrimitiveType::Object,
-                    facets: NumberFacets::NONE
+                    facets: PrimitiveFacets::None
                 }
             )),
             FieldTarget::Object
@@ -493,7 +493,7 @@ mod tests {
                 "x",
                 FieldType::Union(vec![FieldType::Primitive {
                     ty: PrimitiveType::String,
-                    facets: NumberFacets::NONE
+                    facets: PrimitiveFacets::None
                 }])
             )),
             FieldTarget::Union(_)
@@ -549,7 +549,7 @@ mod tests {
         let sm = FieldType::Union(vec![
             FieldType::Primitive {
                 ty: PrimitiveType::String,
-                facets: NumberFacets::NONE,
+                facets: PrimitiveFacets::None,
             },
             FieldType::ModelRef("step".into()),
         ]);
@@ -625,7 +625,7 @@ mod tests {
         let disjoint = FieldType::Union(vec![
             FieldType::Primitive {
                 ty: PrimitiveType::String,
-                facets: NumberFacets::NONE,
+                facets: PrimitiveFacets::None,
             },
             FieldType::ModelRef("modelA".into()),
         ]);

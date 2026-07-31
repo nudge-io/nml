@@ -230,7 +230,12 @@ impl Inner {
             let path = entry.path();
             if path.is_dir() {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name != "node_modules" && name != ".git" && !name.starts_with('.') {
+                // `target` is excluded for the same reason rust-analyzer
+                // excludes it: `cargo package` copies full crate sources —
+                // `.nml` fixtures included — under `target/package/`, and
+                // indexing those copies pollutes the schema registry with
+                // duplicate definitions from files nobody is editing.
+                if name != "node_modules" && name != "target" && !name.starts_with('.') {
                     Self::find_nml_files(&path, files, depth + 1);
                 }
             } else if path.extension().is_some_and(|e| e == "nml") {
@@ -606,15 +611,62 @@ impl Inner {
                 });
             }
         }
-        // Schema-source pass (RFC 0030): a covered `.model.nml` is validated
-        // *as a schema* — extraction errors, directive vocabulary, sibling
-        // info. Uncovered model files stay opaque (no vocabulary_for match ⇒
-        // nothing appended). The pass re-derives extraction errors that
-        // `compute` already emitted as parse errors, so exact duplicates
-        // (same range, message, severity) are suppressed rather than
-        // double-squiggled.
+        // Schema passes for a `.model.nml` buffer. First the LOAD pass:
+        // the editor assembles the buffer's validation universe (covering
+        // package's `[]schema` in manifest order, or directory-mates) and
+        // calls `load_schema` — the same entry the CLI and embedders use —
+        // keeping only this buffer's findings. Composition, cycles,
+        // shorthand arity, oneof/enum integrity, reserved/duplicate names,
+        // and declared defaults reach the editor with CLI parity by
+        // identity. Then the schema-SOURCE pass (RFC 0030): directive
+        // vocabulary for covered files. Both re-derive extraction errors
+        // the parse band already emitted, so exact duplicates (same range,
+        // message, severity) are suppressed rather than double-squiggled.
         if uri.as_str().ends_with(".model.nml") {
-            match self.vocabulary_for_document(uri) {
+            let outcome = self.vocabulary_for_document(uri);
+            let universe = match &outcome {
+                packages::VocabularyOutcome::Covered(vocab) => &vocab.universe,
+                _ => &packages::SchemaUniverse::None,
+            };
+            let (sources, own_name) = match uri.to_file_path() {
+                // Store coverage: the package's hash-verified source
+                // snapshot IS the universe — no disk reads at all.
+                Ok(own_path) => {
+                    if let packages::SchemaUniverse::Snapshot(pkg) = universe {
+                        snapshot_universe(&own_path, text, &pkg.sources)
+                    } else {
+                        let declared: &[std::path::PathBuf] = match universe {
+                            packages::SchemaUniverse::Declared(paths) => paths,
+                            _ => &[],
+                        };
+                        let read = |p: &Path| -> Option<String> {
+                            let file_uri = Url::from_file_path(p).ok()?;
+                            let buffered = self
+                                .documents
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(&file_uri)
+                                .cloned();
+                            buffered.or_else(|| fs::read_to_string(p).ok())
+                        };
+                        assemble_schema_universe(&own_path, text, declared, &read)
+                    }
+                }
+                // A non-file buffer (untitled) still validates — as its own
+                // single-source universe.
+                Err(()) => (vec![(uri.to_string(), text.to_string())], uri.to_string()),
+            };
+            for diag in diagnostics::schema_load_pass(&own_name, &sources, Some(uri)) {
+                let duplicate = diags.iter().any(|d| {
+                    d.range == diag.range
+                        && d.message == diag.message
+                        && d.severity == diag.severity
+                });
+                if !duplicate {
+                    diags.push(diag);
+                }
+            }
+            match outcome {
                 packages::VocabularyOutcome::Covered(vocab) => {
                     for diag in diagnostics::schema_source_pass(text, &vocab, Some(uri)) {
                         let duplicate = diags.iter().any(|d| {
@@ -890,6 +942,108 @@ impl Inner {
 /// of the (canonicalized) workspace roots. Clients can send arbitrary
 /// `file://` URIs in watched-file notifications, so this is the boundary
 /// check that keeps the server from reading files outside the workspace.
+/// Directory-mates fallback bound: a pathological directory must not turn
+/// every diagnostics pull into an unbounded load. Manifest-declared
+/// universes are author-bounded and uncapped.
+const MAX_UNIVERSE_FILES: usize = 128;
+
+/// Assemble a `.model.nml` buffer's validation universe as `(name, text)`
+/// sources for `load_schema`, plus the name identifying the buffer itself.
+///
+/// Covered files use `declared` — the covering package's `[]schema` in
+/// MANIFEST order, because merge order decides which duplicate definition
+/// is "second" (and so carries the error); the editor must agree with
+/// every other consumer of the package about that. Uncovered files fall
+/// back to the buffer's directory-mates in sorted order (deterministic
+/// merge ⇒ deterministic attribution), bounded by [`MAX_UNIVERSE_FILES`].
+///
+/// Reads are buffer-first through `read` (an open buffer is the sole
+/// source of truth for its file; disk is the fallback), the buffer's own
+/// text always wins for its own path, and symlinked directory-mates are
+/// refused — the same disk-intake rule as [`watched_file_is_eligible`].
+/// A declared file that is missing on disk contributes nothing (its
+/// absence is the package's own resolution problem, reported there); a
+/// covered-but-undeclared buffer (the sibling trap) is appended AFTER the
+/// declared set, so duplicate attribution lands on the undeclared file —
+/// the one whose declaration status is in question.
+fn assemble_schema_universe(
+    own_path: &Path,
+    own_text: &str,
+    declared: &[PathBuf],
+    read: &dyn Fn(&Path) -> Option<String>,
+) -> (Vec<(String, String)>, String) {
+    let name_of = |p: &Path| p.to_string_lossy().into_owned();
+    let own_name = name_of(own_path);
+    let mut sources: Vec<(String, String)> = Vec::new();
+
+    if declared.is_empty() {
+        // Directory-mates universe. Sorted for determinism; own file
+        // always present (and always the buffer's text).
+        let mut mates: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = own_path.parent() {
+            if let Ok(entries) = fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let is_model = p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(".model.nml"));
+                    let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true);
+                    if is_model && !is_symlink && p != own_path {
+                        mates.push(p);
+                    }
+                }
+            }
+        }
+        mates.sort();
+        mates.truncate(MAX_UNIVERSE_FILES.saturating_sub(1));
+        // Own file first: with no declared order to honor, putting the
+        // buffer first pins duplicate attribution onto the OTHER file —
+        // the user is looking at this one, and the loader errors the
+        // second occurrence.
+        sources.push((own_name.clone(), own_text.to_string()));
+        for mate in mates {
+            if let Some(text) = read(&mate) {
+                sources.push((name_of(&mate), text));
+            }
+        }
+        return (sources, own_name);
+    }
+
+    let mut own_declared = false;
+    for entry in declared {
+        if entry.as_path() == own_path {
+            own_declared = true;
+            sources.push((own_name.clone(), own_text.to_string()));
+        } else if let Some(text) = read(entry) {
+            sources.push((name_of(entry), text));
+        }
+    }
+    if !own_declared {
+        sources.push((own_name.clone(), own_text.to_string()));
+    }
+    (sources, own_name)
+}
+
+/// Assemble a STORE-covered buffer's validation universe: the package's
+/// hash-verified `(logical name, text)` sources in declaration order,
+/// with the buffer's own text appended LAST. Always appended,
+/// unconditionally: store sources live in the store slot, never in the
+/// workspace, so the buffer cannot be one of them — and logical names
+/// (`[a-z][a-z0-9-]*`) can never collide with the buffer's absolute-path
+/// key, so no dedup is needed or possible.
+fn snapshot_universe(
+    own_path: &Path,
+    own_text: &str,
+    sources: &[(String, String)],
+) -> (Vec<(String, String)>, String) {
+    let own_name = own_path.to_string_lossy().into_owned();
+    let mut out: Vec<(String, String)> = Vec::with_capacity(sources.len() + 1);
+    out.extend(sources.iter().cloned());
+    out.push((own_name.clone(), own_text.to_string()));
+    (out, own_name)
+}
+
 fn watched_file_is_eligible(path: &Path, roots: &[PathBuf]) -> bool {
     let is_symlink = fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
@@ -8467,6 +8621,126 @@ workflow VoiceAgent:
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    /// The workspace walk skips build/dependency dirs: `target` (where
+    /// `cargo package` copies full crate sources — `.nml` fixtures
+    /// included — so indexing it pollutes the registry with duplicate
+    /// definitions), `node_modules`, and anything hidden. A schema in a
+    /// normal source dir is still found.
+    #[test]
+    fn workspace_walk_skips_build_and_hidden_dirs() {
+        let root = temp_workspace("walk-deny");
+        for dir in ["target/package/x", "node_modules/pkg", ".cache", "src"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("target/package/x/a.model.nml"), "model a:\n").unwrap();
+        fs::write(root.join("node_modules/pkg/b.model.nml"), "model b:\n").unwrap();
+        fs::write(root.join(".cache/c.model.nml"), "model c:\n").unwrap();
+        fs::write(root.join("src/d.model.nml"), "model d:\n").unwrap();
+
+        let mut files = Vec::new();
+        Inner::find_nml_files(&root, &mut files, 0);
+
+        assert_eq!(
+            files,
+            vec![root.join("src/d.model.nml")],
+            "only the source-dir schema may be indexed"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Schema universe assembly ──────────────────────────────
+
+    /// Declared (covered) universe: manifest order preserved, buffer
+    /// text wins for the own file, a missing declared file contributes
+    /// nothing, and an undeclared own file is appended LAST (duplicate
+    /// attribution lands on the file whose declaration is in question).
+    #[test]
+    fn declared_universe_keeps_manifest_order_and_buffer_text() {
+        let root = temp_workspace("universe-declared");
+        let a = root.join("a.model.nml");
+        let b = root.join("b.model.nml");
+        fs::write(&a, "model a:\n").unwrap();
+        fs::write(&b, "STALE DISK TEXT").unwrap();
+        let missing = root.join("gone.model.nml");
+
+        let read = |p: &Path| fs::read_to_string(p).ok();
+        let declared = vec![a.clone(), missing.clone(), b.clone()];
+        let (sources, own_name) = assemble_schema_universe(&b, "model b:\n", &declared, &read);
+        assert_eq!(own_name, b.to_string_lossy());
+        let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![a.to_string_lossy(), b.to_string_lossy()],
+            "manifest order, missing file skipped"
+        );
+        assert_eq!(sources[1].1, "model b:\n", "buffer text wins over disk");
+
+        // Undeclared own file: appended after the declared set.
+        let c = root.join("c.model.nml");
+        let (sources, _) = assemble_schema_universe(&c, "model c:\n", &declared, &read);
+        assert_eq!(
+            sources.last().map(|(n, _)| n.as_str()),
+            Some(c.to_string_lossy().as_ref()),
+            "undeclared own file is appended last"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Store-snapshot universe: the package's sources in declaration
+    /// order (merge order = duplicate attribution), buffer appended
+    /// last under its path key — validated against the PUBLISHED
+    /// package, not directory neighbors.
+    #[test]
+    fn snapshot_universe_keeps_order_and_appends_buffer_last() {
+        let sources = vec![
+            ("core".to_string(), "model a:\n".to_string()),
+            ("extra".to_string(), "model b:\n".to_string()),
+        ];
+        let own = Path::new("/ws/mine.model.nml");
+        let (out, own_name) = snapshot_universe(own, "model c:\n", &sources);
+        let names: Vec<&str> = out.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["core", "extra", "/ws/mine.model.nml"]);
+        assert_eq!(own_name, "/ws/mine.model.nml");
+        assert_eq!(out[2].1, "model c:\n", "buffer text is the live text");
+    }
+
+    /// Directory-mates (uncovered) universe: own buffer first, mates
+    /// sorted, non-model files and symlinks refused.
+    #[test]
+    fn dir_mates_universe_is_sorted_and_symlink_free() {
+        let root = temp_workspace("universe-mates");
+        let own = root.join("m.model.nml");
+        fs::write(&own, "model m:\n").unwrap();
+        fs::write(root.join("z.model.nml"), "model z:\n").unwrap();
+        fs::write(root.join("a.model.nml"), "model a:\n").unwrap();
+        fs::write(root.join("notes.nml"), "x Y:\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("a.model.nml"), root.join("link.model.nml")).unwrap();
+
+        let read = |p: &Path| fs::read_to_string(p).ok();
+        let (sources, own_name) = assemble_schema_universe(&own, "model m:\n", &[], &read);
+        let names: Vec<String> = sources
+            .iter()
+            .map(|(n, _)| {
+                Path::new(n)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["m.model.nml", "a.model.nml", "z.model.nml"],
+            "own first, mates sorted, symlink and non-model refused"
+        );
+        assert_eq!(own_name, own.to_string_lossy());
+
+        fs::remove_dir_all(&root).ok();
     }
 
     // ── Hover markdown safety ─────────────────────────────────

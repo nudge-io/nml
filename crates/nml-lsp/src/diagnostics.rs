@@ -57,22 +57,25 @@ pub fn compute(
     // error at once replaces the legacy first-error-only behaviour, and running
     // the validators on the best-effort AST keeps feedback alive mid-edit
     // instead of going dark on the first syntax error.
-    let (file, parse_errors) = nml_core::cst::parse_to_ast_all(source);
+    // ONE parse yields all three views: the semantic AST for the
+    // validators, this buffer's own extracted definitions for the
+    // definition-side checks, and the findings set — which already
+    // includes the RFC 0018 facet definition rules (NML2058), so the
+    // parse band carries them for every document with no separate walk.
+    // (Previously this fn parsed the same text up to three times per
+    // keystroke: parse, facet re-extraction, merge re-extraction.)
+    let (file, own_defs, parse_errors) = nml_core::cst::parse_and_extract(source);
 
     for diag in parse_errors {
         push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
     }
 
-    // RFC 0018 facet DEFINITION rules (NML2058). Context-free over the
-    // lowered AST, so they publish here — off the parse band every
-    // document already gets — rather than from a mode-gated
-    // re-extraction: `.model.nml` files (where facets are actually
-    // authored) are registry sources and skip the merge branch below,
-    // and the covered-schema pass reaches only package-bound files.
-    // One call, every document, no second parse.
-    for diag in nml_core::schema::facet_definition_diagnostics(&file) {
-        push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
-    }
+    // Declared defaults, composition, cycles, and every other
+    // schema-level rule for a `.model.nml` buffer arrive through
+    // [`schema_load_pass`] — the editor loads the buffer's package
+    // through the SAME `load_schema` entry the CLI and embedders use,
+    // then keeps only this buffer's findings. Nothing schema-level is
+    // checked here: one engine, one findings set, no drift.
 
     let mut symbols = nml_core::symbols::SymbolTable::new();
     symbols.register_file(&file);
@@ -110,7 +113,7 @@ pub fn compute(
             // collision-checking) them against themselves would be noise.
             let doc_is_registry_source = config.uri_is_registry_source;
             if !doc_is_registry_source {
-                let (own, _) = nml_core::cst::extract_schema(source);
+                let own = own_defs;
                 for m in own.models {
                     if models.iter().any(|k| k.name == m.name) {
                         // CLI parity (RFC 0012): the same collision `nml
@@ -183,6 +186,24 @@ pub fn compute(
                     .with_modifiers(config.modifiers.clone())
                     .with_membership_semantics(config.membership.clone());
                 for diag in validator.validate(&file) {
+                    // A `.model.nml` buffer's mixin (`is`) targets are judged
+                    // by the SCHEMA LOAD PASS against the buffer's TRUE
+                    // universe — its covering package's sources (workspace,
+                    // store, or in-binary snapshot). The validator resolves
+                    // them against the WORKSPACE REGISTRY, which cannot see
+                    // snapshot sources: for a store-covered buffer this arm
+                    // reported `unknown \`is\` target` for parents the
+                    // package genuinely defines (caught by the provenance
+                    // matrix e2e). Same-code findings from the load pass
+                    // carry the same did-you-mean, so nothing is lost.
+                    if config.uri_is_registry_source
+                        && matches!(
+                            diag.code,
+                            Some(codes::UNKNOWN_MIXIN | codes::INVALID_MIXIN_KIND)
+                        )
+                    {
+                        continue;
+                    }
                     push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
                 }
             }
@@ -288,6 +309,48 @@ fn push_diagnostic(
     });
 }
 
+/// Cross-definition schema validation for a `.model.nml` buffer — the
+/// editor calls the loader. `sources` is the buffer's whole validation
+/// universe (its covering package's `[]schema` files in manifest order,
+/// or its directory-mates when uncovered), read buffer-first; `own_name`
+/// is the entry naming this buffer. The pass runs
+/// [`nml_validate::loader::load_schema`] — the byte-for-byte entry point
+/// the CLI and embedders use, so composition, cycles, shorthand arity,
+/// oneof/enum integrity, reserved/duplicate names, and declared defaults
+/// reach the editor with CLI parity by identity, not by test — and keeps
+/// only findings stamped with `own_name`. Foreign files' findings carry
+/// their own source stamps and are dropped: their spans index THEIR text,
+/// and they get their own findings when their buffers are validated (the
+/// wrong-buffer attribution rule). Extraction errors for the own file are
+/// byte-identical to the parse band's; the caller's exact-duplicate
+/// suppression collapses them.
+pub fn schema_load_pass(
+    own_name: &str,
+    sources: &[(String, String)],
+    uri: Option<&tower_lsp::lsp_types::Url>,
+) -> Vec<Diagnostic> {
+    let own_text = match sources.iter().find(|(n, _)| n == own_name) {
+        Some((_, text)) => text,
+        // No own entry means the caller assembled a universe that cannot
+        // attribute anything to this buffer — nothing to report.
+        None => return Vec::new(),
+    };
+    let line_index = LineIndex::new(own_text);
+    let refs: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|(n, t)| (n.as_str(), t.as_str()))
+        .collect();
+    let (_schema, findings) = nml_validate::loader::load_schema(&refs);
+    let mut out = Vec::new();
+    for diag in findings
+        .into_iter()
+        .filter(|d| d.source.as_deref() == Some(own_name))
+    {
+        push_diagnostic(diag, None, uri, &line_index, &mut out);
+    }
+    out
+}
+
 /// Schema-source pass (RFC 0030): diagnostics for a **covered** `.model.nml`
 /// document — a file `vocabulary_for` resolved to a covering package. Opaque
 /// files never reach here (zero vocabulary diagnostics by construction).
@@ -312,6 +375,7 @@ pub fn schema_source_pass(
     for diag in errors {
         push_diagnostic(diag, None, uri, &line_index, &mut out);
     }
+
     let vocab_names: Vec<String> = vocab.directives.iter().map(|d| d.name.clone()).collect();
     let vocab_has = |name: &str| vocab_names.iter().any(|n| n == name);
     for model in &schema.models {
@@ -608,6 +672,7 @@ fn validate_value_templates(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     fn default_config() -> DiagnosticConfig {
@@ -694,6 +759,7 @@ package demo:
                 .manifest
                 .directives,
             undeclared_sibling,
+            universe: crate::packages::SchemaUniverse::None,
         }
     }
 
@@ -897,6 +963,207 @@ package demo:
             a[0],
             b[0]
         );
+    }
+
+    // ── Schema load pass (the editor calls the loader) ────────
+
+    fn load_pass(own: &str, sources: &[(&str, &str)]) -> Vec<Diagnostic> {
+        let owned: Vec<(String, String)> = sources
+            .iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect();
+        schema_load_pass(own, &owned, None)
+    }
+
+    /// Another file's findings must NOT paint onto this buffer. The
+    /// merged registry once put five other files' default errors on a
+    /// two-line config buffer, spans mapped through the wrong line
+    /// index and clamped (round 29). The load pass enforces the rule
+    /// structurally: every finding carries its declaring source, and
+    /// only this buffer's survive the filter.
+    #[test]
+    fn other_files_findings_never_land_on_this_buffer() {
+        let bad = "model cfg:\n    count number = \"high\"\n";
+        let clean = "// just a comment\n";
+        let diags = load_pass(
+            "own.model.nml",
+            &[
+                ("own.model.nml", clean),
+                ("f1.model.nml", bad),
+                ("f2.model.nml", "model broken:\n    @@@\n"),
+            ],
+        );
+        assert!(
+            diags.is_empty(),
+            "foreign defaults and parse errors must not appear here: {diags:?}"
+        );
+        // And the buffer's OWN bad default still reports, exactly once.
+        let diags = load_pass("own.model.nml", &[("own.model.nml", bad)]);
+        assert_eq!(
+            diags
+                .iter()
+                .filter(|d| d.message.contains("as the default for"))
+                .count(),
+            1,
+            "own default reports once: {diags:?}"
+        );
+    }
+
+    /// A schema author sees a bad DEFAULT in the editor, once — via the
+    /// loader itself, so editor and CLI cannot disagree about a schema
+    /// they both read. An unresolvable enum reference must NOT
+    /// false-positive (value-shape fallback: false negatives, never
+    /// false positives).
+    #[test]
+    fn default_type_errors_reach_the_editor_once() {
+        let source = "model cfg:\n    count number = \"high\"\n";
+        let diags = load_pass("cfg.model.nml", &[("cfg.model.nml", source)]);
+        assert_eq!(
+            diags
+                .iter()
+                .filter(|d| d.message.contains("as the default for"))
+                .count(),
+            1,
+            "want exactly one default diagnostic: {diags:?}"
+        );
+        let partial = "model m:\n    e someClosedEnum? = \"active\"\n";
+        let d2 = load_pass("m.model.nml", &[("m.model.nml", partial)]);
+        assert!(
+            !d2.iter().any(|d| d.message.contains("as the default for")),
+            "partial view must not invent default errors: {d2:?}"
+        );
+    }
+
+    /// Cross-file composition: an unknown `is` target in THIS buffer is
+    /// reported here; one resolved by a SIBLING source is not. The rule
+    /// class that motivated the pass — load-only until now.
+    #[test]
+    fn unknown_is_target_reaches_editor_and_siblings_resolve() {
+        let diags = load_pass(
+            "child.model.nml",
+            &[("child.model.nml", "model child is missing:\n    y string\n")],
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("unknown `is` target")),
+            "unresolved mixin must reach the editor: {diags:?}"
+        );
+        let diags = load_pass(
+            "child.model.nml",
+            &[
+                ("base.model.nml", "trait base:\n    x string\n"),
+                ("child.model.nml", "model child is base:\n    y string\n"),
+            ],
+        );
+        assert!(
+            diags.is_empty(),
+            "a sibling-resolved mixin must not error: {diags:?}"
+        );
+    }
+
+    /// Shorthand arity is judged POST-inheritance (RFC 0005 §8): an
+    /// inherited `!` plus an own `!` collide, and the finding lands on
+    /// THIS buffer (the child wrote the second one).
+    #[test]
+    fn inherited_shorthand_collision_reaches_editor() {
+        let diags = load_pass(
+            "child.model.nml",
+            &[
+                ("base.model.nml", "trait base:\n    a string!\n"),
+                ("child.model.nml", "model child is base:\n    b string!\n"),
+            ],
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("!")),
+            "post-inheritance shorthand collision must reach the editor: {diags:?}"
+        );
+    }
+
+    /// A reference cycle spanning two files reports on THIS buffer's
+    /// member (each member gets its own copy, stamped with its source).
+    #[test]
+    fn cross_file_cycle_lands_on_own_member() {
+        let diags = load_pass(
+            "b.model.nml",
+            &[
+                ("a.model.nml", "model a:\n    fb b\n"),
+                ("b.model.nml", "model b:\n    fa a\n"),
+            ],
+        );
+        assert_eq!(
+            diags
+                .iter()
+                .filter(|d| d.message.contains("circular dependency"))
+                .count(),
+            1,
+            "own cycle member reports once: {diags:?}"
+        );
+    }
+
+    /// Reserved type-constructor names reach the editor (previously
+    /// load-only), and a cross-source duplicate is attributed to the
+    /// SECOND source — shown when editing it, silent on the first.
+    #[test]
+    fn reserved_and_duplicate_names_reach_editor_with_loader_attribution() {
+        let diags = load_pass(
+            "s.model.nml",
+            &[("s.model.nml", "model set:\n    x string\n")],
+        );
+        assert!(
+            diags.iter().any(|d| d.message.contains("set")),
+            "reserved constructor name must reach the editor: {diags:?}"
+        );
+        let first = ("first.model.nml", "model x:\n    a string\n");
+        let second = ("second.model.nml", "model x:\n    b string\n");
+        let on_second = load_pass("second.model.nml", &[first, second]);
+        assert!(
+            on_second
+                .iter()
+                .any(|d| d.message.contains("duplicate model definition")),
+            "duplicate attributes to the second source: {on_second:?}"
+        );
+        let on_first = load_pass("first.model.nml", &[first, second]);
+        assert!(
+            !on_first
+                .iter()
+                .any(|d| d.message.contains("duplicate model definition")),
+            "first definition wins and stays clean: {on_first:?}"
+        );
+    }
+
+    /// Snapshot universes deliver LOGICAL source names ("base"), not
+    /// filenames — the load pass and its filter must be name-shape
+    /// agnostic (the buffer's own key is a path; package entries are
+    /// bare identifiers).
+    #[test]
+    fn logical_source_names_resolve_like_filenames() {
+        let diags = load_pass(
+            "/ws/child.model.nml",
+            &[
+                ("base", "trait base:\n    x string\n"),
+                (
+                    "/ws/child.model.nml",
+                    "model child is base, nope:\n    y string\n",
+                ),
+            ],
+        );
+        let msgs: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            !msgs.iter().any(|m| m.contains("'base'")),
+            "base must resolve: {msgs:?}"
+        );
+    }
+
+    /// A universe with no entry for the buffer reports nothing — the
+    /// pass can attribute nothing to it.
+    #[test]
+    fn load_pass_without_own_entry_is_empty() {
+        let diags = load_pass(
+            "missing.model.nml",
+            &[("other.model.nml", "model broken:\n    @@@\n")],
+        );
+        assert!(diags.is_empty(), "no own entry ⇒ no findings: {diags:?}");
     }
 
     /// RFC 0018 (round 22): facet DEFINITION findings reach the editor

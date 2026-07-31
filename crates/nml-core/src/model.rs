@@ -130,10 +130,39 @@ pub struct FieldDef {
     pub span: Span,
 }
 
-/// One RFC 0018 numeric bound (`min`/`max`, inclusive or exclusive).
+/// The value domain a facet list ranges over: `number` (RFC 0018) or
+/// `duration` (RFC 0017 literals under the same facet grammar). Bounds
+/// compare with the domain's own EXACT ordering — `Number`'s numeric
+/// `Ord`, `Duration`'s `total_nanos` — never through floats.
+pub trait FacetDomain: Ord + Clone + std::fmt::Display + Serialize {
+    /// Exact divisibility for `multipleOf`. Implementations must be
+    /// total (a zero/degenerate modulus answers `false`, it never
+    /// panics) — the declaration rules reject non-positive moduli, but
+    /// enforcement must stay safe on any loaded value.
+    fn is_multiple_of(&self, m: &Self) -> bool;
+}
+
+impl FacetDomain for crate::types::Number {
+    fn is_multiple_of(&self, m: &Self) -> bool {
+        crate::types::Number::is_multiple_of(self, m)
+    }
+}
+
+impl FacetDomain for crate::duration::Duration {
+    /// Unit-blind by design: the semantic basis is `total_nanos`, so
+    /// `1500ms` is a multiple of `250ms` and of `500ms` but not of
+    /// `1s` — exactly as the same quantities compare for equality
+    /// (RFC 0017 semantic equivalence).
+    fn is_multiple_of(&self, m: &Self) -> bool {
+        let m = m.total_nanos();
+        m != 0 && self.total_nanos() % m == 0
+    }
+}
+
+/// One facet bound (`min`/`max`, inclusive or exclusive) over domain `T`.
 #[derive(Debug, Clone, Serialize)]
-pub struct FacetBound {
-    pub value: crate::types::Number,
+pub struct FacetBoundOf<T> {
+    pub value: T,
     pub exclusive: bool,
     /// The facet's `key = value` span in the schema source. Config-side
     /// violation MESSAGES carry the facet's authored spelling (schema
@@ -143,25 +172,56 @@ pub struct FacetBound {
     pub span: Span,
 }
 
-/// An RFC 0018 `multipleOf` facet.
+/// A `multipleOf` facet over domain `T`.
 #[derive(Debug, Clone, Serialize)]
-pub struct FacetMultiple {
-    pub value: crate::types::Number,
+pub struct FacetMultipleOf<T> {
+    pub value: T,
     pub span: Span,
 }
 
-/// RFC 0018 numeric facets on a `number` field. Empty (`NONE`) for
-/// every non-number primitive — the loader rejects misplaced facets
-/// (NML2058) before enforcement ever consults them.
+/// RFC 0018 facets over one value domain `T`. Empty (`NONE`) when the
+/// field declares none — the loader rejects misplaced facets (NML2058)
+/// before enforcement ever consults them.
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct NumberFacets {
-    pub min: Option<FacetBound>,
-    pub max: Option<FacetBound>,
-    pub multiple_of: Option<FacetMultiple>,
+pub struct Facets<T> {
+    pub min: Option<FacetBoundOf<T>>,
+    pub max: Option<FacetBoundOf<T>>,
+    pub multiple_of: Option<FacetMultipleOf<T>>,
 }
 
-impl NumberFacets {
-    pub const NONE: NumberFacets = NumberFacets {
+/// The RFC 0018 numeric bound — [`FacetBoundOf`] over [`Number`](crate::types::Number).
+pub type FacetBound = FacetBoundOf<crate::types::Number>;
+/// The RFC 0018 numeric `multipleOf` — [`FacetMultipleOf`] over `Number`.
+pub type FacetMultiple = FacetMultipleOf<crate::types::Number>;
+/// Facets on a `number` field.
+pub type NumberFacets = Facets<crate::types::Number>;
+/// Facets on a `duration` field.
+pub type DurationFacets = Facets<crate::duration::Duration>;
+
+/// The facets a primitive field carries, tagged by domain — a `number`
+/// field's bounds are `Number`s, a `duration` field's are `Duration`s,
+/// and the type system keeps the two from ever being compared across
+/// domains. `None` for every other primitive.
+#[derive(Debug, Clone, Default, Serialize)]
+pub enum PrimitiveFacets {
+    #[default]
+    None,
+    Number(NumberFacets),
+    Duration(DurationFacets),
+}
+
+impl PrimitiveFacets {
+    pub fn is_none(&self) -> bool {
+        match self {
+            PrimitiveFacets::None => true,
+            PrimitiveFacets::Number(f) => f.is_none(),
+            PrimitiveFacets::Duration(f) => f.is_none(),
+        }
+    }
+}
+
+impl<T> Facets<T> {
+    pub const NONE: Facets<T> = Facets {
         min: None,
         max: None,
         multiple_of: None,
@@ -169,14 +229,41 @@ impl NumberFacets {
     pub fn is_none(&self) -> bool {
         self.min.is_none() && self.max.is_none() && self.multiple_of.is_none()
     }
+}
+
+impl<T: FacetDomain> Facets<T> {
+    /// The canonical `key = value` renderings, declaration order
+    /// (min/max/multipleOf) — the one spelling hover, Display, and
+    /// definition diagnostics share.
+    pub fn canonical_parts(&self) -> Vec<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(b) = &self.min {
+            parts.push(format!(
+                "{} = {}",
+                if b.exclusive { "exclusiveMin" } else { "min" },
+                b.value
+            ));
+        }
+        if let Some(b) = &self.max {
+            parts.push(format!(
+                "{} = {}",
+                if b.exclusive { "exclusiveMax" } else { "max" },
+                b.value
+            ));
+        }
+        if let Some(m) = &self.multiple_of {
+            parts.push(format!("multipleOf = {}", m.value));
+        }
+        parts
+    }
 
     /// Every RFC 0018 violation `n` commits against these facets, as
     /// message tails (the caller prefixes the subject). **The single
     /// comparison home**: config-side value checks and definition-side
     /// default checks both route here, so the two can never disagree
-    /// about what "violates" means. Comparisons are exact —
-    /// `Number`'s numeric `Ord` and `is_multiple_of`, never f64.
-    pub fn violations(&self, n: &crate::types::Number) -> Vec<String> {
+    /// about what "violates" means. Comparisons are exact — the
+    /// domain's own `Ord` and `is_multiple_of`, never f64.
+    pub fn violations(&self, n: &T) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(b) = &self.min {
             let fails = if b.exclusive {
@@ -223,7 +310,7 @@ impl NumberFacets {
     /// anyway. Building them speculatively cost ~193ns per discarded
     /// message (a 16x constant on faceted unions); this answers the
     /// same question with zero allocation.
-    pub fn admits(&self, n: &crate::types::Number) -> bool {
+    pub fn admits(&self, n: &T) -> bool {
         if let Some(b) = &self.min {
             if if b.exclusive {
                 *n <= b.value
@@ -252,14 +339,15 @@ impl NumberFacets {
 /// The type of a field.
 #[derive(Debug, Clone, Serialize)]
 pub enum FieldType {
-    /// A primitive, optionally carrying RFC 0018 facets (only ever
-    /// non-empty when `ty` is `Number` in a loaded schema). A struct
-    /// variant deliberately: every pre-facet `Primitive(...)` pattern
-    /// breaks at compile time, so each match site is reviewed rather
-    /// than silently bypassed.
+    /// A primitive, optionally carrying facets (domain-tagged: only
+    /// ever non-`None` when `ty` is `Number` or `Duration` in a loaded
+    /// schema, and always the variant matching `ty`). A struct variant
+    /// deliberately: every pre-facet `Primitive(...)` pattern breaks at
+    /// compile time, so each match site is reviewed rather than
+    /// silently bypassed.
     Primitive {
         ty: PrimitiveType,
-        facets: NumberFacets,
+        facets: PrimitiveFacets,
     },
     List(Box<FieldType>),
     ModelRef(String),
@@ -316,24 +404,11 @@ impl std::fmt::Display for FieldType {
                 // RFC 0018: the faceted type IS the contract — hover and
                 // every model-side rendering show it in canonical form.
                 if !facets.is_none() {
-                    let mut parts: Vec<String> = Vec::new();
-                    if let Some(b) = &facets.min {
-                        parts.push(format!(
-                            "{} = {}",
-                            if b.exclusive { "exclusiveMin" } else { "min" },
-                            b.value
-                        ));
-                    }
-                    if let Some(b) = &facets.max {
-                        parts.push(format!(
-                            "{} = {}",
-                            if b.exclusive { "exclusiveMax" } else { "max" },
-                            b.value
-                        ));
-                    }
-                    if let Some(m) = &facets.multiple_of {
-                        parts.push(format!("multipleOf = {}", m.value));
-                    }
+                    let parts = match facets {
+                        PrimitiveFacets::None => Vec::new(),
+                        PrimitiveFacets::Number(fs) => fs.canonical_parts(),
+                        PrimitiveFacets::Duration(fs) => fs.canonical_parts(),
+                    };
                     write!(f, "({})", parts.join(", "))?;
                 }
                 Ok(())

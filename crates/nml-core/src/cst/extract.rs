@@ -6,7 +6,9 @@
 //! (`find_*_errors`, `resolve_model_inheritance`) operate on `ExtractedSchema` and
 //! are reused unchanged.
 
-use crate::cst::ast::{AstNode, BlockDecl, Decl, Entry, OneOfDecl, Root, TypeExpr, TypeExprKind};
+use crate::cst::ast::{
+    AstNode, BlockDecl, Decl, Entry, Facet, OneOfDecl, Root, TypeExpr, TypeExprKind,
+};
 use crate::cst::syntax::{node_span, token_span};
 use crate::cst::value::decode_string_token;
 use crate::model::{EnumDef, FieldDef, FieldType, MixinRef, ModelDef, ModelKind, OneOfDef};
@@ -156,29 +158,30 @@ fn extract_directives(
         .collect()
 }
 
-/// RFC 0018: build the facet record from a Named type's facet list.
-/// Decode errors extract as the zero placeholder without re-reporting —
-/// the shared lower pass owns the diagnostic (same contract as
-/// [`extract_directives`]); unknown keys and conflicts are the
-/// AST-side definition pass's findings (NML2058), where spans are
-/// richer. Last writer wins here; an invalid definition never loads.
-fn extract_facets(te: &TypeExpr) -> crate::model::NumberFacets {
-    let mut out = crate::model::NumberFacets::NONE;
+/// RFC 0018: build the facet record from a Named type's facet list,
+/// generic over the facet domain (`Number` for `number` fields,
+/// `Duration` for `duration` fields — `decode` embodies the domain).
+/// Decode failures and cross-domain values are DROPPED without
+/// re-reporting — the shared lower pass and the AST-side definition
+/// pass (NML2058) own the diagnostics, where spans are richer; a facet
+/// that decodes into the wrong domain must not load as a bound, or
+/// enforcement would fire a rule nobody wrote. Last writer wins here;
+/// an invalid definition never loads.
+fn extract_facets_as<T: Clone>(
+    te: &TypeExpr,
+    decode: impl Fn(&Facet) -> Option<T>,
+) -> crate::model::Facets<T> {
+    let mut out = crate::model::Facets::NONE;
     let Some(list) = te.facet_list() else {
         return out;
     };
     for f in list.facets() {
         let span = node_span(f.syntax());
-        let text = match (f.dash(), f.number()) {
-            (Some(_), Some(n)) => format!("-{}", n.text()),
-            (None, Some(n)) => n.text().to_string(),
-            _ => continue,
-        };
-        let Ok(value) = super::value::parse_number(&text, span) else {
+        let Some(value) = decode(&f) else {
             continue;
         };
-        let bound = |exclusive| crate::model::FacetBound {
-            value,
+        let bound = |exclusive| crate::model::FacetBoundOf {
+            value: value.clone(),
             exclusive,
             span,
         };
@@ -187,11 +190,45 @@ fn extract_facets(te: &TypeExpr) -> crate::model::NumberFacets {
             "exclusiveMin" => out.min = Some(bound(true)),
             "max" => out.max = Some(bound(false)),
             "exclusiveMax" => out.max = Some(bound(true)),
-            "multipleOf" => out.multiple_of = Some(crate::model::FacetMultiple { value, span }),
+            "multipleOf" => out.multiple_of = Some(crate::model::FacetMultipleOf { value, span }),
             _ => {}
         }
     }
     out
+}
+
+/// The raw `-`?digits text of a facet's numeric magnitude, with its span.
+fn facet_magnitude(f: &Facet) -> Option<(String, crate::span::Span)> {
+    let span = node_span(f.syntax());
+    match (f.dash(), f.number()) {
+        (Some(_), Some(n)) => Some((format!("-{}", n.text()), span)),
+        (None, Some(n)) => Some((n.text().to_string(), span)),
+        _ => None,
+    }
+}
+
+/// Decode a facet value in the NUMBER domain — a bare numeric literal;
+/// a unit suffix means the author wrote a duration, which is not a
+/// number bound (the definition pass reports the mismatch).
+fn decode_number_facet(f: &Facet) -> Option<crate::types::Number> {
+    if f.unit().is_some() {
+        return None;
+    }
+    let (text, span) = facet_magnitude(f)?;
+    super::value::parse_number(&text, span).ok()
+}
+
+/// Decode a facet value in the DURATION domain — `magnitude unit`
+/// (RFC 0017); a bare number is not a duration bound (the definition
+/// pass reports the mismatch).
+fn decode_duration_facet(f: &Facet) -> Option<crate::duration::Duration> {
+    let unit = f.unit()?;
+    let (text, span) = facet_magnitude(f)?;
+    let unit_span = crate::span::Span::new(
+        usize::from(unit.text_range().start()),
+        usize::from(unit.text_range().end()),
+    );
+    crate::duration::parse_duration_literal(&text, unit.text(), span, unit_span).ok()
 }
 
 fn resolve_field_type(te: &TypeExpr) -> FieldType {
@@ -200,17 +237,22 @@ fn resolve_field_type(te: &TypeExpr) -> FieldType {
             let name = token_text(te.name());
             match name.parse::<PrimitiveType>() {
                 Ok(prim) => FieldType::Primitive {
-                    // Facets attach to Number ONLY — misplacement is
-                    // reported by `schema::facet_definition_diagnostics`
-                    // (emitted from `extract_schema` itself); dropping
-                    // them here keeps the model claim literal, so
-                    // enforcement can never fire a facet on a
-                    // type-mismatched value. (Field evaluated before
-                    // `ty` because the check borrows `prim`.)
-                    facets: if prim == PrimitiveType::Number {
-                        extract_facets(te)
-                    } else {
-                        crate::model::NumberFacets::NONE
+                    // Facets attach to Number and Duration ONLY, each in
+                    // its own domain — misplacement is reported by
+                    // `schema::facet_definition_diagnostics` (emitted
+                    // from `extract_schema` itself); dropping them here
+                    // keeps the model claim literal, so enforcement can
+                    // never fire a facet on a type-mismatched value.
+                    // (Field evaluated before `ty` because the check
+                    // borrows `prim`.)
+                    facets: match prim {
+                        PrimitiveType::Number => crate::model::PrimitiveFacets::Number(
+                            extract_facets_as(te, decode_number_facet),
+                        ),
+                        PrimitiveType::Duration => crate::model::PrimitiveFacets::Duration(
+                            extract_facets_as(te, decode_duration_facet),
+                        ),
+                        _ => crate::model::PrimitiveFacets::None,
                     },
                     ty: prim,
                 },

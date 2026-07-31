@@ -444,18 +444,39 @@ fn facets_of(te: &ast::TypeExpr, errors: &mut Vec<NmlError>) -> Vec<FacetExpr> {
             // bound absent from the source). The NML0014/NML0013 error
             // is the finding; a fabricated facet on top is noise. Safe
             // for fmt, which refuses to format an errored document.
-            let value = match super::value::parse_number(&text, vspan) {
-                Ok(n) => n,
-                Err(e) => {
-                    errors.push(e);
-                    return None;
+            //
+            // A unit token makes the literal a DURATION (RFC 0017) —
+            // same decode-or-drop contract, RFC 0017's own errors
+            // (unknown unit, out of range, negative).
+            let value = match f.unit() {
+                Some(unit) => {
+                    let unit_span = Span::new(
+                        usize::from(unit.text_range().start()),
+                        usize::from(unit.text_range().end()),
+                    );
+                    let vspan = Span::new(vspan.start, unit_span.end);
+                    match crate::duration::parse_duration_literal(
+                        &text,
+                        unit.text(),
+                        vspan,
+                        unit_span,
+                    ) {
+                        Ok(d) => SpannedValue::new(crate::types::Value::Duration(d), vspan),
+                        Err(e) => {
+                            errors.push(e);
+                            return None;
+                        }
+                    }
                 }
+                None => match super::value::parse_number(&text, vspan) {
+                    Ok(n) => SpannedValue::new(crate::types::Value::Number(n), vspan),
+                    Err(e) => {
+                        errors.push(e);
+                        return None;
+                    }
+                },
             };
-            Some(FacetExpr {
-                key,
-                value: SpannedValue::new(crate::types::Value::Number(value), vspan),
-                span,
-            })
+            Some(FacetExpr { key, value, span })
         })
         .collect()
 }

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use nml_core::ast::*;
-use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, NumberFacets, OneOfDef};
+use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef, PrimitiveFacets};
 use nml_core::schema::{ExtractedSchema, report_graph_cycles};
 use nml_core::schema_index::{BodyShape, FieldTarget, SchemaIndex};
 use nml_core::span::Span;
@@ -562,12 +562,13 @@ impl SchemaValidator {
                 if matches!(keyword, "model" | "trait" | "enum") {
                     self.validate_body(&block.body, true, keyword, &mut diagnostics);
                     if matches!(keyword, "model" | "trait") {
-                        self.validate_field_defaults(block, &mut diagnostics);
-                        // RFC 0018 facet definition rules (NML2058) are
-                        // NOT here: they emit once, inside
-                        // `extract_schema` — the API every surface
-                        // constructs schemas through — so both verbs,
-                        // the LSP, and the loader agree by construction.
+                        // Declared defaults are NOT checked here. Both
+                        // their facet rules (NML2058, via
+                        // `extract_schema`) and their type rules (via
+                        // `default_diagnostics`, below) emit from paths
+                        // every schema consumer passes through — this
+                        // verb reaches them through `load_schema`. A
+                        // second check here would print one defect twice.
                     }
                 }
             }
@@ -702,7 +703,8 @@ impl SchemaValidator {
                     }
                 });
             }
-            self.validate_field_defaults(block, diags);
+            // Defaults: see `default_diagnostics` — checked once, where
+            // the schema is loaded, not once per validating surface.
         }
 
         self.validate_body(&block.body, is_schema_def, keyword, diags);
@@ -988,39 +990,6 @@ impl SchemaValidator {
     /// value-checking can never diverge. Only this model's own declared fields
     /// are checked (inherited fields are checked on their defining model), so a
     /// default is never reported twice.
-    fn validate_field_defaults(&self, block: &BlockDecl, diags: &mut Vec<Diagnostic>) {
-        let Some(model) = self.find_model(&block.name.name) else {
-            return;
-        };
-        for entry in &block.body.entries {
-            let BodyEntryKind::FieldDefinition(fd) = &entry.kind else {
-                continue;
-            };
-            let Some(default) = &fd.default_value else {
-                continue;
-            };
-            let Some(field) = model.fields.iter().find(|f| f.name == fd.name.name) else {
-                continue;
-            };
-            // TYPE checking only. Facet violations on defaults are
-            // reported by `facet_definition_diagnostics`, which every
-            // consumer gets by construction (loader, packages, boot —
-            // not just this verb), so re-reporting them here would
-            // print one defect twice with two different phrasings.
-            let mut scratch = Vec::new();
-            self.validate_value_against_type(
-                &default.value,
-                &field.field_type,
-                &field.name,
-                "as the default for",
-                default.span,
-                &mut scratch,
-            );
-            scratch.retain(|d| d.code != Some(codes::FACET_VIOLATION));
-            diags.extend(scratch);
-        }
-    }
-
     fn validate_body(
         &self,
         body: &Body,
@@ -2082,8 +2051,19 @@ impl SchemaValidator {
         match field_type {
             FieldType::Primitive { ty: prim, facets } => {
                 self.validate_primitive_value(value, prim, field_name, context, span, diags);
-                if let Value::Number(n) = value {
-                    validate_facets(n, facets, field_name, span, diags);
+                // Facets are domain-tagged: number bounds fire only on
+                // number values, duration bounds only on durations — a
+                // type-mismatched value already has its type diagnostic
+                // from `validate_primitive_value`, and firing a facet on
+                // it would measure across domains.
+                match (facets, value) {
+                    (PrimitiveFacets::Number(fs), Value::Number(n)) => {
+                        validate_facets(fs, n, field_name, span, diags);
+                    }
+                    (PrimitiveFacets::Duration(fs), Value::Duration(d)) => {
+                        validate_facets(fs, d, field_name, span, diags);
+                    }
+                    _ => {}
                 }
             }
             FieldType::ModelRef(ref_name) => {
@@ -2205,20 +2185,24 @@ impl SchemaValidator {
                         // all, and speculatively formatting messages we
                         // then discard cost ~193ns each (a 16x constant
                         // on faceted unions).
-                        if let (
-                            FieldType::Primitive {
-                                ty: PrimitiveType::Number,
-                                facets,
-                            },
-                            Value::Number(n),
-                        ) = (v, value)
-                        {
-                            if facets.admits(n) {
-                                admitted = true;
-                                break;
-                            }
-                            if first_rejection.is_some() {
-                                continue;
+                        if let FieldType::Primitive { facets, .. } = v {
+                            let verdict = match (facets, value) {
+                                (PrimitiveFacets::Number(fs), Value::Number(n)) => {
+                                    Some(fs.admits(n))
+                                }
+                                (PrimitiveFacets::Duration(fs), Value::Duration(d)) => {
+                                    Some(fs.admits(d))
+                                }
+                                _ => None,
+                            };
+                            if let Some(admits) = verdict {
+                                if admits {
+                                    admitted = true;
+                                    break;
+                                }
+                                if first_rejection.is_some() {
+                                    continue;
+                                }
                             }
                         }
                         let mut scratch = Vec::new();
@@ -2851,19 +2835,74 @@ fn type_has_facets(t: &FieldType) -> bool {
     }
 }
 
+/// Every declared default measured against its own field type — the
+/// **single** default-checking entry. The loader (and therefore the CLI
+/// verbs, schema packages, and downstream boots), the LSP's registry
+/// pass, and the covered-schema pass all call this, so a default is
+/// judged identically wherever a schema is loaded instead of once per
+/// surface that happens to remember.
+///
+/// Reuses `validate_value_against_type` rather than walking the type
+/// again: parallel traversals of exactly this shape produced three
+/// separate facet regressions in this RFC's review history.
+///
+/// Facet violations are dropped — `cst::extract_schema` already emits
+/// them for every consumer (RFC 0018 §1.2), so keeping them would
+/// double-report. Safe on a PARTIAL schema view (the LSP's open-buffer
+/// registry): an unresolvable model or enum reference degrades to a
+/// value-shape check, never a false "unknown definition".
+pub fn default_diagnostics(schema: &ExtractedSchema) -> Vec<Diagnostic> {
+    // The clone is deliberate. `SchemaValidator` owns its definitions,
+    // and threading a borrowed one through would widen its API for a
+    // measured 46 µs on a real 85-model schema set — a quarter of one
+    // keystroke's diagnostics work, linear, and not on any hot loop.
+    // Revisit only with a schema set large enough to feel it.
+    let validator = SchemaValidator::new(
+        schema.models.clone(),
+        schema.enums.clone(),
+        schema.oneofs.clone(),
+    )
+    .composition_checked_at_load();
+    let mut out = Vec::new();
+    for model in &schema.models {
+        for field in &model.fields {
+            let Some(default) = &field.default_value else {
+                continue;
+            };
+            let mut scratch = Vec::new();
+            validator.validate_value_against_type(
+                &default.value,
+                &field.field_type,
+                &field.name,
+                "as the default for",
+                default.span,
+                &mut scratch,
+            );
+            scratch.retain(|d| d.code != Some(codes::FACET_VIOLATION));
+            if let Some(src) = model.source.as_deref() {
+                for d in &mut scratch {
+                    *d = d.clone().with_source(src);
+                }
+            }
+            out.extend(scratch);
+        }
+    }
+    out
+}
+
 /// RFC 0018 facet enforcement (NML2057). Exact comparisons through
 /// `Number`'s numeric `Ord` and `is_multiple_of` — a boundary can never
 /// lie the way an f64 comparison does. Values echoed are authored
 /// literals on both sides (config value, schema facet): raw-AST band,
 /// bounded by their own written length.
-fn validate_facets(
-    n: &nml_core::types::Number,
-    facets: &NumberFacets,
+fn validate_facets<T: nml_core::model::FacetDomain>(
+    facets: &nml_core::model::Facets<T>,
+    value: &T,
     field_name: &str,
     span: Span,
     diags: &mut Vec<Diagnostic>,
 ) {
-    for tail in facets.violations(n) {
+    for tail in facets.violations(value) {
         diags.push(
             Diagnostic::error(format!("'{field_name}' {tail}"))
                 .with_code(codes::FACET_VIOLATION)
@@ -2951,6 +2990,7 @@ fn string_content_span(span: Span) -> Span {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use nml_core::diagnostic::Severity;
 
@@ -3092,58 +3132,142 @@ mod tests {
         }
     }
 
-    /// **The parity invariant.** A declared default and the same
-    /// literal written as a config value face the SAME type, so they
-    /// must produce the SAME number of facet violations. Two separate
-    /// traversals decide that today — the definition-side walk in
-    /// nml-core and enforcement's walk here — and every facet defect
-    /// found in rounds 24-26 was those two disagreeing about which
-    /// sub-type a value faces (scalar unions, unions of collections,
-    /// fallback legs). This sweeps the shapes so a divergence fails
-    /// here instead of shipping silently.
+    /// **The parity invariant, generated.** A declared default and the
+    /// same literal written as a config value face the SAME type, so
+    /// they must produce the SAME facet violations — not merely the
+    /// same COUNT, but the same bound named in the same words.
+    ///
+    /// Two traversals decide that: the definition-side walk in nml-core
+    /// and enforcement's walk here. Every facet defect in rounds 24-26
+    /// was them disagreeing about which sub-type a value faces (scalar
+    /// unions, unions of collections, fallback legs) — and each was
+    /// missed because the guard was a hand-picked list, i.e. only the
+    /// shapes someone thought of. This sweeps the CROSS-PRODUCT so a
+    /// divergence in a shape nobody enumerated still fails here.
+    ///
+    /// Pairs whose value-side schema or config does not parse cleanly
+    /// are skipped: they exercise the parse band, not the facet walks.
     #[test]
     fn default_checking_and_value_checking_agree() {
-        // (type, literal) — every shape the two walks must agree on.
-        let corpus = [
-            ("number(min = 10)", "5"),
-            ("number(min = 10)", "50"),
-            ("number(min = 10, max = 20)", "25"),
-            ("number(multipleOf = 0.1)", "0.25"),
-            ("number(multipleOf = 0.1)", "0.3"),
-            ("(number(min = 10) | string)", "5"),
-            ("(string | number(min = 10))", "5"),
-            ("(number(min = 10) | string)", "50"),
-            ("(number(min = 10) | number(max = 0))", "5"),
-            ("(number(min = 10) | number(max = 0))", "-5"),
-            ("[]number(min = 10)", "[5]"),
-            ("[]number(min = 10)", "[5, 3]"),
-            ("[]number(min = 10)", "[50]"),
-            ("([]number(min = 10) | []string)", "[5]"),
-            ("([]string | []number(min = 10))", "[5]"),
-            ("set<number(min = 10)>", "[5]"),
-            ("(set<number(min = 10)> | set<string>)", "[5]"),
-            ("number(min = 10)", "3 | 5"),
-            ("number(min = 10)", "3 | 50"),
-            ("number(min = 10)", "50 | 60"),
-            ("(number(min = 10) | string)", "3 | 5"),
+        const TYPES: &[&str] = &[
+            "number(min = 10)",
+            "number(max = 0)",
+            "number(exclusiveMin = 10)",
+            "number(exclusiveMax = 0)",
+            "number(min = 1, max = 20)",
+            "number(multipleOf = 0.1)",
+            "[]number(min = 10)",
+            "[][]number(min = 10)",
+            "set<number(min = 10)>",
+            "set<[]number(min = 10)>",
+            "[]set<number(min = 10)>",
+            "(number(min = 10) | string)",
+            "(string | number(min = 10))",
+            "(number(min = 10) | bool)",
+            "(number(min = 10) | money)",
+            "(number(min = 10) | duration)",
+            "(number(min = 10) | number)",
+            "(number(min = 10) | number(max = 0))",
+            "(number(min = 10) | []number(min = 5))",
+            "([]number(min = 10) | []string)",
+            "([]string | []number(min = 10))",
+            "(set<number(min = 10)> | set<string>)",
+            "([][]number(min = 10) | []string)",
+            "[](number(min = 10) | string)",
+            "set<number(min = 10) | string>",
+            // Duration domain (RFC 0017 literals under the RFC 0018
+            // facet grammar) — same parity obligation, same walk.
+            "duration(min = 1s)",
+            "duration(max = 1m)",
+            "duration(exclusiveMin = 1s)",
+            "duration(multipleOf = 250ms)",
+            "duration(min = 1s, max = 2h)",
+            "[]duration(min = 1s)",
+            "(duration(min = 1s) | string)",
+            "(duration(min = 1s) | number(min = 10))",
         ];
-        let facet_errs = |ds: &[Diagnostic]| -> usize {
-            ds.iter()
+        const VALUES: &[&str] = &[
+            "5",
+            "50",
+            "-5",
+            "0",
+            "0.25",
+            "0.3",
+            "10",
+            "20",
+            "\"x\"",
+            "true",
+            "[]",
+            "[5]",
+            "[50]",
+            "[5, 3]",
+            "[5, 50]",
+            "[5, \"x\"]",
+            "[[5]]",
+            "[[5], [50]]",
+            "3 | 5",
+            "3 | 50",
+            "50 | 60",
+            "[3] | [5]",
+            // Durations, mixed units deliberately: `1000ms` must
+            // satisfy `min = 1s` (semantic comparison), `1500ms` must
+            // fail `multipleOf = 250ms`'s neighbor `1s` but not
+            // `250ms` — unit-blind, nanos-exact.
+            "500ms",
+            "1s",
+            "1000ms",
+            "1500ms",
+            "90s",
+            "2h",
+            "3h",
+            "[1s, 500ms]",
+            "500ms | 2s",
+        ];
+        // The two surfaces prefix the subject differently; the RULE
+        // text after it is what must match.
+        let tails = |ds: &[Diagnostic]| -> Vec<String> {
+            let mut v: Vec<String> = ds
+                .iter()
                 .filter(|d| d.code == Some(nml_core::diagnostic::codes::FACET_VIOLATION))
-                .count()
+                .map(|d| {
+                    let m = d.rendered_message();
+                    m.strip_prefix("default for ").unwrap_or(&m).to_string()
+                })
+                .collect();
+            v.sort();
+            v
         };
-        for (ty, lit) in corpus {
-            // A: the literal as a declared DEFAULT.
-            let as_default = format!("model m:\n    p {ty} = {lit}\n");
-            let a = facet_errs(&nml_core::cst::extract_schema(&as_default).1);
-            // B: the same literal as a config VALUE.
-            let schema = format!("model m:\n    p {ty}?\n");
-            let b = facet_errs(&diags(&schema, &format!("m X:\n    p = {lit}\n")));
-            assert_eq!(
-                a, b,
-                "parity broken for `{ty}` = `{lit}`: default reported {a}, value reported {b}"
-            );
+        let mut compared = 0usize;
+        for ty in TYPES {
+            for lit in VALUES {
+                // B: the literal as a config VALUE. Skip shapes whose
+                // schema or config cannot parse — not our subject.
+                let schema = format!("model m:\n    p {ty}?\n");
+                let Ok(cfg) = nml_core::cst::parse_to_ast(&format!("m X:\n    p = {lit}\n")) else {
+                    continue;
+                };
+                let b = tails(&make_validator(&schema).validate(&cfg));
+                // A: the same literal as a declared DEFAULT.
+                let as_default = format!("model m:\n    p {ty} = {lit}\n");
+                let (_s, a_diags) = nml_core::cst::extract_schema(&as_default);
+                if a_diags.iter().any(|d| {
+                    d.severity == Severity::Error
+                        && d.code != Some(nml_core::diagnostic::codes::FACET_VIOLATION)
+                }) {
+                    continue; // the default itself failed to parse/declare
+                }
+                let a = tails(&a_diags);
+                assert_eq!(
+                    a, b,
+                    "parity broken for `{ty}` = `{lit}`:\n  default: {a:?}\n  value:   {b:?}"
+                );
+                compared += 1;
+            }
         }
+        assert!(
+            compared >= 400,
+            "expected a broad sweep, only compared {compared} pairs"
+        );
     }
 
     /// RFC 0018 §1.2's by-construction promise, pinned at the path
@@ -6252,11 +6376,11 @@ workflow W:
 
     #[test]
     fn type_mismatched_default_is_rejected() {
+        // Defaults are judged where the schema is LOADED — one check
+        // for every consumer (CLI verbs, packages, boots) instead of
+        // one per validating surface.
         let src = "model cfg:\n    count number = \"high\"\n";
-        let file = nml_core::cst::parse_to_ast(src).unwrap();
-        let schema = nml_core::cst::extract_schema(src).0;
-        let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
-        let diags = validator.validate(&file);
+        let diags = crate::loader::load_schema(&[("s.nml", src)]).1;
         assert!(
             diags
                 .iter()
@@ -6290,13 +6414,13 @@ workflow W:
     fn inherited_default_not_double_reported() {
         // A bad default on a parent is reported once (on the parent), not again
         // on each child that inherits it.
+        // The loader checks defaults BEFORE `resolve_model_inheritance`
+        // copies a parent's fields (defaults included) into every child
+        // — which is precisely what keeps one declaration to one
+        // finding, however many models inherit it.
         let src = "model base:\n    count number = \"high\"\n\nmodel child is base:\n    extra string = \"x\"\n";
-        let file = nml_core::cst::parse_to_ast(src).unwrap();
-        let mut schema = nml_core::cst::extract_schema(src).0;
-        nml_core::schema::resolve_model_inheritance(&mut schema);
-        let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs);
-        let count = validator
-            .validate(&file)
+        let count = crate::loader::load_schema(&[("s.nml", src)])
+            .1
             .iter()
             .filter(|d| d.message.contains("as the default for") && d.message.contains("count"))
             .count();
@@ -6311,10 +6435,7 @@ workflow W:
     /// otherwise poison every instance).
     #[test]
     fn set_default_with_duplicates_is_rejected_at_schema_load() {
-        let check = |src: &str| {
-            let file = nml_core::cst::parse_to_ast(src).unwrap();
-            make_validator(src).validate(&file)
-        };
+        let check = |src: &str| crate::loader::load_schema(&[("s.nml", src)]).1;
         let d = check("model m:\n    xs set<string> = [\"a\", \"a\"]\n");
         assert!(
             d.iter()
@@ -6446,7 +6567,7 @@ mod trait_instance_tests {
         SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
     }
 
-    const SCHEMA: &str = "trait monitored:\n    timeout duration = \"5s\"\n\n\
+    const SCHEMA: &str = "trait monitored:\n    timeout duration = 5s\n\n\
                           model endpoint is monitored:\n    url string+\n";
 
     fn check(source: &str, strict: bool) -> Vec<Diagnostic> {
@@ -6717,7 +6838,7 @@ mod shared_property_validation_tests {
     use super::*;
     use nml_core::diagnostic::Severity;
 
-    const SCHEMA: &str = "trait monitored:\n    timeout duration = \"5s\"\n\n\
+    const SCHEMA: &str = "trait monitored:\n    timeout duration = 5s\n\n\
                           trait accessControlled:\n    |allow []role?\n    |deny []role?\n\n\
                           model endpoint is monitored, accessControlled:\n    url string+\n\n\
                           model service:\n    endpoints []endpoint\n";

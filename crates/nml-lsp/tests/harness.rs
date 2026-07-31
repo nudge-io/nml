@@ -1541,3 +1541,157 @@ async fn explain_code_action_is_negotiation_gated() {
         }
     }
 }
+
+// ── Universe provenance matrix ────────────────────────────────────────
+
+/// One fixture trio, four transports. Every leg's universe holds the SAME
+/// three texts — a trait the buffer resolves against, a "polluted" source
+/// carrying a facet-violating default, and the buffer itself (one mixin
+/// that resolves, one deliberately missing) — delivered through each
+/// provenance the server's universe `match` can select:
+///
+/// | leg       | channel                                | variant    |
+/// |-----------|----------------------------------------|------------|
+/// | declared  | workspace manifest `[]schema` files    | `Declared` |
+/// | store     | published, hash-verified store package | `Snapshot` |
+/// | in-binary | injected provider (the `nudge lsp` \
+///               wiring)                                | `Snapshot` |
+/// | dir-mates | plain files beside the buffer          | `None`     |
+///
+/// Identical universe content must produce identical verdicts, asserted
+/// through the REAL JSON-RPC pull per leg:
+/// 1. the missing mixin is reported (the universe was consulted),
+/// 2. the trait-resolved mixin is clean (the universe's content bound),
+/// 3. the polluted source's default error never lands on the buffer
+///    (the round-29 attribution filter, on every channel).
+///
+/// The Snapshot legs additionally plant a DECOY directory-mate defining
+/// the missing name — and assert it stays missing: hash-pinned published
+/// sources beat unpinned disk neighbors, as an executable claim rather
+/// than a doc comment.
+const UNI_BASE: &str = "trait base:\n    x string\n";
+const UNI_POLLUTED: &str = "model polluted:\n    n number(min = 1) = 0\n";
+const UNI_BUFFER: &str = "model child is base, nope:\n    y string\n";
+const UNI_DECOY: &str = "model nope:\n    z string\n";
+
+fn universe_package() -> nml_validate::package::SchemaPackage {
+    let manifest = "\
+package uni:
+    version = \"0.1.0\"
+    formatVersion = 1
+    rootMarkers:
+        - \"app.nml\"
+
+[]schema schemas:
+    - base:
+        file = \"base.model.nml\"
+    - polluted:
+        file = \"polluted.model.nml\"
+
+[]validator validators:
+    - base:
+        files:
+            - \"app.nml\"
+        schemas:
+            - base
+";
+    nml_validate::package::SchemaPackage::from_parts(manifest, |file| match file {
+        "base.model.nml" => Ok(UNI_BASE.to_string()),
+        "polluted.model.nml" => Ok(UNI_POLLUTED.to_string()),
+        other => Err(format!("unexpected schema file {other}")),
+    })
+    .expect("universe fixture package")
+}
+
+fn assert_universe_verdicts(leg: &str, report: &Value) {
+    let diags = report["diagnostics"].as_array().expect("diagnostics array");
+    let msgs: Vec<&str> = diags.iter().filter_map(|d| d["message"].as_str()).collect();
+    assert!(
+        msgs.iter()
+            .any(|m| m.contains("unknown `is` target 'nope'")),
+        "[{leg}] the missing mixin must reach the editor: {msgs:?}"
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| m.contains("'base'") && m.contains("unknown")),
+        "[{leg}] the universe's trait must resolve 'base': {msgs:?}"
+    );
+    assert!(
+        !msgs.iter().any(|m| m.contains("default for")),
+        "[{leg}] the polluted source's default error must never land here: {msgs:?}"
+    );
+}
+
+#[tokio::test]
+async fn universe_provenance_matrix() {
+    // Leg 1 — DECLARED: manifest + schema files on disk; the buffer is a
+    // covered-but-undeclared sibling (root rule), appended last by the
+    // assembler. Mirrors the proven `directive_workspace` discovery path.
+    {
+        let base = temp_dir("uni-declared");
+        let ws = base.join("ws");
+        fs::create_dir_all(&ws).expect("create workspace");
+        let manifest = universe_package();
+        fs::write(ws.join("uni.package.nml"), &manifest.manifest_text).expect("manifest");
+        fs::write(ws.join("base.model.nml"), UNI_BASE).expect("base");
+        fs::write(ws.join("polluted.model.nml"), UNI_POLLUTED).expect("polluted");
+        fs::write(ws.join("app.nml"), "").expect("claim anchor");
+
+        let mut h = Harness::new(Store::at(base.join("store")));
+        h.initialize(&ws).await;
+        let report = h.open(&ws.join("child.model.nml"), UNI_BUFFER).await;
+        assert_universe_verdicts("declared", &report);
+    }
+
+    // Leg 2 — STORE Snapshot: the same package published to a store; a
+    // decoy dir-mate defines the missing name and must be IGNORED.
+    {
+        let base = temp_dir("uni-store");
+        let store_base = base.join("store");
+        fs::create_dir_all(&store_base).expect("store dir");
+        Store::at(&store_base)
+            .publish(&universe_package())
+            .expect("publish universe package");
+        let ws = base.join("ws");
+        fs::create_dir_all(&ws).expect("create workspace");
+        fs::write(ws.join("app.nml"), "").expect("claim anchor");
+        fs::write(ws.join("decoy.model.nml"), UNI_DECOY).expect("decoy");
+
+        let mut h = Harness::new(Store::at(&store_base));
+        h.initialize(&ws).await;
+        let report = h.open(&ws.join("child.model.nml"), UNI_BUFFER).await;
+        assert_universe_verdicts("store", &report);
+    }
+
+    // Leg 3 — IN-BINARY Snapshot: the same package value injected through
+    // the provider constructor (the `nudge lsp` wiring); decoy again.
+    {
+        let base = temp_dir("uni-inbinary");
+        let ws = base.join("ws");
+        fs::create_dir_all(&ws).expect("create workspace");
+        fs::write(ws.join("app.nml"), "").expect("claim anchor");
+        fs::write(ws.join("decoy.model.nml"), UNI_DECOY).expect("decoy");
+
+        let mut h = Harness::new_provider(universe_package(), Store::at(base.join("store")));
+        h.initialize(&ws).await;
+        let report = h.open(&ws.join("child.model.nml"), UNI_BUFFER).await;
+        assert_universe_verdicts("in-binary", &report);
+    }
+
+    // Leg 4 — DIR-MATES fallback: no manifest, no store, no decoy (the
+    // missing name must stay genuinely missing); the same texts as plain
+    // disk siblings.
+    {
+        let base = temp_dir("uni-mates");
+        let ws = base.join("ws");
+        fs::create_dir_all(&ws).expect("create workspace");
+        fs::write(ws.join("base.model.nml"), UNI_BASE).expect("base");
+        fs::write(ws.join("polluted.model.nml"), UNI_POLLUTED).expect("polluted");
+
+        let mut h = Harness::new(Store::at(base.join("store")));
+        h.initialize(&ws).await;
+        let report = h.open(&ws.join("child.model.nml"), UNI_BUFFER).await;
+        assert_universe_verdicts("dir-mates", &report);
+    }
+}

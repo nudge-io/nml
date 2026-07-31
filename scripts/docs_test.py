@@ -202,6 +202,19 @@ def extract_blocks(path: Path) -> list[Block]:
     return blocks
 
 
+def sample_codes(output: str, sample: Path, severity: str) -> set[str]:
+    """The distinct `severity[NML####]` codes on the SAMPLE's own output
+    lines. Path-scoped so a `schema=` dir's own findings are context, not
+    part of the example's claim — the shared extraction behind both
+    `expect-error` and `expect-output` code-set contracts."""
+    return {
+        code
+        for line in output.splitlines()
+        if str(sample) in line
+        for code in re.findall(rf"{severity}\[(NML\d{{4}})\]", line)
+    }
+
+
 def run_check(block: Block) -> tuple[bool, str]:
     """Returns (passed, detail)."""
     if block.malformed:
@@ -251,20 +264,62 @@ def run_check(block: Block) -> tuple[bool, str]:
         if expected_error is not None:
             if proc.returncode == 0:
                 return False, "expected an error, but the check passed"
-            if expected_error not in output:
+            # Code-SET equality, not containment: the annotation declares the
+            # complete set of distinct error codes the EXAMPLE produces
+            # (`[NML2057]`, or `[NML2057, NML2058]` for multi-code examples).
+            # Containment let an example silently start producing ADDITIONAL
+            # errors — documentation drift that twice needed catching by
+            # hand. Scoped to the sample's own findings (line-path prefix):
+            # `schema=docs/errors/schemas-bad` fences deliberately load a
+            # broken schema dir whose OWN errors are context, not the
+            # example's claim. Warnings are exempt (they render
+            # `warning[...]` and don't fail the check); `expect-output` is
+            # the tool for asserting them.
+            declared = re.findall(r"NML\d{4}", expected_error)
+            if not declared:
+                # Prose expectation (`expect-error='tabs are not permitted'`):
+                # a message-TEXT claim, asserted by containment — the code-set
+                # contract below only governs code-list annotations.
+                if expected_error not in output:
+                    return False, (
+                        f"error output did not contain {expected_error!r};"
+                        f" got:\n{output.strip()}"
+                    )
+                return True, ""
+            produced = sample_codes(output, sample, "error")
+            if produced != set(declared):
                 return False, (
-                    f"error output did not contain {expected_error!r};"
-                    f" got:\n{output.strip()}"
+                    f"example's error codes {sorted(produced)} != declared"
+                    f" {sorted(set(declared))}; got:\n{output.strip()}"
                 )
             return True, ""
         expected_output = block.value("expect-output")
         if expected_output is not None:
-            # Exit-code-free: warnings don't fail `nml check`, but the
-            # documented output must still appear.
-            if expected_output not in output:
+            declared = re.findall(r"NML\d{4}", expected_output)
+            if not declared:
+                # Prose expectation: a rendered-text claim, containment.
+                # Exit-code-free — warnings don't fail `nml check`.
+                if expected_output not in output:
+                    return False, (
+                        f"output did not contain {expected_output!r};"
+                        f" got:\n{output.strip()}"
+                    )
+                return True, ""
+            # Code-list mode is the WARNING-side twin of `expect-error`'s
+            # set contract: the example must exit 0 (a documented warning
+            # that starts ERRORING is the worst drift shape — the old
+            # substring check kept passing on the error text), and the
+            # sample's warning-code set must equal the declared list.
+            if proc.returncode != 0:
                 return False, (
-                    f"output did not contain {expected_output!r};"
+                    "expect-output documents warnings, but the check FAILED;"
                     f" got:\n{output.strip()}"
+                )
+            produced = sample_codes(output, sample, "warning")
+            if produced != set(declared):
+                return False, (
+                    f"example's warning codes {sorted(produced)} != declared"
+                    f" {sorted(set(declared))}; got:\n{output.strip()}"
                 )
             return True, ""
         if proc.returncode != 0:
@@ -613,6 +668,51 @@ ERROR_INDEX = "crates/nml-core/assets/error-index.md"
 CODES_SOURCE = "crates/nml-core/src/diagnostic.rs"
 
 
+def error_index_census(index_text: str) -> tuple[list[tuple[str, str]], str]:
+    """Per-section example coverage over the error index.
+
+    Two facts per `## NML####` section: does it carry at least one
+    EXECUTED fence, and does any code-declaring fence declare the
+    section's own code? The second is a hard failure — a section whose
+    examples all demonstrate *other* codes is documentation drift (the
+    reader came for this code and the example shows something else).
+    Sections with only clean (`nml check`, no expectation) fences count
+    as covered — they demonstrate the fixed spelling. Example-free
+    sections are a printed census stat, not a failure: some codes are
+    legitimately example-free (bounds like NML0007, tombstones)."""
+    failures: list[tuple[str, str]] = []
+    parts = re.split(r"^## (NML\d{4})\s*$", index_text, flags=re.M)
+    covered = own_proving = 0
+    example_free: list[str] = []
+    for code, body in zip(parts[1::2], parts[2::2]):
+        fences = re.findall(r"```nml check[^\n]*", body)
+        if not fences:
+            example_free.append(code)
+            continue
+        covered += 1
+        declaring = [f for f in fences if re.search(r"NML\d{4}", f)]
+        if not declaring:
+            continue
+        if any(code in f for f in declaring):
+            own_proving += 1
+        else:
+            failures.append(
+                (
+                    ERROR_INDEX,
+                    f"{code}: none of its {len(declaring)} code-declaring"
+                    f" fence(s) declares {code} — its examples demonstrate"
+                    " other codes",
+                )
+            )
+    total = covered + len(example_free)
+    census = (
+        f"error-index census: {covered}/{total} sections carry executed"
+        f" examples ({own_proving} proving their own code,"
+        f" {len(example_free)} example-free)"
+    )
+    return failures, census
+
+
 def check_error_index() -> list[tuple[str, str]]:
     """Bidirectional drift guard: every code constant has a `## NML####`
     section in the error index, and every section corresponds to a declared
@@ -703,6 +803,9 @@ def check_error_index() -> list[tuple[str, str]]:
             )
         )
     failures.extend(check_relative_links(index_path))
+    census_failures, census = error_index_census(index_text)
+    failures.extend(census_failures)
+    print(census)
     return failures
 
 

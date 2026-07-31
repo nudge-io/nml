@@ -254,7 +254,8 @@ pub fn parse_best_effort(source: &str) -> crate::ast::File {
 /// reading the tree directly (extraction needs no owned AST). Returns the
 /// [`ExtractedSchema`](crate::schema::ExtractedSchema) plus the **full**
 /// error set — syntactic *and* semantic (e.g. an out-of-precision money default),
-/// position-sorted and bounded, identical to [`parse_to_ast_all`]. Resilient:
+/// position-sorted and bounded, and a strict superset of [`parse_to_ast_all`]'s:
+/// the RFC 0018 facet definition rules (NML2058) are appended here. Resilient:
 /// definitions from the well-formed parts are always returned, so a mid-edit
 /// schema file still contributes what it can. This is the single schema-loading
 /// primitive shared by the validator's loader, the LSP registry, and embedders.
@@ -264,20 +265,38 @@ pub fn extract_schema(
     crate::schema::ExtractedSchema,
     Vec<crate::diagnostic::Diagnostic>,
 ) {
+    let (_file, schema, diags) = parse_and_extract(source);
+    (schema, diags)
+}
+
+/// One parse, every output: the semantic AST, the extracted schema, and
+/// the full findings set (lower-pass diagnostics plus the RFC 0018
+/// facet definition rules). The single-parse form exists for surfaces
+/// that need both views of the same text — the LSP re-parsed a buffer
+/// per keystroke deriving them separately (~1.3 ms each on a real
+/// 26 KB schema file). [`extract_schema`] is a narrowing of this;
+/// [`parse_to_ast_all`] is **not** — its findings are the lower pass
+/// only (no facet definition rules), because the parse verb reports
+/// syntax, not schema semantics.
+///
+/// RFC 0018: facet definition rules (NML2058) are emitted HERE — the
+/// one API every schema-consuming surface constructs through (both
+/// CLI verbs, the LSP, the nml-validate loader and thus packages) —
+/// so a misdeclared facet cannot load anywhere by construction.
+pub fn parse_and_extract(
+    source: &str,
+) -> (
+    crate::ast::File,
+    crate::schema::ExtractedSchema,
+    Vec<crate::diagnostic::Diagnostic>,
+) {
     use ast::AstNode as _;
-    // One parse; the canonical lower pass yields every diagnostic, and `extract`
-    // reads the same tree for the schema itself. Like `parse_to_ast_all`, the
-    // public reporting boundary speaks the unified findings model (RFC 0008).
     let (parsed, lowered_ast, errors, suppressed) = parse_lowered(source);
     let root = ast::Root::cast(parsed.syntax()).expect("parse always yields a Root node");
-    // RFC 0018: facet definition rules (NML2058) are emitted HERE — the
-    // one API every schema-consuming surface constructs through (both
-    // CLI verbs, the LSP, the nml-validate loader and thus packages) —
-    // so a misdeclared facet cannot load anywhere by construction.
     let facet_diags = crate::schema::facet_definition_diagnostics(&lowered_ast);
     let mut diags = finalize_diagnostics(errors, suppressed);
     diags.extend(facet_diags);
-    (extract::extract(&root), diags)
+    (lowered_ast, extract::extract(&root), diags)
 }
 
 /// The leading documentation comment of the top-level declaration named `name`

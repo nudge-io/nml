@@ -799,6 +799,20 @@ mod tests {
         );
         let twice = format(&parse(&once).unwrap());
         assert_eq!(once, twice, "facet rendering must be a fixed point");
+
+        // Duration facet values (RFC 0017) canonicalize and round-trip
+        // through the same renderer.
+        let src = "model job:\n    t duration( min=1s ,  multipleOf =250ms )\n";
+        let once = format(&parse(src).unwrap());
+        assert!(
+            once.contains("t duration(min = 1s, multipleOf = 250ms)"),
+            "{once:?}"
+        );
+        let twice = format(&parse(&once).unwrap());
+        assert_eq!(
+            once, twice,
+            "duration facet rendering must be a fixed point"
+        );
     }
 
     /// Every extreme literal the language accepts survives formatting:

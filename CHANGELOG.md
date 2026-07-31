@@ -4,6 +4,37 @@
 
 ### Changed
 
+- **Duration facets (RFC 0018 §3 deferral closed)** — `duration` is now
+  a legal facet carrier beside `number`: `timeout duration(min = 1s,
+  max = 2h, multipleOf = 250ms)`. One generic engine (`Facets<T:
+  FacetDomain>`; `NumberFacets`/`DurationFacets` are aliases, and
+  `FieldType::Primitive` now carries domain-tagged `PrimitiveFacets`)
+  keeps the two families byte-identical in behavior: bounds compare
+  semantically (`min = 1000ms` ≡ `min = 1s`; nanos-exact, never
+  floats), `multipleOf` is unit-blind nanos divisibility, and defaults,
+  config values, unions, and collections all face the same walk on
+  every surface (generated default/value parity grid extended over the
+  duration rows). Declaration rules (NML2058): bounds must be duration
+  LITERALS (`min = 5s` — a unitless bound teaches the shape), a
+  duration bound on a `number` field errors symmetrically, ranges are
+  judged semantically across units, and `multipleOf = 0s` is rejected
+  like its numeric zero sibling.
+
+- **The editor calls the loader** — `.model.nml` buffers now get
+  cross-definition schema validation in the editor: unknown/wrong-kind
+  `is` targets, inheritance and reference cycles, post-inheritance
+  shorthand arity, oneof/enum integrity, reserved type-constructor
+  names, cross-source duplicates, and declared-default checks, all by
+  running `nml_validate::loader::load_schema` — the same entry every
+  CLI verb and embedder uses — over the buffer's covering package
+  (`[]schema`, manifest order, buffer-first reads) or its
+  directory-mates when uncovered, keeping only the buffer's own
+  source-stamped findings. CLI/editor parity is by identity, not by
+  test; `nml-lsp`'s separate buffer-scoped default check is deleted as
+  redundant. The workspace index walk now also skips `target/`
+  (`cargo package` copies crate sources there, `.nml` fixtures
+  included).
+
 - **Durations are literals (RFC 0017)** — `30s` parses to a typed
   `Value::Duration` (magnitude + unit, faithful storage, **semantic**
   equality: `30s == 30000ms`, so sets and reload diffs treat the two
@@ -128,6 +159,18 @@
   `Document`, `ValueResolver`, `Diagnostic`, `Severity`, `SchemaIndex`,
   the defaults family) so the common parse → validate → defaults →
   deserialize flow is a single dependency.
+
+- **Declared defaults are checked where the schema is loaded** — a
+  field's `= default` is now type-checked by `load_schema` (and so by
+  both CLI verbs, schema packages, and any embedder), instead of only
+  by surfaces that happened to validate a file containing the
+  definition. A type-wrong default in a `--schema` directory used to
+  load clean and materialize into runtime config; it is now an error at
+  load. **API change**: `SchemaValidator::validate()` no longer reports
+  default diagnostics — call `nml_validate::schema::default_diagnostics`
+  (or just use `load_schema`, which does). The check runs *before*
+  inheritance resolution, so one declared default yields exactly one
+  finding however many models inherit it.
 
 ### Added
 

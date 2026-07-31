@@ -58,6 +58,10 @@ impl std::fmt::Display for FieldTypeExpr {
                         write!(f, "{} = ", facet.key.name)?;
                         match &facet.value.value {
                             crate::types::Value::Number(n) => write!(f, "{n}")?,
+                            // A duration renders as authored (`250ms`,
+                            // RFC 0017 Display) — the fmt fixed point
+                            // depends on canonical value rendering.
+                            crate::types::Value::Duration(d) => write!(f, "{d}")?,
                             other => write!(f, "{other:?}")?,
                         }
                     }

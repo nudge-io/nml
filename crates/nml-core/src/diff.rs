@@ -711,7 +711,7 @@ fn diff_unmodeled_remainder(
             name: String::new(),
             field_type: FieldType::List(Box::new(FieldType::Primitive {
                 ty: crate::types::PrimitiveType::String,
-                facets: crate::model::NumberFacets::NONE,
+                facets: crate::model::PrimitiveFacets::None,
             })),
             optional: true,
             shorthand: false,

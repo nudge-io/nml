@@ -627,6 +627,17 @@ impl Facet {
     pub fn number(&self) -> Option<SyntaxToken> {
         token(&self.0, SyntaxKind::Number)
     }
+    /// The value's duration-unit token (`s` in `min = 5s`), when the
+    /// facet value is a duration literal (RFC 0017): the Ident AFTER
+    /// the number token — the first Ident is the facet key.
+    pub fn unit(&self) -> Option<SyntaxToken> {
+        let number = self.number()?;
+        self.0
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .skip_while(|t| t.text_range().start() < number.text_range().end())
+            .find(|t| t.kind() == SyntaxKind::Ident)
+    }
 }
 
 /// The shape of a [`TypeExpr`].

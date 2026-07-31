@@ -884,19 +884,29 @@ impl<'a> Parser<'a> {
                         f.complete(self, SyntaxKind::Facet);
                         break;
                     }
-                    // A number literal, optionally signed — the only
-                    // facet value type (schemas are contracts, not
-                    // programs; no references, no expressions).
+                    // A number or duration literal, optionally signed —
+                    // the only facet value types (schemas are contracts,
+                    // not programs; no references, no expressions).
                     self.eat(SyntaxKind::Dash);
                     if !self.at(SyntaxKind::Number) {
                         self.expected(
-                            vec![crate::error::ExpectedItem::Desc("a number literal")],
+                            vec![crate::error::ExpectedItem::Desc(
+                                "a number or duration literal",
+                            )],
                             None,
                         );
                         f.complete(self, SyntaxKind::Facet);
                         break;
                     }
                     self.bump(); // number
+                    // RFC 0017 duration unit (`5s`, `250ms`): an Ident
+                    // glued to the magnitude on the same line. Whether
+                    // the unit is legal here is the definition pass's
+                    // question (domain vs the field's type) — the
+                    // grammar just carries the author's literal.
+                    if self.at(SyntaxKind::Ident) && !self.newline_before() {
+                        self.bump(); // unit
+                    }
                     f.complete(self, SyntaxKind::Facet);
                     if !self.eat(SyntaxKind::Comma) {
                         break;

@@ -79,7 +79,7 @@ service Api:
 is echoed with control characters escaped — file content can never
 smuggle raw terminal escapes into your output.
 
-```nml check expect-error='[NML0004]'
+```nml check expect-error='[NML0002, NML0004]'
 service Api:
     x = ^oops
 ```
@@ -110,7 +110,7 @@ the open columns, so the fix is a straight pick from that list. (NML
 recovers by treating the line's column as a new level, so later lines
 still parse.)
 
-```nml check expect-error='[NML0006]'
+```nml check expect-error='[NML0002, NML0006]'
 service Api:
         port = 8080
     host = "0.0.0.0"
@@ -140,7 +140,7 @@ clipping occurs.)
 set elements are *alternatives*, written `set<a | b>`. Machine-fixable:
 the comma becomes `|`.
 
-```nml check expect-error='[NML0008]'
+```nml check expect-error='[NML0002, NML0008]'
 model deploy:
     regions set<string, number>
 ```
@@ -284,7 +284,7 @@ The fence below is stored with LF endings and converted to lone-CR
 ("old Mac") endings by the docs harness before it runs, so this
 example is executable, not illustrative:
 
-```nml check eol=cr expect-error='[NML0016]'
+```nml check eol=cr expect-error='[NML0002, NML0016]'
 service Api:
     port = 8080
 ```
@@ -581,7 +581,7 @@ model widget:
 type constructors; a definition so named could never be referenced with
 arguments.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2010]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2010]'
 model set:
     x string?
 ```
@@ -593,7 +593,7 @@ model set:
 **Multiple positional fields.** A bare scalar list item supplies one value,
 so a model may mark at most one field positional (`+`).
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2011]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2011]'
 model twoPositional:
     a string+
     b string+
@@ -606,7 +606,7 @@ model twoPositional:
 **Oneof arm references an unknown model.** Every arm's target must be a
 declared `model`.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2012]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2012]'
 oneof thing by kind:
     "x" -> missingModel
 ```
@@ -617,7 +617,7 @@ oneof thing by kind:
 
 **Inheritance cycle.** `is` chains must be acyclic.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2013]'
+```nml check expect-error='[NML2013]'
 model cycleA is cycleB:
     x string?
 model cycleB is cycleA:
@@ -632,7 +632,7 @@ model cycleB is cycleA:
 loop. Legal — recursive configs exist — but often an unintended
 self-reference, so it warns.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2014]'
+```nml check expect-output='[NML2014]'
 model node:
     next otherNode?
 model otherNode:
@@ -647,7 +647,7 @@ loop.
 **Duplicate discriminator value.** Each arm's value must be unique within
 its `oneof` — dispatch would otherwise be ambiguous.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2015]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2015]'
 oneof dupValue by kind:
     "x" -> widget
     "x" -> widget
@@ -660,7 +660,7 @@ oneof dupValue by kind:
 **Oneof name collision.** A `oneof` shares a name with a model or enum;
 names are one namespace across all three definition kinds.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2016]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2016]'
 oneof widget by kind:
     "w" -> widget
 ```
@@ -672,7 +672,7 @@ oneof widget by kind:
 **Default discriminator matches no arm.** A declared default must name one
 of the union's arm values.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2017]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2017]'
 oneof withDefault by kind = "zzz":
     "a" -> widget
 ```
@@ -684,7 +684,7 @@ oneof withDefault by kind = "zzz":
 **Discriminator type is not an enum.** `by <field> as <type>` requires
 `<type>` to be a declared enum.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2018]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2018]'
 oneof badType by kind as notAnEnum:
     "a" -> widget
 ```
@@ -697,7 +697,7 @@ oneof badType by kind as notAnEnum:
 must equal the enum's variants exactly — no missing variant, no arm outside
 the enum. Both directions report this code.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2019]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2019]'
 enum letters:
     - "a"
     - "b"
@@ -713,7 +713,7 @@ oneof exhaustive by kind as letters:
 model or trait (RFC 0011). A typo'd target carries a machine-applicable
 did-you-mean; in the editor it is a one-click fix.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2020]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2020]'
 trait auditable:
     auditedBy string?
 
@@ -729,7 +729,7 @@ model/trait.
 **`is` target is not composable.** Only models and traits compose with
 `is`; an enum or a `oneof` cannot be mixed in.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2021]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2021]'
 enum sizes:
     - "s"
     - "m"
@@ -748,7 +748,7 @@ they bundle fields for `is`, and never describe a value — not directly,
 in `[]`/`set<>`, in a union, behind a `|` modifier, or in `(K -> V)` arm
 positions.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2022]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2022]'
 trait auditable:
     auditedBy string?
 
@@ -765,7 +765,7 @@ declare a `model` if you need a nested value type.
 discriminator dispatch, so every arm must name an instantiable model —
 a trait can never be selected.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2023]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2023]'
 trait auditable:
     auditedBy string?
 
@@ -1276,7 +1276,7 @@ field named like the union's discriminator. An instance's property of that
 name is always read as the discriminator, so the field itself can never be
 set — almost always an authoring mistake, so it warns.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2054]'
+```nml check expect-output='[NML2054]'
 model logEntry:
     kind string?
 oneof record by kind:
@@ -1313,9 +1313,9 @@ those fields.
 
 ## NML2057
 
-**Facet violation.** A `number` value falls outside a facet its schema
-declares (RFC 0018): `min`/`max` (inclusive), `exclusiveMin`/
-`exclusiveMax`, or `multipleOf`.
+**Facet violation.** A `number` or `duration` value falls outside a
+facet its schema declares (RFC 0018): `min`/`max` (inclusive),
+`exclusiveMin`/`exclusiveMax`, or `multipleOf`.
 
 ```nml check expect-error='[NML2057]'
 model server:
@@ -1328,12 +1328,25 @@ server Web:
 The message names the field, its value, and the facet as authored:
 `'port' is 70000, above the schema's max = 65535`.
 
-Enforcement is **exact**: bounds compare through the RFC 0016 decimal
-core, and `multipleOf` is decided by exact decimal divisibility — so
-`0.3` IS a multiple of `0.1` here (binary-float validators famously say
-otherwise), and boundary values behave like the schema reads. Values
-are checked after the type check, element-wise for `[]number` and
-`set<number>`, and field defaults are held to the same rule.
+Enforcement is **exact**: number bounds compare through the RFC 0016
+decimal core, and `multipleOf` is decided by exact decimal
+divisibility — so `0.3` IS a multiple of `0.1` here (binary-float
+validators famously say otherwise), and boundary values behave like
+the schema reads. Duration bounds compare **semantically** in
+nanoseconds (RFC 0017): `1000ms` satisfies `min = 1s`, and
+`multipleOf` is unit-blind divisibility — `1500ms` is a multiple of
+`250ms` but not of `1s`:
+
+```nml check expect-error='[NML2057]'
+model job:
+    interval duration(min = 1s, multipleOf = 250ms)
+
+job Sync:
+    interval = 900ms
+```
+
+Values are checked after the type check, element-wise for
+collections, and field defaults are held to the same rule.
 
 **Fix:** change the value to satisfy the constraint, or change the
 schema if the constraint is wrong. Nothing is ever clamped or rounded
@@ -1342,12 +1355,16 @@ for you.
 ## NML2058
 
 **Invalid facet declaration.** The schema itself misuses facets
-(RFC 0018): facets on a non-`number` type, an unknown or duplicate
+(RFC 0018): facets on a type that is neither `number` nor `duration`,
+a facet value in the wrong domain (a unitless bound on a `duration`
+field, a duration bound on a `number` field), an unknown or duplicate
 facet key, `min`/`exclusiveMin` (or `max`/`exclusiveMax`) together, an
-unsatisfiable range (`min = 2, max = 1`, or an exclusive bound meeting
-its counterpart), or `multipleOf` that is not positive. (A default
-violating its own facets reports as NML2057 — it is a value breaking a
-constraint, found where values are checked.)
+unsatisfiable range (`min = 2, max = 1` — judged semantically for
+durations, so `exclusiveMin = 1000ms, max = 1s` is empty — or an
+exclusive bound meeting its counterpart), or `multipleOf` that is not
+positive (`0s` included). (A default violating its own facets reports
+as NML2057 — it is a value breaking a constraint, found where values
+are checked.)
 
 ```nml check expect-error='[NML2058]'
 model m:
@@ -1355,9 +1372,22 @@ model m:
 ```
 
 The message names the field and the rule: ``'name': facets attach only
-to `number` — `string` cannot carry them``.
+to `number` and `duration` — `string` cannot carry them``.
 
-**Fix:** move range constraints to `number` fields; string/collection
+A cross-domain facet value is the same code — the field's type picks
+the domain, and the bound must be written in it:
+
+```nml check expect-error='[NML2058]'
+model job:
+    timeout duration(min = 5)
+```
+
+The message teaches the literal shape: ``'timeout': `duration` facets
+take duration literals (`min = 5s`, `min = 5ms`, ...) — `5` has no
+unit``.
+
+**Fix:** move range constraints to `number` or `duration` fields
+(duration bounds are duration literals: `min = 5s`); string/collection
 length constraints are deliberately not spelled with these keys.
 
 ## NML3000

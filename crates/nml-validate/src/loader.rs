@@ -114,6 +114,20 @@ pub fn load_schema(sources: &[(&str, &str)]) -> (ExtractedSchema, Vec<Diagnostic
     // definition that wrote it.
     diagnostics.extend(find_composition_errors(&schema));
 
+    // Declared defaults, checked where the schema is LOADED — the path
+    // packages, boots, and both CLI verbs share. Until now nothing here
+    // looked at a default's value, so `port number = "eighty"` in a
+    // `--schema` directory loaded clean and materialized a string into
+    // a number field: the same silent-bad-value hole RFC 0018 closed
+    // for facets, one code over.
+    //
+    // BEFORE inheritance resolution, deliberately: that pass COPIES a
+    // trait's fields — defaults and all — into every child, so a walk
+    // afterwards reports one declared default once per inheritor plus
+    // once on the trait. A default is declared exactly once and is
+    // judged exactly where it is written.
+    diagnostics.extend(crate::schema::default_diagnostics(&schema));
+
     resolve_model_inheritance(&mut schema);
 
     // Positional-shorthand (`+`, RFC 0005) arity — axis-aware, checked post-inheritance
@@ -384,7 +398,7 @@ mod trait_tests {
 
     #[test]
     fn traits_load_merge_and_default_through_the_index() {
-        let src = "trait monitored:\n    timeout duration = \"5s\"\n\n\
+        let src = "trait monitored:\n    timeout duration = 5s\n\n\
                    model endpoint is monitored:\n    url string+\n";
         let (schema, diags) = load_schema(&[("t.model.nml", src)]);
         assert!(diags.is_empty(), "{diags:?}");
