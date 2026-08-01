@@ -4,7 +4,7 @@ import { Wasm, WasmProcess } from "@vscode/wasm-wasi/v1";
 import { StreamMessageReader, StreamMessageWriter } from "vscode-jsonrpc/node";
 import { MessageTransports } from "vscode-languageclient/node";
 import { NmlLogs } from "./logging";
-import { isPathInsideWorkspace } from "./pathSecurity";
+import { evaluateNeutralServerPathOverride } from "./pathSecurity";
 
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -38,18 +38,25 @@ export async function resolveNeutralServer(
   const roots = (workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
   const override = workspace.getConfiguration("nml").get<string>("server.path", "");
   if (override) {
-    if (await isPathInsideWorkspace(override, roots)) {
+    const evaluated = await evaluateNeutralServerPathOverride(override, roots);
+    if (evaluated.accepted) {
+      return {
+        kind: "process",
+        command: evaluated.command,
+        args: [],
+        label: "neutral (nml.server.path)",
+      };
+    }
+    if (evaluated.reason === "relative") {
+      logs.warn(
+        `Refusing nml.server.path — relative paths are not allowed (${override}). ` +
+          "Set an absolute path (e.g. ~/.cargo/bin/nml-lsp)."
+      );
+    } else {
       logs.warn(
         `Refusing nml.server.path inside the workspace (${override}). ` +
           "Use a global install, bundled WASM, or a binary outside the workspace."
       );
-    } else {
-      return {
-        kind: "process",
-        command: override,
-        args: [],
-        label: "neutral (nml.server.path)",
-      };
     }
   }
   const module = Uri.joinPath(ctx.extensionUri, "server", "nml-lsp.wasm");

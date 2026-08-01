@@ -23,6 +23,10 @@ The status bar (bottom-right) names the active schema and where it came from.
 
 - `nml.server.path` — absolute path to a native `nml-lsp` binary to use instead
   of the bundled WASM server (machine-scoped: a repository cannot set it).
+- `nml.trace.server` — log LSP protocol traffic to the trace output channel.
+
+Host compatibility (`engines.vscode` vs `@types/vscode`) is documented in
+[VSCODE-API.md](./VSCODE-API.md).
 
 ## Commands
 

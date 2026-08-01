@@ -34,3 +34,22 @@ export async function isPathInsideWorkspace(
   const rootReals = await Promise.all(workspaceRoots.map((r) => realPath(r)));
   return isPathInsideWorkspaceRoots(targetReal, rootReals);
 }
+
+export type NeutralServerPathOverride =
+  | { accepted: true; command: string }
+  | { accepted: false; reason: "relative" | "inside-workspace" };
+
+/** Validate `nml.server.path` before spawn — absolute, outside workspace. */
+export async function evaluateNeutralServerPathOverride(
+  pathOverride: string,
+  workspaceRoots: readonly string[]
+): Promise<NeutralServerPathOverride> {
+  const command = pathOverride.trim();
+  if (!path.isAbsolute(command)) {
+    return { accepted: false, reason: "relative" };
+  }
+  if (await isPathInsideWorkspace(command, workspaceRoots)) {
+    return { accepted: false, reason: "inside-workspace" };
+  }
+  return { accepted: true, command };
+}

@@ -111,7 +111,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "Absolute path to the neutral nml-lsp binary. Defaults to ~/.cargo/bin/nml-lsp. Machine-scoped on purpose: a workspace cannot set it, so a repository can never redirect the language server at an untrusted binary. Paths inside an open workspace folder are refused (same RCE class as workspace-resident provider binaries)."
+          "description": "Absolute path to the neutral nml-lsp binary (relative paths are refused). Defaults to ~/.cargo/bin/nml-lsp. Machine-scoped on purpose: a workspace cannot set it, so a repository can never redirect the language server at an untrusted binary. Paths inside an open workspace folder are refused (same RCE class as workspace-resident provider binaries)."
         },
         "nml.trace.server": {
           "type": "string",
@@ -133,15 +133,17 @@
   },
   "main": "./dist/extension.js",
   "scripts": {
+    "check:engines": "node scripts/check-vscode-engine.mjs",
+    "test:engine-policy": "node --test scripts/vscodeEnginePolicy.test.mjs",
     "bundle:wasm": "mkdir -p server && cp ../../target/wasm32-wasip1/release/nml-lsp.wasm server/nml-lsp.wasm",
     "bundle:js": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify --sourcemap",
-    "typecheck": "tsc -b tsconfig.json tsconfig.test.json",
-    "compile": "tsc -b tsconfig.json tsconfig.test.json",
+    "typecheck": "npm run check:engines && tsc -b tsconfig.json tsconfig.test.json",
+    "compile": "npm run check:engines && tsc -b tsconfig.json tsconfig.test.json",
     "watch": "tsc -b tsconfig.json tsconfig.test.json -w",
-    "test:unit": "tsc -b tsconfig.json tsconfig.test.json && mocha --ui tdd out/test/unit/**/*.js",
+    "test:unit": "npm run check:engines && tsc -b tsconfig.json tsconfig.test.json && mocha --ui tdd out/test/unit/**/*.js && npm run test:engine-policy",
     "pretest": "npm run bundle:wasm && npm run bundle:js && npm run compile",
     "test": "vscode-test",
-    "vscode:prepublish": "npm run bundle:wasm && npm run bundle:js"
+    "vscode:prepublish": "npm run check:engines && npm run bundle:wasm && npm run bundle:js"
   },
   "dependencies": {
     "@vscode/wasm-wasi": "^1.0.1",
@@ -151,7 +153,7 @@
   "devDependencies": {
     "@types/mocha": "^10.0.7",
     "@types/node": "^25.3.2",
-    "@types/vscode": "^1.91.0",
+    "@types/vscode": "1.91.0",
     "@vscode/test-cli": "^0.0.10",
     "@vscode/test-electron": "^3.1.0",
     "esbuild": "^0.28.1",

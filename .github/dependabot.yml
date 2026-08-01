@@ -11,13 +11,25 @@ updates:
         patterns: ["*"]
 
   # VS Code extension dependencies.
+  #
+  # @types/vscode is excluded from automation: its version must move in lockstep
+  # with engines.vscode (see editors/vscode/VSCODE-API.md). Grouped bumps that
+  # include @types/vscode break `vsce package` (e.g. PR #8).
   - package-ecosystem: npm
     directory: /editors/vscode
     schedule:
       interval: weekly
     groups:
-      npm:
+      npm-production:
+        dependency-type: production
         patterns: ["*"]
+      npm-development:
+        dependency-type: development
+        patterns: ["*"]
+        exclude-patterns:
+          - "@types/vscode"
+    ignore:
+      - dependency-name: "@types/vscode"
 
   # Rust workspace.
   - package-ecosystem: cargo

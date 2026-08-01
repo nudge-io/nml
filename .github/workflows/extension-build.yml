@@ -41,6 +41,10 @@ jobs:
         working-directory: editors/vscode
         run: npm ci
 
+      - name: VS Code API floor (engines.vscode ↔ @types/vscode)
+        working-directory: editors/vscode
+        run: npm run check:engines
+
       - name: Type-check
         working-directory: editors/vscode
         run: npm run typecheck

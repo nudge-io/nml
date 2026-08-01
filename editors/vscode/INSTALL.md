@@ -2,6 +2,8 @@
 
 Complete steps to build, package, and install the NML language extension (with LSP) into Cursor.
 
+**Host compatibility:** the extension requires VS Code API **1.91+** (`engines.vscode` in `package.json`). Current Cursor releases satisfy this — the same VSIX installs in both VS Code and Cursor.
+
 ## Prerequisites
 
 - Rust toolchain (`cargo`)

@@ -86,6 +86,10 @@ The bundled extension adds editor packaging on top of the neutral server:
 - **NML: Show Language Server Log** / **NML: Show Language Server Trace**:
   palette commands to open the structured log channels.
 - **`nml.server.path`** (machine-scoped): absolute path to a native `nml-lsp`
-  binary. Paths inside an open workspace folder are refused.
+  binary. Relative paths are refused. Paths inside an open workspace folder are
+  refused.
 - **`nml.trace.server`** (machine-scoped): set to `messages` or `verbose`
   to record LSP protocol traffic in the trace channel (off by default).
+
+Host API compatibility (`engines.vscode` vs `@types/vscode`) is documented in
+[`editors/vscode/VSCODE-API.md`](../../editors/vscode/VSCODE-API.md).

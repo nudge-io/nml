@@ -10,10 +10,11 @@ import {
   State,
 } from "vscode-languageclient/node";
 import { WasmProcess } from "@vscode/wasm-wasi/v1";
+import { ClientLifecycleState, LspClientStateValue } from "./contracts/lifecycle";
+import { resolveLifecycleState } from "./lifecycleState";
 import { NmlLogs } from "./logging";
 import { resolveServer } from "./providerDiscovery";
 import { createWasmServer, wasmUriConverters } from "./serverAcquisition";
-import { ClientLifecycleState } from "./contracts/lifecycle";
 
 export class NmlClientManager {
   private client: LanguageClient | undefined;
@@ -38,24 +39,12 @@ export class NmlClientManager {
     return this.serverLabel;
   }
 
-  getClientState(): State {
-    return this.clientState;
-  }
-
-  /** Single source of truth for status-bar lifecycle presentation. */
   getLifecycleState(): ClientLifecycleState {
-    if (this.connectionLost) return "disconnected";
-    const client = this.client;
-    const state = this.clientState;
-    if (!client) {
-      if (state === State.Starting) return "starting";
-      if (state === State.StartFailed) return "failed";
-      return "absent";
-    }
-    if (state === State.Starting) return "starting";
-    if (state === State.StartFailed) return "failed";
-    if (state === State.Stopped) return "disconnected";
-    return "running";
+    return resolveLifecycleState({
+      connectionLost: this.connectionLost,
+      hasClient: this.client !== undefined,
+      clientState: this.clientState as LspClientStateValue,
+    });
   }
 
   serialize(op: () => Promise<void>): Promise<void> {
@@ -105,7 +94,7 @@ export class NmlClientManager {
       progressOnInitialization: true,
       initializationOptions: { explainCommand: "nml.explain" },
       initializationFailedHandler: (error) => {
-        this.reportStartFailure(resolution.label, String(error));
+        void this.failStart(resolution.label, String(error));
         return false;
       },
       errorHandler: {
@@ -152,10 +141,7 @@ export class NmlClientManager {
       await client.start();
       await this.applyTraceSetting();
     } catch (err) {
-      this.reportStartFailure(resolution.label, String(err));
-      this.client = undefined;
-      this.clientState = State.StartFailed;
-      this.onStateChange();
+      await this.failStart(resolution.label, String(err), client);
     }
   }
 
@@ -167,6 +153,20 @@ export class NmlClientManager {
       `NML: failed to start the NML language server (${label}). ` +
         `Set nml.server.path to an nml-lsp binary, or install one.`
     );
+  }
+
+  private async failStart(
+    label: string,
+    detail: string,
+    client?: LanguageClient
+  ): Promise<void> {
+    this.reportStartFailure(label, detail);
+    const old = client ?? this.client;
+    this.client = undefined;
+    this.clientState = State.StartFailed;
+    if (old) await old.stop().catch(() => undefined);
+    await this.terminateWasm();
+    this.onStateChange();
   }
 
   private async handleConnectionClosed(): Promise<void> {
