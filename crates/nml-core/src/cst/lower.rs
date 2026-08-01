@@ -448,33 +448,45 @@ fn facets_of(te: &ast::TypeExpr, errors: &mut Vec<NmlError>) -> Vec<FacetExpr> {
             // A unit token makes the literal a DURATION (RFC 0017) —
             // same decode-or-drop contract, RFC 0017's own errors
             // (unknown unit, out of range, negative).
-            let value = match f.unit() {
-                Some(unit) => {
-                    let unit_span = Span::new(
-                        usize::from(unit.text_range().start()),
-                        usize::from(unit.text_range().end()),
-                    );
-                    let vspan = Span::new(vspan.start, unit_span.end);
-                    match crate::duration::parse_duration_literal(
-                        &text,
-                        unit.text(),
-                        vspan,
-                        unit_span,
-                    ) {
-                        Ok(d) => SpannedValue::new(crate::types::Value::Duration(d), vspan),
-                        Err(e) => {
-                            errors.push(e);
-                            return None;
-                        }
-                    }
-                }
-                None => match super::value::parse_number(&text, vspan) {
+            let raw_components = f.duration_components();
+            let has_units = raw_components.iter().any(|(_, u)| u.is_some());
+            let value = if !has_units {
+                match super::value::parse_number(&text, vspan) {
                     Ok(n) => SpannedValue::new(crate::types::Value::Number(n), vspan),
                     Err(e) => {
                         errors.push(e);
                         return None;
                     }
-                },
+                }
+            } else if let Some((dangling, _)) = raw_components.iter().find(|(_, u)| u.is_none()) {
+                // A dangling magnitude (`min = 1h30`) is NML3008, exactly
+                // as in value position — never a silently truncated bound.
+                let break_span = Span::new(
+                    usize::from(dangling.text_range().start()),
+                    usize::from(dangling.text_range().end()),
+                );
+                errors.push(crate::error::NmlError::Duration {
+                    kind: crate::duration::DurationErrorKind::MalformedCompound { break_span },
+                    span: Span::new(vspan.start, break_span.end),
+                });
+                return None;
+            } else {
+                let pairs: Vec<_> = raw_components
+                    .into_iter()
+                    .map(|(n, u)| (n, u.expect("checked above")))
+                    .collect();
+                let components = super::syntax::duration_component_tokens(&pairs, &text);
+                let literal_span = pairs
+                    .last()
+                    .map(|(_, u)| Span::new(vspan.start, usize::from(u.text_range().end())))
+                    .unwrap_or(vspan);
+                match crate::duration::parse_components_cst(&components, literal_span) {
+                    Ok(d) => SpannedValue::new(crate::types::Value::Duration(d), literal_span),
+                    Err(e) => {
+                        errors.push(e);
+                        return None;
+                    }
+                }
             };
             Some(FacetExpr { key, value, span })
         })

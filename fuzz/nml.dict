@@ -88,6 +88,12 @@
 "us"
 "ns"
 
+# ── compound durations (RFC 0017 §10) ───────────────────────────────────
+"1h30m"
+"5m2s"
+"1h2h"
+"1h30"
+
 # ── digit separators & numeric shapes (RFC 0016) ────────────────────────
 "_"
 "0."

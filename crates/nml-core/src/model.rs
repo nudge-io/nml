@@ -202,12 +202,18 @@ pub type DurationFacets = Facets<crate::duration::Duration>;
 /// field's bounds are `Number`s, a `duration` field's are `Duration`s,
 /// and the type system keeps the two from ever being compared across
 /// domains. `None` for every other primitive.
+///
+/// The payloads are boxed: a `Duration` bound stores its canonical
+/// segments inline (~1/8 KiB per facet record), and most fields carry no
+/// facets at all — the box keeps `FieldType` (and with it every
+/// `FieldDef`) at pointer scale instead of paying the largest variant
+/// everywhere.
 #[derive(Debug, Clone, Default, Serialize)]
 pub enum PrimitiveFacets {
     #[default]
     None,
-    Number(NumberFacets),
-    Duration(DurationFacets),
+    Number(Box<NumberFacets>),
+    Duration(Box<DurationFacets>),
 }
 
 impl PrimitiveFacets {

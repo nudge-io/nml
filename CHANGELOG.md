@@ -4,6 +4,16 @@
 
 ### Changed
 
+- **Compound duration literals (RFC 0017 amendment)** — durations now
+  support attached compound syntax (`1h30m`, `5m2s`) and inline-spaced
+  forms (`1h 30m`). The lexer suffix-run rule tokenizes glued compounds
+  as alternating `Number`/`Ident` pairs; duplicate units in source
+  diagnose as `NML3007` with a merge fix; dangling magnitudes are
+  `NML3008`; the `NML3005` fractional fix now respells at the authored
+  granularity (`1.5h` → `1h30m`, not `90m`). Coercion text (`$ENV`)
+  silently merges duplicates and decomposes exact fractions. Wire JSON
+  now carries a `segments` array (breaking, pre-1.0).
+
 - **VS Code extension tooling** — migrated from npm to a pnpm 11 workspace
   (root `pnpm-lock.yaml`, supply-chain policy in `pnpm-workspace.yaml`).
   Contributors: `corepack enable && pnpm install`, then `just verify-ext`.

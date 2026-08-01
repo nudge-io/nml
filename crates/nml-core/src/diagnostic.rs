@@ -372,13 +372,20 @@ pub mod codes {
         /// machine-applicable suggestion (RFC 0017).
         UNKNOWN_UNIT = 3004;
         /// A duration magnitude with a fractional part (`30.5s`) —
-        /// durations are integers; the fix respells the value in a finer
-        /// unit (`30500ms`) when one exists (RFC 0017).
+        /// durations are integers; the fix respells the value exactly at
+        /// the authored granularity (`30s500ms`) when one exists
+        /// (RFC 0017).
         FRACTIONAL_DURATION = 3005;
         /// A duration outside the value domain: negative, or a total
         /// beyond `std::time::Duration::MAX` (durations convert
         /// infallibly by construction — RFC 0017).
         DURATION_OUT_OF_RANGE = 3006;
+        /// A compound duration literal repeats the same unit (`1h2h`) —
+        /// the fix merges to the canonical form (`3h`).
+        DUPLICATE_DURATION_UNIT = 3007;
+        /// A compound duration has a dangling magnitude without a unit
+        /// suffix (`1h30`, `5m2`).
+        MALFORMED_COMPOUND_DURATION = 3008;
 
         /// A package validator binding is fully shadowed by earlier
         /// bindings — its globs can never match first (RFC 0030).

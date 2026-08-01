@@ -203,11 +203,8 @@
       }
     },
     "duration-literal": {
-      "match": "\\b(\\d[\\d_]*)(ms|us|ns|h|m|s)\\b",
-      "captures": {
-        "1": { "name": "constant.numeric.duration.nml" },
-        "2": { "name": "keyword.other.unit.duration.nml" }
-      }
+      "match": "\\b\\d[\\d_]*(?:\\.\\d+)?(?:ms|us|ns|h|m|s)(?:\\d[\\d_]*(?:\\.\\d+)?(?:ms|us|ns|h|m|s))*\\b",
+      "name": "constant.numeric.duration.nml"
     },
     "number": {
       "name": "constant.numeric.nml",

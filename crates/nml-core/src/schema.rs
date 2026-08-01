@@ -810,6 +810,43 @@ mod tests {
         let (_s, diags) = crate::cst::extract_schema(clean);
         assert!(diags.is_empty(), "well-formed must load clean: {diags:?}");
 
+        // Compound literals (RFC 0017 §10) work in facet position too,
+        // and the bounds still judge semantically: the default 90m
+        // satisfies min = 1h30m because they are one value.
+        let compound = "model m:\n    t duration(min = 1h30m, max = 2h) = 90m\n";
+        let (s, diags) = crate::cst::extract_schema(compound);
+        assert!(
+            diags.is_empty(),
+            "compound facet must load clean: {diags:?}"
+        );
+        let field = s.models[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "t")
+            .expect("field t");
+        let crate::model::FieldType::Primitive {
+            facets: crate::model::PrimitiveFacets::Duration(fs),
+            ..
+        } = &field.field_type
+        else {
+            panic!("duration facets expected: {:?}", field.field_type);
+        };
+        assert_eq!(
+            fs.min.as_ref().map(|m| m.value.to_string()).as_deref(),
+            Some("1h30m")
+        );
+
+        // REGRESSION: a dangling magnitude in facet position (`min =
+        // 1h30`) once loaded silently as the truncated bound `1h` — it
+        // must be NML3008, exactly as in value position.
+        let (_s, diags) = crate::cst::extract_schema("model m:\n    t duration(min = 1h30)\n");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code.is_some_and(|c| c.to_string() == "NML3008")),
+            "dangling facet magnitude must be NML3008, never a truncated bound: {diags:?}"
+        );
+
         let equal = "model m:\n    t duration(min = 1000ms, max = 1s)\n";
         let (_s, diags) = crate::cst::extract_schema(equal);
         assert!(diags.is_empty(), "1000ms == 1s is satisfiable: {diags:?}");

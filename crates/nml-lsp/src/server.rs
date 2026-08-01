@@ -3593,7 +3593,7 @@ fn normalized_total(d: &nml_core::duration::Duration) -> Option<String> {
         DurationUnit::Nanoseconds,
     ] {
         if nanos % unit.nanos() as u128 == 0 {
-            if unit == d.unit() {
+            if d.segments().iter().any(|s| s.unit == unit) {
                 return None;
             }
             return Some(format!(
@@ -7076,6 +7076,15 @@ workflow VoiceAgent:
         assert_eq!(normalized_total(&d("500ms")), None);
         assert_eq!(normalized_total(&d("250us")), None);
         assert_eq!(normalized_total(&d("750ns")), None);
+        // Compound literals (RFC 0017 §10) normalize like any value…
+        assert_eq!(
+            normalized_total(&d("1h30m")).as_deref(),
+            Some("5_400_000ms")
+        );
+        assert_eq!(normalized_total(&d("5m2s")).as_deref(), Some("302_000ms"));
+        // …and skip the restatement when ANY authored segment already
+        // spells the normalized unit.
+        assert_eq!(normalized_total(&d("1s500ms")), None);
         // Zero teaches nothing in any unit.
         assert_eq!(normalized_total(&d("0s")), None);
         // Grouping delegate: the separator is the language's.

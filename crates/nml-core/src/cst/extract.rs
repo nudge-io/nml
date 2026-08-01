@@ -211,7 +211,7 @@ fn facet_magnitude(f: &Facet) -> Option<(String, crate::span::Span)> {
 /// a unit suffix means the author wrote a duration, which is not a
 /// number bound (the definition pass reports the mismatch).
 fn decode_number_facet(f: &Facet) -> Option<crate::types::Number> {
-    if f.unit().is_some() {
+    if f.duration_components().iter().any(|(_, u)| u.is_some()) {
         return None;
     }
     let (text, span) = facet_magnitude(f)?;
@@ -222,13 +222,19 @@ fn decode_number_facet(f: &Facet) -> Option<crate::types::Number> {
 /// (RFC 0017); a bare number is not a duration bound (the definition
 /// pass reports the mismatch).
 fn decode_duration_facet(f: &Facet) -> Option<crate::duration::Duration> {
-    let unit = f.unit()?;
+    // Every magnitude must carry its unit: a dangling one (`min = 1h30`)
+    // must NOT load as the truncated bound — the lower pass reports it.
+    let pairs: Vec<_> = f
+        .duration_components()
+        .into_iter()
+        .map(|(n, u)| u.map(|u| (n, u)))
+        .collect::<Option<_>>()?;
+    if pairs.is_empty() {
+        return None;
+    }
     let (text, span) = facet_magnitude(f)?;
-    let unit_span = crate::span::Span::new(
-        usize::from(unit.text_range().start()),
-        usize::from(unit.text_range().end()),
-    );
-    crate::duration::parse_duration_literal(&text, unit.text(), span, unit_span).ok()
+    let components = super::syntax::duration_component_tokens(&pairs, &text);
+    crate::duration::parse_components_cst(&components, span).ok()
 }
 
 fn resolve_field_type(te: &TypeExpr) -> FieldType {
@@ -246,11 +252,11 @@ fn resolve_field_type(te: &TypeExpr) -> FieldType {
                     // (Field evaluated before `ty` because the check
                     // borrows `prim`.)
                     facets: match prim {
-                        PrimitiveType::Number => crate::model::PrimitiveFacets::Number(
+                        PrimitiveType::Number => crate::model::PrimitiveFacets::Number(Box::new(
                             extract_facets_as(te, decode_number_facet),
-                        ),
+                        )),
                         PrimitiveType::Duration => crate::model::PrimitiveFacets::Duration(
-                            extract_facets_as(te, decode_duration_facet),
+                            Box::new(extract_facets_as(te, decode_duration_facet)),
                         ),
                         _ => crate::model::PrimitiveFacets::None,
                     },

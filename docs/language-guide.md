@@ -135,7 +135,7 @@ list item fills that field:
 | `number` | Unquoted decimal | `8000`, `3.14`, `-1`, `10_000` |
 | `money` | Amount + currency code | `19.99 USD`, `1299 JPY` |
 | `bool` | Unquoted | `true`, `false` |
-| `duration` | Unquoted with unit | `72h`, `30s`, `500ms`, `250us` |
+| `duration` | Unquoted with unit(s) | `72h`, `30s`, `500ms`, `1h30m` |
 | `path` | Quoted URL path | `"/"`, `"/user/{username}"`, `"/assets/{*}"` |
 | `secret` | Environment reference | `$ENV.API_KEY` |
 
@@ -164,10 +164,13 @@ allows at most 2 decimal places.
 | `us` | microseconds |
 | `ns` | nanoseconds |
 
-Durations are typed literals: an unsigned integer attached to one unit
-(`30s`, never `"30s"`, `1.5h`, or `1h30m`). The authored unit is kept —
-`72h` formats as `72h` — while comparison is by value, so `30s` and
-`30000ms` are the same duration to sets and reload diffs.
+Durations are typed literals: one or more unsigned integers, each
+attached to its unit, coarse to fine (`30s`, `1h30m` — never `"30s"` or
+`1.5h`; a fractional magnitude gets a fix suggesting the exact
+respelling at the same granularity, like `1h30m` for `1.5h`). The
+authored units are kept — `72h` formats as `72h`, and `90m` never
+becomes `1h30m` — while comparison is by value, so `30s` and `30000ms`
+(or `90m` and `1h30m`) are the same duration to sets and reload diffs.
 
 #### Path Variables
 

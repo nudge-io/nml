@@ -33,6 +33,7 @@ fn test_check_valid_files() {
         "tests/fixtures/valid/scalar-shared-property.nml",
         "tests/fixtures/valid/number-boundaries.nml",
         "tests/fixtures/valid/numeric-facets.nml",
+        "tests/fixtures/valid/duration-compound.nml",
     ];
 
     for file in files {
@@ -140,7 +141,7 @@ fn test_parse_money_values() {
 #[test]
 fn test_parse_duration_values() {
     // The duration wire shape is an API (RFC 0017 §6), pinned exactly:
-    // externally tagged, magnitude bare, unit as its source suffix.
+    // externally tagged, segments array of {magnitude, unit} pairs.
     let output = nml_bin()
         .args(["parse", "tests/fixtures/valid/duration-values.nml"])
         .output()
@@ -156,7 +157,7 @@ fn test_parse_duration_values() {
         ["value"]["value"];
     assert_eq!(
         value,
-        &serde_json::json!({"Duration": {"magnitude": 30, "unit": "s"}}),
+        &serde_json::json!({"Duration": {"segments": [{"magnitude": 30, "unit": "s"}]}}),
         "wire shape drifted: {value}"
     );
     for unit in ["\"s\"", "\"ms\"", "\"h\"", "\"m\"", "\"us\"", "\"ns\""] {
@@ -164,6 +165,49 @@ fn test_parse_duration_values() {
     }
     // Separators are spelling: the wire carries the value, bare.
     assert!(stdout.contains("\"magnitude\": 1000"), "{stdout}");
+}
+
+#[test]
+fn test_parse_compound_duration_values() {
+    // Compound literals (RFC 0017 §10) ride the same wire shape: one
+    // segments array, canonical coarse→fine order, pinned exactly.
+    let output = nml_bin()
+        .args(["parse", "tests/fixtures/valid/duration-compound.nml"])
+        .output()
+        .expect("failed to run nml");
+
+    assert!(
+        output.status.success(),
+        "parse should succeed for compound durations: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let entries = &json["declarations"][0]["kind"]["Block"]["body"]["entries"];
+    let value_of = |i: usize| &entries[i]["kind"]["Property"]["value"]["value"];
+    assert_eq!(
+        value_of(0),
+        &serde_json::json!({"Duration": {"segments": [
+            {"magnitude": 1, "unit": "h"},
+            {"magnitude": 30, "unit": "m"}
+        ]}}),
+        "compound wire shape drifted"
+    );
+    assert_eq!(
+        value_of(1),
+        &serde_json::json!({"Duration": {"segments": [
+            {"magnitude": 5, "unit": "m"},
+            {"magnitude": 2, "unit": "s"}
+        ]}}),
+    );
+    // The authored single-unit respelling of the same value is stored
+    // faithfully — never re-segmented on the wire.
+    assert_eq!(
+        value_of(2),
+        &serde_json::json!({"Duration": {"segments": [
+            {"magnitude": 90, "unit": "m"}
+        ]}}),
+    );
 }
 
 #[test]

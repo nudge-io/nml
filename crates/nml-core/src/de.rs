@@ -2561,12 +2561,16 @@ workflow W:
             retries: Vec<std::time::Duration>,
             fine: std::time::Duration,
             grouped: std::time::Duration,
+            compound: std::time::Duration,
+            postel: std::time::Duration,
         }
         // `resolved` is a plain string — exactly what `resolve.rs` leaves
         // behind for `$ENV.TTL` — and must coerce identically. `retries`
         // exercises the seq × handshake composition: every array element
-        // routes through the same `deserialize_struct` path.
-        let source = "service App:\n    timeout = 90m\n    resolved = \"1500ms\"\n    label = 250ms\n    opt = 2h\n    retries = [1s, 1500ms]\n    fine = 750ns\n    grouped = \"1_000_000ns\"\n";
+        // routes through the same `deserialize_struct` path. `compound`
+        // and `postel` are the RFC 0017 §10 forms: an authored compound
+        // literal and the spaced coercion-text spelling.
+        let source = "service App:\n    timeout = 90m\n    resolved = \"1500ms\"\n    label = 250ms\n    opt = 2h\n    retries = [1s, 1500ms]\n    fine = 750ns\n    grouped = \"1_000_000ns\"\n    compound = 1h30m45s\n    postel = \"1h 30m\"\n";
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
@@ -2585,6 +2589,9 @@ workflow W:
         // The closed ladder's tail, and separator-grouped coerced text.
         assert_eq!(c.fine, std::time::Duration::from_nanos(750));
         assert_eq!(c.grouped, std::time::Duration::from_millis(1));
+        // Compound literal and spaced coercion text (RFC 0017 §10).
+        assert_eq!(c.compound, std::time::Duration::from_secs(90 * 60 + 45));
+        assert_eq!(c.postel, std::time::Duration::from_secs(90 * 60));
     }
 
     /// The coercion inherits the family's never-echo rule: a failed

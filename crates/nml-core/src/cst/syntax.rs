@@ -240,6 +240,32 @@ pub(super) fn token_span(tok: &SyntaxToken) -> crate::span::Span {
     crate::span::Span::new(text_offset(r.start()), text_offset(r.end()))
 }
 
+/// The duration decoder's borrowed component views, from paired
+/// magnitude/unit tokens — the ONE assembly the value decoder, the facet
+/// lowering, and the facet extraction all share, so their tokens→decoder
+/// handoff cannot drift. `first_magnitude` substitutes for the first
+/// magnitude's text: an authored sign lives in a separate `Dash` token,
+/// so the signed spelling (`"-5"`) exists in no single token.
+pub(super) fn duration_component_tokens<'a>(
+    pairs: &'a [(SyntaxToken, SyntaxToken)],
+    first_magnitude: &'a str,
+) -> Vec<crate::duration::ComponentTokens<'a>> {
+    pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (magnitude, unit))| crate::duration::ComponentTokens {
+            magnitude: if i == 0 {
+                first_magnitude
+            } else {
+                magnitude.text()
+            },
+            unit: unit.text(),
+            magnitude_span: token_span(magnitude),
+            unit_span: token_span(unit),
+        })
+        .collect()
+}
+
 /// The span of a node's **significant** content — first to last non-trivia token
 /// in its subtree. Unlike [`node_span`], this excludes leading/trailing attached
 /// trivia (comments, whitespace) — important wherever spans drive behaviour

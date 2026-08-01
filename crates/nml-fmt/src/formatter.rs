@@ -730,6 +730,15 @@ mod tests {
             ("1_000ms", "1000ms"),
             ("1_000_000 ns", "1000000ns"),
             ("0s", "0s"),
+            // Compound literals (RFC 0017 §10): spaced components join,
+            // segments render coarse→fine, zero components drop as
+            // spelling — but units NEVER carry (`60m` stays `60m`).
+            ("1h30m", "1h30m"),
+            ("1h 30m", "1h30m"),
+            ("30m1h", "1h30m"),
+            ("5m2s", "5m2s"),
+            ("1h0s", "1h"),
+            ("60m", "60m"),
         ] {
             let file = parse(&format!("service App:\n    x = {source_value}\n")).unwrap();
             let formatted = format(&file);
@@ -738,8 +747,9 @@ mod tests {
                 "{source_value}: got {formatted:?}"
             );
         }
-        idempotent("service App:\n    x = 72h\n    y = 500 ms\n");
+        idempotent("service App:\n    x = 72h\n    y = 500 ms\n    z = 1h 30m\n");
         roundtrip("service App:\n    x = 30s\n");
+        roundtrip("service App:\n    x = 1h30m45s\n");
     }
 
     /// RFC 0016 §1.10: the exact-decimal fixed-point table. Every output
@@ -801,13 +811,14 @@ mod tests {
         assert_eq!(once, twice, "facet rendering must be a fixed point");
 
         // Duration facet values (RFC 0017) canonicalize and round-trip
-        // through the same renderer.
-        let src = "model job:\n    t duration( min=1s ,  multipleOf =250ms )\n";
+        // through the same renderer — compound values included.
+        let src = "model job:\n    t duration( min=1s ,  multipleOf =250ms )\n    g duration(max = 1h 30m)\n";
         let once = format(&parse(src).unwrap());
         assert!(
             once.contains("t duration(min = 1s, multipleOf = 250ms)"),
             "{once:?}"
         );
+        assert!(once.contains("g duration(max = 1h30m)"), "{once:?}");
         let twice = format(&parse(&once).unwrap());
         assert_eq!(
             once, twice,

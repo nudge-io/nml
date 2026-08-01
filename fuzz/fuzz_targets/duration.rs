@@ -81,17 +81,46 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // ── the literal decoder (`30s` in source) ───────────────────────────
-    // Split as money.rs does: "<magnitude> <unit>", unit defaulting to `s`.
-    // Spans mirror a real literal so the machine-fix arithmetic is
+    // ── the literal decoder (`30s`, compound `1h30m` in source) ─────────
+    // Whitespace-split pieces alternate magnitude/unit ("1 h 30 m" is the
+    // two-component literal `1h30m`), a trailing unpaired magnitude takes
+    // `s` so bare numbers still decode — the fuzzer thereby drives the
+    // MULTI-component paths (duplicate-unit merged fix, per-component
+    // rejection order) that a single component never reaches. Spans
+    // mirror a real attached literal so the machine-fix arithmetic is
     // exercised on coherent, not degenerate, ranges.
-    let (raw, unit) = s.split_once(' ').unwrap_or((s, "s"));
-    let span = Span::new(0, raw.len() + unit.len());
-    let unit_span = Span::new(raw.len(), raw.len() + unit.len());
-    match nml_core::duration::parse_duration_literal(raw, unit, span, unit_span) {
+    let pieces: Vec<&str> = s.split(' ').collect();
+    let mut components = Vec::new();
+    let mut offset = 0usize;
+    let mut i = 0;
+    while i < pieces.len() {
+        let magnitude = pieces[i];
+        let unit = pieces.get(i + 1).copied().unwrap_or("s");
+        let magnitude_span = Span::new(offset, offset + magnitude.len());
+        let unit_span = Span::new(magnitude_span.end, magnitude_span.end + unit.len());
+        components.push(nml_core::duration::ComponentTokens {
+            magnitude,
+            unit,
+            magnitude_span,
+            unit_span,
+        });
+        offset = unit_span.end;
+        i += 2;
+    }
+    let span = Span::new(0, offset);
+    match nml_core::duration::parse_components_cst(&components, span) {
         Ok(d) => {
-            assert_eq!(d.magnitude(), d.magnitude());
-            assert!(DurationUnit::from_suffix(unit).is_some());
+            assert!(
+                d.total_nanos() <= u64::MAX as u128 * 1_000_000_000 + 999_999_999,
+                "literal decode escaped the domain gate for {s:?}"
+            );
+            // Acceptance implies every authored suffix was a real unit.
+            assert!(
+                components
+                    .iter()
+                    .all(|c| DurationUnit::from_suffix(c.unit).is_some()),
+                "accepted literal with a non-unit suffix for {s:?}"
+            );
             // The literal's canonical form re-reads through the text
             // grammar: one value domain, two entry points.
             let shown = d.to_string();
@@ -106,11 +135,25 @@ fuzz_target!(|data: &[u8]| {
             // input if it is wrong.
             let diag = e.to_diagnostic();
             let _ = diag.rendered_message();
+            // NML3005/NML3007 fixes are duration respellings by
+            // construction — a replacement the coercion grammar cannot
+            // re-read would be a corrupting machine fix.
+            let fix_is_a_spelling = diag.code.is_some_and(|c| {
+                let c = c.to_string();
+                c == "NML3005" || c == "NML3007"
+            });
             for suggestion in &diag.suggestions {
                 assert!(
                     suggestion.span.start <= suggestion.span.end,
                     "inverted fix span for {s:?}"
                 );
+                if fix_is_a_spelling {
+                    assert!(
+                        Duration::parse_text(&suggestion.replacement).is_ok(),
+                        "unparseable machine fix for {s:?}: {:?}",
+                        suggestion.replacement
+                    );
+                }
             }
         }
     }

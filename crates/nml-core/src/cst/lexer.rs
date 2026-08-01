@@ -232,9 +232,26 @@ impl<'a> Lexer<'a> {
             b'@' => self.scan_role(),
             b'$' => self.scan_secret(),
             c if is_ident_start(c) => {
+                // Suffix-run (RFC 0017 compound durations): an identifier
+                // whose first byte immediately follows an ASCII digit scans
+                // letters only, so `1h30m` alternates Number/Ident tokens
+                // instead of `Number("1") Ident("h30m")`. Identifiers not
+                // after a digit keep the full charset (`sha256`, `my-svc`).
+                let suffix_run = self.pos > 0 && self.bytes[self.pos - 1].is_ascii_digit();
                 let mut end = start;
-                while self.bytes.get(end).copied().is_some_and(is_ident_continue) {
-                    end += 1;
+                if suffix_run {
+                    while self
+                        .bytes
+                        .get(end)
+                        .copied()
+                        .is_some_and(|b| b.is_ascii_alphabetic())
+                    {
+                        end += 1;
+                    }
+                } else {
+                    while self.bytes.get(end).copied().is_some_and(is_ident_continue) {
+                        end += 1;
+                    }
                 }
                 self.push(SyntaxKind::Ident, start, end);
                 self.pos = end;
@@ -655,6 +672,78 @@ mod tests {
             .filter(|t| t.kind == SyntaxKind::Dedent)
             .count();
         assert_eq!(dedents, 1, "blank CRLF line must not dedent");
+    }
+
+    #[test]
+    fn suffix_run_splits_glued_duration_units() {
+        use SyntaxKind::*;
+        let toks = lex("x = 1h30m\n");
+        let nontrivia: Vec<_> = toks.tokens.iter().filter(|t| !t.kind.is_trivia()).collect();
+        assert_eq!(
+            nontrivia
+                .iter()
+                .map(|t| (t.kind, t.text))
+                .collect::<Vec<_>>(),
+            vec![
+                (Ident, "x"),
+                (Eq, "="),
+                (Number, "1"),
+                (Ident, "h"),
+                (Number, "30"),
+                (Ident, "m"),
+            ]
+        );
+        assert_lossless("x = 1h30m\n");
+        assert_lossless("x = 5m2s\n");
+    }
+
+    #[test]
+    fn suffix_run_leaves_sha256_and_money_unchanged() {
+        use SyntaxKind::*;
+        assert_eq!(kinds("sha256"), vec![Ident]);
+        assert_eq!(kinds("x = 19.99USD"), vec![Ident, Eq, Number, Ident]);
+        let lexed = lex("x = 19.99USD");
+        let usd = lexed
+            .tokens
+            .iter()
+            .find(|t| t.kind == SyntaxKind::Ident && t.text == "USD")
+            .expect("USD ident");
+        assert_eq!(usd.text, "USD");
+        assert_lossless("x = 19.99USD\n");
+    }
+
+    #[test]
+    fn suffix_run_next_line_ident_is_not_after_digit() {
+        let src = "count = 5\ns = 1\n";
+        let toks = lex(src);
+        let idents: Vec<_> = toks
+            .tokens
+            .iter()
+            .filter(|t| t.kind == SyntaxKind::Ident)
+            .map(|t| t.text)
+            .collect();
+        assert_eq!(idents, vec!["count", "s"]);
+        assert_lossless(src);
+    }
+
+    #[test]
+    fn suffix_run_scans_letters_only() {
+        use SyntaxKind::*;
+        // A suffix-run ident stops at any non-letter: `5s-3` is
+        // Number/Ident/Dash/Number (previously the ident charset would
+        // have swallowed `s-3` into one token). Idents NOT after a digit
+        // keep the full charset — `s-3` alone stays one ident.
+        assert_eq!(
+            kinds("x = 5s-3"),
+            vec![Ident, Eq, Number, Ident, Dash, Number]
+        );
+        // Digit separators inside compound magnitudes keep alternating.
+        assert_eq!(
+            kinds("x = 1h1_000ms"),
+            vec![Ident, Eq, Number, Ident, Number, Ident]
+        );
+        assert_lossless("x = 5s-3\n");
+        assert_lossless("x = 1h1_000ms\n");
     }
 
     #[test]

@@ -239,19 +239,53 @@ fn number_or_money(toks: &[SyntaxToken], span: Span, negative: bool) -> Result<V
             if money::is_currency_code(unit.text()) {
                 return Ok(Value::Money(money::parse_money(&raw, unit.text(), span)?));
             }
-            let unit_span = Span::new(
-                text_offset(unit.text_range().start()),
-                text_offset(unit.text_range().end()),
-            );
-            Ok(Value::Duration(crate::duration::parse_duration_literal(
-                &raw,
-                unit.text(),
-                span,
-                unit_span,
-            )?))
+            parse_duration_value_tokens(toks, num_idx, negative, span)
         }
         _ => Ok(Value::Number(parse_number(&raw, span)?)),
     }
+}
+
+/// Decode alternating `Number`/`Ident` tokens as a (possibly compound)
+/// duration. The parser guarantees the alternation shape; a dangling
+/// magnitude (`1h30`) is the NML3008 rejection, anchored on its own span.
+fn parse_duration_value_tokens(
+    toks: &[SyntaxToken],
+    start: usize,
+    negative: bool,
+    span: Span,
+) -> Result<Value, NmlError> {
+    let mut pairs: Vec<(SyntaxToken, SyntaxToken)> = Vec::new();
+    let mut i = start;
+    while let Some(number) = toks.get(i).filter(|t| t.kind() == SyntaxKind::Number) {
+        let Some(unit) = toks.get(i + 1).filter(|t| t.kind() == SyntaxKind::Ident) else {
+            return Err(NmlError::Duration {
+                kind: crate::duration::DurationErrorKind::MalformedCompound {
+                    break_span: super::syntax::token_span(number),
+                },
+                span,
+            });
+        };
+        pairs.push((number.clone(), unit.clone()));
+        i += 2;
+    }
+    let Some((first_number, _)) = pairs.first() else {
+        return Err(NmlError::Duration {
+            kind: crate::duration::DurationErrorKind::MalformedCompound { break_span: span },
+            span,
+        });
+    };
+    // The first magnitude may carry a reconstructed sign (`-30`), which
+    // exists in no single token's text.
+    let first_magnitude = if negative {
+        format!("-{}", first_number.text())
+    } else {
+        first_number.text().to_string()
+    };
+    let components = super::syntax::duration_component_tokens(&pairs, &first_magnitude);
+    Ok(Value::Duration(crate::duration::parse_components_cst(
+        &components,
+        span,
+    )?))
 }
 
 fn decode_array(node: &SyntaxNode, sink: &mut ValueErrors) -> SpannedValue {

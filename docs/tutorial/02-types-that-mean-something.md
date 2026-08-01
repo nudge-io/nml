@@ -83,7 +83,7 @@ service Api:
 
 They are typed quantities, not strings: `30s` equals `30000ms` wherever
 values compare, the magnitude is a whole number (`30.5s` is an error with
-a fix — `30500ms`), and a mistyped unit like `30x` is rejected with a
+a fix — `30s500ms`), and a mistyped unit like `30x` is rejected with a
 suggestion. When a schema types the field as `duration` (next chapter), a
 bare number, a boolean, or a quoted string there becomes a check-time
 error instead of a surprise at 3 a.m.

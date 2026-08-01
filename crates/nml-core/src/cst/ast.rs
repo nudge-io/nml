@@ -627,16 +627,41 @@ impl Facet {
     pub fn number(&self) -> Option<SyntaxToken> {
         token(&self.0, SyntaxKind::Number)
     }
-    /// The value's duration-unit token (`s` in `min = 5s`), when the
-    /// facet value is a duration literal (RFC 0017): the Ident AFTER
-    /// the number token — the first Ident is the facet key.
-    pub fn unit(&self) -> Option<SyntaxToken> {
-        let number = self.number()?;
-        self.0
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .skip_while(|t| t.text_range().start() < number.text_range().end())
-            .find(|t| t.kind() == SyntaxKind::Ident)
+    /// The facet value's magnitude tokens, each with its unit suffix when
+    /// one follows — `[]` for no value, `[(1, None)]` for a bare number
+    /// facet, `[(5, Some(s))]` for `min = 5s`, several entries for a
+    /// compound (`min = 1h30m`). A `None` unit beside `Some` units is a
+    /// dangling magnitude (`min = 1h30`) — the lower pass reports it as
+    /// NML3008; extraction must never pair-and-drop it silently. The walk
+    /// starts after the `=` so the facet KEY ident is never mistaken for
+    /// a unit.
+    pub fn duration_components(&self) -> Vec<(SyntaxToken, Option<SyntaxToken>)> {
+        let mut components: Vec<(SyntaxToken, Option<SyntaxToken>)> = Vec::new();
+        let mut after_eq = false;
+        for el in self.0.children_with_tokens() {
+            let Some(tok) = el.into_token() else {
+                continue;
+            };
+            if tok.kind() == SyntaxKind::Eq {
+                after_eq = true;
+                continue;
+            }
+            if !after_eq || tok.kind() == SyntaxKind::Dash {
+                continue;
+            }
+            match tok.kind() {
+                SyntaxKind::Number => components.push((tok, None)),
+                SyntaxKind::Ident => {
+                    if let Some(last) = components.last_mut() {
+                        if last.1.is_none() {
+                            last.1 = Some(tok);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        components
     }
 }
 

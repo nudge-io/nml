@@ -899,20 +899,18 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     self.bump(); // number
-                    // RFC 0017 duration unit (`5s`, `250ms`): an Ident
-                    // glued to the magnitude on the same line. Whether
-                    // the unit is legal here is the definition pass's
-                    // question (domain vs the field's type) — the
-                    // grammar just carries the author's literal. An Ident
-                    // followed by `=` is NOT a unit: it is the next facet
-                    // key after a missing comma (`min = 5 max = 10`), and
-                    // eating it would misdirect the lead diagnostic to
-                    // "unknown unit `max`" instead of the real defect.
+                    // RFC 0017 duration unit (`5s`, `1h30m`): Ident(s) glued
+                    // to magnitude(s) on the same line.
                     if self.at(SyntaxKind::Ident)
                         && !self.newline_before()
                         && self.nth(1) != SyntaxKind::Eq
                     {
+                        let unit_idx = self.pos;
                         self.bump(); // unit
+                        let unit_text = self.token_text_at(unit_idx);
+                        if crate::duration::is_duration_suffix_shape(unit_text) {
+                            self.consume_duration_component_tail();
+                        }
                     }
                     f.complete(self, SyntaxKind::Facet);
                     if !self.eat(SyntaxKind::Comma) {
@@ -1099,16 +1097,40 @@ impl<'a> Parser<'a> {
     }
 
     /// A number, optionally followed by a **same-line** unit identifier —
-    /// a currency code (money) or a duration unit (RFC 0017). The parser
-    /// recognizes only the `Number Ident` *shape*; classification (3
-    /// uppercase → currency, a `DurationUnit` suffix → duration unit, anything
-    /// else → `NML3004`) is the value layer's job, so a mistyped suffix
-    /// gets a coded diagnostic with a fix instead of a generic parse error.
+    /// a currency code (money) or a duration unit (RFC 0017). Compound
+    /// durations (`1h30m`) consume an alternating Number/Ident chain.
     fn number_value(&mut self) {
         self.bump(); // number
-        if self.at_number_suffix() {
-            self.bump();
+        if !self.at_number_suffix() {
+            return;
         }
+        let unit_start = self.pos;
+        self.bump(); // first suffix ident
+        let unit_text = self.token_text_at(unit_start);
+        if crate::money::is_currency_code(unit_text) {
+            return;
+        }
+        if crate::duration::is_duration_suffix_shape(unit_text) {
+            self.consume_duration_component_tail();
+        }
+    }
+
+    /// Continue a compound duration literal: `Number` + duration-suffix
+    /// `Ident` pairs on the same line until the chain ends or a dangling
+    /// `Number` remains (decoder emits NML3008).
+    fn consume_duration_component_tail(&mut self) {
+        while self.at(SyntaxKind::Number) && !self.newline_before() {
+            self.bump(); // magnitude
+            if self.at_number_suffix() {
+                self.bump(); // unit
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn token_text_at(&self, idx: usize) -> &str {
+        self.toks.get(idx).map_or("", |t| t.text)
     }
 
     /// A unit suffix must follow the number on the same line — otherwise an
