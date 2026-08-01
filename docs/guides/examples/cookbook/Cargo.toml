@@ -25,7 +25,7 @@ tokio = { workspace = true }
 # Recipe: "Migrate from TOML" — the equivalence test parses the SAME config
 # from TOML and NML into one struct and asserts equality, so the migration
 # cheatsheet's claims are executed, not asserted.
-toml = "0.8"
+toml = "1.1"
 # Recipe: "Test your schemas" — the shared fixtures tool authors use.
 nml-validate = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
