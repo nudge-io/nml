@@ -1361,6 +1361,448 @@ async fn hover_on_a_diagnostic_explains_the_code() {
     );
 }
 
+// ── RFC 0017 §10 duration LSP tooling (CST-driven) ───────────────────────
+
+fn duration_schema_workspace(base: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let ws = base.join("ws");
+    fs::create_dir_all(&ws).expect("create workspace");
+    let model = ws.join("service.model.nml");
+    let model_text = "model service:\n    timeout duration?\n    interval duration(min = 1s)\n";
+    fs::write(&model, model_text).expect("write model");
+    let app = ws.join("app.nml");
+    (ws, model, app)
+}
+
+const DUR_APP: &str = "service Api:\n    timeout = 1h30m\n    interval = 30\n";
+
+/// Compound duration hover: ranged markdown with per-component breakdown and total.
+#[tokio::test]
+async fn duration_hover_on_compound_literal() {
+    let base = temp_dir("duration-hover");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let (ws, model, app) = duration_schema_workspace(&base);
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness
+        .open(&model, fs::read_to_string(&model).unwrap().as_str())
+        .await;
+    harness.open(&app, DUR_APP).await;
+    let result = harness
+        .request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                // Inside `1h30m` on `    timeout = 1h30m`.
+                "position": { "line": 1, "character": 17 },
+            }),
+        )
+        .await;
+    let value = result["contents"]["value"]
+        .as_str()
+        .expect("markdown hover");
+    assert!(value.contains("**duration**"), "{value}");
+    assert!(value.contains("1h30m"), "{value}");
+    assert!(
+        value.contains("1h + 30m = 90m"),
+        "breakdown with human respelling: {value}"
+    );
+    assert!(value.contains("total"), "{value}");
+    assert_eq!(
+        result["range"]["start"]["character"], 14,
+        "hover range starts at the literal: {result}"
+    );
+    assert_eq!(
+        result["range"]["end"]["character"], 19,
+        "hover range ends after the literal: {result}"
+    );
+}
+
+/// Bare-number unit completion in a duration-typed config field (end of digits).
+#[tokio::test]
+async fn duration_unit_completion_on_bare_number() {
+    let base = temp_dir("duration-completion-bare");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let (ws, model, app) = duration_schema_workspace(&base);
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness
+        .open(&model, fs::read_to_string(&model).unwrap().as_str())
+        .await;
+    harness.open(&app, DUR_APP).await;
+    let result = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                // After `30` on `    interval = 30`.
+                "position": { "line": 2, "character": 17 },
+            }),
+        )
+        .await;
+    let items = result.as_array().expect("completion item array");
+    let labels: Vec<&str> = items
+        .iter()
+        .filter_map(|i| i["label"].as_str())
+        .filter(|l| l.starts_with("30"))
+        .collect();
+    assert!(
+        labels.contains(&"30s"),
+        "duration units offered for bare magnitude: {labels:?}"
+    );
+}
+
+/// Mid-compound completion offers only units finer than the previous segment.
+#[tokio::test]
+async fn duration_mid_compound_unit_completion() {
+    let base = temp_dir("duration-completion-mid");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let (ws, model, app) = duration_schema_workspace(&base);
+    let text = "service Api:\n    timeout = 1h30\n";
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness
+        .open(&model, fs::read_to_string(&model).unwrap().as_str())
+        .await;
+    harness.open(&app, text).await;
+    let result = harness
+        .request(
+            "textDocument/completion",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                // On the dangling `30` in `1h30`.
+                "position": { "line": 1, "character": 18 },
+            }),
+        )
+        .await;
+    let items = result.as_array().expect("completion item array");
+    let minute = items
+        .iter()
+        .find(|i| i["label"].as_str() == Some("30m"))
+        .unwrap_or_else(|| panic!("30m offered: {result}"));
+    assert!(
+        !items.iter().any(|i| i["label"].as_str() == Some("30h")),
+        "hours must not be re-offered after `1h`: {result}"
+    );
+    assert!(
+        minute["labelDetails"]["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains('=')),
+        "preview total in label details: {minute}"
+    );
+}
+
+/// Document highlight selects the whole duration literal, not just the token.
+#[tokio::test]
+async fn duration_document_highlight_covers_literal() {
+    let base = temp_dir("duration-highlight");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let (ws, model, app) = duration_schema_workspace(&base);
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness
+        .open(&model, fs::read_to_string(&model).unwrap().as_str())
+        .await;
+    harness.open(&app, DUR_APP).await;
+    let result = harness
+        .request(
+            "textDocument/documentHighlight",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                "position": { "line": 1, "character": 16 },
+            }),
+        )
+        .await;
+    let highlights = result.as_array().expect("highlight array");
+    assert_eq!(highlights.len(), 1, "{result}");
+    assert_eq!(
+        highlights[0]["range"]["start"]["character"], 14,
+        "highlight starts at literal: {result}"
+    );
+    assert_eq!(
+        highlights[0]["range"]["end"]["character"], 19,
+        "highlight ends after literal: {result}"
+    );
+}
+
+/// Semantic tokens mark duration literals with the `duration` modifier on `number`.
+#[tokio::test]
+async fn duration_semantic_tokens_full() {
+    let base = temp_dir("duration-semtok");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let (ws, model, app) = duration_schema_workspace(&base);
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness
+        .open(&model, fs::read_to_string(&model).unwrap().as_str())
+        .await;
+    harness.open(&app, DUR_APP).await;
+    let result = harness
+        .request(
+            "textDocument/semanticTokens/full",
+            json!({ "textDocument": { "uri": file_uri(&app) } }),
+        )
+        .await;
+    let data = result["data"].as_array().expect("semantic token data");
+    assert!(
+        data.len() >= 5,
+        "duration literals produce semantic tokens: {result}"
+    );
+    assert_eq!(
+        data[4],
+        json!(1),
+        "duration modifier bit set on first token: {data:?}"
+    );
+}
+
+/// Inlay hints show the coarsest exact total for multi-component literals.
+#[tokio::test]
+async fn duration_inlay_hint_shows_total() {
+    let base = temp_dir("duration-inlay");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let (ws, model, app) = duration_schema_workspace(&base);
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness
+        .open(&model, fs::read_to_string(&model).unwrap().as_str())
+        .await;
+    harness.open(&app, DUR_APP).await;
+    let result = harness
+        .request(
+            "textDocument/inlayHint",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 10, "character": 0 },
+                },
+            }),
+        )
+        .await;
+    let hints = result.as_array().expect("inlay hint array");
+    assert!(
+        hints.iter().any(|h| {
+            h["label"]
+                .as_str()
+                .is_some_and(|l| l.starts_with("= ") && l.contains('m'))
+        }),
+        "coarsest total hint after compound literal: {result}"
+    );
+}
+
+/// Selection range parent chain includes the enclosing duration literal span.
+#[tokio::test]
+async fn duration_selection_range_includes_literal() {
+    let base = temp_dir("duration-selection");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let (ws, model, app) = duration_schema_workspace(&base);
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness
+        .open(&model, fs::read_to_string(&model).unwrap().as_str())
+        .await;
+    harness.open(&app, DUR_APP).await;
+    let result = harness
+        .request(
+            "textDocument/selectionRange",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                "positions": [{ "line": 1, "character": 17 }],
+            }),
+        )
+        .await;
+    let ranges = result.as_array().expect("selection range array");
+    let mut out = Vec::new();
+    let mut cur = &ranges[0];
+    loop {
+        let r = &cur["range"];
+        out.push((
+            r["start"]["character"].as_u64().unwrap() as u32,
+            r["end"]["character"].as_u64().unwrap() as u32,
+        ));
+        if cur.get("parent").is_none_or(Value::is_null) {
+            break;
+        }
+        cur = &cur["parent"];
+    }
+    assert!(
+        out.contains(&(13, 19)),
+        "literal span appears in selection parent chain: {out:?}"
+    );
+}
+
+/// NML3008 dangling magnitude carries related-information on the break.
+#[tokio::test]
+async fn duration_dangling_magnitude_surfaces_related_info() {
+    let base = temp_dir("duration-nml3008");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let (ws, model, app) = duration_schema_workspace(&base);
+    let text = "service Api:\n    timeout = 1h30\n";
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness
+        .open(&model, fs::read_to_string(&model).unwrap().as_str())
+        .await;
+    let report = harness.open(&app, text).await;
+    let diags = report["diagnostics"].as_array().expect("diagnostics");
+    let d = diags
+        .iter()
+        .find(|d| d["code"] == json!("NML3008"))
+        .unwrap_or_else(|| panic!("NML3008 diagnostic: {diags:?}"));
+    let related = d["relatedInformation"]
+        .as_array()
+        .expect("related information");
+    assert!(
+        !related.is_empty(),
+        "dangling magnitude points at the break: {d}"
+    );
+}
+
+/// NML3005 sole-component fractional fix is offered as a quick-fix.
+#[tokio::test]
+async fn duration_fractional_quickfix() {
+    let base = temp_dir("duration-nml3005");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let (ws, model, app) = duration_schema_workspace(&base);
+    let text = "service Api:\n    timeout = 1.5h\n";
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness
+        .open(&model, fs::read_to_string(&model).unwrap().as_str())
+        .await;
+    let report = harness.open(&app, text).await;
+    let diags = report["diagnostics"].as_array().expect("diagnostics");
+    let d = diags
+        .iter()
+        .find(|d| d["code"] == json!("NML3005"))
+        .unwrap_or_else(|| panic!("NML3005 diagnostic: {diags:?}"));
+    let actions = harness
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                "range": d["range"],
+                "context": { "diagnostics": [d] },
+            }),
+        )
+        .await;
+    let titles: Vec<&str> = actions
+        .as_array()
+        .expect("actions")
+        .iter()
+        .filter_map(|a| a["title"].as_str())
+        .collect();
+    assert!(
+        titles.iter().any(|t| t.contains("1h30m")),
+        "granularity-preserving compound fix: {titles:?}"
+    );
+}
+
+/// NML3007 duplicate-unit merge fix is offered as a quick-fix.
+#[tokio::test]
+async fn duration_duplicate_unit_quickfix() {
+    let base = temp_dir("duration-nml3007");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let (ws, model, app) = duration_schema_workspace(&base);
+    let text = "service Api:\n    timeout = 1h2h\n";
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    harness
+        .open(&model, fs::read_to_string(&model).unwrap().as_str())
+        .await;
+    let report = harness.open(&app, text).await;
+    let diags = report["diagnostics"].as_array().expect("diagnostics");
+    let d = diags
+        .iter()
+        .find(|d| d["code"] == json!("NML3007"))
+        .unwrap_or_else(|| panic!("NML3007 diagnostic: {diags:?}"));
+    let actions = harness
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                "range": d["range"],
+                "context": { "diagnostics": [d] },
+            }),
+        )
+        .await;
+    let titles: Vec<&str> = actions
+        .as_array()
+        .expect("actions")
+        .iter()
+        .filter_map(|a| a["title"].as_str())
+        .collect();
+    assert!(
+        titles.iter().any(|t| t.contains("3h")),
+        "merged whole-literal fix: {titles:?}"
+    );
+}
+
+/// UTF-16 position encoding is declared and hover ranges stay correct past non-ASCII.
+#[tokio::test]
+async fn duration_utf16_position_encoding_and_ranges() {
+    let base = temp_dir("duration-utf16");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let (ws, model, app) = duration_schema_workspace(&base);
+    let text = "service Api:\n    label = \"☕\"\n    timeout = 30s\n";
+
+    let mut harness = Harness::new(Store::at(&store_base));
+    let caps = harness
+        .request(
+            "initialize",
+            json!({ "capabilities": {}, "rootUri": file_uri(&ws) }),
+        )
+        .await;
+    assert_eq!(
+        caps["capabilities"]["positionEncoding"],
+        json!("utf-16"),
+        "server declares UTF-16: {caps}"
+    );
+    harness.notify("initialized", json!({})).await;
+    harness
+        .open(&model, fs::read_to_string(&model).unwrap().as_str())
+        .await;
+    harness.open(&app, text).await;
+    let result = harness
+        .request(
+            "textDocument/hover",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                // On `30s` — line index shifted by the emoji string on line 1.
+                "position": { "line": 2, "character": 16 },
+            }),
+        )
+        .await;
+    let value = result["contents"]["value"]
+        .as_str()
+        .expect("markdown hover");
+    assert!(value.contains("30s"), "{value}");
+    assert_eq!(
+        result["range"]["start"]["character"], 14,
+        "UTF-16 range pins literal start: {result}"
+    );
+}
+
 /// Schema-driven block-keyword completion (RFC 0012 editor package): an open
 /// document completes block keywords from its resolved schema context — the
 /// scope registry's concrete models — labeled with "schema" provenance.

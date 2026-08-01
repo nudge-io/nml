@@ -4,6 +4,18 @@
 
 ### Changed
 
+- **Duration LSP tooling (RFC 0017 §10)** — compound duration literals
+  are a first-class CST node; hover, highlight, unit completion,
+  inlay hints, semantic tokens, and selection ranges all query the same
+  `DurationLiteral` seam (UTF-16 positions, tight component spans).
+  Hover shows the component breakdown with its human respelling and the
+  normalized total; unit suffixes carry a dedicated `durationUnit`
+  semantic-token type (`superType: number`) for theming; highlights
+  include a leading facet sign (`-5s`), while hover/hints/completions
+  stay silent on signed literals (durations are unsigned).
+  Mid-compound completion ranks only finer units; `NML3005`/`NML3007`
+  quick-fixes and `NML3008` related-information are wired end-to-end.
+
 - **Compound duration literals (RFC 0017 amendment)** — durations now
   support attached compound syntax (`1h30m`, `5m2s`) and inline-spaced
   forms (`1h 30m`). The lexer suffix-run rule tokenizes glued compounds

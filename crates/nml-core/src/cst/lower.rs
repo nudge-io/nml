@@ -411,29 +411,34 @@ fn facets_of(te: &ast::TypeExpr, errors: &mut Vec<NmlError>) -> Vec<FacetExpr> {
                 name: String::new(),
                 span,
             });
-            let (text, vspan) = match (f.dash(), f.number()) {
-                (Some(d), Some(n)) => (
-                    format!("-{}", n.text()),
-                    Span::new(
-                        usize::from(d.text_range().start()),
-                        usize::from(n.text_range().end()),
+            let (text, vspan) = if let Some(dl) = f.duration_literal() {
+                let components = dl.components();
+                let first = components.first()?.0.text().to_string();
+                let span = super::syntax::node_span(dl.syntax());
+                let text = if f.dash().is_some() {
+                    format!("-{}", first)
+                } else {
+                    first
+                };
+                (text, span)
+            } else {
+                match (f.dash(), f.number()) {
+                    (Some(d), Some(n)) => (
+                        format!("-{}", n.text()),
+                        Span::new(
+                            usize::from(d.text_range().start()),
+                            usize::from(n.text_range().end()),
+                        ),
                     ),
-                ),
-                (None, Some(n)) => (
-                    n.text().to_string(),
-                    Span::new(
-                        usize::from(n.text_range().start()),
-                        usize::from(n.text_range().end()),
+                    (None, Some(n)) => (
+                        n.text().to_string(),
+                        Span::new(
+                            usize::from(n.text_range().start()),
+                            usize::from(n.text_range().end()),
+                        ),
                     ),
-                ),
-                // Parser already errored (expected a number literal).
-                // DROP the facet rather than invent `= 0`: a fabricated
-                // bound makes every later rule measure against
-                // something nobody wrote (`multipleOf = )` reported
-                // "must be positive (got 0)", and a default then got a
-                // VALUE diagnostic against that phantom). Matches
-                // extraction, which also drops it.
-                _ => return None,
+                    _ => return None,
+                }
             };
             // A facet whose literal does not decode is DROPPED, not
             // recovered to zero — matching extraction (cst/extract.rs),
@@ -448,29 +453,19 @@ fn facets_of(te: &ast::TypeExpr, errors: &mut Vec<NmlError>) -> Vec<FacetExpr> {
             // A unit token makes the literal a DURATION (RFC 0017) —
             // same decode-or-drop contract, RFC 0017's own errors
             // (unknown unit, out of range, negative).
-            let raw_components = f.duration_components();
-            let has_units = raw_components.iter().any(|(_, u)| u.is_some());
-            let value = if !has_units {
-                match super::value::parse_number(&text, vspan) {
-                    Ok(n) => SpannedValue::new(crate::types::Value::Number(n), vspan),
-                    Err(e) => {
-                        errors.push(e);
-                        return None;
-                    }
+            let raw_components = f.duration_literal().map(|dl| dl.components());
+            let value = if let Some(raw_components) = raw_components {
+                if let Some((dangling, _)) = raw_components.iter().find(|(_, u)| u.is_none()) {
+                    let break_span = Span::new(
+                        usize::from(dangling.text_range().start()),
+                        usize::from(dangling.text_range().end()),
+                    );
+                    errors.push(crate::error::NmlError::Duration {
+                        kind: crate::duration::DurationErrorKind::MalformedCompound { break_span },
+                        span: Span::new(vspan.start, break_span.end),
+                    });
+                    return None;
                 }
-            } else if let Some((dangling, _)) = raw_components.iter().find(|(_, u)| u.is_none()) {
-                // A dangling magnitude (`min = 1h30`) is NML3008, exactly
-                // as in value position — never a silently truncated bound.
-                let break_span = Span::new(
-                    usize::from(dangling.text_range().start()),
-                    usize::from(dangling.text_range().end()),
-                );
-                errors.push(crate::error::NmlError::Duration {
-                    kind: crate::duration::DurationErrorKind::MalformedCompound { break_span },
-                    span: Span::new(vspan.start, break_span.end),
-                });
-                return None;
-            } else {
                 let pairs: Vec<_> = raw_components
                     .into_iter()
                     .map(|(n, u)| (n, u.expect("checked above")))
@@ -482,6 +477,14 @@ fn facets_of(te: &ast::TypeExpr, errors: &mut Vec<NmlError>) -> Vec<FacetExpr> {
                     .unwrap_or(vspan);
                 match crate::duration::parse_components_cst(&components, literal_span) {
                     Ok(d) => SpannedValue::new(crate::types::Value::Duration(d), literal_span),
+                    Err(e) => {
+                        errors.push(e);
+                        return None;
+                    }
+                }
+            } else {
+                match super::value::parse_number(&text, vspan) {
+                    Ok(n) => SpannedValue::new(crate::types::Value::Number(n), vspan),
                     Err(e) => {
                         errors.push(e);
                         return None;

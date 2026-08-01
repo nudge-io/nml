@@ -20,6 +20,7 @@
 //! (structural green-tree splicing, RFC 0030 P2).
 
 pub mod ast;
+pub mod duration_query;
 pub mod edit;
 pub mod extract;
 mod lexer;
@@ -28,6 +29,7 @@ mod parser;
 mod syntax;
 mod value;
 
+pub use duration_query::{DurationLiteralAt, duration_literal_at, duration_literals_in};
 pub use syntax::{NmlLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 pub(crate) use value::KNOWN_NAMESPACES;
 pub use value::{ValueErrors, decode_value, decode_value_all};
@@ -248,6 +250,13 @@ pub fn parse_to_ast(source: &str) -> crate::error::NmlResult<crate::ast::File> {
 /// structure, and this names that intent at the call site.
 pub fn parse_best_effort(source: &str) -> crate::ast::File {
     parse_to_ast_all(source).0
+}
+
+/// The feature-handler seam: one lex+parse yields both the semantic AST (for
+/// schema-governor walks) and the lossless CST (for span queries).
+pub fn parse_best_effort_with_tree(source: &str) -> (crate::ast::File, Parse) {
+    let (parsed, file, _errors, _suppressed) = parse_lowered(source);
+    (file, parsed)
 }
 
 /// Extract schema definitions (models / enums / oneofs) from source over the CST,

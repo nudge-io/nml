@@ -108,6 +108,9 @@ pub enum SyntaxKind {
     Value,
     ArrayValue,
     Fallback,
+    /// RFC 0017: a duration literal (`5s`, `1h30m`, `5 foo`) — the
+    /// alternating `Number`/`Ident` chain wrapped for position queries.
+    DurationLiteral,
     /// An error *node* wrapping recovered tokens (panic-mode recovery).
     Error,
 }
@@ -177,6 +180,7 @@ impl SyntaxKind {
             Value => "a value",
             ArrayValue => "an array value",
             Fallback => "a fallback chain",
+            DurationLiteral => "a duration literal",
             Error => "unparsed input",
         }
     }

@@ -1,8 +1,8 @@
 # NML Language Support
 
 Schema-aware editing for the **NML** configuration language: diagnostics,
-completions, hovers, and go-to-definition, validated against your project's
-schema.
+completions, hovers, go-to-definition, and duration-aware semantic
+highlighting, validated against your project's schema.
 
 ## How it works
 

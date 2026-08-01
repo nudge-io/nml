@@ -199,6 +199,17 @@ fn extract_facets_as<T: Clone>(
 
 /// The raw `-`?digits text of a facet's numeric magnitude, with its span.
 fn facet_magnitude(f: &Facet) -> Option<(String, crate::span::Span)> {
+    if let Some(dl) = f.duration_literal() {
+        let components = dl.components();
+        let first = components.first()?.0.text().to_string();
+        let span = node_span(dl.syntax());
+        let text = if f.dash().is_some() {
+            format!("-{}", first)
+        } else {
+            first
+        };
+        return Some((text, span));
+    }
     let span = node_span(f.syntax());
     match (f.dash(), f.number()) {
         (Some(_), Some(n)) => Some((format!("-{}", n.text()), span)),
@@ -211,7 +222,7 @@ fn facet_magnitude(f: &Facet) -> Option<(String, crate::span::Span)> {
 /// a unit suffix means the author wrote a duration, which is not a
 /// number bound (the definition pass reports the mismatch).
 fn decode_number_facet(f: &Facet) -> Option<crate::types::Number> {
-    if f.duration_components().iter().any(|(_, u)| u.is_some()) {
+    if f.duration_literal().is_some() {
         return None;
     }
     let (text, span) = facet_magnitude(f)?;
@@ -222,10 +233,9 @@ fn decode_number_facet(f: &Facet) -> Option<crate::types::Number> {
 /// (RFC 0017); a bare number is not a duration bound (the definition
 /// pass reports the mismatch).
 fn decode_duration_facet(f: &Facet) -> Option<crate::duration::Duration> {
-    // Every magnitude must carry its unit: a dangling one (`min = 1h30`)
-    // must NOT load as the truncated bound — the lower pass reports it.
-    let pairs: Vec<_> = f
-        .duration_components()
+    let dl = f.duration_literal()?;
+    let pairs: Vec<_> = dl
+        .components()
         .into_iter()
         .map(|(n, u)| u.map(|u| (n, u)))
         .collect::<Option<_>>()?;

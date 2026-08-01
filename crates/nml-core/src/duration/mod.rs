@@ -109,8 +109,9 @@ impl DurationUnit {
     }
 
     /// The units strictly finer than this one, coarsest first — the
-    /// candidate order for the fractional-magnitude fix.
-    pub(crate) fn finer(self) -> &'static [DurationUnit] {
+    /// candidate order for the fractional-magnitude fix and the LSP's
+    /// mid-compound unit completion.
+    pub fn finer(self) -> &'static [DurationUnit] {
         let i = Self::ALL
             .iter()
             .position(|u| *u == self)
@@ -260,6 +261,77 @@ impl Duration {
     pub fn parse_text(text: &str) -> Result<Duration, DurationTextError> {
         parse::parse_text(text)
     }
+
+    /// The total respelled in the coarsest single unit that is exact and
+    /// in-domain (`1h30m` → `90m`). `None` when it would echo the authored
+    /// spelling or the literal is single-segment.
+    pub fn coarsest_exact(&self) -> Option<String> {
+        if self.segments().len() <= 1 {
+            return None;
+        }
+        let nanos = self.total_nanos();
+        if nanos == 0 {
+            return None;
+        }
+        for unit in DurationUnit::ALL {
+            let unit_nanos = unit.nanos() as u128;
+            if nanos % unit_nanos != 0 {
+                continue;
+            }
+            let Ok(magnitude) = u64::try_from(nanos / unit_nanos) else {
+                continue;
+            };
+            if let Some(d) = Duration::new(magnitude, unit) {
+                let spelling = d.to_string();
+                if spelling == self.to_string() {
+                    return None;
+                }
+                return Some(spelling);
+            }
+        }
+        None
+    }
+
+    /// The hover/inlay normalized total: the value in the coarsest of
+    /// `ms`/`us`/`ns` that divides it exactly, grouped and suffixed.
+    /// `None` when that unit is already authored or the value is zero.
+    pub fn normalized_total(&self) -> Option<String> {
+        let nanos = self.total_nanos();
+        if nanos == 0 {
+            return None;
+        }
+        for unit in [
+            DurationUnit::Milliseconds,
+            DurationUnit::Microseconds,
+            DurationUnit::Nanoseconds,
+        ] {
+            let unit_nanos = unit.nanos() as u128;
+            if nanos % unit_nanos != 0 {
+                continue;
+            }
+            if self.segments().iter().any(|s| s.unit == unit) {
+                return None;
+            }
+            return Some(format!(
+                "{}{}",
+                group_thousands(nanos / unit_nanos),
+                unit.suffix()
+            ));
+        }
+        None
+    }
+}
+
+fn group_thousands(n: u128) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push('_');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// The wire shape (an API, RFC 0017 §6 as amended): an externally visible
