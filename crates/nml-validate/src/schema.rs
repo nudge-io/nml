@@ -3044,9 +3044,11 @@ mod tests {
             "above the schema's max = 65535",
         );
         ok("svc A:\n    weight = 0\n");
+        // Equality on an exclusive bound reads "at", not "above" — the
+        // value does not exceed the bound, it violates exclusivity.
         bad(
             "svc A:\n    weight = 1\n",
-            "above the schema's exclusiveMax = 1",
+            "at the schema's exclusiveMax = 1",
         );
         ok("svc A:\n    weight = 0.9999999999999999999999999999999999\n");
         ok("svc A:\n    step = 0.3\n"); // the f64 lie, pinned at the validator

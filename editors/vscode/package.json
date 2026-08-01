@@ -113,7 +113,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "Absolute path to the neutral nml-lsp binary (relative paths are refused). Defaults to ~/.cargo/bin/nml-lsp. Machine-scoped on purpose: a workspace cannot set it, so a repository can never redirect the language server at an untrusted binary. Paths inside an open workspace folder are refused (same RCE class as workspace-resident provider binaries)."
+          "description": "Absolute path to the neutral nml-lsp binary (a leading ~/ expands to your home directory; other relative paths are refused). Defaults to ~/.cargo/bin/nml-lsp. Machine-scoped on purpose: a workspace cannot set it, so a repository can never redirect the language server at an untrusted binary. Paths inside an open workspace folder are refused (same RCE class as workspace-resident provider binaries)."
         },
         "nml.trace.server": {
           "type": "string",

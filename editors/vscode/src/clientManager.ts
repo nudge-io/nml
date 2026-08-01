@@ -1,4 +1,4 @@
-import { ExtensionContext, window, workspace } from "vscode";
+import { Disposable, ExtensionContext, window, workspace } from "vscode";
 import { Trace } from "vscode-languageclient/node";
 import {
   CloseAction,
@@ -16,9 +16,31 @@ import { NmlLogs } from "./logging";
 import { resolveServer } from "./providerDiscovery";
 import { createWasmServer, wasmUriConverters } from "./serverAcquisition";
 
+/** The manager's outward seams, constructor-injectable so the unit harness can
+ *  drive the lifecycle with a fake client/process (no extension host).
+ *  Production always uses [`productionDeps`]. */
+export interface NmlClientManagerDeps {
+  readonly resolveServer: typeof resolveServer;
+  readonly createWasmServer: typeof createWasmServer;
+  readonly createLanguageClient: (
+    id: string,
+    name: string,
+    serverOptions: ServerOptions,
+    clientOptions: LanguageClientOptions
+  ) => LanguageClient;
+}
+
+const productionDeps: NmlClientManagerDeps = {
+  resolveServer,
+  createWasmServer,
+  createLanguageClient: (id, name, serverOptions, clientOptions) =>
+    new LanguageClient(id, name, serverOptions, clientOptions),
+};
+
 export class NmlClientManager {
   private client: LanguageClient | undefined;
   private wasmProcess: WasmProcess | undefined;
+  private stateListener: Disposable | undefined;
   private serverLabel = "";
   private clientState: State = State.Stopped;
   private connectionLost = false;
@@ -28,7 +50,8 @@ export class NmlClientManager {
   constructor(
     private readonly context: ExtensionContext,
     private readonly logs: NmlLogs,
-    private readonly onStateChange: () => void
+    private readonly onStateChange: () => void,
+    private readonly deps: NmlClientManagerDeps = productionDeps
   ) {}
 
   getClient(): LanguageClient | undefined {
@@ -72,13 +95,16 @@ export class NmlClientManager {
     this.connectionLost = false;
     this.startFailureReported = false;
 
-    const resolution = await resolveServer(this.context, this.logs);
+    const resolution = await this.deps.resolveServer(this.context, this.logs);
     this.serverLabel = resolution.label;
 
     const serverOptions: ServerOptions =
       resolution.kind === "wasm"
         ? async () => {
-            const server = await createWasmServer(resolution.module, this.logs);
+            const server = await this.deps.createWasmServer(
+              resolution.module,
+              this.logs
+            );
             this.wasmProcess = server.process;
             return server.transports;
           }
@@ -118,14 +144,15 @@ export class NmlClientManager {
         : {}),
     };
 
-    const client = new LanguageClient(
+    const client = this.deps.createLanguageClient(
       "nml-lsp",
       "NML Language Server",
       serverOptions,
       clientOptions
     );
 
-    client.onDidChangeState((event) => {
+    this.stateListener?.dispose();
+    this.stateListener = client.onDidChangeState((event) => {
       this.clientState = event.newState;
       if (event.newState === State.Stopped && this.client === client) {
         this.connectionLost = true;
@@ -163,6 +190,7 @@ export class NmlClientManager {
     this.reportStartFailure(label, detail);
     const old = client ?? this.client;
     this.client = undefined;
+    this.releaseStateListener();
     this.clientState = State.StartFailed;
     if (old) await old.stop().catch(() => undefined);
     await this.terminateWasm();
@@ -173,10 +201,18 @@ export class NmlClientManager {
     this.connectionLost = true;
     const old = this.client;
     this.client = undefined;
+    this.releaseStateListener();
     this.clientState = State.Stopped;
     if (old) await old.stop().catch(() => undefined);
     await this.terminateWasm();
     this.onStateChange();
+  }
+
+  // The per-start subscription must not outlive its client: a leaked listener
+  // keeps reporting a dead client's transitions into the manager's state.
+  private releaseStateListener(): void {
+    this.stateListener?.dispose();
+    this.stateListener = undefined;
   }
 
   private async terminateWasm(): Promise<void> {
@@ -189,6 +225,7 @@ export class NmlClientManager {
     this.connectionLost = false;
     const old = this.client;
     this.client = undefined;
+    this.releaseStateListener();
     this.clientState = State.Stopped;
     if (old) await old.stop().catch(() => undefined);
     await this.terminateWasm();

@@ -272,8 +272,15 @@ impl<T: FacetDomain> Facets<T> {
                 *n < b.value
             };
             if fails {
+                // "below" would lie on the exclusive-equality edge: a value
+                // AT an exclusive bound violates exclusivity, not ordering.
+                let relation = if b.exclusive && *n == b.value {
+                    "at"
+                } else {
+                    "below"
+                };
                 out.push(format!(
-                    "is {n}, below the schema's {} = {}",
+                    "is {n}, {relation} the schema's {} = {}",
                     if b.exclusive { "exclusiveMin" } else { "min" },
                     b.value
                 ));
@@ -286,8 +293,13 @@ impl<T: FacetDomain> Facets<T> {
                 *n > b.value
             };
             if fails {
+                let relation = if b.exclusive && *n == b.value {
+                    "at"
+                } else {
+                    "above"
+                };
                 out.push(format!(
-                    "is {n}, above the schema's {} = {}",
+                    "is {n}, {relation} the schema's {} = {}",
                     if b.exclusive { "exclusiveMax" } else { "max" },
                     b.value
                 ));

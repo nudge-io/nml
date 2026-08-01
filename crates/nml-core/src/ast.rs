@@ -2,10 +2,10 @@ use crate::span::Span;
 use crate::types::SpannedValue;
 use serde::Serialize;
 
-/// One RFC 0018 facet: `min = 1`. The value is always a number literal
-/// (`SpannedValue` holding `Value::Number`; the lowerer guarantees the
-/// variant, recovering to `Number::ZERO` + a diagnostic on a
-/// domain-rejected literal).
+/// One RFC 0018 facet: `min = 1` or (RFC 0017) `min = 5s`. The value is a
+/// number or duration literal (`SpannedValue` holding `Value::Number` or
+/// `Value::Duration`); an undecodable literal is DROPPED with a diagnostic
+/// by both builders — never zero-recovered into a phantom bound.
 #[derive(Debug, Clone, Serialize)]
 pub struct FacetExpr {
     pub key: Identifier,
@@ -17,10 +17,11 @@ pub struct FacetExpr {
 /// The type expression in a field definition (e.g. `string`, `[]route`).
 #[derive(Debug, Clone, Serialize)]
 pub enum FieldTypeExpr {
-    /// A bare or faceted type name: `string`, `number(min = 1)`.
-    /// Facets (RFC 0018) are empty for every non-`number` name in a
-    /// valid schema — the loader rejects them elsewhere with NML2058;
-    /// the parse stays structured either way.
+    /// A bare or faceted type name: `string`, `number(min = 1)`,
+    /// `duration(min = 1s)`. Facets (RFC 0018) are empty for every name
+    /// outside the faceted domains (`number`, `duration`) in a valid
+    /// schema — the loader rejects them elsewhere with NML2058; the
+    /// parse stays structured either way.
     Named {
         name: Identifier,
         facets: Vec<FacetExpr>,

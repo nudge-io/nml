@@ -635,7 +635,15 @@ impl PackageResolver {
             .iter()
             .filter(|(mp, _)| mp.parent().is_some_and(|dir| path.starts_with(dir)))
             .collect();
-        governing.sort_by_key(|(mp, _)| std::cmp::Reverse(mp.components().count()));
+        // Path as the same-depth tiebreak: `ws.manifests` is built from a
+        // HashMap, so depth alone would leave two same-directory manifests
+        // in hash order — vocabulary and universe flipping between server
+        // restarts on identical inputs.
+        governing.sort_by(|(a, _), (b, _)| {
+            std::cmp::Reverse(a.components().count())
+                .cmp(&std::cmp::Reverse(b.components().count()))
+                .then_with(|| a.cmp(b))
+        });
         governing
     }
 
@@ -1106,6 +1114,13 @@ fn package_claims_file_under(package: &SchemaPackage, root: &Path) -> ClaimScan 
     let mut truncated = false;
     while let Some((dir, depth)) = stack.pop() {
         let Ok(entries) = crate::wasi_fs::read_dir(&dir) else {
+            // An unreadable directory (permissions, fd exhaustion) is a
+            // walk that SAW LESS than it wanted to, exactly like the depth
+            // cap — "no bound file seen" must not harden into "no bound
+            // file exists". Without this, a failed read of the root itself
+            // would return a definitive `NoClaim` from a walk that saw
+            // nothing, and the cache would memoize the lie.
+            truncated = true;
             continue;
         };
         for entry in entries {
@@ -1363,6 +1378,20 @@ mod tests {
     fn demo_package_versioned(version: &str) -> SchemaPackage {
         let manifest = MANIFEST.replace("version = \"0.1.0\"", &format!("version = \"{version}\""));
         SchemaPackage::from_parts(&manifest, |_| Ok(CORE.to_string())).expect("demo package loads")
+    }
+
+    /// An unreadable (here: nonexistent) root is a walk that saw nothing,
+    /// not a workspace with nothing in it — the verdict must stay honest
+    /// (`Truncated` ⇒ `Undetermined` upstream), never a definitive
+    /// `NoClaim` that the claims cache would memoize as "no".
+    #[test]
+    fn unreadable_claims_root_is_truncated_not_definitive() {
+        let package = demo_package_versioned("0.9.9");
+        let missing = temp_ws("claims-unreadable").join("never-created");
+        assert!(matches!(
+            package_claims_file_under(&package, &missing),
+            ClaimScan::Truncated
+        ));
     }
 
     /// RFC 0035 in-binary channel: an injected package binds a file with NO
@@ -2061,9 +2090,9 @@ mod tests {
 
     /// Walk-cap honesty: when the bounded claims walk hits its entry cap
     /// before answering, the outcome is `Undetermined` naming the candidate
-    /// package — never a silent Opaque — and it must NOT be memoized (the
-    /// claims cache holds definitive verdicts only, so asking again re-walks
-    /// and stays Undetermined instead of hardening into a cached "no").
+    /// package — never a silent Opaque — and it never HARDENS: `Truncated`
+    /// is memoized AS `Truncated` (keystroke-path freeze), so asking again
+    /// yields `Undetermined` again instead of a cached yes/no.
     ///
     /// Fixture determinism: the only glob-bound file (`apps/site/app.nml`)
     /// sits in a subdirectory, and the walk finishes a directory's entries
@@ -2071,7 +2100,7 @@ mod tests {
     /// always fires before the bound file can be seen, whatever `read_dir`'s
     /// order.
     #[test]
-    fn vocabulary_walk_cap_yields_undetermined_and_is_uncached() {
+    fn vocabulary_walk_cap_stays_undetermined_and_never_hardens() {
         use nml_validate::test_support::{DEMO_CORE, DEMO_MANIFEST_WITH_DIRECTIVES};
         let ws = temp_ws("walkcap");
         let project = ws.join("proj");

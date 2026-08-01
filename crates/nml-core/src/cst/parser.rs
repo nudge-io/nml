@@ -903,8 +903,15 @@ impl<'a> Parser<'a> {
                     // glued to the magnitude on the same line. Whether
                     // the unit is legal here is the definition pass's
                     // question (domain vs the field's type) — the
-                    // grammar just carries the author's literal.
-                    if self.at(SyntaxKind::Ident) && !self.newline_before() {
+                    // grammar just carries the author's literal. An Ident
+                    // followed by `=` is NOT a unit: it is the next facet
+                    // key after a missing comma (`min = 5 max = 10`), and
+                    // eating it would misdirect the lead diagnostic to
+                    // "unknown unit `max`" instead of the real defect.
+                    if self.at(SyntaxKind::Ident)
+                        && !self.newline_before()
+                        && self.nth(1) != SyntaxKind::Eq
+                    {
                         self.bump(); // unit
                     }
                     f.complete(self, SyntaxKind::Facet);
@@ -1110,7 +1117,9 @@ impl<'a> Parser<'a> {
     /// swallowed into the previous value. Same line-significance rule as
     /// [`Self::at_fallback_pipe`] / [`Self::at_field_type`].
     fn at_number_suffix(&self) -> bool {
-        self.at(SyntaxKind::Ident) && !self.newline_before()
+        // An Ident followed by `=` is a key (missing-separator recovery),
+        // never a unit — same rule as the facet-list unit consumer.
+        self.at(SyntaxKind::Ident) && !self.newline_before() && self.nth(1) != SyntaxKind::Eq
     }
 
     /// `[ value (, value)* ,? ]`

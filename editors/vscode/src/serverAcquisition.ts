@@ -1,10 +1,17 @@
 import { Readable, Writable } from "stream";
-import { ExtensionContext, Uri, workspace } from "vscode";
+import { ExtensionContext, Uri, window, workspace } from "vscode";
 import { Wasm, WasmProcess } from "@vscode/wasm-wasi/v1";
 import { StreamMessageReader, StreamMessageWriter } from "vscode-jsonrpc/node";
 import { MessageTransports } from "vscode-languageclient/node";
 import { NmlLogs } from "./logging";
 import { evaluateNeutralServerPathOverride } from "./pathSecurity";
+import {
+  buildUriMapping,
+  duplicateFolderNames,
+  hostToWasi,
+  isPanicShapedStderr,
+  wasiToHost,
+} from "./wasmBridge";
 
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -19,8 +26,18 @@ import { evaluateNeutralServerPathOverride } from "./pathSecurity";
 // `vscode-languageclient`. No compromise on dependency stability.
 // ─────────────────────────────────────────────────────────────────────────
 
-const DEFAULT_NATIVE_PATH =
-  (process.env.HOME || process.env.USERPROFILE || "") + "/.cargo/bin/nml-lsp";
+/** The native default install location. Computed lazily so a homeless
+ *  environment (empty HOME/USERPROFILE) degrades to bare `nml-lsp` — spawned
+ *  via PATH resolution — instead of the nonsense `/.cargo/bin/nml-lsp`. */
+function defaultNativeCommand(logs: NmlLogs): string {
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  if (home) return `${home}/.cargo/bin/nml-lsp`;
+  logs.warn(
+    "No home directory in the environment; resolving `nml-lsp` via PATH. " +
+      "Set nml.server.path to pick an exact binary."
+  );
+  return "nml-lsp";
+}
 
 export type NeutralServer =
   | { kind: "process"; command: string; args: string[]; label: string }
@@ -63,7 +80,12 @@ export async function resolveNeutralServer(
   if (await exists(module)) {
     return { kind: "wasm", module, label: "neutral nml-lsp (wasm)" };
   }
-  return { kind: "process", command: DEFAULT_NATIVE_PATH, args: [], label: "neutral nml-lsp" };
+  return {
+    kind: "process",
+    command: defaultNativeCommand(logs),
+    args: [],
+    label: "neutral nml-lsp",
+  };
 }
 
 async function exists(uri: Uri): Promise<boolean> {
@@ -75,67 +97,37 @@ async function exists(uri: Uri): Promise<boolean> {
   }
 }
 
-/** Map between host file URIs and the WASM server's WASI filesystem namespace.
- *  `wasm-wasi-core`'s `mapWorkspaceFolder` mounts a lone workspace folder at
- *  `/workspace` and each folder of a multi-root workspace at
- *  `/workspaces/${folder.name}` (verified against its source) — so the mount
- *  segment is exactly `WorkspaceFolder.name`, which is what this reads: the two
- *  sides agree by construction, not by guess. The language client otherwise
- *  sends host paths (`file:///Users/…/ws/app.nml`), which do not exist in the
- *  guest's fs — so the server's `std::fs` workspace reads (indexing, sibling
- *  `*.model.nml`/`*.package.nml`) find nothing. These converters rewrite every
- *  URI on the wire so the server sees the mounted paths it can actually read,
- *  and the client sees host paths back. This is the stable-toolchain equivalent
- *  of what `@vscode/wasm-wasi-lsp` does. */
+/** Rewrite every URI on the wire between host paths and the guest's WASI
+ *  mounts (see wasmBridge.ts for the mount-scheme contract). The language
+ *  client otherwise sends host paths (`file:///Users/…/ws/app.nml`), which do
+ *  not exist in the guest's fs — so the server's `std::fs` workspace reads
+ *  (indexing, sibling `*.model.nml`/`*.package.nml`) find nothing. This is the
+ *  stable-toolchain equivalent of what `@vscode/wasm-wasi-lsp` does. */
 export function wasmUriConverters(): {
   code2Protocol: (uri: Uri) => string;
   protocol2Code: (value: string) => Uri;
 } {
-  const folders = workspace.workspaceFolders ?? [];
-  const single = folders.length === 1;
-  // wasm-wasi-core mounts multi-root folders by NAME (`/workspaces/<name>`),
-  // so two folders sharing a basename collapse onto one guest mount and
-  // every URI for the loser cross-attributes to the winner — diagnostics
-  // land on the wrong files. The host scheme owns the collision; the best
-  // the extension can do is refuse to be silent about it.
-  const names = folders.map((f) => f.name);
-  const dupes = names.filter((n, i) => names.indexOf(n) !== i);
+  const folders = (workspace.workspaceFolders ?? []).map((f) => ({
+    name: f.name,
+    uriString: f.uri.toString(),
+  }));
+  const dupes = duplicateFolderNames(folders);
   if (dupes.length > 0) {
-    console.error(
-      `nml: workspace folders with duplicate names ${JSON.stringify([
-        ...new Set(dupes),
-      ])} collide in the WASI mount scheme (/workspaces/<name>); ` +
-        "diagnostics may attach to the wrong folder. Rename the folders " +
-        "(File > Rename Workspace Folder) or use the native server " +
-        "(nml.server.path)."
-    );
+    const message =
+      `nml: workspace folders with duplicate names ${JSON.stringify(dupes)} ` +
+      "collide in the WASI mount scheme (/workspaces/<name>); " +
+      "diagnostics may attach to the wrong folder. Rename the folders " +
+      "(File > Rename Workspace Folder) or use the native server " +
+      "(nml.server.path).";
+    // Both channels: console.error for harness visibility, the toast for
+    // actual users. Runs once per wasm start, so no debounce is needed.
+    console.error(message);
+    void window.showWarningMessage(message);
   }
-  const mapping = folders
-    .map((f) => ({
-      hostPrefix: f.uri.toString().replace(/\/$/, ""),
-      wasiPrefix: `file://${single ? "/workspace" : `/workspaces/${f.name}`}`,
-    }))
-    // Longest host prefix first: with nested workspace folders (`/a` and
-    // `/a/b`) the most specific mount must win, not whichever comes first.
-    .sort((a, b) => b.hostPrefix.length - a.hostPrefix.length);
+  const mapping = buildUriMapping(folders);
   return {
-    code2Protocol: (uri: Uri): string => {
-      const s = uri.toString();
-      for (const m of mapping) {
-        if (s === m.hostPrefix || s.startsWith(`${m.hostPrefix}/`)) {
-          return m.wasiPrefix + s.slice(m.hostPrefix.length);
-        }
-      }
-      return s;
-    },
-    protocol2Code: (value: string): Uri => {
-      for (const m of mapping) {
-        if (value === m.wasiPrefix || value.startsWith(`${m.wasiPrefix}/`)) {
-          return Uri.parse(m.hostPrefix + value.slice(m.wasiPrefix.length));
-        }
-      }
-      return Uri.parse(value);
-    },
+    code2Protocol: (uri: Uri): string => hostToWasi(mapping, uri.toString()),
+    protocol2Code: (value: string): Uri => Uri.parse(wasiToHost(mapping, value)),
   };
 }
 
@@ -180,6 +172,9 @@ export async function createWasmServer(module: Uri, log: NmlLogs): Promise<WasmS
   const wasmOut = proc.stdout;
   const wasmIn = proc.stdin;
   if (!wasmOut || !wasmIn) {
+    // Unreachable under wasm-wasi-core 1.0.2 (pipeIn/pipeOut always wire
+    // stdio), but a host that doesn't must not leak the just-started process.
+    await proc.terminate().catch(() => undefined);
     throw new Error("wasm process was created without piped stdio");
   }
   // Drain stderr to the log — otherwise a panic is both invisible and, on an
@@ -191,7 +186,7 @@ export async function createWasmServer(module: Uri, log: NmlLogs): Promise<WasmS
   proc.stderr?.onData((data) => {
     const text = new TextDecoder().decode(data).replace(/\n$/, "");
     if (text) log.error(text);
-    if (text.includes("panicked") || text.includes("RUST_BACKTRACE")) {
+    if (isPanicShapedStderr(text)) {
       console.error(`nml-lsp stderr: ${text}`);
     }
   });

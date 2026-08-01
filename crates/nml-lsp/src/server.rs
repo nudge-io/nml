@@ -447,6 +447,7 @@ impl Inner {
             modifiers: pc.modifiers.clone(),
             membership,
             uri_is_registry_source: false,
+            load_pass_owns_composition: false,
         }
     }
 
@@ -474,6 +475,7 @@ impl Inner {
             modifiers: pc.modifiers.clone(),
             membership,
             uri_is_registry_source: false,
+            load_pass_owns_composition: false,
         }
     }
 
@@ -561,8 +563,107 @@ impl Inner {
     /// binding identity) when a package claims it, the scope-registry path
     /// otherwise, plus any degraded-state notes pinned to the top of file.
     fn validate_document(&self, uri: &Url, text: &str) -> Vec<tower_lsp::lsp_types::Diagnostic> {
-        let dc = self.diagnostic_config_for(uri);
+        let mut dc = self.diagnostic_config_for(uri);
         let resolved = self.resolve_document(uri);
+        let bound = matches!(
+            resolved.as_ref().map(|r| &r.resolution),
+            Some(Resolution::Bound(_))
+        );
+        // Schema passes for a `.model.nml` buffer, assembled BEFORE the
+        // validator runs: whether the validator's mixin verdicts may be
+        // suppressed (`load_pass_owns_composition`) is a property of the
+        // universe the load pass will actually load — authoritative for
+        // snapshot/declared/untruncated-registry universes, partial for a
+        // truncated registry set or a non-file buffer. A package-BOUND
+        // `.model.nml` (binding globs claiming a model file) skips the
+        // schema passes entirely: its project treats the file as data, and
+        // the package validator owns every verdict — running the load pass
+        // too would double-report composition errors whose package-identity
+        // suffix defeats the exact-duplicate suppression (CLI parity: the
+        // CLI validates it per the project's binding as well).
+        let model_pass = (!bound && uri.as_str().ends_with(".model.nml")).then(|| {
+            let outcome = self.vocabulary_for_document(uri);
+            let universe = match &outcome {
+                packages::VocabularyOutcome::Covered(vocab) => &vocab.universe,
+                _ => &packages::SchemaUniverse::None,
+            };
+            let (sources, own_name, owns_composition) = match uri.to_file_path() {
+                Ok(own_path) => {
+                    // Canonicalized like `with_workspace_view`'s document
+                    // path: coverage was resolved against canonical roots
+                    // and manifest dirs, so a symlink-spelled buffer path
+                    // (`/tmp` vs `/private/tmp`) would fail the
+                    // declared-entry identity check below and double-enter
+                    // its own universe — a wall of false duplicate errors.
+                    let own_path = dunce::canonicalize(&own_path).unwrap_or(own_path);
+                    match universe {
+                        // Store/in-binary coverage: the package's
+                        // hash-verified source snapshot IS the universe —
+                        // no disk reads at all.
+                        packages::SchemaUniverse::Snapshot(pkg) => {
+                            let (sources, own_name) =
+                                snapshot_universe(&own_path, text, &pkg.sources);
+                            (sources, own_name, true)
+                        }
+                        packages::SchemaUniverse::Declared(paths) if !paths.is_empty() => {
+                            let read = |p: &Path| -> Option<String> {
+                                let file_uri = Url::from_file_path(p).ok()?;
+                                let buffered = self
+                                    .documents
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .get(&file_uri)
+                                    .cloned();
+                                buffered.or_else(|| fs::read_to_string(p).ok())
+                            };
+                            let (sources, own_name) =
+                                declared_universe(&own_path, text, paths, &read);
+                            (sources, own_name, true)
+                        }
+                        // Uncovered: the universe is the WORKSPACE
+                        // REGISTRY SET — every `.model.nml` the server
+                        // holds (indexed + open), the same one namespace
+                        // the registry validator, goto-definition, and
+                        // hover resolve against (RFC 0012). Anything
+                        // narrower contradicts the server's own
+                        // navigation: a mixin defined one directory over
+                        // would squiggle "unknown" while F12 jumps to it.
+                        // No filesystem walk: `documents` already carries
+                        // the freshest text for every member. Composition
+                        // ownership holds only while the whole set fits
+                        // the cap — beyond it the load pass would judge
+                        // `is` targets against a truncated namespace the
+                        // validator sees in full.
+                        _ => {
+                            let docs: Vec<(String, String)> = self
+                                .documents
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .iter()
+                                .filter(|(u, _)| u.as_str().ends_with(".model.nml") && *u != uri)
+                                .filter_map(|(u, t)| {
+                                    let p = u.to_file_path().ok()?;
+                                    Some((p.to_string_lossy().into_owned(), t.clone()))
+                                })
+                                .collect();
+                            let (sources, own_name, truncated) =
+                                registry_universe(&own_path, text, docs);
+                            (sources, own_name, !truncated)
+                        }
+                    }
+                }
+                // A non-file buffer (untitled, virtual scheme) still
+                // validates — as its own single-source universe, which can
+                // never judge composition.
+                Err(()) => (
+                    vec![(uri.to_string(), text.to_string())],
+                    uri.to_string(),
+                    false,
+                ),
+            };
+            (outcome, sources, own_name, owns_composition)
+        });
+        dc.load_pass_owns_composition = model_pass.as_ref().is_some_and(|(_, _, _, owns)| *owns);
         let mut diags = match resolved.as_ref().map(|r| &r.resolution) {
             Some(Resolution::Bound(b)) => {
                 let identity = b.identity();
@@ -611,83 +712,20 @@ impl Inner {
                 });
             }
         }
-        // Schema passes for a `.model.nml` buffer. First the LOAD pass:
-        // the editor assembles the buffer's validation universe (covering
-        // package's `[]schema` in manifest order, or directory-mates) and
-        // calls `load_schema` — the same entry the CLI and embedders use —
-        // keeping only this buffer's findings. Composition, cycles,
-        // shorthand arity, oneof/enum integrity, reserved/duplicate names,
-        // and declared defaults reach the editor with CLI parity by
-        // identity. Then the schema-SOURCE pass (RFC 0030): directive
-        // vocabulary for covered files. Both re-derive extraction errors
-        // the parse band already emitted, so exact duplicates (same range,
-        // message, severity) are suppressed rather than double-squiggled.
-        if uri.as_str().ends_with(".model.nml") {
-            let outcome = self.vocabulary_for_document(uri);
-            let universe = match &outcome {
-                packages::VocabularyOutcome::Covered(vocab) => &vocab.universe,
-                _ => &packages::SchemaUniverse::None,
-            };
-            let (sources, own_name) = match uri.to_file_path() {
-                Ok(own_path) => {
-                    // Canonicalized like `with_workspace_view`'s document
-                    // path: coverage was resolved against canonical roots
-                    // and manifest dirs, so a symlink-spelled buffer path
-                    // (`/tmp` vs `/private/tmp`) would fail the
-                    // declared-entry identity check below and double-enter
-                    // its own universe — a wall of false duplicate errors.
-                    let own_path = dunce::canonicalize(&own_path).unwrap_or(own_path);
-                    match universe {
-                        // Store/in-binary coverage: the package's
-                        // hash-verified source snapshot IS the universe —
-                        // no disk reads at all.
-                        packages::SchemaUniverse::Snapshot(pkg) => {
-                            snapshot_universe(&own_path, text, &pkg.sources)
-                        }
-                        packages::SchemaUniverse::Declared(paths) if !paths.is_empty() => {
-                            let read = |p: &Path| -> Option<String> {
-                                let file_uri = Url::from_file_path(p).ok()?;
-                                let buffered = self
-                                    .documents
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .get(&file_uri)
-                                    .cloned();
-                                buffered.or_else(|| fs::read_to_string(p).ok())
-                            };
-                            declared_universe(&own_path, text, paths, &read)
-                        }
-                        // Uncovered: the universe is the WORKSPACE
-                        // REGISTRY SET — every `.model.nml` the server
-                        // holds (indexed + open), the same one namespace
-                        // the registry validator, goto-definition, and
-                        // hover resolve against (RFC 0012). Anything
-                        // narrower contradicts the server's own
-                        // navigation: a mixin defined one directory over
-                        // would squiggle "unknown" while F12 jumps to it.
-                        // No filesystem walk: `documents` already carries
-                        // the freshest text for every member.
-                        _ => {
-                            let docs: Vec<(String, String)> = self
-                                .documents
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .iter()
-                                .filter(|(u, _)| u.as_str().ends_with(".model.nml") && *u != uri)
-                                .filter_map(|(u, t)| {
-                                    let p = u.to_file_path().ok()?;
-                                    Some((p.to_string_lossy().into_owned(), t.clone()))
-                                })
-                                .collect();
-                            registry_universe(&own_path, text, docs)
-                        }
-                    }
-                }
-                // A non-file buffer (untitled) still validates — as its own
-                // single-source universe.
-                Err(()) => (vec![(uri.to_string(), text.to_string())], uri.to_string()),
-            };
-            for diag in diagnostics::schema_load_pass(&own_name, &sources, Some(uri)) {
+        // Schema passes for a `.model.nml` buffer, over the universe
+        // assembled above. First the LOAD pass — `load_schema`, the same
+        // entry the CLI and embedders use, keeping only this buffer's
+        // findings, so composition, cycles, shorthand arity, oneof/enum
+        // integrity, reserved/duplicate names, and declared defaults reach
+        // the editor with CLI parity by identity. Then the schema-SOURCE
+        // pass (RFC 0030): directive vocabulary for covered files. Both
+        // re-derive extraction errors the parse band already emitted, so
+        // exact duplicates (same range, message, severity) are suppressed
+        // rather than double-squiggled.
+        if let Some((outcome, sources, own_name, owns_composition)) = model_pass {
+            for diag in
+                diagnostics::schema_load_pass(&own_name, &sources, Some(uri), owns_composition)
+            {
                 let duplicate = diags.iter().any(|d| {
                     d.range == diag.range
                         && d.message == diag.message
@@ -843,7 +881,10 @@ impl NmlLanguageServer {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&uri);
 
-        if uri.as_str().ends_with("nml-project.nml") {
+        // Segment-anchored: `foo-nml-project.nml` is an ordinary document,
+        // not project config — a bare suffix match would let it clobber the
+        // global config that `nearest_project_config` never reads from it.
+        if uri.as_str().ends_with("/nml-project.nml") {
             let file = nml_core::cst::parse_best_effort(&text);
             let config = nml_core::ProjectConfig::from_file(&file);
             *self
@@ -966,13 +1007,6 @@ impl Inner {
     }
 }
 
-/// Whether a watched-file event should be honored.
-///
-/// Mirrors the safety rules of `index_workspace`/`find_nml_files`: the path
-/// must not be a symlink, and it must canonicalize to a location inside one
-/// of the (canonicalized) workspace roots. Clients can send arbitrary
-/// `file://` URIs in watched-file notifications, so this is the boundary
-/// check that keeps the server from reading files outside the workspace.
 /// Uncovered-universe bound: a pathological workspace must not turn
 /// every diagnostics pull into an unbounded load. Manifest-declared
 /// universes are author-bounded and uncapped.
@@ -1001,10 +1035,20 @@ fn declared_universe(
 ) -> (Vec<(String, String)>, String) {
     let name_of = |p: &Path| p.to_string_lossy().into_owned();
     let own_name = name_of(own_path);
+    // Compare canonical paths on both sides (`/var` vs `/private/var` on
+    // macOS, manifest symlink spelling, case-insensitive FS). Callers
+    // canonicalize before invoking, but tests and defensive parity do too.
+    let own_canonical = dunce::canonicalize(own_path).unwrap_or_else(|_| own_path.to_path_buf());
     let mut sources: Vec<(String, String)> = Vec::new();
     let mut own_declared = false;
     for entry in declared {
-        if entry.as_path() == own_path {
+        // Manifest entries may be symlink- or case-spelled; canonicalize
+        // for identity. A missing entry fails to canonicalize and keeps
+        // its authored spelling; `read` then fails the same way and it
+        // is skipped.
+        let entry_canonical = dunce::canonicalize(entry);
+        let is_own = entry_canonical.as_deref().unwrap_or(entry) == own_canonical.as_path();
+        if is_own {
             own_declared = true;
             sources.push((own_name.clone(), own_text.to_string()));
         } else if let Some(text) = read(entry) {
@@ -1026,18 +1070,25 @@ fn declared_universe(
 /// for deterministic merge order, bounded by [`MAX_UNIVERSE_FILES`]
 /// (own buffer first, so duplicate attribution lands on the other
 /// file); entries beyond the cap drop deterministically (sorted tail).
+///
+/// The returned flag reports whether the cap CUT the set: a truncated
+/// universe is not the registry namespace, so the load pass loses
+/// composition ownership (`is` verdicts stay with the uncapped registry
+/// validator) rather than reporting false "unknown `is` target" errors
+/// for definitions that dropped with the tail.
 fn registry_universe(
     own_path: &Path,
     own_text: &str,
     mut docs: Vec<(String, String)>,
-) -> (Vec<(String, String)>, String) {
+) -> (Vec<(String, String)>, String, bool) {
     let own_name = own_path.to_string_lossy().into_owned();
     docs.sort_by(|a, b| a.0.cmp(&b.0));
+    let truncated = docs.len() > MAX_UNIVERSE_FILES.saturating_sub(1);
     docs.truncate(MAX_UNIVERSE_FILES.saturating_sub(1));
     let mut sources = Vec::with_capacity(docs.len() + 1);
     sources.push((own_name.clone(), own_text.to_string()));
     sources.extend(docs);
-    (sources, own_name)
+    (sources, own_name, truncated)
 }
 
 /// Assemble a STORE-covered buffer's validation universe: the package's
@@ -1059,6 +1110,13 @@ fn snapshot_universe(
     (out, own_name)
 }
 
+/// Whether a watched-file event should be honored.
+///
+/// Mirrors the safety rules of `index_workspace`/`find_nml_files`: the path
+/// must not be a symlink, and it must canonicalize to a location inside one
+/// of the (canonicalized) workspace roots. Clients can send arbitrary
+/// `file://` URIs in watched-file notifications, so this is the boundary
+/// check that keeps the server from reading files outside the workspace.
 fn watched_file_is_eligible(path: &Path, roots: &[PathBuf]) -> bool {
     let is_symlink = fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
@@ -3812,16 +3870,21 @@ impl NmlLanguageServer {
     ) -> Option<CodeAction> {
         // The action writes files: it must never target a path outside the
         // workspace (a root marker in `$HOME` must not make the editor
-        // create `~/nml-project.nml`).
+        // create `~/nml-project.nml`). Containment only — no ancestor
+        // allowance: for any file INSIDE a workspace root the binding walk
+        // (`ancestors_within_roots`) is bounded by that root, so every
+        // legitimate binding root already satisfies this check. A binding
+        // root ABOVE the workspace can only come from an out-of-workspace
+        // file whose unbounded walk matched a marker in `$HOME` or another
+        // shared ancestor — and root markers are attacker-influenced
+        // (`rootMarkers` is a plain string list), so that is exactly the
+        // write this guard exists to refuse.
         {
             let roots = self
                 .workspace_roots
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if !roots
-                .iter()
-                .any(|r| root.starts_with(r) || r.starts_with(root))
-            {
+            if !roots.iter().any(|r| root.starts_with(r)) {
                 return None;
             }
         }
@@ -4368,6 +4431,16 @@ impl LanguageServer for NmlLanguageServer {
                         continue;
                     }
                     if let Ok(content) = fs::read_to_string(&path) {
+                        // Disk-backed like the startup index, so mark it
+                        // indexed: `did_close` drops non-indexed documents,
+                        // and without this a watcher-created file that was
+                        // opened then closed would vanish from the registry
+                        // (dependents stuck on "unknown" until the next
+                        // disk event) even though it still exists on disk.
+                        self.indexed_uris
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(change.uri.clone());
                         self.on_change(change.uri, content);
                     }
                 }
@@ -8653,6 +8726,16 @@ workflow VoiceAgent:
         fs::write(root.join("node_modules/pkg/b.model.nml"), "model b:\n").unwrap();
         fs::write(root.join(".cache/c.model.nml"), "model c:\n").unwrap();
         fs::write(root.join("src/d.model.nml"), "model d:\n").unwrap();
+        // A symlinked schema is refused by the walk even when its target
+        // sits INSIDE the workspace — pinned here directly because the
+        // assembler-level assertion that used to cover the walk's symlink
+        // rule died with the dir-mates universe.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            root.join("src/d.model.nml"),
+            root.join("src/link.model.nml"),
+        )
+        .unwrap();
 
         let mut files = Vec::new();
         Inner::find_nml_files(&root, &mut files, 0);
@@ -8732,12 +8815,16 @@ workflow VoiceAgent:
         let docs: Vec<(String, String)> = (0..MAX_UNIVERSE_FILES + 40)
             .map(|i| (format!("/ws/m{i:04}.model.nml"), format!("model m{i}:\n")))
             .collect();
-        let (sources, own_name) = registry_universe(own, "model mine:\n", docs);
+        let (sources, own_name, truncated) = registry_universe(own, "model mine:\n", docs);
         assert_eq!(own_name, "/ws/mine.model.nml");
         assert_eq!(
             sources.len(),
             MAX_UNIVERSE_FILES,
             "cap bounds the universe including the buffer"
+        );
+        assert!(
+            truncated,
+            "a cut set must report truncation — composition ownership hinges on it"
         );
         assert_eq!(sources[0].0, own_name, "own buffer first");
         let tail: Vec<&str> = sources[1..].iter().map(|(n, _)| n.as_str()).collect();
@@ -8749,6 +8836,14 @@ workflow VoiceAgent:
             Some("/ws/m0126.model.nml"),
             "the cap drops the sorted tail, deterministically"
         );
+
+        // Under the cap the registry set IS the namespace: no truncation,
+        // ownership stays with the load pass.
+        let small: Vec<(String, String)> = (0..3)
+            .map(|i| (format!("/ws/s{i}.model.nml"), format!("model s{i}:\n")))
+            .collect();
+        let (_, _, truncated) = registry_universe(own, "model mine:\n", small);
+        assert!(!truncated, "an uncut set must not report truncation");
     }
 
     // ── Hover markdown safety ─────────────────────────────────

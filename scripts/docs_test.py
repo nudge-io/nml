@@ -11,8 +11,8 @@ Tag grammar (the fence info string after the language word):
     ```nml check strict                 adds --strict (unknowns become errors)
     ```nml check expect-error=<text>    block must FAIL and the output must
                                         contain <text> (spaces: use expect-error="a b")
-    ```nml check expect-output=<text>   output must contain <text>, exit code
-                                        free (for warning-severity examples)
+    ```nml check expect-output=<text>   check must pass AND the output must
+                                        contain <text> (warning examples)
     ```nml check eol=crlf|cr            re-transcribe the block's line endings
                                         before running (fences are stored LF)
                                         so line-ending claims are executable
@@ -81,7 +81,11 @@ DOC_GLOBS = [
     "nml-cli/README.md",
 ]
 
-FENCE_RE = re.compile(r"^```nml\b(.*)$")
+# The leading-whitespace group admits fences indented inside list items
+# (tutorial <details> solutions); the captured prefix is stripped from the
+# body before use — NML is indentation-sensitive, so the snippet must reach
+# the CLI at column 0, exactly as a reader would save it.
+FENCE_RE = re.compile(r"^([ \t]*)```nml\b(.*)$")
 
 EXAMPLE_DIR = "spec/examples"
 TUTORIAL_DIR = "docs/tutorial/examples"
@@ -191,13 +195,21 @@ def extract_blocks(path: Path) -> list[Block]:
     while i < len(lines):
         m = FENCE_RE.match(lines[i])
         if m:
+            indent, info = m.groups()
             start = i + 1  # 1-based fence line
             body: list[str] = []
             i += 1
             while i < len(lines) and lines[i].strip() != "```":
                 body.append(lines[i])
                 i += 1
-            blocks.append(Block(path, start, m.group(1).strip(), "\n".join(body) + "\n"))
+            if indent:
+                # Dedent by exactly the fence's own prefix; lines without it
+                # (blank lines) pass through unchanged.
+                body = [
+                    line[len(indent):] if line.startswith(indent) else line
+                    for line in body
+                ]
+            blocks.append(Block(path, start, info.strip(), "\n".join(body) + "\n"))
         i += 1
     return blocks
 
@@ -213,6 +225,20 @@ def sample_codes(output: str, sample: Path, severity: str) -> set[str]:
         if str(sample) in line
         for code in re.findall(rf"{severity}\[(NML\d{{4}})\]", line)
     }
+
+
+# The bracketed code-list spelling (`[NML2057]`, `[NML2057, NML2058]`) that
+# selects code-set mode for an expectation.
+CODE_SET_RE = re.compile(r"\[NML\d{4}(?:\s*,\s*NML\d{4})*\]")
+
+
+def declared_codes(expectation: str) -> list[str]:
+    """The codes of a code-set annotation, or [] for a prose expectation.
+    Mode is gated on the bracketed spelling — prose that merely MENTIONS a
+    code stays a text-containment claim."""
+    if CODE_SET_RE.search(expectation):
+        return re.findall(r"NML\d{4}", expectation)
+    return []
 
 
 def run_check(block: Block) -> tuple[bool, str]:
@@ -262,6 +288,10 @@ def run_check(block: Block) -> tuple[bool, str]:
 
         expected_error = block.value("expect-error")
         if expected_error is not None:
+            if not expected_error:
+                # An empty expectation asserts nothing; prose containment
+                # would degrade to always-true. A doc-author error, loudly.
+                return False, "expect-error= is empty — declare a code list or message text"
             if proc.returncode == 0:
                 return False, "expected an error, but the check passed"
             # Code-SET equality, not containment: the annotation declares the
@@ -275,7 +305,7 @@ def run_check(block: Block) -> tuple[bool, str]:
             # example's claim. Warnings are exempt (they render
             # `warning[...]` and don't fail the check); `expect-output` is
             # the tool for asserting them.
-            declared = re.findall(r"NML\d{4}", expected_error)
+            declared = declared_codes(expected_error)
             if not declared:
                 # Prose expectation (`expect-error='tabs are not permitted'`):
                 # a message-TEXT claim, asserted by containment — the code-set
@@ -295,10 +325,22 @@ def run_check(block: Block) -> tuple[bool, str]:
             return True, ""
         expected_output = block.value("expect-output")
         if expected_output is not None:
-            declared = re.findall(r"NML\d{4}", expected_output)
+            if not expected_output:
+                # An empty expectation asserts nothing; prose containment
+                # would degrade to always-true. A doc-author error, loudly.
+                return False, "expect-output= is empty — declare a code list or output text"
+            # Both modes require exit 0: `expect-output` documents warnings,
+            # and a documented warning that starts ERRORING is the worst
+            # drift shape — a substring check alone kept passing on the
+            # error text.
+            if proc.returncode != 0:
+                return False, (
+                    "expect-output documents warnings, but the check FAILED;"
+                    f" got:\n{output.strip()}"
+                )
+            declared = declared_codes(expected_output)
             if not declared:
                 # Prose expectation: a rendered-text claim, containment.
-                # Exit-code-free — warnings don't fail `nml check`.
                 if expected_output not in output:
                     return False, (
                         f"output did not contain {expected_output!r};"
@@ -306,15 +348,8 @@ def run_check(block: Block) -> tuple[bool, str]:
                     )
                 return True, ""
             # Code-list mode is the WARNING-side twin of `expect-error`'s
-            # set contract: the example must exit 0 (a documented warning
-            # that starts ERRORING is the worst drift shape — the old
-            # substring check kept passing on the error text), and the
-            # sample's warning-code set must equal the declared list.
-            if proc.returncode != 0:
-                return False, (
-                    "expect-output documents warnings, but the check FAILED;"
-                    f" got:\n{output.strip()}"
-                )
+            # set contract: the sample's warning-code set must equal the
+            # declared list.
             produced = sample_codes(output, sample, "warning")
             if produced != set(declared):
                 return False, (
@@ -667,6 +702,13 @@ def check_rust_source_blocks(path: Path) -> tuple[int, list[tuple[str, str]]]:
 ERROR_INDEX = "crates/nml-core/assets/error-index.md"
 CODES_SOURCE = "crates/nml-core/src/diagnostic.rs"
 
+# THE section-header grammar, shared by the census split and the
+# order/coverage walk. Two parsers disagreed here once: a header with
+# trailing text satisfied a loose coverage match while the strict census
+# split folded its fences into the previous section. Near-miss headers are
+# a hard failure (see `check_error_index`), never a reclassification.
+ERROR_HEADER_RE = re.compile(r"^## (NML\d{4})\s*$", re.M)
+
 
 def error_index_census(index_text: str) -> tuple[list[tuple[str, str]], str]:
     """Per-section example coverage over the error index.
@@ -681,11 +723,13 @@ def error_index_census(index_text: str) -> tuple[list[tuple[str, str]], str]:
     sections are a printed census stat, not a failure: some codes are
     legitimately example-free (bounds like NML0007, tombstones)."""
     failures: list[tuple[str, str]] = []
-    parts = re.split(r"^## (NML\d{4})\s*$", index_text, flags=re.M)
+    parts = ERROR_HEADER_RE.split(index_text)
     covered = own_proving = 0
     example_free: list[str] = []
     for code, body in zip(parts[1::2], parts[2::2]):
-        fences = re.findall(r"```nml check[^\n]*", body)
+        # Line-anchored (with fix-1's indent tolerance): an unanchored match
+        # would count fence spellings quoted mid-prose as examples.
+        fences = re.findall(r"^[ \t]*```nml check[^\n]*", body, flags=re.M)
         if not fences:
             example_free.append(code)
             continue
@@ -733,9 +777,17 @@ def check_error_index() -> list[tuple[str, str]]:
     if not index_path.is_file():
         return [(ERROR_INDEX, "error index missing — every code needs a section")]
     index_text = index_path.read_text(encoding="utf-8")
-    order = [int(m) for m in re.findall(r"^## NML(\d{4})", index_text, re.M)]
-    documented = {f"NML{n:04}" for n in order}
     failures = []
+    # A near-miss header (`## NML0002 — legacy`, `## NML00021`) is a hard
+    # failure: it must not count as coverage here while the census split
+    # folds its fences into the previous section.
+    for line in index_text.splitlines():
+        if re.match(r"## NML\d{4}", line) and not ERROR_HEADER_RE.match(line):
+            failures.append(
+                (ERROR_INDEX, f"malformed section header {line!r} — must be exactly `## NML####`")
+            )
+    order = [int(code[len("NML"):]) for code in ERROR_HEADER_RE.findall(index_text)]
+    documented = {f"NML{n:04}" for n in order}
     if undocumented := sorted(declared - documented):
         failures.append((ERROR_INDEX, f"codes missing a section: {', '.join(undocumented)}"))
     if orphaned := sorted(documented - declared):

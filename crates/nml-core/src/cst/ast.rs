@@ -604,7 +604,7 @@ ast_node!(/// `Name` | `[]TypeExpr` | `(TypeExpr (| TypeExpr)*)` | `(TypeExpr ->
 ast_node!(/// RFC 0018: `(min = 1, max = 65535)` after a type name.
     FacetList => FacetList);
 
-ast_node!(/// One `key = number` facet.
+ast_node!(/// One `key = value` facet — a number or duration literal.
     Facet => Facet);
 
 impl FacetList {

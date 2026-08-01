@@ -32,6 +32,10 @@ export async function activate(context: ExtensionContext): Promise<void> {
       if (e.affectsConfiguration("nml.trace.server")) {
         void manager.applyTraceSetting();
       }
+      // A changed server path only takes effect on a fresh spawn.
+      if (e.affectsConfiguration("nml.server.path")) {
+        void manager.serialize(() => manager.restart());
+      }
     }),
     window.onDidChangeActiveTextEditor(() => void bar.refresh(manager)),
     languages.onDidChangeDiagnostics((e) => {
@@ -47,8 +51,10 @@ export async function activate(context: ExtensionContext): Promise<void> {
 
 export function deactivate(): Thenable<void> | undefined {
   statusBar?.dispose();
-  const stop = clientManager?.stop();
+  const manager = clientManager;
   clientManager = undefined;
   statusBar = undefined;
-  return stop;
+  // Through the serialized queue: an in-flight restart() must complete before
+  // teardown, or its start half re-creates a process nobody will reap.
+  return manager?.serialize(() => manager.stop());
 }

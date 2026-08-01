@@ -20,6 +20,14 @@ pub struct DiagnosticConfig {
     /// its definitions arrive through the registry, so the open-mode
     /// doc-local merge (and its collision reporting) must not re-add them.
     pub uri_is_registry_source: bool,
+    /// Whether the schema LOAD pass owns composition verdicts for this
+    /// document: true only when the universe it will load is authoritative
+    /// (snapshot, declared, or an untruncated registry set). Only then may
+    /// the validator's `UNKNOWN_MIXIN`/`INVALID_MIXIN_KIND` findings be
+    /// suppressed in its favor — a truncated or single-source universe
+    /// judging composition would report false "unknown `is` target" errors
+    /// for parents the registry validator resolves fine.
+    pub load_pass_owns_composition: bool,
 }
 
 /// Where schema validation for a document comes from (RFC 0030).
@@ -196,7 +204,12 @@ pub fn compute(
                     // package genuinely defines (caught by the provenance
                     // matrix e2e). Same-code findings from the load pass
                     // carry the same did-you-mean, so nothing is lost.
-                    if config.uri_is_registry_source
+                    // Suppression is gated on the load pass actually OWNING
+                    // composition: when its universe is truncated (registry
+                    // cap) or single-source (non-file buffer), this arm's
+                    // uncapped registry is the only correct judge and its
+                    // verdicts must stand.
+                    if config.load_pass_owns_composition
                         && matches!(
                             diag.code,
                             Some(codes::UNKNOWN_MIXIN | codes::INVALID_MIXIN_KIND)
@@ -312,8 +325,8 @@ fn push_diagnostic(
 /// Cross-definition schema validation for a `.model.nml` buffer — the
 /// editor calls the loader. `sources` is the buffer's whole validation
 /// universe (its covering package's `[]schema` files in manifest order,
-/// or its directory-mates when uncovered), read buffer-first; `own_name`
-/// is the entry naming this buffer. The pass runs
+/// or the workspace registry set when uncovered), read buffer-first;
+/// `own_name` is the entry naming this buffer. The pass runs
 /// [`nml_validate::loader::load_schema`] — the byte-for-byte entry point
 /// the CLI and embedders use, so composition, cycles, shorthand arity,
 /// oneof/enum integrity, reserved/duplicate names, and declared defaults
@@ -324,10 +337,17 @@ fn push_diagnostic(
 /// wrong-buffer attribution rule). Extraction errors for the own file are
 /// byte-identical to the parse band's; the caller's exact-duplicate
 /// suppression collapses them.
+///
+/// `owns_composition` mirrors [`DiagnosticConfig::load_pass_owns_composition`]:
+/// when false, the universe is known-partial (truncated registry set or a
+/// single-source non-file buffer), so this pass's `UNKNOWN_MIXIN`/
+/// `INVALID_MIXIN_KIND` findings are truncation artifacts and are dropped —
+/// the registry validator's unsuppressed verdicts own composition instead.
 pub fn schema_load_pass(
     own_name: &str,
     sources: &[(String, String)],
     uri: Option<&tower_lsp::lsp_types::Url>,
+    owns_composition: bool,
 ) -> Vec<Diagnostic> {
     let own_text = match sources.iter().find(|(n, _)| n == own_name) {
         Some((_, text)) => text,
@@ -346,6 +366,14 @@ pub fn schema_load_pass(
         .into_iter()
         .filter(|d| d.source.as_deref() == Some(own_name))
     {
+        if !owns_composition
+            && matches!(
+                diag.code,
+                Some(codes::UNKNOWN_MIXIN | codes::INVALID_MIXIN_KIND)
+            )
+        {
+            continue;
+        }
         push_diagnostic(diag, None, uri, &line_index, &mut out);
     }
     out
@@ -462,8 +490,14 @@ fn directive_name_span(
         return fallback;
     };
     // Skip the `#` itself, then take the first occurrence of the name — that
-    // IS the name token (an argument can only follow it).
-    match slice[1..].find(&directive.name) {
+    // IS the name token (an argument can only follow it). `get` rather than
+    // indexing: the parser's invariant is that the span starts at `#` and
+    // covers a non-empty name, but a degenerate span from a parser
+    // regression must degrade to the fallback, not panic the request path.
+    let Some(rest) = slice.get(1..) else {
+        return fallback;
+    };
+    match rest.find(&directive.name) {
         Some(rel) => {
             let start = span.start + 1 + rel;
             nml_core::span::Span::new(start, start + directive.name.len())
@@ -972,7 +1006,7 @@ package demo:
             .iter()
             .map(|(n, t)| (n.to_string(), t.to_string()))
             .collect();
-        schema_load_pass(own, &owned, None)
+        schema_load_pass(own, &owned, None, true)
     }
 
     /// Another file's findings must NOT paint onto this buffer. The

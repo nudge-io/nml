@@ -43,11 +43,10 @@ nml-core = { path = "crates/nml-core", version = "0.1.0" }
 nml-validate = { path = "crates/nml-validate", version = "0.1.0" }
 nml-fmt = { path = "crates/nml-fmt", version = "0.1.0" }
 thiserror = "2"
-# ≥1.0.220: the serde/serde_core split — older serde cannot compile the
-# resolved graph (url 2.5+ and modern derive output reference the split-era
-# markers). The workspace's honest floor (verified by the CI
-# minimal-versions job).
-serde = { version = "1.0.220", features = ["derive"] }
+# ≥1.0.225: required by toml 1.1+ (`serde_core` floor). ≥1.0.220 for the
+# serde/serde_core split — older serde cannot compile the resolved graph.
+# The workspace's honest floor (verified by the CI minimal-versions job).
+serde = { version = "1.0.225", features = ["derive"] }
 # ≥1.0.50: tower-lsp's requirement; the workspace's honest floor (verified
 # by the CI minimal-versions job).
 serde_json = "1.0.50"
@@ -55,4 +54,4 @@ tower-lsp = "0.20"
 # ≥1.17: tower-lsp's own requirement; the workspace's honest floor (verified
 # by the CI minimal-versions job).
 tokio = { version = "1.17", features = ["full"] }
-rowan = "0.15"
+rowan = "0.16"

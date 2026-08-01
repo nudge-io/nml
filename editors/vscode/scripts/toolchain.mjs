@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 
 /**
@@ -39,10 +39,9 @@ export function bundleWasm(packageDir) {
     );
     process.exit(1);
   }
-  runInPackage(packageDir, "sh", [
-    "-c",
-    `mkdir -p server && cp ${JSON.stringify(wasmPath)} server/nml-lsp.wasm`,
-  ]);
+  const serverDir = resolve(packageDir, "server");
+  mkdirSync(serverDir, { recursive: true });
+  copyFileSync(wasmPath, resolve(serverDir, "nml-lsp.wasm"));
 }
 
 /** @param {string} packageDir */

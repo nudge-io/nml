@@ -821,6 +821,36 @@ mod tests {
             "exclusive equal bounds are empty: {diags:?}"
         );
 
+        // Plain cross-unit inversion — the everyday authoring mistake.
+        let inverted = "model m:\n    t duration(min = 2h, max = 90s)\n";
+        let (_s, diags) = crate::cst::extract_schema(inverted);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unsatisfiable")),
+            "2h > 90s must be unsatisfiable: {diags:?}"
+        );
+
+        // Discrete-domain empty range: both bounds exclusive, one
+        // nanosecond apart — lo < hi, yet NO representable value exists
+        // between them. Numbers are dense and cannot hit this; loading
+        // clean here would break the file's own invariant (an
+        // unsatisfiable range must never load clean and then reject
+        // every value).
+        let adjacent = "model m:\n    t duration(exclusiveMin = 0s, exclusiveMax = 1ns)\n";
+        let (_s, diags) = crate::cst::extract_schema(adjacent);
+        assert!(
+            diags.iter().any(|d| d.message.contains("unsatisfiable")),
+            "adjacent exclusive nanos admit nothing: {diags:?}"
+        );
+
+        // One nanosecond of daylight: exclusive bounds 2ns apart admit
+        // exactly 1ns — satisfiable, must load clean.
+        let daylight = "model m:\n    t duration(exclusiveMin = 0s, exclusiveMax = 2ns)\n";
+        let (_s, diags) = crate::cst::extract_schema(daylight);
+        assert!(
+            diags.is_empty(),
+            "a 2ns exclusive gap admits 1ns: {diags:?}"
+        );
+
         let zero = "model m:\n    t duration(multipleOf = 0s)\n";
         let (_s, diags) = crate::cst::extract_schema(zero);
         assert!(
@@ -845,6 +875,44 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.message.contains("is a duration")),
             "duration bound on a number field: {diags:?}"
+        );
+    }
+
+    /// The cross-domain teaching message must never hand out an illegal
+    /// literal: duration magnitudes are non-negative integers, so a
+    /// fractional or negative `n` gets the generic worked example
+    /// (`5s`/`500ms`), not `1.5s`/`-5s` — spellings the parser itself
+    /// rejects (NML3005/NML3006).
+    #[test]
+    fn cross_domain_teaching_example_is_always_legal() {
+        for bad in ["1.5", "-5"] {
+            let src = format!("model m:\n    t duration(min = {bad})\n");
+            let (_s, diags) = crate::cst::extract_schema(&src);
+            let msg = diags
+                .iter()
+                .find(|d| d.message.contains("has no unit"))
+                .map(|d| d.rendered_message())
+                .unwrap_or_else(|| panic!("min = {bad} must be cross-domain: {diags:?}"));
+            assert!(
+                msg.contains("min = 5s") && !msg.contains(&format!("{bad}s")),
+                "example must be a legal literal for {bad}: {msg}"
+            );
+        }
+    }
+
+    /// A missing facet comma (`min = 5 max = 10`) must not eat the next
+    /// key as a duration unit — the lead diagnostic would point at
+    /// "unknown unit `max`" instead of the real defect (the separator).
+    #[test]
+    fn missing_facet_comma_is_not_an_unknown_unit() {
+        let (_s, diags) = crate::cst::extract_schema("model m:\n    x number(min = 5 max = 10)\n");
+        assert!(
+            !diags.is_empty(),
+            "a malformed facet list must not load clean"
+        );
+        assert!(
+            diags.iter().all(|d| !d.message.contains("unknown unit")),
+            "`max` is the next key, not a unit: {diags:?}"
         );
     }
 
@@ -2056,15 +2124,28 @@ fn facet_rules_in_type(
                         ),
                         f.span,
                     ),
-                    (crate::types::Value::Number(n), "duration") => err(
-                        diags,
-                        format!(
-                            "'{field_name}': `duration` facets take duration literals \
-                             (`{} = {n}s`, `{} = {n}ms`, ...) — `{n}` has no unit",
-                            f.key.name, f.key.name
-                        ),
-                        f.span,
-                    ),
+                    (crate::types::Value::Number(n), "duration") => {
+                        // The worked example must itself be a LEGAL literal:
+                        // duration magnitudes are non-negative integers, so
+                        // echoing a fractional or negative `n` would teach a
+                        // spelling the parser rejects (NML3005/NML3006).
+                        let example = if n.is_integral()
+                            && *n >= crate::types::Number::ZERO
+                            && n.to_string().len() <= 12
+                        {
+                            format!("(`{} = {n}s`, `{} = {n}ms`, ...) ", f.key.name, f.key.name)
+                        } else {
+                            format!("(`{} = 5s`, `{} = 500ms`, ...) ", f.key.name, f.key.name)
+                        };
+                        err(
+                            diags,
+                            format!(
+                                "'{field_name}': `duration` facets take duration literals \
+                                 {example}— `{n}` has no unit"
+                            ),
+                            f.span,
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -2132,8 +2213,23 @@ fn facet_rules_in_type(
                 if let Some(o) = ord(l, h) {
                     let strict =
                         l.key.name.starts_with("exclusive") || h.key.name.starts_with("exclusive");
+                    // Durations are a DISCRETE domain (integer nanos): two
+                    // exclusive bounds one nanosecond apart admit no value
+                    // at all, even though lo < hi. Numbers are dense —
+                    // something always sits strictly between distinct
+                    // bounds — so only the duration arm needs this.
+                    let discrete_gap_empty = l.key.name.starts_with("exclusive")
+                        && h.key.name.starts_with("exclusive")
+                        && matches!(
+                            (&l.value.value, &h.value.value),
+                            (
+                                crate::types::Value::Duration(x),
+                                crate::types::Value::Duration(y),
+                            ) if y.total_nanos().saturating_sub(x.total_nanos()) == 1
+                        );
                     if o == std::cmp::Ordering::Greater
                         || (o == std::cmp::Ordering::Equal && strict)
+                        || discrete_gap_empty
                     {
                         err(
                             diags,
