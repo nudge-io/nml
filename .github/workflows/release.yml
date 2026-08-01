@@ -89,7 +89,7 @@ jobs:
             gh release create "$GITHUB_REF_NAME" "$vsix" --generate-notes
           fi
 
-      - uses: pnpm/action-setup@41ff72655975bd18cabda6b0909e8ead0e8c81a9 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         if: env.VSCE_PAT != '' || env.OVSX_PAT != ''
         with:
           package_json_file: package.json
