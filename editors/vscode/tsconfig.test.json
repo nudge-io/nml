@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "out",
+    "rootDir": "src",
+    "types": ["node", "vscode", "mocha"]
+  },
+  "include": ["src/test/**/*.ts"],
+  "references": [{ "path": "./tsconfig.json" }]
+}

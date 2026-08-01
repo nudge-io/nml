@@ -1,13 +1,15 @@
 import { Readable, Writable } from "stream";
-import { ExtensionContext, OutputChannel, Uri, workspace } from "vscode";
+import { ExtensionContext, Uri, workspace } from "vscode";
 import { Wasm, WasmProcess } from "@vscode/wasm-wasi/v1";
 import { StreamMessageReader, StreamMessageWriter } from "vscode-jsonrpc/node";
 import { MessageTransports } from "vscode-languageclient/node";
+import { NmlLogs } from "./logging";
+import { isPathInsideWorkspace } from "./pathSecurity";
 
 
 // ─────────────────────────────────────────────────────────────────────────
 // RFC 0035 — neutral-server delivery. The provider path (`<tool> lsp`) is
-// resolved in extension.ts; this module owns the *neutral* server: the bundled
+// resolved in providerDiscovery.ts; this module owns the *neutral* server: the bundled
 // WASM backend (universal, offline, WASI-sandboxed — the preferred VS Code
 // delivery), with the native binary as the override/fallback.
 //
@@ -29,10 +31,26 @@ export type NeutralServer =
  *  2. The bundled WASM backend, if present (shipped by the build's `bundle:wasm`).
  *  3. The native default path (`~/.cargo/bin/nml-lsp`).
  */
-export async function resolveNeutralServer(ctx: ExtensionContext): Promise<NeutralServer> {
+export async function resolveNeutralServer(
+  ctx: ExtensionContext,
+  logs: NmlLogs
+): Promise<NeutralServer> {
+  const roots = (workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
   const override = workspace.getConfiguration("nml").get<string>("server.path", "");
   if (override) {
-    return { kind: "process", command: override, args: [], label: "neutral (nml.server.path)" };
+    if (await isPathInsideWorkspace(override, roots)) {
+      logs.warn(
+        `Refusing nml.server.path inside the workspace (${override}). ` +
+          "Use a global install, bundled WASM, or a binary outside the workspace."
+      );
+    } else {
+      return {
+        kind: "process",
+        command: override,
+        args: [],
+        label: "neutral (nml.server.path)",
+      };
+    }
   }
   const module = Uri.joinPath(ctx.extensionUri, "server", "nml-lsp.wasm");
   if (await exists(module)) {
@@ -130,7 +148,7 @@ export interface WasmServer {
  *  `vscode-jsonrpc`'s `StreamMessageReader`/`Writer` do the LSP framing — no
  *  hand-rolled framing, no pre-release dependency. `stderr` is forwarded to
  *  `log` so a server panic is visible rather than lost (and its pipe drained). */
-export async function createWasmServer(module: Uri, log: OutputChannel): Promise<WasmServer> {
+export async function createWasmServer(module: Uri, log: NmlLogs): Promise<WasmServer> {
   const wasm = await Wasm.load();
   // Copy into a fresh (non-shared) ArrayBuffer so the bytes satisfy
   // `WebAssembly.compile`'s `BufferSource` regardless of the FS provider.
@@ -150,7 +168,7 @@ export async function createWasmServer(module: Uri, log: OutputChannel): Promise
   // Runs until stdin EOF or `terminate()`. Normal exit resolves; an
   // instantiation/trap before stdio is wired rejects — surface it to the log
   // rather than let it become an unhandledRejection in the extension host.
-  proc.run().catch((err) => log.append(`nml-lsp wasm process error: ${err}\n`));
+  proc.run().catch((err) => log.error(`nml-lsp wasm process error: ${err}`));
 
   const wasmOut = proc.stdout;
   const wasmIn = proc.stdin;
@@ -164,8 +182,8 @@ export async function createWasmServer(module: Uri, log: OutputChannel): Promise
   // timeouts with the actual Rust panic message unrecoverable (exactly how
   // a CI failure shipped with no cause attached).
   proc.stderr?.onData((data) => {
-    const text = new TextDecoder().decode(data);
-    log.append(text);
+    const text = new TextDecoder().decode(data).replace(/\n$/, "");
+    if (text) log.error(text);
     if (text.includes("panicked") || text.includes("RUST_BACKTRACE")) {
       console.error(`nml-lsp stderr: ${text}`);
     }

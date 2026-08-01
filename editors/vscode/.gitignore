@@ -2,6 +2,7 @@ node_modules/
 out/
 dist/
 *.vsix
+*.tsbuildinfo
 # Downloaded VS Code instance for @vscode/test-cli E2E runs.
 .vscode-test/
 

@@ -73,3 +73,19 @@ Documents covered by a schema package (RFC 0030 lineage) validate
 against the package's composed
 schemas automatically; `.model.nml` files feed the workspace registry in
 open mode.
+
+## VS Code extension
+
+The bundled extension adds editor packaging on top of the neutral server:
+
+- **Status bar** (bottom-right): for the active `.nml` file, shows the
+  governing schema package and version. Hover for the content hash
+  (`blake3:{hash8}` plus the full hash), delivery channel, binding, and
+  server label — the auditable chain from squiggle to store slot described
+  in the [shipping tutorial](../tutorial/09-ship-schemas-to-your-users.md).
+- **NML: Show Language Server Log** / **NML: Show Language Server Trace**:
+  palette commands to open the structured log channels.
+- **`nml.server.path`** (machine-scoped): absolute path to a native `nml-lsp`
+  binary. Paths inside an open workspace folder are refused.
+- **`nml.trace.server`** (machine-scoped): set to `messages` or `verbose`
+  to record LSP protocol traffic in the trace channel (off by default).

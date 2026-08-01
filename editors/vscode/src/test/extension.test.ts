@@ -122,8 +122,8 @@ suite("nml explanations (E2E, WASM neutral server)", () => {
       explain,
       `Explain action expected, got: ${JSON.stringify((actions ?? []).map((a) => a.title))}`
     );
-    assert.strictEqual(explain.command?.command, "nml.explain");
-    const code = explain.command?.arguments?.[0];
+    assert.strictEqual(explain!.command?.command, "nml.explain");
+    const code = explain!.command?.arguments?.[0];
     assert.ok(
       typeof code === "string" && /^NML\d{4}$/.test(code),
       `canonical code argument expected, got: ${JSON.stringify(code)}`

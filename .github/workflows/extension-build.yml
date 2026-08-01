@@ -45,6 +45,14 @@ jobs:
         working-directory: editors/vscode
         run: npm run typecheck
 
+      - name: Unit tests (wire contracts + status presentation)
+        working-directory: editors/vscode
+        run: npm run test:unit
+
+      - name: Bundle extension (esbuild + v10)
+        working-directory: editors/vscode
+        run: npm run bundle:js
+
       # `npm test` runs the pretest (bundle:wasm + bundle:js + compile), then
       # drives a real headless VS Code (downloading it + `ms-vscode.wasm-wasi-core`)
       # over the single-root and multi-root E2E suites. Xvfb gives Electron a

@@ -8,6 +8,7 @@ import {
   workspace,
 } from "vscode";
 import { LanguageClient } from "vscode-languageclient/node";
+import { isRecord, readString } from "./contracts/wire";
 
 // ─────────────────────────────────────────────────────────────────────────
 // RFC 0010 tier 2 — full error explanations in-editor.
@@ -30,9 +31,6 @@ const SCHEME = "nml-explain";
 /** The only shape either side accepts; anything else never reaches a request. */
 const CODE = /^NML\d{4}$/i;
 
-interface ExplainResult {
-  markdown: string;
-}
 interface IndexEntry {
   code: string;
   summary: string;
@@ -90,10 +88,17 @@ async function pickCode(
     // Trust nothing off the wire, even our own server's: anything but the
     // contracted array degrades to the same readable warning, never a throw.
     index = Array.isArray(result)
-      ? result.filter(
-          (e): e is IndexEntry =>
-            typeof e?.code === "string" && typeof e?.summary === "string"
-        )
+      ? result
+          .filter(
+            (e): e is Record<string, unknown> =>
+              isRecord(e) &&
+              readString(e, "code") !== undefined &&
+              readString(e, "summary") !== undefined
+          )
+          .map((e) => ({
+            code: readString(e, "code")!,
+            summary: readString(e, "summary")!,
+          }))
       : undefined;
   } catch {
     index = undefined;
@@ -137,14 +142,13 @@ async function explanationMarkdown(
     );
   }
   try {
-    const result = await client.sendRequest<ExplainResult | null>("nml/explain", {
+    const result = await client.sendRequest<unknown>("nml/explain", {
       code: canonical,
     });
-    // Same wire skepticism as the index path: only the contracted string
-    // shape renders; anything else is the readable miss document.
-    return typeof result?.markdown === "string"
-      ? result.markdown
-      : `# ${canonical}\n\nNo such diagnostic code. See \`nml explain --list\`.`;
+    if (isRecord(result) && typeof result.markdown === "string") {
+      return result.markdown;
+    }
+    return `# ${canonical}\n\nNo such diagnostic code. See \`nml explain --list\`.`;
   } catch {
     return (
       `# ${canonical}\n\nThe running NML language server does not provide ` +

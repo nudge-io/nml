@@ -36,6 +36,16 @@
         "command": "nml.explain",
         "title": "Explain a Diagnostic Code",
         "category": "NML"
+      },
+      {
+        "command": "nml.showServerLog",
+        "title": "Show Language Server Log",
+        "category": "NML"
+      },
+      {
+        "command": "nml.showServerTrace",
+        "title": "Show Language Server Trace",
+        "category": "NML"
       }
     ],
     "walkthroughs": [
@@ -66,7 +76,7 @@
           {
             "id": "open",
             "title": "Open an NML file",
-            "description": "Open any `.nml` file. The status bar (bottom-right) names the active schema and its delivery channel. Errors, completions, and hovers come from that schema.\n[Open a folder](command:workbench.action.files.openFolder)",
+            "description": "Open any `.nml` file. The status bar (bottom-right) names the active schema package and version — hover for the content hash (`blake3:{hash8}`), delivery channel, binding, and server label. Errors, completions, and hovers come from that schema.\n[Open a folder](command:workbench.action.files.openFolder)",
             "media": {
               "markdown": "walkthroughs/open.md"
             }
@@ -101,7 +111,14 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "Absolute path to the neutral nml-lsp binary. Defaults to ~/.cargo/bin/nml-lsp. Machine-scoped on purpose: a workspace cannot set it, so a repository can never redirect the language server at an untrusted binary."
+          "description": "Absolute path to the neutral nml-lsp binary. Defaults to ~/.cargo/bin/nml-lsp. Machine-scoped on purpose: a workspace cannot set it, so a repository can never redirect the language server at an untrusted binary. Paths inside an open workspace folder are refused (same RCE class as workspace-resident provider binaries)."
+        },
+        "nml.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "scope": "machine",
+          "description": "Log LSP protocol messages to the NML Language Server Trace output channel. Off by default."
         }
       }
     },
@@ -118,9 +135,10 @@
   "scripts": {
     "bundle:wasm": "mkdir -p server && cp ../../target/wasm32-wasip1/release/nml-lsp.wasm server/nml-lsp.wasm",
     "bundle:js": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify --sourcemap",
-    "typecheck": "tsc --noEmit -p ./",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
+    "typecheck": "tsc -b tsconfig.json tsconfig.test.json",
+    "compile": "tsc -b tsconfig.json tsconfig.test.json",
+    "watch": "tsc -b tsconfig.json tsconfig.test.json -w",
+    "test:unit": "tsc -b tsconfig.json tsconfig.test.json && mocha --ui tdd out/test/unit/**/*.js",
     "pretest": "npm run bundle:wasm && npm run bundle:js && npm run compile",
     "test": "vscode-test",
     "vscode:prepublish": "npm run bundle:wasm && npm run bundle:js"
@@ -128,18 +146,20 @@
   "dependencies": {
     "@vscode/wasm-wasi": "^1.0.1",
     "vscode-jsonrpc": "^8.2.0",
-    "vscode-languageclient": "^9.0.1"
+    "vscode-languageclient": "^10.1.0"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.7",
     "@types/node": "^25.3.2",
-    "@types/vscode": "^1.78.0",
+    "@types/vscode": "^1.91.0",
     "@vscode/test-cli": "^0.0.10",
     "@vscode/test-electron": "^3.1.0",
     "esbuild": "^0.28.1",
+    "mocha": "^11.1.0",
     "typescript": "^5.0.0"
   },
   "overrides": {
-    "serialize-javascript": "^7.0.7"
+    "serialize-javascript": "^7.0.7",
+    "vscode-jsonrpc": "^8.2.0"
   }
 }
