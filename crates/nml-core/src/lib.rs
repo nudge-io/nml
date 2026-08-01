@@ -69,9 +69,6 @@ pub mod defaults;
 /// abort error; this module is the findings report.
 pub mod diagnostic;
 pub mod diff;
-/// Exact duration values (RFC 0017): faithful `(magnitude, unit)` storage
-/// with semantic comparison over the nanosecond total (`30s == 30000ms`),
-/// domain-bounded at construction so `as_std()` is infallible.
 pub mod duration;
 pub mod error;
 pub mod identity;

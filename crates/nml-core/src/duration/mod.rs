@@ -7,8 +7,8 @@
 //! rendering is [`Display`](std::fmt::Display), the one spelling
 //! normalizer (`1h30m`, attached, coarse→fine).
 //!
-//! Two entry grammars, one build path — see [`parse`]: strict source
-//! literals versus Postel coercion text.
+//! Two entry grammars, one build path: strict source literals
+//! ([`parse_components_cst`]) versus Postel coercion text ([`parse_text`]).
 
 mod canonicalize;
 mod decompose;
