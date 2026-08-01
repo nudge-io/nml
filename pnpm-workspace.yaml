@@ -23,5 +23,5 @@ onlyBuiltDependencies:
 
 overrides:
   serialize-javascript: ^7.0.7
-  vscode-jsonrpc: ^8.2.0
+  vscode-jsonrpc: ^9.0.1
   diff: '>=8.0.3'
