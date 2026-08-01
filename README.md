@@ -231,14 +231,16 @@ docs/             Guides, integration docs, RFCs
 ## Building
 
 ```bash
-just test    # cargo test --workspace
-just lint    # clippy, warnings denied
-just install # build + install the LSP and VS Code extension locally
+corepack enable && pnpm install   # once per clone
+just test        # cargo test --workspace
+just lint        # Rust fmt + clippy + doc
+just lint-ext    # extension typecheck
+just install     # build + install the LSP and VS Code extension locally
+just verify-ext  # extension gate (no E2E)
 ```
 
 Minimum supported Rust: see `rust-version` in [Cargo.toml](Cargo.toml).
-Contributions welcome — a CONTRIBUTING guide lands with the first public
-release.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and landing changes.
 
 ## License
 

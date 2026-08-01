@@ -1,0 +1,8 @@
+lockfileVersion: '9.0'
+
+importers:
+  editors/vscode:
+    devDependencies:
+      '@types/vscode':
+        specifier: 1.91.0
+        version: 1.91.0

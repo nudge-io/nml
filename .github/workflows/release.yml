@@ -55,26 +55,57 @@ jobs:
       VSCE_PAT: ${{ secrets.VSCE_PAT }}
       OVSX_PAT: ${{ secrets.OVSX_PAT }}
     steps:
+      # Checkout before download: marketplace publish needs the repo for pnpm
+      # install, and checkout must never run after download (it wipes artifacts).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
       - name: Download the built + tested VSIX
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: nml-lang-vsix
           path: vsix
 
-      - name: Create the GitHub Release and attach the VSIX
+      - name: Validate the VSIX artifact
+        id: vsix
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(vsix/*.vsix)
+          if [ "${#files[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one VSIX in vsix/, got ${#files[@]}"
+            exit 1
+          fi
+          echo "path=${files[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" vsix/*.vsix --generate-notes
+        shell: bash
+        run: |
+          vsix="${{ steps.vsix.outputs.path }}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$vsix" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$vsix" --generate-notes
+          fi
 
+      - uses: pnpm/action-setup@41ff72655975bd18cabda6b0909e8ead0e8c81a9 # v4
+        if: env.VSCE_PAT != '' || env.OVSX_PAT != ''
+        with:
+          package_json_file: package.json
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: env.VSCE_PAT != '' || env.OVSX_PAT != ''
         with:
-          node-version: 22
+          node-version-file: .node-version
+
+      - name: Install extension toolchain (pinned vsce + ovsx for publish)
+        if: env.VSCE_PAT != '' || env.OVSX_PAT != ''
+        run: pnpm install --frozen-lockfile
 
       - name: Publish to the VS Code Marketplace
         if: env.VSCE_PAT != ''
-        run: npx --yes @vscode/vsce publish --packagePath vsix/*.vsix -p "$VSCE_PAT"
+        run: pnpm --filter nml-lang exec vsce publish --packagePath "${{ steps.vsix.outputs.path }}" -p "$VSCE_PAT"
 
       - name: Publish to Open VSX
         if: env.OVSX_PAT != ''
-        run: npx --yes ovsx publish vsix/*.vsix -p "$OVSX_PAT"
+        run: pnpm --filter nml-lang exec ovsx publish "${{ steps.vsix.outputs.path }}" -p "$OVSX_PAT"

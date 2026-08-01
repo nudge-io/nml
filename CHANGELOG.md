@@ -4,6 +4,12 @@
 
 ### Changed
 
+- **VS Code extension tooling** — migrated from npm to a pnpm 11 workspace
+  (root `pnpm-lock.yaml`, supply-chain policy in `pnpm-workspace.yaml`).
+  Contributors: `corepack enable && pnpm install`, then `just verify-ext`.
+  Toolchain gate: `pnpm run check:toolchain` (VS Code API floor, lockfile
+  alignment, Node 22+, Corepack-pinned pnpm).
+
 - **Duration facets (RFC 0018 §3 deferral closed)** — `duration` is now
   a legal facet carrier beside `number`: `timeout duration(min = 1s,
   max = 2h, multipleOf = 250ms)`. One generic engine (`Facets<T:

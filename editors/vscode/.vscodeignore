@@ -12,8 +12,9 @@ out/**
 scripts/**
 node_modules/**
 tsconfig.json
+tsconfig.*.json
+*.tsbuildinfo
 esbuild.*
-**/tsconfig.json
 INSTALL.md
 VSCODE-API.md
 # dist/extension.js.map IS shipped (open-source; maps production stack traces

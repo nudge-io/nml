@@ -6,11 +6,11 @@
 # from this workspace, cheapest first:
 #
 #   1. Formatting drift — CI's first job is `cargo fmt --all --check`.
-#      (This exact class shipped once: python-patched edits in nml-core
-#      diff.rs that were check/clippy/test-green but fmt-dirty.)
-#   2. A workspace that does not compile — a sync point that fails
-#      `cargo check` poisons bisects; skip in an emergency with
-#      NML_PRECOMMIT_SKIP_CHECK=1 (never --no-verify, so 1 always runs).
+#   2. A workspace that does not compile — `cargo check --locked`.
+#      (Skip ONLY this step with NML_PRECOMMIT_SKIP_CHECK=1.)
+#   3. Extension toolchain drift — when editors/vscode or pnpm lockfiles
+#      change, `pnpm run check:toolchain` (always runs for those paths;
+#      not skippable — it is cheap and prevents CI surprises).
 
 set -e
 
@@ -30,11 +30,6 @@ if [ -d docs/rfcs ]; then
             echo "pre-commit: docs/rfcs/README.md has no row for $(basename "$f")" >&2
             exit 1
         fi
-        # The README calls itself the authoritative status list and asks
-        # that it and each RFC's own Status header stay in sync — which
-        # presumes the header exists, in one greppable form. (A survey
-        # using a narrower pattern miscounted these twice; one shape
-        # makes the convention checkable instead of eyeballed.)
         if ! grep -qE '^- \*\*Status:\*\* ' "$f"; then
             echo "pre-commit: $(basename "$f") has no '- **Status:** …' header" >&2
             echo "  (the README index is authoritative; the header keeps the RFC in sync with it)" >&2
@@ -52,13 +47,24 @@ fi
 
 # ── 2. the workspace compiles ───────────────────────────────────────────────
 if [ "${NML_PRECOMMIT_SKIP_CHECK:-0}" != "1" ]; then
-    # --locked: Cargo.lock is committed — a manifest change without its lock
-    # update must fail HERE, not as a red `--locked` CI job after push.
     if ! cargo check --workspace --quiet --locked >/dev/null 2>&1; then
         echo "pre-commit: cargo check --locked failed — a sync point must build." >&2
         echo "  (lock drift? run 'cargo update <crate>' and stage Cargo.lock)" >&2
         echo "  (emergency escape: NML_PRECOMMIT_SKIP_CHECK=1 git commit …)" >&2
         cargo check --workspace --quiet --locked 2>&1 | grep '^error' | head -5 >&2
+        exit 1
+    fi
+fi
+
+# ── 3. extension toolchain policy (when extension or lockfile changes) ─────
+if git diff --cached --name-only | grep -qE '^(editors/vscode/|pnpm-lock\.yaml|pnpm-workspace\.yaml|package\.json|\.node-version)'; then
+    if ! command -v pnpm >/dev/null 2>&1; then
+        echo "pre-commit: pnpm not on PATH — install Node 22+ and run corepack enable." >&2
+        exit 1
+    fi
+    if ! pnpm --filter nml-lang run check:toolchain >/dev/null 2>&1; then
+        echo "pre-commit: extension toolchain check failed — run 'pnpm --filter nml-lang run check:toolchain'." >&2
+        pnpm --filter nml-lang run check:toolchain 2>&1 | tail -8 >&2
         exit 1
     fi
 fi

@@ -10,6 +10,8 @@
     "url": "https://github.com/nudge-io/nml.git"
   },
   "engines": {
+    "node": ">=22",
+    "pnpm": ">=11 <12",
     "vscode": "^1.91.0"
   },
   "extensionDependencies": [
@@ -133,17 +135,23 @@
   },
   "main": "./dist/extension.js",
   "scripts": {
-    "check:engines": "node scripts/check-vscode-engine.mjs",
+    "check:toolchain": "node scripts/check-toolchain.mjs",
     "test:engine-policy": "node --test scripts/vscodeEnginePolicy.test.mjs",
-    "bundle:wasm": "mkdir -p server && cp ../../target/wasm32-wasip1/release/nml-lsp.wasm server/nml-lsp.wasm",
-    "bundle:js": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify --sourcemap",
-    "typecheck": "npm run check:engines && tsc -b tsconfig.json tsconfig.test.json",
-    "compile": "npm run check:engines && tsc -b tsconfig.json tsconfig.test.json",
+    "test:lockfile-policy": "node --test scripts/lockfilePolicy.test.mjs",
+    "test:toolchain-policy": "node --test scripts/toolchainPolicy.test.mjs scripts/toolchainCheck.test.mjs",
+    "typecheck": "tsc -b tsconfig.json tsconfig.test.json",
+    "compile": "node scripts/compile.mjs",
     "watch": "tsc -b tsconfig.json tsconfig.test.json -w",
-    "test:unit": "npm run check:engines && tsc -b tsconfig.json tsconfig.test.json && mocha --ui tdd out/test/unit/**/*.js && npm run test:engine-policy",
-    "pretest": "npm run bundle:wasm && npm run bundle:js && npm run compile",
+    "bundle:wasm": "node scripts/bundleWasm.mjs",
+    "bundle:js": "node scripts/bundleJs.mjs",
+    "test:unit": "tsc -b tsconfig.json tsconfig.test.json && mocha --ui tdd out/test/unit/**/*.js && pnpm run test:engine-policy && pnpm run test:lockfile-policy && pnpm run test:toolchain-policy",
+    "pretest": "node scripts/vscodePrepublish.mjs",
     "test": "vscode-test",
-    "vscode:prepublish": "npm run check:engines && npm run bundle:wasm && npm run bundle:js"
+    "vscode:prepublish": "node scripts/vscodePrepublish.mjs",
+    "package": "vsce package --no-dependencies --allow-missing-repository",
+    "verify": "pnpm run check:toolchain && pnpm run typecheck && pnpm run test:unit && pnpm run bundle:js",
+    "verify:ci": "pnpm run verify && pnpm audit --audit-level=high",
+    "verify:full": "pnpm run verify && pnpm test"
   },
   "dependencies": {
     "@vscode/wasm-wasi": "^1.0.1",
@@ -156,12 +164,11 @@
     "@types/vscode": "1.91.0",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "3.3.0",
     "esbuild": "^0.28.1",
     "mocha": "^11.1.0",
-    "typescript": "^7.0.2"
-  },
-  "overrides": {
-    "serialize-javascript": "^7.0.7",
-    "vscode-jsonrpc": "^8.2.0"
+    "ovsx": "0.10.4",
+    "typescript": "^7.0.2",
+    "yaml": "^2.8.0"
   }
 }

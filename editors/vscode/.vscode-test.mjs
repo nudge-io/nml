@@ -12,7 +12,7 @@ import { defineConfig } from "@vscode/test-cli";
 //
 // Prerequisites (CI): the WASM server must be bundled first
 //   cargo build -p nml-lsp --target wasm32-wasip1 --release
-//   npm run bundle:wasm && npm run compile
+//   pnpm run bundle:wasm && pnpm run compile
 // The WASI host extension is auto-installed into each test instance below.
 const wasi = { installExtensions: ["ms-vscode.wasm-wasi-core"], mocha: { ui: "tdd", timeout: 60_000 } };
 

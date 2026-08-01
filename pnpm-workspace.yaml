@@ -1,0 +1,27 @@
+packages:
+  - editors/vscode
+
+# Supply-chain policy (pnpm 11 — camelCase required in this file).
+# trustPolicy is intentionally omitted: no-downgrade blocks mocha's chokidar
+# transitive (provenance downgrade). minimumReleaseAgeStrict + blockExoticSubdeps
+# + strictDepBuilds remain the primary guards.
+minimumReleaseAge: 1440
+minimumReleaseAgeStrict: true
+blockExoticSubdeps: true
+strictDepBuilds: true
+
+allowBuilds:
+  esbuild: true
+  '@vscode/vsce-sign': true
+  keytar: true
+
+# Belt-and-suspenders with strictDepBuilds: only these packages may run install scripts.
+onlyBuiltDependencies:
+  - esbuild
+  - '@vscode/vsce-sign'
+  - keytar
+
+overrides:
+  serialize-javascript: ^7.0.7
+  vscode-jsonrpc: ^8.2.0
+  diff: '>=8.0.3'

@@ -20,13 +20,22 @@ install-bin: build-lsp
     cp target/release/nml-lsp ~/.cargo/bin/nml-lsp
 
 # Compile the VS Code extension TypeScript
-compile-ext:
-    cd editors/vscode && npm install && npm run compile
+install-ext-deps:
+    corepack enable || true
+    pnpm install
 
-# Package the extension as a VSIX (fresh WASM built first; old VSIXes cleared so
-# exactly one remains for install-ext to pick up regardless of version).
+compile-ext: install-ext-deps
+    pnpm --filter nml-lang run check:toolchain
+    pnpm --filter nml-lang run compile
+
+verify-ext: install-ext-deps
+    pnpm --filter nml-lang run verify
+
+verify-ext-full: install-ext-deps build-lsp-wasm
+    pnpm --filter nml-lang run verify:full
+
 package-ext: compile-ext build-lsp-wasm
-    cd editors/vscode && rm -f *.vsix && npx vsce package --allow-missing-repository
+    cd editors/vscode && rm -f *.vsix && pnpm run package
 
 # Install the VSIX into Cursor (globs the single freshly-built VSIX, so a
 # version bump never breaks this).
@@ -50,6 +59,11 @@ lint:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --locked -- -D warnings
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+
+# Extension typecheck (toolchain gate + tsc); matches extension-build CI verify step
+lint-ext: install-ext-deps
+    pnpm --filter nml-lang run check:toolchain
+    pnpm --filter nml-lang run typecheck
 
 # Format all Rust code
 fmt:

@@ -1,9 +1,9 @@
 /**
  * VS Code API floor policy — shared by the CI guard and its unit tests.
  *
- * `@types/vscode` must not declare a version newer than `engines.vscode`.
- * This mirrors `@vscode/vsce package` validation so failures surface before
- * the expensive extension pipeline runs.
+ * `@types/vscode` must exactly match the semver floor of `engines.vscode` and
+ * must never be newer. This mirrors `@vscode/vsce package` validation so
+ * failures surface before the expensive extension pipeline runs.
  */
 
 /** @returns {[number, number, number] | null} */
@@ -51,14 +51,57 @@ export function validateVscodeEnginePolicy(enginesVscode, typesVscode) {
         "See editors/vscode/VSCODE-API.md.",
     };
   }
+  if (compareSemver(typesVer, engineMin) < 0) {
+    return {
+      ok: false,
+      reason:
+        `@types/vscode ${typesVscode} is below the engines.vscode floor ${enginesVscode}. ` +
+        "Raise @types/vscode to match the floor in the same intentional PR. " +
+        "See editors/vscode/VSCODE-API.md.",
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Ensure package.json @types/vscode matches the lockfile resolved version.
+ * @param {string} typesVscode
+ * @param {string} lockfileTypesVersion
+ */
+export function validateTypesLockfileAlignment(typesVscode, lockfileTypesVersion) {
+  const declaredVer = parseSemverTriple(typesVscode);
+  const lockedVer = parseSemverTriple(lockfileTypesVersion);
+  if (!declaredVer || !lockedVer) {
+    return {
+      ok: false,
+      reason:
+        "cannot compare package.json @types/vscode with pnpm-lock.yaml resolved version.",
+    };
+  }
+  if (compareSemver(declaredVer, lockedVer) !== 0) {
+    return {
+      ok: false,
+      reason:
+        `package.json @types/vscode ${typesVscode} does not match pnpm-lock.yaml resolved ${lockfileTypesVersion}. ` +
+        "Run pnpm install from the repo root and commit the lockfile.",
+    };
+  }
   return { ok: true };
 }
 
 /**
  * @param {unknown} packageJson parsed package.json
- * @param {string | undefined} lockfileTypesVersion resolved @types/vscode from lockfile
+ * @param {string} lockfileTypesVersion resolved @types/vscode from lockfile (required)
  */
 export function validatePackageManifest(packageJson, lockfileTypesVersion) {
+  if (!lockfileTypesVersion) {
+    return {
+      ok: false,
+      reason:
+        "lockfile @types/vscode version is required — run check-toolchain from the repo root after pnpm install.",
+    };
+  }
+
   const enginesVscode = packageJson?.engines?.vscode;
   const typesVscode = packageJson?.devDependencies?.["@types/vscode"];
   if (!enginesVscode || !typesVscode) {
@@ -71,14 +114,13 @@ export function validatePackageManifest(packageJson, lockfileTypesVersion) {
   const declared = validateVscodeEnginePolicy(enginesVscode, typesVscode);
   if (!declared.ok) return declared;
 
-  if (lockfileTypesVersion) {
-    const locked = validateVscodeEnginePolicy(enginesVscode, lockfileTypesVersion);
-    if (!locked.ok) {
-      return {
-        ok: false,
-        reason: `package-lock.json resolves @types/vscode to ${lockfileTypesVersion}, which exceeds engines.vscode ${enginesVscode}. Run npm install after aligning versions.`,
-      };
-    }
+  const locked = validateVscodeEnginePolicy(enginesVscode, lockfileTypesVersion);
+  if (!locked.ok) {
+    return {
+      ok: false,
+      reason: `pnpm-lock.yaml @types/vscode ${lockfileTypesVersion}: ${locked.reason}`,
+    };
   }
-  return { ok: true };
+
+  return validateTypesLockfileAlignment(typesVscode, lockfileTypesVersion);
 }

@@ -7,8 +7,7 @@ Complete steps to build, package, and install the NML language extension (with L
 ## Prerequisites
 
 - Rust toolchain (`cargo`)
-- Node.js and npm
-- `vsce` CLI: `npm install -g @vscode/vsce`
+- Node.js **22+** and pnpm **11** (`corepack enable` from the repo root)
 - Cursor IDE
 
 ## Step 1: Build the LSP binary
@@ -31,26 +30,28 @@ The extension defaults to `~/.cargo/bin/nml-lsp`. If you want a different locati
 
 ## Step 3: Compile the extension TypeScript
 
+From the **repo root**:
+
 ```bash
-cd editors/vscode
-npm install
-npm run compile
+corepack enable
+pnpm install
+just compile-ext
 ```
 
-This compiles `src/extension.ts` into `out/extension.js`. The compiled JS is what Cursor actually runs — if you skip this step, the extension will use stale code.
+This compiles TypeScript into `out/` and bundles `dist/extension.js`. The VSIX ships the bundle — if you skip this step, the extension will use stale code.
 
 ## Step 4: Package the VSIX
 
 ```bash
-npx vsce package --allow-missing-repository
+just package-ext
 ```
 
-This creates `nml-lang-0.1.0.vsix` in the current directory.
+Or from `editors/vscode/` after WASM is built: `pnpm run package`.
 
 ## Step 5: Install in Cursor
 
 ```bash
-cursor --install-extension nml-lang-0.1.0.vsix
+cursor --install-extension editors/vscode/*.vsix
 ```
 
 ## Step 6: Reload Cursor
@@ -61,7 +62,7 @@ Open the command palette (Cmd+Shift+P) and run **Developer: Reload Window**.
 
 1. Open any `.nml` file.
 2. Open **Output** (View > Output) and select **"NML Language Server"** from the dropdown.
-3. You should see `Starting NML LSP: /Users/<you>/.cargo/bin/nml-lsp`.
+3. You should see the neutral server starting (WASM or native path).
 4. Try Cmd+Click on a name to test go-to-definition.
 
 ## Quick one-liner (after initial setup)
@@ -69,13 +70,7 @@ Open the command palette (Cmd+Shift+P) and run **Developer: Reload Window**.
 From the `nml` repo root:
 
 ```bash
-unset CARGO_TARGET_DIR \
-  && cargo build -p nml-lsp --release \
-  && cp target/release/nml-lsp ~/.cargo/bin/nml-lsp \
-  && cd editors/vscode \
-  && npm run compile \
-  && npx vsce package --allow-missing-repository \
-  && cursor --install-extension nml-lang-0.1.0.vsix
+just install
 ```
 
 Then reload Cursor.
@@ -84,6 +79,6 @@ Then reload Cursor.
 
 - **No "NML Language Server" in Output dropdown**: The extension didn't activate. Check Extensions view — is `NML Language Support` installed and enabled?
 - **"Failed to start language server"**: The binary path is wrong. Verify with `which nml-lsp` or set `nml.server.path` in Cursor settings.
-- **Changes not taking effect**: Make sure you ran `npm run compile` before `vsce package`. The VSIX bundles `out/extension.js`, not the TypeScript source.
-- **Binary didn't change after rebuild**: Cursor sets `CARGO_TARGET_DIR` to a sandbox temp folder. The build succeeds but the binary goes to the wrong place. Run `unset CARGO_TARGET_DIR` before `cargo build`. Verify with `md5 target/release/nml-lsp` before and after to confirm the binary actually changed.
+- **Changes not taking effect**: Run `just compile-ext` (or `just package-ext`) before installing the VSIX. The VSIX bundles `dist/extension.js`, not the TypeScript source.
+- **Binary didn't change after rebuild**: Cursor sets `CARGO_TARGET_DIR` to a sandbox temp folder. Run `unset CARGO_TARGET_DIR` before `cargo build`. Verify with `md5 target/release/nml-lsp` before and after.
 - **Cmd+Click not working**: Reload Cursor after installing. The LSP must be running (check Output panel).

@@ -16,14 +16,14 @@ updates:
   # with engines.vscode (see editors/vscode/VSCODE-API.md). Grouped bumps that
   # include @types/vscode break `vsce package` (e.g. PR #8).
   - package-ecosystem: npm
-    directory: /editors/vscode
+    directory: /
     schedule:
       interval: weekly
     groups:
-      npm-production:
+      pnpm-production:
         dependency-type: production
         patterns: ["*"]
-      npm-development:
+      pnpm-development:
         dependency-type: development
         patterns: ["*"]
         exclude-patterns:

@@ -32,32 +32,22 @@ jobs:
         # must be built from exactly the dependency set the gates verified.
         run: cargo build -p nml-lsp --target wasm32-wasip1 --release --locked
 
+      - uses: pnpm/action-setup@41ff72655975bd18cabda6b0909e8ead0e8c81a9 # v4
+        with:
+          package_json_file: package.json
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: editors/vscode/package-lock.json
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
       - name: Install extension deps
-        working-directory: editors/vscode
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
-      - name: VS Code API floor (engines.vscode ↔ @types/vscode)
-        working-directory: editors/vscode
-        run: npm run check:engines
+      - name: Extension verify (toolchain · typecheck · unit · bundle · audit)
+        run: pnpm --filter nml-lang run verify:ci
 
-      - name: Type-check
-        working-directory: editors/vscode
-        run: npm run typecheck
-
-      - name: Unit tests (wire contracts + status presentation)
-        working-directory: editors/vscode
-        run: npm run test:unit
-
-      - name: Bundle extension (esbuild + v10)
-        working-directory: editors/vscode
-        run: npm run bundle:js
-
-      # `npm test` runs the pretest (bundle:wasm + bundle:js + compile), then
+      # `pnpm test` runs the pretest (vscodePrepublish: wasm + js + compile), then
       # drives a real headless VS Code (downloading it + `ms-vscode.wasm-wasi-core`)
       # over the single-root and multi-root E2E suites. Xvfb gives Electron a
       # virtual display — started EXPLICITLY, not via `xvfb-run`: the wrapper's
@@ -70,11 +60,10 @@ jobs:
         working-directory: editors/vscode
         run: |
           Xvfb :99 -screen 0 1280x800x24 > /dev/null 2>&1 &
-          DISPLAY=:99 npm test
+          DISPLAY=:99 pnpm test
 
       - name: Package the VSIX
-        working-directory: editors/vscode
-        run: npx --yes @vscode/vsce package --allow-missing-repository
+        run: pnpm --filter nml-lang run package
 
       - name: Upload the VSIX artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -18,10 +18,9 @@ must be built and bundled first:
 
 ```sh
 # from the repo root
+corepack enable && pnpm install
 cargo build -p nml-lsp --target wasm32-wasip1 --release
-# from editors/vscode
-npm install
-npm test          # pretest bundles the .wasm and compiles; vscode-test runs it
+just verify-ext-full   # or: cd editors/vscode && pnpm test
 ```
 
 `@vscode/test-cli` downloads a throwaway VS Code into `.vscode-test/` and
@@ -38,7 +37,7 @@ only difference is transport.
 ## Debugging the extension (F5)
 
 The repo gitignores `.vscode/`, so editor launch config is each contributor's
-own. To debug interactively: build the bundle (`npm run bundle:js`, and once,
+own. To debug interactively: build the bundle (`pnpm run bundle:js`, and once,
 the WASM server per the Prerequisites above — without it the neutral server
 falls back to native `~/.cargo/bin/nml-lsp`), then add a personal
 `editors/vscode/.vscode/launch.json`:

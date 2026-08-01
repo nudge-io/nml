@@ -6,6 +6,6 @@ dist/
 # Downloaded VS Code instance for @vscode/test-cli E2E runs.
 .vscode-test/
 
-# Bundled language server, copied from the Rust build by `npm run bundle:wasm`
+# Bundled language server, copied from the Rust build by `pnpm run bundle:wasm`
 # (runs on `vscode:prepublish` so the .wasm ships in the .vsix).
 server/
