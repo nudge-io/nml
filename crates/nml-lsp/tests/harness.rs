@@ -1556,7 +1556,7 @@ async fn explain_code_action_is_negotiation_gated() {
 /// | store     | published, hash-verified store package | `Snapshot` |
 /// | in-binary | injected provider (the `nudge lsp` \
 ///               wiring)                                | `Snapshot` |
-/// | dir-mates | plain files beside the buffer          | `None`     |
+/// | registry  | plain workspace files (indexed set)    | `None`     |
 ///
 /// Identical universe content must produce identical verdicts, asserted
 /// through the REAL JSON-RPC pull per leg:
@@ -1679,19 +1679,57 @@ async fn universe_provenance_matrix() {
         assert_universe_verdicts("in-binary", &report);
     }
 
-    // Leg 4 — DIR-MATES fallback: no manifest, no store, no decoy (the
-    // missing name must stay genuinely missing); the same texts as plain
-    // disk siblings.
+    // Leg 4 — REGISTRY fallback: no manifest, no store, no decoy (the
+    // missing name must stay genuinely missing). The universe is the
+    // workspace registry set, so the trait deliberately lives in a
+    // DIFFERENT directory than the buffer — the exact layout that once
+    // produced a false `unknown \`is\` target` squiggle on a mixin the
+    // same server could F12 to (the load pass's fallback used to see
+    // only parent-directory neighbors).
     {
-        let base = temp_dir("uni-mates");
+        let base = temp_dir("uni-registry");
+        let ws = base.join("ws");
+        fs::create_dir_all(ws.join("a")).expect("create ws/a");
+        fs::create_dir_all(ws.join("b")).expect("create ws/b");
+        fs::write(ws.join("a/base.model.nml"), UNI_BASE).expect("base");
+        fs::write(ws.join("a/polluted.model.nml"), UNI_POLLUTED).expect("polluted");
+
+        let mut h = Harness::new(Store::at(base.join("store")));
+        h.initialize(&ws).await;
+        let report = h.open(&ws.join("b/child.model.nml"), UNI_BUFFER).await;
+        assert_universe_verdicts("registry", &report);
+    }
+
+    // Leg 5 — BUFFER-FIRST LIVENESS through the production read path: a
+    // declared sibling's UNSAVED edit must change the buffer's verdict
+    // (the unit tests cover the assembler; this pins the server's own
+    // documents-lock closure with genuinely divergent buffer vs disk).
+    {
+        let base = temp_dir("uni-liveness");
         let ws = base.join("ws");
         fs::create_dir_all(&ws).expect("create workspace");
+        let manifest = universe_package();
+        fs::write(ws.join("uni.package.nml"), &manifest.manifest_text).expect("manifest");
         fs::write(ws.join("base.model.nml"), UNI_BASE).expect("base");
         fs::write(ws.join("polluted.model.nml"), UNI_POLLUTED).expect("polluted");
+        fs::write(ws.join("app.nml"), "").expect("claim anchor");
 
         let mut h = Harness::new(Store::at(base.join("store")));
         h.initialize(&ws).await;
         let report = h.open(&ws.join("child.model.nml"), UNI_BUFFER).await;
-        assert_universe_verdicts("dir-mates", &report);
+        assert_universe_verdicts("liveness-pre", &report);
+
+        // Rename the trait in the OPEN buffer only — disk still says
+        // `base`. The child's next pull must see the buffer.
+        h.open(&ws.join("base.model.nml"), "trait renamed:\n    x string\n")
+            .await;
+        let report = h.diagnostics(&file_uri(&ws.join("child.model.nml"))).await;
+        let diags = report["diagnostics"].as_array().expect("array");
+        assert!(
+            diags.iter().any(|d| d["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("unknown `is` target 'base'"))),
+            "an unsaved sibling edit must reach the buffer's verdict: {diags:?}"
+        );
     }
 }

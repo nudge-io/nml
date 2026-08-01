@@ -76,12 +76,41 @@ mod tests {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).expect("source readable");
-                for (i, line) in text.lines().enumerate() {
-                    if line.contains("fs::read_dir(")
-                        && !line.contains("wasi_fs::read_dir(")
-                        && !line.trim_start().starts_with("//")
-                    {
-                        offenders.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+                // Comment-stripped, whitespace-collapsed view: catches
+                // multiline calls (`fs::read_dir\n(dir)`), the
+                // `Path::read_dir()` METHOD form (which returns the same
+                // panicking `std::fs::ReadDir`), and import-style
+                // aliases (`use std::fs::read_dir;` / `read_dir as rd`)
+                // that a line-literal match waves through. Legal calls
+                // are removed via sentinel replacement BEFORE matching,
+                // so no counting arithmetic can underflow or double-hit.
+                let stripped: String = text
+                    .lines()
+                    .map(|l| l.split("//").next().unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let collapsed: String = stripped.split_whitespace().collect::<Vec<_>>().join("");
+                let scrubbed = collapsed.replace("wasi_fs::read_dir(", "\u{0}LEGAL\u{0}(");
+                let violation = scrubbed.contains("fs::read_dir(")
+                    || scrubbed.contains(".read_dir(")
+                    || scrubbed.contains("usestd::fs::read_dir")
+                    || scrubbed.contains("read_diras")
+                    || scrubbed.split("usestd::fs::{").skip(1).any(|seg| {
+                        seg.split('}')
+                            .next()
+                            .is_some_and(|b| b.contains("read_dir"))
+                    });
+                if violation {
+                    for (i, line) in text.lines().enumerate() {
+                        let code = line.split("//").next().unwrap_or("");
+                        if code.contains("read_dir") && !code.contains("wasi_fs::read_dir(") {
+                            offenders.push(format!(
+                                "{}:{}: {}",
+                                path.display(),
+                                i + 1,
+                                line.trim()
+                            ));
+                        }
                     }
                 }
             }

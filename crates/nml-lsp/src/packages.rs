@@ -135,12 +135,13 @@ pub enum SchemaUniverse {
     /// PUBLISHED sources, not whatever sits nearby on disk. Nothing
     /// live exists to prefer: store slots are written exactly once.
     /// (A store source file OPENED directly is outside workspace
-    /// roots, resolves as uncovered, and its directory-mates are the
-    /// slot's own siblings — the correct universe emerges from the
-    /// fallback.)
+    /// roots and resolves as uncovered — pinned by
+    /// `store_slot_paths_resolve_uncovered`.)
     Snapshot(std::sync::Arc<nml_validate::package::SchemaPackage>),
-    /// No usable declaration — assembly falls back to the buffer's
-    /// directory-mates.
+    /// No usable declaration — assembly falls back to the WORKSPACE
+    /// REGISTRY SET (every `.model.nml` document the server holds), the
+    /// same one-namespace the registry validator and go-to-definition
+    /// resolve against (RFC 0012).
     None,
 }
 
@@ -1937,6 +1938,38 @@ mod tests {
             ),
             other => panic!("workspace coverage must declare paths, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// A path OUTSIDE the workspace roots — e.g. a store slot's own
+    /// source file opened directly — never resolves coverage: root
+    /// containment fails for every definition source, so the file
+    /// validates as uncovered rather than borrowing some package's
+    /// authority.
+    #[test]
+    fn store_slot_paths_resolve_uncovered() {
+        let ws = temp_ws("outside-roots-uncovered");
+        let store_base = ws.join("store");
+        std::fs::create_dir_all(&store_base).unwrap();
+        Store::at(&store_base)
+            .publish(&nml_validate::test_support::demo_package_with_directives())
+            .expect("publish");
+        let resolver = PackageResolver::new(Some(Store::at(&store_base)), test_events().0);
+        let roots = vec![ws.join("project")];
+        std::fs::create_dir_all(&roots[0]).unwrap();
+        let view = WorkspaceView {
+            roots: &roots,
+            manifests: &[],
+            doc_text: &no_docs,
+        };
+        let outside = store_base.join("schema-packages/demo/core.model.nml");
+        assert!(
+            !matches!(
+                resolver.vocabulary_for(&outside, &view),
+                VocabularyOutcome::Covered(_)
+            ),
+            "outside-roots paths must not resolve coverage"
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 

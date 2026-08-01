@@ -629,27 +629,58 @@ impl Inner {
                 _ => &packages::SchemaUniverse::None,
             };
             let (sources, own_name) = match uri.to_file_path() {
-                // Store coverage: the package's hash-verified source
-                // snapshot IS the universe — no disk reads at all.
                 Ok(own_path) => {
-                    if let packages::SchemaUniverse::Snapshot(pkg) = universe {
-                        snapshot_universe(&own_path, text, &pkg.sources)
-                    } else {
-                        let declared: &[std::path::PathBuf] = match universe {
-                            packages::SchemaUniverse::Declared(paths) => paths,
-                            _ => &[],
-                        };
-                        let read = |p: &Path| -> Option<String> {
-                            let file_uri = Url::from_file_path(p).ok()?;
-                            let buffered = self
+                    // Canonicalized like `with_workspace_view`'s document
+                    // path: coverage was resolved against canonical roots
+                    // and manifest dirs, so a symlink-spelled buffer path
+                    // (`/tmp` vs `/private/tmp`) would fail the
+                    // declared-entry identity check below and double-enter
+                    // its own universe — a wall of false duplicate errors.
+                    let own_path = dunce::canonicalize(&own_path).unwrap_or(own_path);
+                    match universe {
+                        // Store/in-binary coverage: the package's
+                        // hash-verified source snapshot IS the universe —
+                        // no disk reads at all.
+                        packages::SchemaUniverse::Snapshot(pkg) => {
+                            snapshot_universe(&own_path, text, &pkg.sources)
+                        }
+                        packages::SchemaUniverse::Declared(paths) if !paths.is_empty() => {
+                            let read = |p: &Path| -> Option<String> {
+                                let file_uri = Url::from_file_path(p).ok()?;
+                                let buffered = self
+                                    .documents
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .get(&file_uri)
+                                    .cloned();
+                                buffered.or_else(|| fs::read_to_string(p).ok())
+                            };
+                            declared_universe(&own_path, text, paths, &read)
+                        }
+                        // Uncovered: the universe is the WORKSPACE
+                        // REGISTRY SET — every `.model.nml` the server
+                        // holds (indexed + open), the same one namespace
+                        // the registry validator, goto-definition, and
+                        // hover resolve against (RFC 0012). Anything
+                        // narrower contradicts the server's own
+                        // navigation: a mixin defined one directory over
+                        // would squiggle "unknown" while F12 jumps to it.
+                        // No filesystem walk: `documents` already carries
+                        // the freshest text for every member.
+                        _ => {
+                            let docs: Vec<(String, String)> = self
                                 .documents
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .get(&file_uri)
-                                .cloned();
-                            buffered.or_else(|| fs::read_to_string(p).ok())
-                        };
-                        assemble_schema_universe(&own_path, text, declared, &read)
+                                .iter()
+                                .filter(|(u, _)| u.as_str().ends_with(".model.nml") && *u != uri)
+                                .filter_map(|(u, t)| {
+                                    let p = u.to_file_path().ok()?;
+                                    Some((p.to_string_lossy().into_owned(), t.clone()))
+                                })
+                                .collect();
+                            registry_universe(&own_path, text, docs)
+                        }
                     }
                 }
                 // A non-file buffer (untitled) still validates — as its own
@@ -942,31 +973,27 @@ impl Inner {
 /// of the (canonicalized) workspace roots. Clients can send arbitrary
 /// `file://` URIs in watched-file notifications, so this is the boundary
 /// check that keeps the server from reading files outside the workspace.
-/// Directory-mates fallback bound: a pathological directory must not turn
+/// Uncovered-universe bound: a pathological workspace must not turn
 /// every diagnostics pull into an unbounded load. Manifest-declared
 /// universes are author-bounded and uncapped.
 const MAX_UNIVERSE_FILES: usize = 128;
 
-/// Assemble a `.model.nml` buffer's validation universe as `(name, text)`
-/// sources for `load_schema`, plus the name identifying the buffer itself.
-///
-/// Covered files use `declared` — the covering package's `[]schema` in
-/// MANIFEST order, because merge order decides which duplicate definition
-/// is "second" (and so carries the error); the editor must agree with
-/// every other consumer of the package about that. Uncovered files fall
-/// back to the buffer's directory-mates in sorted order (deterministic
-/// merge ⇒ deterministic attribution), bounded by [`MAX_UNIVERSE_FILES`].
+/// Assemble a COVERED `.model.nml` buffer's validation universe from its
+/// package's `[]schema` paths, in MANIFEST order — merge order decides
+/// which duplicate definition is "second" (and so carries the error), so
+/// the editor must agree with every other consumer of the package.
 ///
 /// Reads are buffer-first through `read` (an open buffer is the sole
-/// source of truth for its file; disk is the fallback), the buffer's own
-/// text always wins for its own path, and symlinked directory-mates are
-/// refused — the same disk-intake rule as [`watched_file_is_eligible`].
-/// A declared file that is missing on disk contributes nothing (its
-/// absence is the package's own resolution problem, reported there); a
-/// covered-but-undeclared buffer (the sibling trap) is appended AFTER the
-/// declared set, so duplicate attribution lands on the undeclared file —
-/// the one whose declaration status is in question.
-fn assemble_schema_universe(
+/// source of truth for its file; disk is the fallback), and the buffer's
+/// own text always wins for its own path. A declared file missing on
+/// disk contributes nothing (its absence is the package's own resolution
+/// problem, reported there); a covered-but-undeclared buffer (the
+/// sibling trap) is appended AFTER the declared set, so duplicate
+/// attribution lands on the undeclared file — the one whose declaration
+/// status is in question. `own_path` is canonicalized by the caller so
+/// the declared-entry identity check cannot be defeated by symlink or
+/// case spelling.
+fn declared_universe(
     own_path: &Path,
     own_text: &str,
     declared: &[PathBuf],
@@ -975,41 +1002,6 @@ fn assemble_schema_universe(
     let name_of = |p: &Path| p.to_string_lossy().into_owned();
     let own_name = name_of(own_path);
     let mut sources: Vec<(String, String)> = Vec::new();
-
-    if declared.is_empty() {
-        // Directory-mates universe. Sorted for determinism; own file
-        // always present (and always the buffer's text).
-        let mut mates: Vec<PathBuf> = Vec::new();
-        if let Some(dir) = own_path.parent() {
-            if let Ok(entries) = crate::wasi_fs::read_dir(dir) {
-                for entry in entries {
-                    let p = entry.path();
-                    let is_model = p
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.ends_with(".model.nml"));
-                    let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true);
-                    if is_model && !is_symlink && p != own_path {
-                        mates.push(p);
-                    }
-                }
-            }
-        }
-        mates.sort();
-        mates.truncate(MAX_UNIVERSE_FILES.saturating_sub(1));
-        // Own file first: with no declared order to honor, putting the
-        // buffer first pins duplicate attribution onto the OTHER file —
-        // the user is looking at this one, and the loader errors the
-        // second occurrence.
-        sources.push((own_name.clone(), own_text.to_string()));
-        for mate in mates {
-            if let Some(text) = read(&mate) {
-                sources.push((name_of(&mate), text));
-            }
-        }
-        return (sources, own_name);
-    }
-
     let mut own_declared = false;
     for entry in declared {
         if entry.as_path() == own_path {
@@ -1022,6 +1014,29 @@ fn assemble_schema_universe(
     if !own_declared {
         sources.push((own_name.clone(), own_text.to_string()));
     }
+    (sources, own_name)
+}
+
+/// Assemble an UNCOVERED `.model.nml` buffer's validation universe from
+/// the workspace registry set: every other `.model.nml` document the
+/// server holds (indexed + open), freshest text by construction. This is
+/// the SAME one-namespace the registry validator and go-to-definition
+/// resolve against (RFC 0012) — an uncovered buffer's `is` targets must
+/// get the same verdict the server's own navigation gives them. Sorted
+/// for deterministic merge order, bounded by [`MAX_UNIVERSE_FILES`]
+/// (own buffer first, so duplicate attribution lands on the other
+/// file); entries beyond the cap drop deterministically (sorted tail).
+fn registry_universe(
+    own_path: &Path,
+    own_text: &str,
+    mut docs: Vec<(String, String)>,
+) -> (Vec<(String, String)>, String) {
+    let own_name = own_path.to_string_lossy().into_owned();
+    docs.sort_by(|a, b| a.0.cmp(&b.0));
+    docs.truncate(MAX_UNIVERSE_FILES.saturating_sub(1));
+    let mut sources = Vec::with_capacity(docs.len() + 1);
+    sources.push((own_name.clone(), own_text.to_string()));
+    sources.extend(docs);
     (sources, own_name)
 }
 
@@ -8668,7 +8683,7 @@ workflow VoiceAgent:
 
         let read = |p: &Path| fs::read_to_string(p).ok();
         let declared = vec![a.clone(), missing.clone(), b.clone()];
-        let (sources, own_name) = assemble_schema_universe(&b, "model b:\n", &declared, &read);
+        let (sources, own_name) = declared_universe(&b, "model b:\n", &declared, &read);
         assert_eq!(own_name, b.to_string_lossy());
         let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
@@ -8680,7 +8695,7 @@ workflow VoiceAgent:
 
         // Undeclared own file: appended after the declared set.
         let c = root.join("c.model.nml");
-        let (sources, _) = assemble_schema_universe(&c, "model c:\n", &declared, &read);
+        let (sources, _) = declared_universe(&c, "model c:\n", &declared, &read);
         assert_eq!(
             sources.last().map(|(n, _)| n.as_str()),
             Some(c.to_string_lossy().as_ref()),
@@ -8708,39 +8723,32 @@ workflow VoiceAgent:
         assert_eq!(out[2].1, "model c:\n", "buffer text is the live text");
     }
 
-    /// Directory-mates (uncovered) universe: own buffer first, mates
-    /// sorted, non-model files and symlinks refused.
+    /// Registry (uncovered) universe: own buffer first, members sorted,
+    /// and the MAX_UNIVERSE_FILES bound applies deterministically to the
+    /// sorted tail — the cap is a real pin, not a comment.
     #[test]
-    fn dir_mates_universe_is_sorted_and_symlink_free() {
-        let root = temp_workspace("universe-mates");
-        let own = root.join("m.model.nml");
-        fs::write(&own, "model m:\n").unwrap();
-        fs::write(root.join("z.model.nml"), "model z:\n").unwrap();
-        fs::write(root.join("a.model.nml"), "model a:\n").unwrap();
-        fs::write(root.join("notes.nml"), "x Y:\n").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(root.join("a.model.nml"), root.join("link.model.nml")).unwrap();
-
-        let read = |p: &Path| fs::read_to_string(p).ok();
-        let (sources, own_name) = assemble_schema_universe(&own, "model m:\n", &[], &read);
-        let names: Vec<String> = sources
-            .iter()
-            .map(|(n, _)| {
-                Path::new(n)
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
+    fn registry_universe_is_sorted_capped_and_own_first() {
+        let own = Path::new("/ws/mine.model.nml");
+        let docs: Vec<(String, String)> = (0..MAX_UNIVERSE_FILES + 40)
+            .map(|i| (format!("/ws/m{i:04}.model.nml"), format!("model m{i}:\n")))
             .collect();
+        let (sources, own_name) = registry_universe(own, "model mine:\n", docs);
+        assert_eq!(own_name, "/ws/mine.model.nml");
         assert_eq!(
-            names,
-            vec!["m.model.nml", "a.model.nml", "z.model.nml"],
-            "own first, mates sorted, symlink and non-model refused"
+            sources.len(),
+            MAX_UNIVERSE_FILES,
+            "cap bounds the universe including the buffer"
         );
-        assert_eq!(own_name, own.to_string_lossy());
-
-        fs::remove_dir_all(&root).ok();
+        assert_eq!(sources[0].0, own_name, "own buffer first");
+        let tail: Vec<&str> = sources[1..].iter().map(|(n, _)| n.as_str()).collect();
+        let mut sorted = tail.clone();
+        sorted.sort();
+        assert_eq!(tail, sorted, "members sorted for deterministic merge");
+        assert_eq!(
+            tail.last().copied(),
+            Some("/ws/m0126.model.nml"),
+            "the cap drops the sorted tail, deterministically"
+        );
     }
 
     // ── Hover markdown safety ─────────────────────────────────

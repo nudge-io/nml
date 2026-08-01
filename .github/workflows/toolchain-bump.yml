@@ -55,7 +55,12 @@ jobs:
             exit 0
           fi
           branch="toolchain-bump/$latest"
-          if [ "$(gh pr list --head "$branch" --state open --json number --jq length)" != "0" ]; then
+          # Assignment as its own statement so `set -e` propagates a gh
+          # failure: inlined in the `if` condition, a rate-limited/offline
+          # `gh` yields an empty string, the comparison "succeeds", and the
+          # job exits green claiming a PR exists — silently skipping bumps.
+          open_prs="$(gh pr list --head "$branch" --state open --json number --jq length)"
+          if [ "$open_prs" != "0" ]; then
             echo "bump PR for $latest already open"
             exit 0
           fi

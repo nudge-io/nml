@@ -68,6 +68,23 @@ export function wasmUriConverters(): {
 } {
   const folders = workspace.workspaceFolders ?? [];
   const single = folders.length === 1;
+  // wasm-wasi-core mounts multi-root folders by NAME (`/workspaces/<name>`),
+  // so two folders sharing a basename collapse onto one guest mount and
+  // every URI for the loser cross-attributes to the winner — diagnostics
+  // land on the wrong files. The host scheme owns the collision; the best
+  // the extension can do is refuse to be silent about it.
+  const names = folders.map((f) => f.name);
+  const dupes = names.filter((n, i) => names.indexOf(n) !== i);
+  if (dupes.length > 0) {
+    console.error(
+      `nml: workspace folders with duplicate names ${JSON.stringify([
+        ...new Set(dupes),
+      ])} collide in the WASI mount scheme (/workspaces/<name>); ` +
+        "diagnostics may attach to the wrong folder. Rename the folders " +
+        "(File > Rename Workspace Folder) or use the native server " +
+        "(nml.server.path)."
+    );
+  }
   const mapping = folders
     .map((f) => ({
       hostPrefix: f.uri.toString().replace(/\/$/, ""),
