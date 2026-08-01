@@ -59,16 +59,21 @@ describe("check-toolchain CLI", () => {
   });
 
   it("exits 1 when runtime versions fail policy", () => {
+    // GitHub Actions sets CI=true, which intentionally disables the test
+    // runtime override — unset it so this negative-path test can inject
+    // bad versions without fighting the real CI toolchain.
+    const env = {
+      ...process.env,
+      NML_TOOLCHAIN_TEST_RUNTIME: JSON.stringify({
+        pnpmVersion: "10.0.0",
+        nodeVersion: "22.0.0",
+      }),
+    };
+    delete env.CI;
     const result = spawnSync(process.execPath, [checkScript], {
       cwd: packageDir,
       encoding: "utf8",
-      env: {
-        ...process.env,
-        NML_TOOLCHAIN_TEST_RUNTIME: JSON.stringify({
-          pnpmVersion: "10.0.0",
-          nodeVersion: "22.0.0",
-        }),
-      },
+      env,
     });
     assert.equal(result.status, 1, result.stdout || result.stderr);
     assert.match(result.stderr, /check-toolchain:/);
