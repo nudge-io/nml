@@ -165,7 +165,12 @@ pub enum VocabularyOutcome {
 
 /// Verdict of one bounded claims walk ([`package_claims_file_under`]).
 /// `Truncated` is deliberately distinct from `NoClaim`: a capped walk proves
-/// nothing, so it must be neither cached nor treated as definitive absence.
+/// nothing and must never be treated as definitive absence. It IS cached —
+/// as `Truncated`, never coerced to a yes/no — under the same staleness
+/// contract as the definitive verdicts (keyed by content hash + root;
+/// filesystem-only changes surface when the hash next changes). Re-walking
+/// ~2k entries on EVERY pull froze the keystroke path on oversized roots
+/// and, under wasm-wasi-core, leaked one guest fd per directory per pull.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClaimScan {
     Claims,
@@ -290,7 +295,7 @@ pub struct PackageResolver {
     /// walk is a keystroke-path hazard. The content hash keys glob changes;
     /// filesystem-only changes under an unchanged package are picked up when
     /// the hash next changes (acceptable staleness for a coverage question).
-    claims_cache: Mutex<HashMap<(String, PathBuf), bool>>,
+    claims_cache: Mutex<HashMap<(String, PathBuf), ClaimScan>>,
 }
 
 impl PackageResolver {
@@ -350,32 +355,26 @@ impl PackageResolver {
     /// memo for (content hash, root) first, walk only on a miss.
     fn package_claims_cached(&self, def: &Definition, root: &Path) -> ClaimScan {
         let key = (def.hash.clone(), root.to_path_buf());
-        if let Some(&claims) = self
+        if let Some(&scan) = self
             .claims_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
         {
-            return if claims {
-                ClaimScan::Claims
-            } else {
-                ClaimScan::NoClaim
-            };
+            return scan;
         }
         let scan = package_claims_file_under(&def.package, root);
-        // Only DEFINITIVE verdicts are cached: a truncated walk proves
-        // nothing, and memoizing it would freeze "undetermined" into a wrong
-        // yes/no until the content hash next changes.
-        if let verdict @ (ClaimScan::Claims | ClaimScan::NoClaim) = scan {
+        {
             let mut cache = self.claims_cache.lock().unwrap_or_else(|e| e.into_inner());
             // Bounded like the validator cache and for the same reason: source
             // edits mint a new content hash per keystroke, so unbounded entries
             // grow for the length of the session. Cap-and-clear; walks are cheap
-            // to redo on demand.
+            // to redo on demand. `Truncated` is cached AS truncated (it stays
+            // "answer unknown" — see `ClaimScan`), never as a yes/no.
             if cache.len() >= VALIDATOR_CACHE_CAP {
                 cache.clear();
             }
-            cache.insert(key, verdict == ClaimScan::Claims);
+            cache.insert(key, scan);
         }
         scan
     }
@@ -1105,10 +1104,10 @@ fn package_claims_file_under(package: &SchemaPackage, root: &Path) -> ClaimScan 
     // treat it as definitive absence.
     let mut truncated = false;
     while let Some((dir, depth)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Ok(entries) = crate::wasi_fs::read_dir(&dir) else {
             continue;
         };
-        for entry in entries.flatten() {
+        for entry in entries {
             visited += 1;
             if visited > MAX_ENTRIES {
                 return ClaimScan::Truncated;

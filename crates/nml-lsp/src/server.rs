@@ -218,11 +218,11 @@ impl Inner {
         if depth > MAX_DIR_DEPTH || files.len() >= MAX_FILE_COUNT {
             return;
         }
-        let entries = match fs::read_dir(dir) {
+        let entries = match crate::wasi_fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
         };
-        for entry in entries.flatten() {
+        for entry in entries {
             let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
             if is_symlink {
                 continue;
@@ -981,8 +981,8 @@ fn assemble_schema_universe(
         // always present (and always the buffer's text).
         let mut mates: Vec<PathBuf> = Vec::new();
         if let Some(dir) = own_path.parent() {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
+            if let Ok(entries) = crate::wasi_fs::read_dir(dir) {
+                for entry in entries {
                     let p = entry.path();
                     let is_model = p
                         .file_name()

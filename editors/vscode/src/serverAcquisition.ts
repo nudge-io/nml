@@ -126,6 +126,9 @@ export async function createWasmServer(module: Uri, log: OutputChannel): Promise
       err: { kind: "pipeOut" },
     },
     mountPoints: [{ kind: "workspaceFolder" }],
+    // Panic messages already reach the log via the stderr drain below;
+    // the backtrace turns "panicked in std" into a named caller.
+    env: { RUST_BACKTRACE: "1" },
   });
   // Runs until stdin EOF or `terminate()`. Normal exit resolves; an
   // instantiation/trap before stdio is wired rejects — surface it to the log
@@ -138,8 +141,18 @@ export async function createWasmServer(module: Uri, log: OutputChannel): Promise
     throw new Error("wasm process was created without piped stdio");
   }
   // Drain stderr to the log — otherwise a panic is both invisible and, on an
-  // undrained pipe, a backpressure hazard.
-  proc.stderr?.onData((data) => log.append(new TextDecoder().decode(data)));
+  // undrained pipe, a backpressure hazard. Panic-shaped lines ALSO go to
+  // console.error: the OutputChannel has no read-back API, so in the E2E
+  // harness a server abort would otherwise surface only as downstream
+  // timeouts with the actual Rust panic message unrecoverable (exactly how
+  // a CI failure shipped with no cause attached).
+  proc.stderr?.onData((data) => {
+    const text = new TextDecoder().decode(data);
+    log.append(text);
+    if (text.includes("panicked") || text.includes("RUST_BACKTRACE")) {
+      console.error(`nml-lsp stderr: ${text}`);
+    }
+  });
 
   const nodeReadable = new Readable({ read() {} });
   wasmOut.onData((data) => nodeReadable.push(Buffer.from(data)));

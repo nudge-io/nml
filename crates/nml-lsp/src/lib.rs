@@ -2,6 +2,7 @@ pub mod diagnostics;
 pub mod packages;
 pub mod position;
 pub mod server;
+mod wasi_fs;
 
 #[cfg(not(target_arch = "wasm32"))]
 use tower_lsp::Server;
