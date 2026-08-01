@@ -1,6 +1,8 @@
 pub mod diagnostics;
+pub mod duration_lsp;
 pub mod packages;
 pub mod position;
+pub mod semantic_tokens;
 pub mod server;
 mod wasi_fs;
 

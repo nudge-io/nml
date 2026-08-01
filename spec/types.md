@@ -87,14 +87,16 @@ debug = false
 
 ### `duration`
 
-Exact time duration literals (RFC 0017) — an unsigned integer
-immediately followed by one unit suffix (see [syntax.md](syntax.md)
-§Duration Literals for the exact grammar):
+Exact time duration literals (RFC 0017, as amended) — one or more
+components, each an unsigned integer immediately followed by a unit
+suffix (see [syntax.md](syntax.md) §Duration Literals for the exact
+grammar):
 
 ```
 sessionDuration = 72h
 timeout = 30s
 pollInterval = 500ms
+gracePeriod = 1h30m
 ```
 
 Supported units (the complete set, closed by construction — `ns` is the
@@ -106,13 +108,16 @@ domain's resolution floor, `h` the largest exact unit):
 - `us` -- microseconds (ASCII spelling; `µ` is not source-legal)
 - `ns` -- nanoseconds
 
-Durations are stored as the authored `(magnitude, unit)` pair — the
-formatter never rescales `72h` — and compare **semantically**: `30s`
-equals `30000ms`, so a set cannot hold both and a reload diff between
-the two spellings is no change. Deserialization lands in the consumer's
-native duration type; a duration-typed field fed from `$ENV` arrives as
-resolved text and is coerced to the same typed value at that boundary,
-exactly as numbers and bools are.
+Durations are stored as the authored segments, coarse→fine — the
+formatter never rescales `72h` or carries `60m` into `1h` — and compare
+**semantically**: `30s` equals `30000ms` and `90m` equals `1h30m`, so a
+set cannot hold both spellings and a reload diff between them is no
+change. Deserialization lands in the consumer's native duration type; a
+duration-typed field fed from `$ENV` arrives as resolved text and is
+coerced to the same typed value at that boundary, exactly as numbers and
+bools are (the coercion grammar additionally merges repeated units and
+decomposes exact fractions — `"1.5h"` → `1h30m` — for machine-emitted
+input).
 
 ### `path`
 

@@ -187,14 +187,18 @@ jobs:
             fuzz-corpus-
       - name: smoke-run fuzz targets
         working-directory: fuzz
-        # The fixtures corpus gives the coverage-guided mutator a running
-        # start (real documents, boundary literals) instead of starting
-        # from zero bytes each run; the first dir is the writable corpus.
+        # Every target in fuzz_targets/ runs — a target that exists but is
+        # never smoked is a regression net with a hole in it. The tracked
+        # seeds/<target>/ landmarks and the fixtures corpus give the
+        # coverage-guided mutator a running start (real documents,
+        # boundary literals) instead of starting from zero bytes each run;
+        # the first dir is the writable corpus, the rest are read-only —
+        # the same layout the Justfile's local `fuzz` recipe uses.
         run: |
-          for target in number document money format; do
-            mkdir -p "corpus/$target"  # fresh checkouts have no corpus dir; libFuzzer requires it
-            cargo +nightly fuzz run "$target" "corpus/$target" ../tests/fixtures/valid \
-              -- -runs=20000 -max_total_time=60
+          for target in number document money format duration validate; do
+            mkdir -p "corpus/$target" "seeds/$target"  # fresh checkouts have no corpus dir; libFuzzer requires it
+            cargo +nightly fuzz run "$target" "corpus/$target" "seeds/$target" ../tests/fixtures/valid \
+              -- -runs=20000 -max_total_time=60 -dict=nml.dict
           done
       # actions/cache saves only on job SUCCESS (post-if), so the run that
       # FINDS a crash would otherwise discard both its grown corpus and the

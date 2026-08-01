@@ -6783,22 +6783,32 @@ mod duration_tests {
         for ok in ["72h", "30m", "5s", "500ms", "0s"] {
             assert!(diags_for(ok).is_empty(), "{ok} is a typed duration");
         }
-        // The migration: a QUOTED duration is NML0001 with the literal as
-        // the machine-applicable fix (spanning the whole quoted string).
-        let diags = diags_for("\"30s\"");
-        let hit = diags
-            .iter()
-            .find(|d| code_of(d).as_deref() == Some("NML0001"))
-            .expect("quoted duration is the replaced-syntax migration");
-        assert_eq!(
-            hit.suggestions.first().map(|s| s.replacement.as_str()),
-            Some("30s")
-        );
+        // The migration: a QUOTED duration is NML0001 with the canonical
+        // literal as the machine-applicable fix (spanning the whole quoted
+        // string). The coercion grammar judges the string, so compound
+        // spellings and exact fractions migrate too — to the canonical
+        // compound literal.
+        for (quoted, fix) in [
+            ("\"30s\"", "30s"),
+            ("\"1h 30m\"", "1h30m"),
+            ("\"1.5h\"", "1h30m"),
+        ] {
+            let diags = diags_for(quoted);
+            let hit = diags
+                .iter()
+                .find(|d| code_of(d).as_deref() == Some("NML0001"))
+                .unwrap_or_else(|| {
+                    panic!("quoted duration is the replaced-syntax migration: {diags:?}")
+                });
+            assert_eq!(
+                hit.suggestions.first().map(|s| s.replacement.as_str()),
+                Some(fix),
+                "{quoted}"
+            );
+        }
         // A string that is NOT duration text — and every other wrong kind —
         // is the ordinary type mismatch, never a special case.
-        for bad in [
-            "\"30x\"", "\"1.5h\"", "\"-3s\"", "\"s\"", "\"12\"", "30", "true",
-        ] {
+        for bad in ["\"30x\"", "\"-3s\"", "\"s\"", "\"12\"", "30", "true"] {
             let diags = diags_for(bad);
             assert!(
                 diags

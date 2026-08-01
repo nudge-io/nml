@@ -898,21 +898,17 @@ impl<'a> Parser<'a> {
                         f.complete(self, SyntaxKind::Facet);
                         break;
                     }
-                    self.bump(); // number
-                    // RFC 0017 duration unit (`5s`, `250ms`): an Ident
-                    // glued to the magnitude on the same line. Whether
-                    // the unit is legal here is the definition pass's
-                    // question (domain vs the field's type) — the
-                    // grammar just carries the author's literal. An Ident
-                    // followed by `=` is NOT a unit: it is the next facet
-                    // key after a missing comma (`min = 5 max = 10`), and
-                    // eating it would misdirect the lead diagnostic to
-                    // "unknown unit `max`" instead of the real defect.
-                    if self.at(SyntaxKind::Ident)
-                        && !self.newline_before()
-                        && self.nth(1) != SyntaxKind::Eq
-                    {
-                        self.bump(); // unit
+                    if self.peek_number_suffix() {
+                        let suffix_text = self.token_text_at(self.pos + 1).to_string();
+                        let dl = self.start();
+                        self.bump(); // magnitude
+                        self.bump(); // unit (facet values have no money path)
+                        if crate::duration::is_duration_suffix_shape(&suffix_text) {
+                            self.consume_duration_component_tail();
+                        }
+                        dl.complete(self, SyntaxKind::DurationLiteral);
+                    } else {
+                        self.bump(); // bare number
                     }
                     f.complete(self, SyntaxKind::Facet);
                     if !self.eat(SyntaxKind::Comma) {
@@ -1099,27 +1095,70 @@ impl<'a> Parser<'a> {
     }
 
     /// A number, optionally followed by a **same-line** unit identifier —
-    /// a currency code (money) or a duration unit (RFC 0017). The parser
-    /// recognizes only the `Number Ident` *shape*; classification (3
-    /// uppercase → currency, a `DurationUnit` suffix → duration unit, anything
-    /// else → `NML3004`) is the value layer's job, so a mistyped suffix
-    /// gets a coded diagnostic with a fix instead of a generic parse error.
+    /// a currency code (money) or a duration unit (RFC 0017). Compound
+    /// durations (`1h30m`) consume an alternating Number/Ident chain inside
+    /// a [`SyntaxKind::DurationLiteral`] node; money stays flat.
     fn number_value(&mut self) {
-        self.bump(); // number
-        if self.at_number_suffix() {
-            self.bump();
+        if !self.at(SyntaxKind::Number) {
+            return;
         }
+        if self.peek_number_suffix() {
+            let suffix_text = self.token_text_at(self.pos + 1).to_string();
+            if !crate::money::is_currency_code(&suffix_text) {
+                let m = self.start();
+                self.bump(); // magnitude
+                self.bump(); // unit (known duration suffix or unknown)
+                if crate::duration::is_duration_suffix_shape(&suffix_text) {
+                    self.consume_duration_component_tail();
+                }
+                m.complete(self, SyntaxKind::DurationLiteral);
+                return;
+            }
+        }
+        self.bump(); // bare number or money magnitude
+        if self.at_number_suffix() {
+            self.bump(); // currency code
+        }
+    }
+
+    /// Continue a compound duration literal: `Number` + duration-suffix
+    /// `Ident` pairs on the same line until the chain ends or a dangling
+    /// `Number` remains (decoder emits NML3008).
+    fn consume_duration_component_tail(&mut self) {
+        while self.at(SyntaxKind::Number) && !self.newline_before() {
+            self.bump(); // magnitude
+            if self.at_number_suffix() {
+                self.bump(); // unit
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn token_text_at(&self, idx: usize) -> &str {
+        self.toks.get(idx).map_or("", |t| t.text)
     }
 
     /// A unit suffix must follow the number on the same line — otherwise an
     /// identifier starting the *next* entry (a `USD = …` property, or —
     /// far more plausibly — a field named `s`, `m`, or `h`) would be
     /// swallowed into the previous value. Same line-significance rule as
-    /// [`Self::at_fallback_pipe`] / [`Self::at_field_type`].
+    /// [`Self::at_fallback_pipe`] / [`Self::at_field_type`]. Call when the
+    /// cursor sits on the suffix `Ident` (after the magnitude is bumped).
     fn at_number_suffix(&self) -> bool {
         // An Ident followed by `=` is a key (missing-separator recovery),
         // never a unit — same rule as the facet-list unit consumer.
         self.at(SyntaxKind::Ident) && !self.newline_before() && self.nth(1) != SyntaxKind::Eq
+    }
+
+    /// Lookahead from a `Number` token: a same-line suffix `Ident` follows.
+    fn peek_number_suffix(&self) -> bool {
+        self.nth(1) == SyntaxKind::Ident
+            && !self
+                .toks
+                .get(self.pos + 1)
+                .is_some_and(|t| t.newline_before)
+            && self.nth(2) != SyntaxKind::Eq
     }
 
     /// `[ value (, value)* ,? ]`

@@ -867,7 +867,8 @@ duration *format* back when a duration was a quoted string only schema
 validation could judge. The parser now guarantees the format, so the
 check cannot fire: a malformed literal surfaces at decode as
 [NML3004](#nml3004) (unknown unit), [NML3005](#nml3005) (fractional
-magnitude), or [NML3006](#nml3006) (out of domain); a quoted duration in
+magnitude), [NML3006](#nml3006) (out of domain), [NML3007](#nml3007)
+(duplicate unit), or [NML3008](#nml3008) (malformed compound); a quoted duration in
 a duration-typed field is the [NML0001](#nml0001) migration; and any
 other value there is the ordinary [NML2008](#nml2008) type mismatch.
 Codes are never renumbered or reused, so this section remains as the
@@ -1461,18 +1462,21 @@ service Api:
 ## NML3005
 
 **Fractional duration magnitude.** A duration magnitude is a whole
-number — `30.5s` is rejected rather than rounded or multi-unit-parsed
-(one spelling per value, the same error-over-guessing rule exact numbers
-follow). When the value is expressible in a finer unit, the fix respells
-it exactly (`30.5s` → `30500ms`, `1.5h` → `90m`, `0.5ms` → `500us`);
-only past the domain's `ns` resolution floor is there no fix.
+number — `30.5s` is rejected rather than rounded (the same
+error-over-guessing rule exact numbers follow). When the value has an
+exact whole-unit spelling, the fix respells it at the authored
+granularity as a compound literal (`30.5s` → `30s500ms`, `1.5h` →
+`1h30m`, `0.5ms` → `500us`); only past the domain's `ns` resolution
+floor is there no fix. In a compound literal the fix is withheld —
+replacing the whole literal with one component's respelling would drop
+its siblings.
 
 ```nml check expect-error='[NML3005]'
 service Api:
     requestTimeout = 30.5s
 ```
 
-**Fix:** apply the suggestion (`30500ms`), or pick the intended whole
+**Fix:** apply the suggestion (`30s500ms`), or pick the intended whole
 magnitude.
 
 ## NML3006
@@ -1491,6 +1495,34 @@ service Api:
 ```
 
 **Fix:** use a non-negative magnitude within the unit's stated maximum.
+
+## NML3007
+
+**Duplicate duration unit in a compound literal.** The same unit appears
+more than once in one duration literal (`1h2h`). Unlike coercion from
+machine-emitted strings, authored source is diagnosed rather than silently
+merged — the fix replaces the literal with the merged canonical form (`3h`).
+
+```nml check expect-error='[NML3007]'
+service Api:
+    requestTimeout = 1h2h
+```
+
+**Fix:** apply the suggestion (`3h`), or spell the intended components once each.
+
+## NML3008
+
+**Malformed compound duration.** A magnitude in a compound literal is not
+followed by a unit suffix (`1h30`, `5m2`). Each component must be an
+integer magnitude immediately followed by a unit (`h`, `m`, `s`, `ms`, `us`,
+or `ns`).
+
+```nml check expect-error='[NML3008]'
+service Api:
+    requestTimeout = 1h30
+```
+
+**Fix:** add the missing unit suffix, or remove the dangling magnitude.
 
 ## NML4000
 

@@ -12,6 +12,7 @@
 //! behavior is spec-defined (spec/syntax.md: Source text, Strings) and
 //! pinned by the `cst::tests` unit suite plus the fuzz batteries there.
 
+use crate::cst::ast::{self, AstNode};
 use crate::cst::syntax::{
     SyntaxKind, SyntaxNode, SyntaxToken, content_span, node_span, text_offset,
 };
@@ -111,6 +112,11 @@ pub fn decode_value(node: &SyntaxNode) -> Result<SpannedValue, NmlError> {
 
 fn decode_scalar(node: &SyntaxNode, sink: &mut ValueErrors) -> SpannedValue {
     let span = content_span(node);
+
+    if let Some(dl) = node.children().find_map(ast::DurationLiteral::cast) {
+        return decode_duration_literal(&dl, node, span, sink);
+    }
+
     let toks = sig_tokens(node);
     // Decode is *semantic* validation; an empty value node is a syntactic failure
     // the parser already reported, so it yields a placeholder rather than a
@@ -239,19 +245,67 @@ fn number_or_money(toks: &[SyntaxToken], span: Span, negative: bool) -> Result<V
             if money::is_currency_code(unit.text()) {
                 return Ok(Value::Money(money::parse_money(&raw, unit.text(), span)?));
             }
-            let unit_span = Span::new(
-                text_offset(unit.text_range().start()),
-                text_offset(unit.text_range().end()),
-            );
-            Ok(Value::Duration(crate::duration::parse_duration_literal(
-                &raw,
-                unit.text(),
-                span,
-                unit_span,
-            )?))
+            // Durations are wrapped in [`SyntaxKind::DurationLiteral`] at parse
+            // time; a flat Number+Ident here is unreachable for valid trees.
+            Ok(Value::Number(parse_number(&raw, span)?))
         }
         _ => Ok(Value::Number(parse_number(&raw, span)?)),
     }
+}
+
+/// Decode a [`SyntaxKind::DurationLiteral`] node into a duration value.
+fn decode_duration_literal(
+    dl: &ast::DurationLiteral,
+    owner: &SyntaxNode,
+    span: Span,
+    sink: &mut ValueErrors,
+) -> SpannedValue {
+    let negative = sig_tokens(owner)
+        .first()
+        .is_some_and(|t| t.kind() == SyntaxKind::Dash);
+    match decode_duration_components(&dl.components(), negative, span) {
+        Ok(v) => SpannedValue::new(v, span),
+        Err(e) => {
+            sink.push(e);
+            SpannedValue::new(Value::String(String::new()), span)
+        }
+    }
+}
+
+/// Shared magnitude/unit pairing for value and facet duration literals.
+pub(crate) fn decode_duration_components(
+    components: &[(SyntaxToken, Option<SyntaxToken>)],
+    negative: bool,
+    span: Span,
+) -> Result<Value, NmlError> {
+    if let Some((dangling, _)) = components.iter().find(|(_, u)| u.is_none()) {
+        return Err(NmlError::Duration {
+            kind: crate::duration::DurationErrorKind::MalformedCompound {
+                break_span: super::syntax::token_span(dangling),
+            },
+            span,
+        });
+    }
+    let pairs: Vec<(SyntaxToken, SyntaxToken)> = components
+        .iter()
+        .map(|(n, u)| (n.clone(), u.clone().expect("checked above")))
+        .collect();
+    let Some((first_number, _)) = pairs.first() else {
+        return Err(NmlError::Duration {
+            kind: crate::duration::DurationErrorKind::MalformedCompound { break_span: span },
+            span,
+        });
+    };
+    let first_magnitude = if negative {
+        format!("-{}", first_number.text())
+    } else {
+        first_number.text().to_string()
+    };
+    let component_tokens = super::syntax::duration_component_tokens(&pairs, &first_magnitude);
+    Ok(Value::Duration(crate::duration::parse_components_cst(
+        &component_tokens,
+        span,
+    )?))
 }
 
 fn decode_array(node: &SyntaxNode, sink: &mut ValueErrors) -> SpannedValue {

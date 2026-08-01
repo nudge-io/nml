@@ -4,6 +4,28 @@
 
 ### Changed
 
+- **Duration LSP tooling (RFC 0017 §10)** — compound duration literals
+  are a first-class CST node; hover, highlight, unit completion,
+  inlay hints, semantic tokens, and selection ranges all query the same
+  `DurationLiteral` seam (UTF-16 positions, tight component spans).
+  Hover shows the component breakdown with its human respelling and the
+  normalized total; unit suffixes carry a dedicated `durationUnit`
+  semantic-token type (`superType: number`) for theming; highlights
+  include a leading facet sign (`-5s`), while hover/hints/completions
+  stay silent on signed literals (durations are unsigned).
+  Mid-compound completion ranks only finer units; `NML3005`/`NML3007`
+  quick-fixes and `NML3008` related-information are wired end-to-end.
+
+- **Compound duration literals (RFC 0017 amendment)** — durations now
+  support attached compound syntax (`1h30m`, `5m2s`) and inline-spaced
+  forms (`1h 30m`). The lexer suffix-run rule tokenizes glued compounds
+  as alternating `Number`/`Ident` pairs; duplicate units in source
+  diagnose as `NML3007` with a merge fix; dangling magnitudes are
+  `NML3008`; the `NML3005` fractional fix now respells at the authored
+  granularity (`1.5h` → `1h30m`, not `90m`). Coercion text (`$ENV`)
+  silently merges duplicates and decomposes exact fractions. Wire JSON
+  now carries a `segments` array (breaking, pre-1.0).
+
 - **VS Code extension tooling** — migrated from npm to a pnpm 11 workspace
   (root `pnpm-lock.yaml`, supply-chain policy in `pnpm-workspace.yaml`).
   Contributors: `corepack enable && pnpm install`, then `just verify-ext`.

@@ -106,6 +106,28 @@
         "path": "./syntaxes/nml.tmLanguage.json"
       }
     ],
+    "semanticTokenTypes": [
+      {
+        "id": "durationUnit",
+        "superType": "number",
+        "description": "Unit suffix of a duration literal (RFC 0017). Falls back to number coloring in themes without a specific rule."
+      }
+    ],
+    "semanticTokenModifiers": [
+      {
+        "id": "duration",
+        "description": "Duration literal magnitude (RFC 0017 compound literals)"
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "nml",
+        "scopes": {
+          "number.duration": ["constant.numeric.duration.nml"],
+          "durationUnit": ["keyword.other.unit.nml"]
+        }
+      }
+    ],
     "configuration": {
       "title": "NML",
       "properties": {

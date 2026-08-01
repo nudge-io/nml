@@ -16,6 +16,7 @@ use nml_core::{FieldTarget, SchemaIndex};
 use nml_validate::schema::MembershipSemantics;
 
 use crate::diagnostics::{self, SchemaMode};
+use crate::duration_lsp::{self, DurationUnitContext};
 use crate::packages::{self, Resolution, WorkspaceView};
 use crate::position::{self, LineIndex};
 
@@ -1929,7 +1930,7 @@ fn summarize_body(body: &Body) -> String {
 /// The `<prop> = ⌖` prefix of a value position: the property name to the left
 /// of `=` on the cursor's line, or `None` when the line has no `=` before the
 /// cursor. The one line-parse every value-position lookup shares.
-fn value_position_prop_name(source: &str, pos: Position) -> Option<&str> {
+pub(crate) fn value_position_prop_name(source: &str, pos: Position) -> Option<&str> {
     let line = position::line_at(source, pos.line)?;
     let end = position::utf16_to_byte(line, pos.character);
     let eq_pos = line[..end].find('=')?;
@@ -1946,12 +1947,12 @@ fn value_position_prop_name(source: &str, pos: Position) -> Option<&str> {
 /// IS its discriminator the arm keys govern the value (tier-0 scaffolds
 /// `kind = ` from exactly this pseudo-field; the value position must then
 /// actually complete).
-struct ValueGovernors<'i> {
-    fields: Vec<&'i FieldDef>,
+pub(crate) struct ValueGovernors<'i> {
+    pub(crate) fields: Vec<&'i FieldDef>,
     discriminator_arms: Vec<String>,
 }
 
-fn value_governors_at<'i>(
+pub(crate) fn value_governors_at<'i>(
     file: &File,
     pos: Position,
     index: &'i SchemaIndex,
@@ -2133,97 +2134,21 @@ fn find_value_completions_at(
     (!variants.is_empty() || !arms.is_empty()).then_some(ValueCompletions { variants, arms })
 }
 
-/// What a duration unit-suffix completion replaces (RFC 0017): the typed
-/// digits and their precise edit ranges. `insert` covers exactly the
-/// digits before the cursor; `replace` extends through any letter run
-/// after it (re-triggering inside an existing `30s` replaces the old
-/// suffix instead of stacking a second one). The digits and suffix are
-/// ASCII by grammar, so the UTF-16 column arithmetic is exact.
-struct DurationUnitContext {
-    digits: String,
-    insert: Range,
-    replace: Range,
-}
-
-/// Duration unit-suffix completion (RFC 0017): when the cursor sits
-/// immediately after a bare integer in a duration-typed value position,
-/// return the typed digits and their edit ranges so the handler can offer
-/// the full literals (`30s`/`30ms`/…). The detector computes the digits'
-/// own ranges rather than borrowing the scalar-value token range — in a
-/// list position (`retries = [30`) the token heuristic would start at the
-/// bracket and an accepted edit would eat it. Built on the same governor
-/// walk as the other value detectors; `None` anywhere else, so a number
-/// in a `number`-typed field never grows unit noise.
-fn find_duration_unit_completions_at(
-    file: &File,
-    source: &str,
-    pos: Position,
-    index: &SchemaIndex,
-    line_index: &LineIndex,
-) -> Option<DurationUnitContext> {
-    fn governs_duration(ty: &FieldType) -> bool {
-        match ty {
-            FieldType::Primitive {
-                ty: nml_core::types::PrimitiveType::Duration,
-                ..
-            } => true,
-            FieldType::List(inner) | FieldType::Set(inner) | FieldType::Modifier(inner) => {
-                governs_duration(inner)
-            }
-            FieldType::Union(members) => members.iter().any(governs_duration),
-            FieldType::Arms { target, .. } => governs_duration(target),
-            _ => false,
+/// Whether a schema field type can govern a duration value — the gate for
+/// unit-suffix completion on a bare number in value position.
+pub(crate) fn governs_duration(ty: &FieldType) -> bool {
+    match ty {
+        FieldType::Primitive {
+            ty: nml_core::types::PrimitiveType::Duration,
+            ..
+        } => true,
+        FieldType::List(inner) | FieldType::Set(inner) | FieldType::Modifier(inner) => {
+            governs_duration(inner)
         }
+        FieldType::Union(members) => members.iter().any(governs_duration),
+        FieldType::Arms { target, .. } => governs_duration(target),
+        _ => false,
     }
-    let context = {
-        let line = position::line_at(source, pos.line)?;
-        let mut col = position::utf16_to_byte(line, pos.character).min(line.len());
-        while col > 0 && !line.is_char_boundary(col) {
-            col -= 1;
-        }
-        let before = &line[..col];
-        // A magnitude is a `[0-9_]` run (separators are part of the typed
-        // literal — without `_` here, completion would go dead on exactly
-        // the magnitudes separators make attractive, `timeout = 1_000`).
-        let start = before
-            .rfind(|c: char| !c.is_ascii_digit() && c != '_')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let digits = &before[start..];
-        // The run must START a value token (preceded only by the value
-        // introducers, never mid-word — `x30` is an identifier tail), must
-        // contain a digit, and must not LEAD with `_` (that spelling is an
-        // identifier's, never a magnitude's).
-        let prev = before[..start].trim_end().chars().next_back();
-        if digits.is_empty()
-            || digits.starts_with('_')
-            || !digits.bytes().any(|b| b.is_ascii_digit())
-            || !matches!(prev, Some('=' | '[' | ',' | '|') | None)
-        {
-            return None;
-        }
-        let cursor_char = position::byte_to_utf16(line, col);
-        let digits_start = Position::new(pos.line, cursor_char - digits.len() as u32);
-        let suffix_run = line[col..]
-            .bytes()
-            .take_while(|b| b.is_ascii_alphabetic())
-            .count();
-        DurationUnitContext {
-            digits: digits.to_string(),
-            insert: Range::new(digits_start, Position::new(pos.line, cursor_char)),
-            replace: Range::new(
-                digits_start,
-                Position::new(pos.line, cursor_char + suffix_run as u32),
-            ),
-        }
-    };
-    let prop_name = value_position_prop_name(source, pos)?;
-    let governors = value_governors_at(file, pos, index, line_index, prop_name);
-    governors
-        .fields
-        .iter()
-        .any(|f| governs_duration(&f.field_type))
-        .then_some(context)
 }
 
 // ── Schema-driven field completion (RFC 0003) ─────────────────────────────────
@@ -3502,14 +3427,18 @@ fn simplify_number_action(source: &str, offset: usize) -> Option<SimplifyNumber>
         .token_at_offset((offset.min(source.len()) as u32).into())
         .find(|t| t.kind() == nml_core::cst::SyntaxKind::Number)?;
     // Money literals (`19.90 USD`) are Number + currency Ident inside one
-    // Value node (cst/mod.rs). Simplifying the number half would fight
-    // `nml fmt`, which re-renders money at the currency's canonical
-    // exponent — the edit reverts on the next format and the action
-    // reappears forever. Skip: money has no author-controlled scale.
-    let in_money = tok.parent().is_some_and(|p| {
-        p.children_with_tokens()
-            .filter_map(|e| e.into_token())
-            .any(|t| t.kind() == nml_core::cst::SyntaxKind::Ident)
+    // Value node. Duration literals wrap in `DurationLiteral`. Simplifying
+    // the number half would fight `nml fmt` or corrupt compounds.
+    let parent = tok.parent()?;
+    if parent.kind() == nml_core::cst::SyntaxKind::DurationLiteral {
+        return None;
+    }
+    let in_money = parent.children_with_tokens().any(|e| {
+        e.into_token().is_some_and(|t| {
+            t.kind() == nml_core::cst::SyntaxKind::Ident
+                && t.text().len() == 3
+                && t.text().chars().all(|c| c.is_ascii_uppercase())
+        })
     });
     if in_money {
         return None;
@@ -3558,52 +3487,6 @@ fn format_value(value: &Value) -> String {
         Value::Role(r) => r.clone(),
         _ => "...".to_string(),
     }
-}
-
-/// `30000` → `30_000` — thousands grouping with the language's own digit
-/// separator, so a grouped total is itself a pasteable NML literal.
-fn group_thousands(n: u128) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
-            out.push('_');
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/// The hover's normalized total for a duration (RFC 0017): the value in
-/// the **coarsest of `ms`/`us`/`ns` that divides it exactly**, grouped and
-/// suffixed — a pasteable literal. `None` when that unit is the authored
-/// one (the echo would restate the literal). Backward-identical for the
-/// coarse units: every `h`/`m`/`s` total is an exact `ms` multiple, so
-/// `30s` still reads `30_000ms`.
-fn normalized_total(d: &nml_core::duration::Duration) -> Option<String> {
-    use nml_core::duration::DurationUnit;
-    let nanos = d.total_nanos();
-    if nanos == 0 {
-        // Every zero is every unit's zero; an echo teaches nothing.
-        return None;
-    }
-    for unit in [
-        DurationUnit::Milliseconds,
-        DurationUnit::Microseconds,
-        DurationUnit::Nanoseconds,
-    ] {
-        if nanos % unit.nanos() as u128 == 0 {
-            if unit == d.unit() {
-                return None;
-            }
-            return Some(format!(
-                "{}{}",
-                group_thousands(nanos / unit.nanos() as u128),
-                unit.suffix()
-            ));
-        }
-    }
-    None
 }
 
 /// Whether a property name suggests credential material.
@@ -3825,6 +3708,12 @@ fn duration_unit_item(
         label: literal.clone(),
         kind: Some(CompletionItemKind::UNIT),
         detail: Some(unit_name.to_string()),
+        label_details: duration_lsp::completion_preview(ctx, suffix).map(|preview| {
+            CompletionItemLabelDetails {
+                detail: Some(format!("= {preview}")),
+                ..Default::default()
+            }
+        }),
         sort_text: Some(sort),
         filter_text: Some(literal),
         text_edit: Some(text_edit),
@@ -4266,6 +4155,10 @@ impl LanguageServer for NmlLanguageServer {
                         work_done_progress_options: Default::default(),
                     },
                 )),
+                position_encoding: Some(PositionEncodingKind::UTF16),
+                inlay_hint_provider: Some(OneOf::Left(true)),
+                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                semantic_tokens_provider: Some(crate::semantic_tokens::server_capabilities()),
                 ..Default::default()
             },
             ..Default::default()
@@ -4581,12 +4474,12 @@ impl LanguageServer for NmlLanguageServer {
                 Option<DurationUnitContext>,
             ) = {
                 let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-                match docs
-                    .get(&uri)
-                    .map(|source| (source, nml_core::cst::parse_best_effort(source)))
-                {
+                match docs.get(&uri).map(|source| {
+                    let (file, parse) = nml_core::cst::parse_best_effort_with_tree(source);
+                    (source, file, parse)
+                }) {
                     // Parse once and build one schema index, shared by all detectors.
-                    Some((source, file)) => {
+                    Some((source, file, parse)) => {
                         let index: &SchemaIndex = handle.index();
                         let line_index = LineIndex::new(source);
                         let model_refs =
@@ -4598,12 +4491,20 @@ impl LanguageServer for NmlLanguageServer {
                                 });
                         let values =
                             find_value_completions_at(&file, source, pos, index, &line_index);
-                        let duration = find_duration_unit_completions_at(
-                            &file,
-                            source,
+                        let duration = duration_lsp::find_duration_unit_completions_at(
+                            &parse,
                             pos,
-                            index,
                             &line_index,
+                            || {
+                                value_position_prop_name(source, pos)
+                                    .map(|prop| {
+                                        value_governors_at(&file, pos, index, &line_index, prop)
+                                            .fields
+                                            .iter()
+                                            .any(|f| governs_duration(&f.field_type))
+                                    })
+                                    .unwrap_or(false)
+                            },
                         );
                         (model_refs, discriminator, values, duration)
                     }
@@ -4642,21 +4543,14 @@ impl LanguageServer for NmlLanguageServer {
             // (RFC 0017): `30` offers the full literals `30s`/`30ms`/`30m`/
             // `30h`, replacing exactly the typed digits — full-literal
             // labels, because clients filter against the token text (`30`),
-            // which a bare suffix label would never match.
+            // which a bare suffix label would never match. Units whose
+            // composed literal would be out of domain are withheld — a
+            // completion must never insert an instant diagnostic.
             if let Some(ctx) = duration_context {
-                // Ranking is a UX judgment owned here (most-likely-first,
-                // NOT ladder order); the strings come from the enum's one
-                // vocabulary table, so the list can never lag the unit set.
-                use nml_core::duration::DurationUnit as DU;
-                const UNIT_RANKING: [DU; 6] = [
-                    DU::Seconds,
-                    DU::Milliseconds,
-                    DU::Minutes,
-                    DU::Hours,
-                    DU::Microseconds,
-                    DU::Nanoseconds,
-                ];
-                for (i, unit) in UNIT_RANKING.iter().enumerate() {
+                for (i, unit) in ctx.units.iter().enumerate() {
+                    if !duration_lsp::completion_is_valid(&ctx, unit.suffix()) {
+                        continue;
+                    }
                     items.push(duration_unit_item(
                         &ctx,
                         unit.suffix(),
@@ -5265,6 +5159,16 @@ impl LanguageServer for NmlLanguageServer {
             };
             let byte_col = position::utf16_to_byte(line, pos.character);
 
+            // One lex+parse for every hover surface: the CST feeds the
+            // duration query, the lowered AST feeds the field-hover walk.
+            let (file, parse) = nml_core::cst::parse_best_effort_with_tree(&source_clone);
+            let line_index = LineIndex::new(&source_clone);
+            if let Some(hover) =
+                duration_lsp::duration_hover(&parse, &source_clone, pos, &line_index)
+            {
+                return Ok(Some(hover));
+            }
+
             // Directive hover (RFC 0030/0032): `#name` in a covered model file
             // renders the vocabulary entry. Unknown names get no hover — the
             // vocabulary diagnostic already explains them.
@@ -5319,8 +5223,6 @@ impl LanguageServer for NmlLanguageServer {
             let is_prop = is_property_name_position(line, &word, byte_col);
 
             if is_prop && !word.is_empty() {
-                let file = nml_core::cst::parse_best_effort(&source_clone);
-                let line_index = LineIndex::new(&source_clone);
                 if let Some(keyword) = find_enclosing_block_keyword(&file, pos, &line_index) {
                     let handle = self.schema_index_for(&uri);
                     if let Some(model) = handle.index().model(&keyword) {
@@ -5356,27 +5258,6 @@ impl LanguageServer for NmlLanguageServer {
             }
 
             if !is_prop {
-                // Duration literal hover (RFC 0017): the authored form with
-                // its normalized total (`30s — 30_000ms`), so cross-unit
-                // values compare at a glance. The total renders in the
-                // coarsest of {ms, us, ns} that divides it exactly, and is
-                // skipped when that would merely restate the literal
-                // (`500us` is its own normalized form). Grouping uses the
-                // language's own `_` separator, so the hover text is
-                // itself a valid literal — copy it, paste it.
-                if let Ok(d) = nml_core::duration::Duration::parse_text(&word) {
-                    let mut text = format!("**duration** `{d}`");
-                    if let Some(total) = normalized_total(&d) {
-                        text.push_str(&format!(" — {total}"));
-                    }
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: text,
-                        }),
-                        range: None,
-                    }));
-                }
                 let builtin_info = match word.as_str() {
                     "string" => Some("**string** -- Quoted text value"),
                     "number" => Some(
@@ -5411,9 +5292,7 @@ impl LanguageServer for NmlLanguageServer {
 
             if !word.is_empty() {
                 let model_ref_types = if !is_prop {
-                    let file = nml_core::cst::parse_best_effort(&source_clone);
                     let handle = self.schema_index_for(&uri);
-                    let line_index = LineIndex::new(&source_clone);
                     find_model_ref_types_at(&file, &source_clone, pos, handle.index(), &line_index)
                 } else {
                     Vec::new()
@@ -5574,25 +5453,34 @@ impl LanguageServer for NmlLanguageServer {
         let pos = params.text_document_position_params.position;
         let uri = params.text_document_position_params.text_document.uri;
 
-        let (word, source_clone) = {
+        let source_clone = {
             let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
             let Some(source) = docs.get(&uri) else {
                 return Ok(None);
             };
-            let Some(line) = position::line_at(source, pos.line) else {
+            source.clone()
+        };
+        let parse = nml_core::cst::parse(&source_clone);
+
+        let line_index = LineIndex::new(&source_clone);
+        if let Some(range) = duration_lsp::duration_highlight_range(&parse, pos, &line_index) {
+            return Ok(Some(vec![DocumentHighlight {
+                range,
+                kind: Some(DocumentHighlightKind::READ),
+            }]));
+        }
+
+        let word = {
+            let Some(line) = position::line_at(&source_clone, pos.line) else {
                 return Ok(None);
             };
-            (
-                extract_word_at(line, position::utf16_to_byte(line, pos.character)),
-                source.clone(),
-            )
+            extract_word_at(line, position::utf16_to_byte(line, pos.character))
         };
 
         if word.is_empty() {
             return Ok(None);
         }
 
-        let line_index = LineIndex::new(&source_clone);
         let refs = find_references_in_source(&source_clone, &word, &line_index);
 
         if refs.is_empty() {
@@ -5607,6 +5495,132 @@ impl LanguageServer for NmlLanguageServer {
                     .collect(),
             ))
         }
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        let source = {
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            match docs.get(&uri) {
+                Some(s) => s.clone(),
+                None => return Ok(None),
+            }
+        };
+        let parse = nml_core::cst::parse(&source);
+        Ok(Some(crate::semantic_tokens::full(&parse, &source)))
+    }
+
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> Result<Option<SemanticTokensRangeResult>> {
+        let uri = params.text_document.uri;
+        let source = {
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            match docs.get(&uri) {
+                Some(s) => s.clone(),
+                None => return Ok(None),
+            }
+        };
+        let line_index = LineIndex::new(&source);
+        let span = Span::new(
+            line_index.offset(params.range.start),
+            line_index.offset(params.range.end),
+        );
+        let parse = nml_core::cst::parse(&source);
+        Ok(Some(crate::semantic_tokens::range(&parse, &source, span)))
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let source = {
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            match docs.get(&uri) {
+                Some(s) => s.clone(),
+                None => return Ok(None),
+            }
+        };
+        let line_index = LineIndex::new(&source);
+        let span = Span::new(
+            line_index.offset(params.range.start),
+            line_index.offset(params.range.end),
+        );
+        let parse = nml_core::cst::parse(&source);
+        let hints = nml_core::cst::duration_literals_in(&parse, span)
+            .into_iter()
+            .filter_map(|at| {
+                // Signed literals are domain-invalid (durations are
+                // unsigned): a `= 90m` hint beside `-1h30m` would mislead.
+                if at.components.len() <= 1 || at.sign.is_some() {
+                    return None;
+                }
+                // Token-reconstructed attached text: immune to interior
+                // trivia (tabs, multiple spaces) in the spaced source form.
+                let d =
+                    nml_core::duration::Duration::parse_text(&at.literal.attached_text()).ok()?;
+                let hint = d.coarsest_exact()?;
+                Some(InlayHint {
+                    position: line_index.position(at.tight_span().end),
+                    label: InlayHintLabel::String(format!("= {hint}")),
+                    kind: Some(InlayHintKind::TYPE),
+                    padding_left: Some(true),
+                    text_edits: None,
+                    tooltip: None,
+                    padding_right: None,
+                    data: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok((!hints.is_empty()).then_some(hints))
+    }
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let uri = params.text_document.uri;
+        let source = {
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            match docs.get(&uri) {
+                Some(s) => s.clone(),
+                None => return Ok(None),
+            }
+        };
+        let parse = nml_core::cst::parse(&source);
+        let line_index = LineIndex::new(&source);
+        let mut out = Vec::new();
+        for pos in params.positions {
+            let byte = line_index.offset(pos);
+            let root = parse.syntax();
+            let tok = root
+                .token_at_offset((byte as u32).into())
+                .right_biased()
+                .or_else(|| root.token_at_offset((byte as u32).into()).left_biased());
+            let mut chain: Option<Box<SelectionRange>> = None;
+            let mut node = tok.and_then(|t| t.parent());
+            while let Some(n) = node {
+                let span = Span::new(
+                    usize::from(n.text_range().start()),
+                    usize::from(n.text_range().end()),
+                );
+                let range = line_index.range(span);
+                chain = Some(Box::new(SelectionRange {
+                    range,
+                    parent: chain,
+                }));
+                node = n.parent();
+            }
+            // LSP contract: exactly one entry per requested position. A
+            // position outside any token gets an empty range at itself.
+            out.push(chain.map(|r| *r).unwrap_or(SelectionRange {
+                range: Range::new(pos, pos),
+                parent: None,
+            }));
+        }
+        Ok(Some(out))
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
@@ -7019,15 +7033,19 @@ workflow VoiceAgent:
             "model service:\n    timeout duration?\n    retries set<duration>?\n    port number?\n    name string?\n",
         );
         let detect = |source: &str, line: u32, character: u32| {
-            let file = nml_core::cst::parse_best_effort(source);
+            let (file, parse) = nml_core::cst::parse_best_effort_with_tree(source);
             let li = LineIndex::new(source);
-            find_duration_unit_completions_at(
-                &file,
-                source,
-                Position::new(line, character),
-                &idx,
-                &li,
-            )
+            let pos = Position::new(line, character);
+            duration_lsp::find_duration_unit_completions_at(&parse, pos, &li, || {
+                value_position_prop_name(source, pos)
+                    .map(|prop| {
+                        value_governors_at(&file, pos, &idx, &li, prop)
+                            .fields
+                            .iter()
+                            .any(|f| governs_duration(&f.field_type))
+                    })
+                    .unwrap_or(false)
+            })
         };
         let span_of = |r: Range| (r.start.character, r.end.character);
         // Cursor right after `30` in a duration-typed value position.
@@ -7066,21 +7084,28 @@ workflow VoiceAgent:
     fn hover_normalized_total_rule() {
         let d = |text: &str| nml_core::duration::Duration::parse_text(text).unwrap();
         // Coarse units render their ms total, `_`-grouped.
-        assert_eq!(normalized_total(&d("30s")).as_deref(), Some("30_000ms"));
-        assert_eq!(normalized_total(&d("90m")).as_deref(), Some("5_400_000ms"));
-        assert_eq!(normalized_total(&d("2h")).as_deref(), Some("7_200_000ms"));
+        assert_eq!(d("30s").normalized_total().as_deref(), Some("30_000ms"));
+        assert_eq!(d("90m").normalized_total().as_deref(), Some("5_400_000ms"));
+        assert_eq!(d("2h").normalized_total().as_deref(), Some("7_200_000ms"));
         // Sub-ms values pick the coarsest EXACT unit — never `0ms`.
-        assert_eq!(normalized_total(&d("1000us")).as_deref(), Some("1ms"));
-        assert_eq!(normalized_total(&d("2000ns")).as_deref(), Some("2us"));
+        assert_eq!(d("1000us").normalized_total().as_deref(), Some("1ms"));
+        assert_eq!(d("2000ns").normalized_total().as_deref(), Some("2us"));
         // A value that is its own normalized form shows nothing extra.
-        assert_eq!(normalized_total(&d("500ms")), None);
-        assert_eq!(normalized_total(&d("250us")), None);
-        assert_eq!(normalized_total(&d("750ns")), None);
+        assert_eq!(d("500ms").normalized_total(), None);
+        assert_eq!(d("250us").normalized_total(), None);
+        assert_eq!(d("750ns").normalized_total(), None);
+        // Compound literals (RFC 0017 §10) normalize like any value…
+        assert_eq!(
+            d("1h30m").normalized_total().as_deref(),
+            Some("5_400_000ms")
+        );
+        assert_eq!(d("5m2s").normalized_total().as_deref(), Some("302_000ms"));
+        // …and skip the restatement when ANY authored segment already
+        // spells the normalized unit.
+        assert_eq!(d("1s500ms").normalized_total(), None);
         // Zero teaches nothing in any unit.
-        assert_eq!(normalized_total(&d("0s")), None);
-        // Grouping delegate: the separator is the language's.
-        assert_eq!(group_thousands(1_234_567), "1_234_567");
-        assert_eq!(group_thousands(999), "999");
+        assert_eq!(d("0s").normalized_total(), None);
+        assert_eq!(d("1h30m").coarsest_exact().as_deref(), Some("90m"));
     }
 
     /// Round-17 border pins: a modifier-declared field completes WITH its

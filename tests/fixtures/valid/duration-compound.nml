@@ -1,0 +1,4 @@
+service Api:
+    requestTimeout = 1h30m
+    pollInterval = 5m2s
+    gracePeriod = 90m

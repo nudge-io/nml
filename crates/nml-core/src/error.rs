@@ -534,13 +534,25 @@ impl NmlError {
                             None => diag,
                         }
                     }
-                    // The finer-unit respelling replaces the whole literal
-                    // (`30.5s` → `30500ms`) — value-preserving by
-                    // construction, so machine-applicable.
+                    // The granularity-preserving respelling replaces the
+                    // whole literal (`1.5h` → `1h30m`, `30.5s` →
+                    // `30s500ms`) — value-preserving by construction, so
+                    // machine-applicable.
                     DurationErrorKind::FractionalMagnitude {
                         equivalent: Some(equivalent),
                         ..
                     } => diag.with_suggestion(equivalent, *span),
+                    // The merged form replaces the whole literal (`1h2h` →
+                    // `3h`) — value-preserving by construction.
+                    DurationErrorKind::DuplicateUnit { merged } => {
+                        diag.with_suggestion(merged, *span)
+                    }
+                    // No machine fix (completing or deleting the dangling
+                    // magnitude would change the value); the related span
+                    // points at the exact break.
+                    DurationErrorKind::MalformedCompound { break_span } => {
+                        diag.with_related(*break_span, "this magnitude has no unit")
+                    }
                     _ => diag,
                 }
             }

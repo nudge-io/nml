@@ -607,6 +607,52 @@ ast_node!(/// RFC 0018: `(min = 1, max = 65535)` after a type name.
 ast_node!(/// One `key = value` facet — a number or duration literal.
     Facet => Facet);
 
+ast_node!(/// RFC 0017: a duration literal (`5s`, `1h30m`) — the wrapped
+    /// `Number`/`Ident` chain inside a [`SyntaxKind::Value`] or
+    /// [`SyntaxKind::Facet`]. A leading `Dash` (negative) stays outside.
+    DurationLiteral => DurationLiteral);
+
+impl DurationLiteral {
+    /// Magnitude/unit token pairs in source order. A `None` unit is a
+    /// dangling magnitude (`1h30`) — NML3008 at decode time.
+    pub fn components(&self) -> Vec<(SyntaxToken, Option<SyntaxToken>)> {
+        let mut components: Vec<(SyntaxToken, Option<SyntaxToken>)> = Vec::new();
+        for el in self.0.children_with_tokens() {
+            let Some(tok) = el.into_token() else {
+                continue;
+            };
+            match tok.kind() {
+                SyntaxKind::Number => components.push((tok, None)),
+                SyntaxKind::Ident => {
+                    if let Some(last) = components.last_mut() {
+                        if last.1.is_none() {
+                            last.1 = Some(tok);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        components
+    }
+
+    /// The literal respelled in canonical **attached** form (`1h30m`),
+    /// reconstructed from the tokens alone — immune to interior trivia
+    /// (spaces, tabs) in the spaced source form (`1h 30m`). Dangling
+    /// magnitudes are included verbatim, so a malformed literal still
+    /// fails downstream parsing rather than silently dropping a component.
+    pub fn attached_text(&self) -> String {
+        let mut out = String::new();
+        for (mag, unit) in self.components() {
+            out.push_str(mag.text());
+            if let Some(u) = unit {
+                out.push_str(u.text());
+            }
+        }
+        out
+    }
+}
+
 impl FacetList {
     pub fn facets(&self) -> impl Iterator<Item = Facet> + '_ {
         children(&self.0)
@@ -623,20 +669,13 @@ impl Facet {
     pub fn dash(&self) -> Option<SyntaxToken> {
         token(&self.0, SyntaxKind::Dash)
     }
-    /// The value's number token.
+    /// The value's number token (bare number facet only).
     pub fn number(&self) -> Option<SyntaxToken> {
         token(&self.0, SyntaxKind::Number)
     }
-    /// The value's duration-unit token (`s` in `min = 5s`), when the
-    /// facet value is a duration literal (RFC 0017): the Ident AFTER
-    /// the number token — the first Ident is the facet key.
-    pub fn unit(&self) -> Option<SyntaxToken> {
-        let number = self.number()?;
-        self.0
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .skip_while(|t| t.text_range().start() < number.text_range().end())
-            .find(|t| t.kind() == SyntaxKind::Ident)
+    /// The facet's duration literal, when the value carries a unit suffix.
+    pub fn duration_literal(&self) -> Option<DurationLiteral> {
+        child(&self.0)
     }
 }
 

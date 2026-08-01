@@ -199,6 +199,17 @@ fn extract_facets_as<T: Clone>(
 
 /// The raw `-`?digits text of a facet's numeric magnitude, with its span.
 fn facet_magnitude(f: &Facet) -> Option<(String, crate::span::Span)> {
+    if let Some(dl) = f.duration_literal() {
+        let components = dl.components();
+        let first = components.first()?.0.text().to_string();
+        let span = node_span(dl.syntax());
+        let text = if f.dash().is_some() {
+            format!("-{}", first)
+        } else {
+            first
+        };
+        return Some((text, span));
+    }
     let span = node_span(f.syntax());
     match (f.dash(), f.number()) {
         (Some(_), Some(n)) => Some((format!("-{}", n.text()), span)),
@@ -211,7 +222,7 @@ fn facet_magnitude(f: &Facet) -> Option<(String, crate::span::Span)> {
 /// a unit suffix means the author wrote a duration, which is not a
 /// number bound (the definition pass reports the mismatch).
 fn decode_number_facet(f: &Facet) -> Option<crate::types::Number> {
-    if f.unit().is_some() {
+    if f.duration_literal().is_some() {
         return None;
     }
     let (text, span) = facet_magnitude(f)?;
@@ -222,13 +233,18 @@ fn decode_number_facet(f: &Facet) -> Option<crate::types::Number> {
 /// (RFC 0017); a bare number is not a duration bound (the definition
 /// pass reports the mismatch).
 fn decode_duration_facet(f: &Facet) -> Option<crate::duration::Duration> {
-    let unit = f.unit()?;
+    let dl = f.duration_literal()?;
+    let pairs: Vec<_> = dl
+        .components()
+        .into_iter()
+        .map(|(n, u)| u.map(|u| (n, u)))
+        .collect::<Option<_>>()?;
+    if pairs.is_empty() {
+        return None;
+    }
     let (text, span) = facet_magnitude(f)?;
-    let unit_span = crate::span::Span::new(
-        usize::from(unit.text_range().start()),
-        usize::from(unit.text_range().end()),
-    );
-    crate::duration::parse_duration_literal(&text, unit.text(), span, unit_span).ok()
+    let components = super::syntax::duration_component_tokens(&pairs, &text);
+    crate::duration::parse_components_cst(&components, span).ok()
 }
 
 fn resolve_field_type(te: &TypeExpr) -> FieldType {
@@ -246,11 +262,11 @@ fn resolve_field_type(te: &TypeExpr) -> FieldType {
                     // (Field evaluated before `ty` because the check
                     // borrows `prim`.)
                     facets: match prim {
-                        PrimitiveType::Number => crate::model::PrimitiveFacets::Number(
+                        PrimitiveType::Number => crate::model::PrimitiveFacets::Number(Box::new(
                             extract_facets_as(te, decode_number_facet),
-                        ),
+                        )),
                         PrimitiveType::Duration => crate::model::PrimitiveFacets::Duration(
-                            extract_facets_as(te, decode_duration_facet),
+                            Box::new(extract_facets_as(te, decode_duration_facet)),
                         ),
                         _ => crate::model::PrimitiveFacets::None,
                     },

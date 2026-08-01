@@ -20,6 +20,7 @@
 //! (structural green-tree splicing, RFC 0030 P2).
 
 pub mod ast;
+pub mod duration_query;
 pub mod edit;
 pub mod extract;
 mod lexer;
@@ -28,6 +29,7 @@ mod parser;
 mod syntax;
 mod value;
 
+pub use duration_query::{DurationLiteralAt, duration_literal_at, duration_literals_in};
 pub use syntax::{NmlLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 pub(crate) use value::KNOWN_NAMESPACES;
 pub use value::{ValueErrors, decode_value, decode_value_all};
@@ -248,6 +250,13 @@ pub fn parse_to_ast(source: &str) -> crate::error::NmlResult<crate::ast::File> {
 /// structure, and this names that intent at the call site.
 pub fn parse_best_effort(source: &str) -> crate::ast::File {
     parse_to_ast_all(source).0
+}
+
+/// The feature-handler seam: one lex+parse yields both the semantic AST (for
+/// schema-governor walks) and the lossless CST (for span queries).
+pub fn parse_best_effort_with_tree(source: &str) -> (crate::ast::File, Parse) {
+    let (parsed, file, _errors, _suppressed) = parse_lowered(source);
+    (file, parsed)
 }
 
 /// Extract schema definitions (models / enums / oneofs) from source over the CST,
@@ -1798,6 +1807,9 @@ service App is Base:
         assert_eq!(d("500ms").to_string(), "500ms");
         assert_eq!(d("72h").to_string(), "72h");
         assert_eq!(d("5m").to_string(), "5m");
+        assert_eq!(d("1h30m").to_string(), "1h30m");
+        assert_eq!(d("5m2s").to_string(), "5m2s");
+        assert_eq!(d("1h 30m").to_string(), "1h30m");
         // Magnitude spelling normalizes through the decoded value.
         assert_eq!(d("030s").to_string(), "30s");
         assert!(matches!(
@@ -1836,6 +1848,65 @@ service App is Base:
         // Precedence: the trailing-dot malformation fires BEFORE duration
         // decoding, exactly as it does for money (`19. USD`).
         assert_eq!(err_code("30. s"), Some(codes::INVALID_NUMBER.to_string()));
+    }
+
+    /// Compound-literal rejections end to end (RFC 0017 §10): the codes,
+    /// the machine fixes, and the fix-suppression rule that keeps every
+    /// suggestion value-preserving.
+    #[test]
+    fn compound_duration_rejections_teach_and_fix() {
+        use crate::diagnostic::codes;
+        let diag_of = |expr: &str| {
+            let src = wrap(expr);
+            decode_value(&first_value_node(&parse(&src).syntax()))
+                .expect_err(expr)
+                .to_diagnostic()
+        };
+
+        // NML3007: a repeated unit, with the whole literal's merged form
+        // as the fix — value-preserving even with other units present.
+        let d = diag_of("1h2h");
+        assert_eq!(d.code.map(|c| c.to_string()).as_deref(), Some("NML3007"));
+        assert_eq!(
+            d.suggestions.first().map(|s| s.replacement.as_str()),
+            Some("3h")
+        );
+        let d = diag_of("1h2h30m");
+        assert_eq!(
+            d.suggestions.first().map(|s| s.replacement.as_str()),
+            Some("3h30m")
+        );
+
+        // NML3008: a dangling magnitude — no machine fix (completing or
+        // deleting it would change the value), the related span points
+        // at the break.
+        let d = diag_of("1h30");
+        assert_eq!(d.code.map(|c| c.to_string()).as_deref(), Some("NML3008"));
+        assert!(d.suggestions.is_empty(), "no value-changing fix: {d:?}");
+        assert!(
+            !d.related.is_empty(),
+            "the break location must be pointed at: {d:?}"
+        );
+
+        // NML3005 in a compound: the respelling fix is WITHHELD — replacing
+        // `1.5h30m` with the component's respelling (`1h30m`) would
+        // silently drop the `30m` while looking plausible.
+        let d = diag_of("1.5h30m");
+        assert_eq!(
+            d.code.map(|c| c.to_string()),
+            Some(codes::FRACTIONAL_DURATION.to_string())
+        );
+        assert!(
+            d.suggestions.is_empty(),
+            "a component fix would corrupt: {d:?}"
+        );
+
+        // Sole component gets the granularity-preserving compound fix.
+        let d = diag_of("1.5h");
+        assert_eq!(
+            d.suggestions.first().map(|s| s.replacement.as_str()),
+            Some("1h30m")
+        );
     }
 
     /// `_` digit separators end to end (RFC 0017 follow-up): legal
