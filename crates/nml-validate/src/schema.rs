@@ -7191,6 +7191,23 @@ mod replaced_literal_tests {
         );
         assert!(diags.is_empty(), "{diags:?}");
     }
+
+    /// `$ENV.KEY` on a typed field is DEFERRED (resolved later), so the
+    /// teaching arms must never fire on it and the field must not error:
+    /// the migration is for source LITERALS only, never references. The
+    /// origin bug was `port = $ENV.PORT | "3000"` — the reference primary
+    /// must stay clean while only the quoted fallback teaches.
+    #[test]
+    fn env_reference_on_typed_field_is_deferred_not_taught() {
+        let diags = diags_for(
+            "model svc:\n    port number\n    admin bool\n",
+            "svc A:\n    port = $ENV.PORT\n    admin = $ENV.ADMIN\n",
+        );
+        assert!(
+            diags.is_empty(),
+            "an $ENV reference on a typed field is deferred, never taught: {diags:?}"
+        );
+    }
 }
 
 #[cfg(test)]

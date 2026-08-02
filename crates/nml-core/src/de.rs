@@ -2912,6 +2912,52 @@ workflow W:
         assert!(!err.contains("hunter2"), "never the content: {err}");
     }
 
+    /// Same leak-safety on the NUMBER lane (a separate coercer): a
+    /// resolved value that fails numeric parsing names the variable and
+    /// the reason, never the content. The numeric error type is
+    /// provenance-erasing by construction (digit counts, not the input),
+    /// but the lane is pinned independently of the duration one.
+    #[test]
+    fn resolved_number_coercion_failure_names_the_variable_not_the_value() {
+        use crate::resolve::ValueResolver;
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            #[expect(
+                dead_code,
+                reason = "deserialization target only — the test asserts the error"
+            )]
+            port: u16,
+        }
+        let source = "server S:\n    port = $ENV.PORT\n";
+        let file = parse_to_ast(source).unwrap();
+        let resolver = ValueResolver::new(|k| (k == "PORT").then(|| "s3cr3t-not-a-number".into()));
+        let doc = Document::new(&file);
+        let body = doc.block("server", "S").body().unwrap();
+        let err = crate::de::from_body_resolved::<Config>(body, &resolver)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("$ENV.PORT"), "names the knob: {err}");
+        assert!(!err.contains("s3cr3t"), "never the content: {err}");
+    }
+
+    /// The empty-credential hazard is structurally impossible: an env
+    /// var set to empty is treated as unset at the mint site, so a
+    /// `Value::Resolved` can NEVER carry empty text — the
+    /// `resolved.as_str().unwrap_or_default()` consumer pattern cannot be
+    /// silently fed "". A resolving load of an empty var errors instead.
+    #[test]
+    fn empty_env_never_mints_resolved() {
+        use crate::resolve::{ResolveError, ValueResolver};
+        let resolver = ValueResolver::new(|k| (k == "EMPTY").then(String::new));
+        let err = resolver
+            .resolve(&Value::Secret("$ENV.EMPTY".into()))
+            .unwrap_err();
+        assert!(
+            matches!(err, ResolveError::EnvNotSet(_)),
+            "empty env is unset, never a Resolved: {err:?}"
+        );
+    }
+
     /// Quoted duration literal: the de-layer teaching mirrors the
     /// validator's NML0001 posture for raw-serde embedders.
     #[test]
