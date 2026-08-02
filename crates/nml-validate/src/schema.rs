@@ -2270,8 +2270,59 @@ impl SchemaValidator {
         span: Span,
         diags: &mut Vec<Diagnostic>,
     ) {
+        // The RFC 0047 resolved lane runs exactly ONCE per declared value,
+        // here — before the fallback split below. Resolution
+        // short-circuits on the first leg that succeeds, so resolving the
+        // whole chain once is precisely what deserialization does;
+        // judging legs individually would reject a config the runtime
+        // happily runs (`$ENV.OVERRIDE | $ENV.STALE` with a valid
+        // override). Nested values (list elements, block fields) re-enter
+        // through this same door and so get their own single check.
+        // Only FACETED primitives have anything to judge here, and the
+        // guard is load-bearing rather than an optimization: without it
+        // an unfaceted `secret` field would have its `$ENV` READ and its
+        // plaintext materialized on every validation, purely to be
+        // dropped. Credentials stay outside the lane's resolution, not
+        // just outside its judgment.
+        // Wrapper layers are looked THROUGH (`scalar_facets` unwraps
+        // `Modifier`), because the lane's "once per declared value" rule
+        // is about the VALUE, not about how many type layers the schema
+        // spells around it. Getting this wrong is not a missed check but
+        // an inverted one: the wrapper arms below re-enter with the SAME
+        // value, so a lane guard that only recognized a bare `Primitive`
+        // would skip the whole-chain check here and then run it once per
+        // FALLBACK LEG underneath — resolving legs the runtime never
+        // reads and reporting a violation in a leg that never wins.
+        if let Some(resolver) = &self.env_resolution {
+            if let Some(facets) = scalar_facets(field_type) {
+                if !matches!(facets, PrimitiveFacets::None) {
+                    check_resolved_facets(resolver, facets, value, field_name, span, diags);
+                }
+            }
+        }
+
+        self.validate_value_type_only(value, field_type, field_name, context, span, diags);
+    }
+
+    /// The TYPE/shape half, with the resolved lane already run once for
+    /// the whole declared value. Fallback chains split here — every leg
+    /// must be a legal spelling for the field, whichever wins at runtime
+    /// — and the split RECURSES, because `a | b | c` parses
+    /// right-associative as `Fallback(a, Fallback(b, c))`: a non-recursive
+    /// split would hand the nested tail to the type match and report a
+    /// bogus "expected number, got fallback" on every chain of three or
+    /// more legs.
+    fn validate_value_type_only(
+        &self,
+        value: &Value,
+        field_type: &FieldType,
+        field_name: &str,
+        context: &str,
+        span: Span,
+        diags: &mut Vec<Diagnostic>,
+    ) {
         if let Value::Fallback(primary, fallback) = value {
-            self.validate_value_against_type(
+            self.validate_value_type_only(
                 &primary.value,
                 field_type,
                 field_name,
@@ -2279,7 +2330,7 @@ impl SchemaValidator {
                 primary.span,
                 diags,
             );
-            self.validate_value_against_type(
+            self.validate_value_type_only(
                 &fallback.value,
                 field_type,
                 field_name,
@@ -2289,7 +2340,22 @@ impl SchemaValidator {
             );
             return;
         }
+        self.validate_non_fallback_value(value, field_type, field_name, context, span, diags);
+    }
 
+    /// The type/shape half of [`Self::validate_value_against_type`], with
+    /// fallback chains already split and the resolved lane already run.
+    /// Recursive descent re-enters through the public door, so nested
+    /// values keep their own single resolved check.
+    fn validate_non_fallback_value(
+        &self,
+        value: &Value,
+        field_type: &FieldType,
+        field_name: &str,
+        context: &str,
+        span: Span,
+        diags: &mut Vec<Diagnostic>,
+    ) {
         match field_type {
             FieldType::Primitive { ty: prim, facets } => {
                 self.validate_primitive_value(value, prim, field_name, context, span, diags);
@@ -2305,20 +2371,13 @@ impl SchemaValidator {
                     (PrimitiveFacets::Duration(fs), Value::Duration(d)) => {
                         validate_facets(fs, d, field_name, span, diags);
                     }
-                    // The resolved lane (RFC 0047): a deferred value on a
-                    // faceted field is checkable here only when this
-                    // validator owns the file's resolution (boot; the
-                    // deploy CLI's own files). A `secret`-typed field can
-                    // never enter this arm — it carries no facets — so
-                    // credentials are structurally outside the lane.
-                    (
-                        PrimitiveFacets::Number(_) | PrimitiveFacets::Duration(_),
-                        Value::Secret(_) | Value::Reference(_),
-                    ) => {
-                        if let Some(resolver) = &self.env_resolution {
-                            check_resolved_facets(resolver, facets, value, field_name, span, diags);
-                        }
-                    }
+                    // Deferred values (`$ENV.KEY`, const references) are
+                    // judged by the RFC 0047 resolved lane at the top of
+                    // `validate_value_against_type` — once per declared
+                    // value, so a fallback chain resolves the way
+                    // deserialization resolves it. A `secret`-typed field
+                    // carries no facets, so credentials are structurally
+                    // outside that lane.
                     _ => {}
                 }
             }
@@ -2461,8 +2520,14 @@ impl SchemaValidator {
                                 }
                             }
                         }
+                        // Type-only, for the same reason as `Modifier`:
+                        // a variant is another spelling of THIS value,
+                        // so re-entering the public door would re-run
+                        // the resolved lane once per candidate variant
+                        // — resolving an `$ENV` repeatedly to judge one
+                        // declared value.
                         let mut scratch = Vec::new();
-                        self.validate_value_against_type(
+                        self.validate_value_type_only(
                             value,
                             v,
                             field_name,
@@ -2486,7 +2551,10 @@ impl SchemaValidator {
                 }
             }
             FieldType::Modifier(declared) => {
-                self.validate_value_against_type(value, declared, field_name, context, span, diags);
+                // Type-only re-entry: this is the SAME value one layer
+                // down, not a nested one, and the public door already ran
+                // its resolved-lane check through this wrapper.
+                self.validate_value_type_only(value, declared, field_name, context, span, diags);
             }
             FieldType::Arms { .. } => {
                 // An arm set is a block of arms, never a scalar value.
@@ -3250,24 +3318,50 @@ fn check_resolved_facets(
     span: Span,
     diags: &mut Vec<Diagnostic>,
 ) {
+    // A value that needs no resolution was already judged by the literal
+    // facet arm; re-checking it here would double-report.
+    if !matches!(
+        value,
+        Value::Secret(_) | Value::Reference(_) | Value::Fallback(..)
+    ) {
+        return;
+    }
+    // Whether a resolution that lands on an ordinary LITERAL may be
+    // judged here. Only a `const` reference may: nothing else in the walk
+    // ever sees the value a const stands for, so without this its facets
+    // would go unchecked. A fallback chain is different — its legs are
+    // type- and facet-checked individually by the split, so judging the
+    // literal leg it resolves to would report the same violation twice,
+    // at two different spans.
+    let literal_is_unjudged_elsewhere = matches!(value, Value::Reference(_));
     let Ok(resolved) = resolver.resolve(value) else {
         return;
     };
-    let Value::Resolved(text) = resolved else {
-        return;
-    };
-    match facets {
-        PrimitiveFacets::Number(fs) => {
+    match (facets, &resolved) {
+        // Env-provenance text: interpret with the de-layer's own coercion
+        // parsers, and name the VARIABLE rather than the content.
+        (PrimitiveFacets::Number(fs), Value::Resolved(text)) => {
             if let Ok(n) = nml_core::types::Number::parse_coercion(text.as_str()) {
                 validate_facets_resolved(fs, &n, text.var(), field_name, span, diags);
             }
         }
-        PrimitiveFacets::Duration(fs) => {
+        (PrimitiveFacets::Duration(fs), Value::Resolved(text)) => {
             if let Ok(d) = nml_core::duration::Duration::parse_text(text.as_str()) {
                 validate_facets_resolved(fs, &d, text.var(), field_name, span, diags);
             }
         }
-        PrimitiveFacets::None => {}
+        // A const reference resolved to a typed literal: the value is
+        // authored in-file and carries no secret provenance, so it takes
+        // the ORDINARY value-echoing diagnostic — the same one the
+        // literal would have drawn had it been written inline. Without
+        // this, a faceted field could dodge its bounds behind a `const`.
+        (PrimitiveFacets::Number(fs), Value::Number(n)) if literal_is_unjudged_elsewhere => {
+            validate_facets(fs, n, field_name, span, diags);
+        }
+        (PrimitiveFacets::Duration(fs), Value::Duration(d)) if literal_is_unjudged_elsewhere => {
+            validate_facets(fs, d, field_name, span, diags);
+        }
+        _ => {}
     }
 }
 
@@ -7736,6 +7830,176 @@ mod resolved_facet_tests {
         );
     }
 
+    /// Fallback chains resolve ONCE, primary-wins — the same selection
+    /// deserialization makes. Judging legs individually would reject a
+    /// config the runtime runs happily: `$ENV.OVERRIDE | $ENV.STALE` with
+    /// a valid override and a stale-invalid baseline. Both walks must
+    /// agree, since they share the leaf.
+    #[test]
+    fn fallback_resolves_once_primary_wins_in_both_walks() {
+        let schema = "model svc:\n    drain duration(multipleOf = 1s)?\n";
+        let body = "svc A:\n    drain = $ENV.OVERRIDE | $ENV.STALE\n";
+        let env: &'static [(&'static str, &'static str)] =
+            &[("OVERRIDE", "5s"), ("STALE", "900ms")];
+
+        // Deep walk: the dead leg must NOT be judged.
+        let diags = diags_with_env(schema, body, env);
+        assert!(
+            diags.is_empty(),
+            "a losing fallback leg must never fail validation: {diags:?}"
+        );
+
+        // Shallow walk: identical verdict, same leaf.
+        let s = nml_core::cst::extract_schema(schema).0;
+        let v = SchemaValidator::new(s.models, s.enums, s.oneofs);
+        let file = nml_core::parse("deploy D:\n    drain = $ENV.OVERRIDE | $ENV.STALE\n").unwrap();
+        let block_body = match &file.declarations[0].kind {
+            nml_core::ast::DeclarationKind::Block(b) => &b.body,
+            other => panic!("fixture must parse as a block: {other:?}"),
+        };
+        let s2 =
+            nml_core::cst::extract_schema("model deploy:\n    drain duration(multipleOf = 1s)?\n")
+                .0;
+        let v2 = SchemaValidator::new(s2.models, s2.enums, s2.oneofs);
+        assert!(
+            v2.validate_resolved_facets(block_body, "deploy", &fixed(env))
+                .is_empty(),
+            "shallow walk must agree with the deep walk on primary-wins"
+        );
+        let _ = v;
+
+        // …and when the WINNING leg violates, both still catch it.
+        let bad: &'static [(&'static str, &'static str)] =
+            &[("OVERRIDE", "900ms"), ("STALE", "5s")];
+        assert_eq!(facet_errors(&diags_with_env(schema, body, bad)).len(), 1);
+        assert_eq!(
+            v2.validate_resolved_facets(block_body, "deploy", &fixed(bad))
+                .len(),
+            1
+        );
+    }
+
+    /// A chain of THREE OR MORE legs parses right-associative
+    /// (`a | b | c` → `Fallback(a, Fallback(b, c))`), so the type split
+    /// must RECURSE. A non-recursive split hands the nested tail to the
+    /// type match and reports a bogus "expected number, got fallback" —
+    /// a hard false reject on every resolver-free surface (`nml check`,
+    /// the LSP, tenant-upload validation), for a chain the runtime
+    /// resolves happily.
+    #[test]
+    fn multi_leg_fallback_chains_are_not_type_mismatches() {
+        for (schema, body) in [
+            (
+                "model svc:\n    port number\n",
+                "svc A:\n    port = $ENV.A | $ENV.B | 3000\n",
+            ),
+            (
+                "model svc:\n    port number\n",
+                "svc A:\n    port = $ENV.A | $ENV.B | $ENV.C | 3000\n",
+            ),
+            (
+                "model svc:\n    t duration\n",
+                "svc A:\n    t = $ENV.A | $ENV.B | 5s\n",
+            ),
+            (
+                "model svc:\n    name string\n",
+                "svc A:\n    name = $ENV.A | $ENV.B | \"x\"\n",
+            ),
+        ] {
+            // Resolver-free: the lane is off, so this is pure type checking.
+            let s = nml_core::cst::extract_schema(schema).0;
+            let v = SchemaValidator::new(s.models, s.enums, s.oneofs);
+            let diags = v.validate(&nml_core::cst::parse_to_ast(body).unwrap());
+            assert!(
+                diags.is_empty(),
+                "{body:?} must type-check clean: {diags:?}"
+            );
+
+            // And with the lane on, still clean when nothing is set.
+            let diags = diags_with_env(schema, body, &[]);
+            assert!(diags.is_empty(), "{body:?} with a resolver: {diags:?}");
+        }
+    }
+
+    /// A fallback whose winning leg is a facet-violating LITERAL must be
+    /// reported ONCE. The leg split already judges literals; the resolved
+    /// lane resolving the chain to that same literal must not echo it a
+    /// second time at the chain span.
+    #[test]
+    fn fallback_to_violating_literal_reports_once() {
+        let schema = "model svc:\n    port number(min = 4000)\n";
+        let body = "svc A:\n    port = 3000 | $ENV.P\n";
+        for env in [
+            &[][..],
+            &[("P", "9000")][..], // primary literal wins regardless
+        ] {
+            let diags = diags_with_env(schema, body, unsafe {
+                // The helper takes &'static; these literals are static.
+                std::mem::transmute::<&[(&str, &str)], &'static [(&'static str, &'static str)]>(env)
+            });
+            assert_eq!(
+                facet_errors(&diags).len(),
+                1,
+                "one violation, one report: {diags:?}"
+            );
+        }
+    }
+
+    /// An unfaceted field must not have its `$ENV` READ during
+    /// validation. For a `secret` field that means the credential is
+    /// never even materialized — outside the lane's resolution, not just
+    /// outside its judgment.
+    #[test]
+    fn unfaceted_fields_are_never_resolved_by_the_lane() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        READS.store(0, Ordering::SeqCst);
+
+        let s = nml_core::cst::extract_schema(
+            "model svc:\n    apiKey secret\n    label string\n    port number(min = 1)\n",
+        )
+        .0;
+        let v = SchemaValidator::new(s.models, s.enums, s.oneofs).with_env_resolution(
+            ValueResolver::new(|k| {
+                READS.fetch_add(1, Ordering::SeqCst);
+                (k == "PORT").then(|| "8080".to_string())
+            }),
+        );
+        let diags = v.validate(
+            &nml_core::cst::parse_to_ast(
+                "svc A:\n    apiKey = $ENV.KEY\n    label = $ENV.LABEL\n    port = $ENV.PORT\n",
+            )
+            .unwrap(),
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(
+            READS.load(Ordering::SeqCst),
+            1,
+            "only the faceted field may be resolved — secret/string fields must not be read"
+        );
+    }
+
+    /// A `const` reference is a deferred value too. Resolved through a
+    /// symbol table it yields an ordinary literal — which must still face
+    /// its facets, or a faceted field could dodge its bounds by hiding
+    /// the value behind a `const`. Authored in-file and secret-free, so
+    /// it takes the ordinary value-echoing message.
+    #[test]
+    fn const_referenced_values_are_facet_checked() {
+        let s = nml_core::cst::extract_schema("model svc:\n    port number(min = 10)\n").0;
+        let resolver = ValueResolver::without_env()
+            .with_symbols(|name| (name == "LOW").then(|| Value::Number("5".parse().unwrap())));
+        let v = SchemaValidator::new(s.models, s.enums, s.oneofs).with_env_resolution(resolver);
+        let diags = v.validate(&nml_core::cst::parse_to_ast("svc A:\n    port = LOW\n").unwrap());
+        let errs = facet_errors(&diags);
+        assert_eq!(errs.len(), 1, "a const must not dodge facets: {diags:?}");
+        assert!(
+            errs[0].message.contains("below the schema's min = 10"),
+            "{}",
+            errs[0].message
+        );
+    }
+
     /// The shallow walk resolves the WHOLE property value, so fallback
     /// chains behave exactly like deserialization: primary set-and-bad →
     /// error; primary unset → the literal leg (already judged by the
@@ -7760,6 +8024,85 @@ mod resolved_facet_tests {
         assert!(
             v.validate_resolved_facets(body, "deploy", &fixed(&[]))
                 .is_empty()
+        );
+    }
+
+    /// "Once per declared value" is about the VALUE, not about how many
+    /// type layers the schema wraps around it. A faceted primitive behind
+    /// a `Modifier` resolves exactly ONCE for the whole fallback chain —
+    /// and, because resolution short-circuits on the first leg that
+    /// succeeds, that means the winning leg only.
+    ///
+    /// The wrapper arms re-enter the TYPE-ONLY door for exactly this
+    /// reason. Routing them back through the public door instead skips
+    /// the whole-chain check (the guard sees `Modifier`, not `Primitive`)
+    /// and then runs the lane once per LEG underneath — reading variables
+    /// the runtime never reads, and reporting a bound violation in a leg
+    /// that never wins. The read count is what makes both halves visible.
+    #[test]
+    fn a_wrapped_faceted_field_resolves_once_for_the_whole_chain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        READS.store(0, Ordering::SeqCst);
+
+        let s = nml_core::cst::extract_schema("model svc:\n    |window duration(min = 60s)?\n").0;
+        assert!(
+            matches!(&s.models[0].fields[0].field_type, FieldType::Modifier(_)),
+            "fixture must exercise the wrapper arm: {:?}",
+            s.models[0].fields[0].field_type
+        );
+        let v = SchemaValidator::new(s.models, s.enums, s.oneofs).with_env_resolution(
+            ValueResolver::new(|k| {
+                READS.fetch_add(1, Ordering::SeqCst);
+                (k == "GOOD").then(|| "90s".to_string())
+            }),
+        );
+        let diags = v.validate(
+            &nml_core::cst::parse_to_ast("svc A:\n    window = $ENV.GOOD | $ENV.STALE\n").unwrap(),
+        );
+
+        assert!(
+            facet_errors(&diags).is_empty(),
+            "the winning leg satisfies the bound; a losing leg must not be judged: {diags:?}"
+        );
+        assert_eq!(
+            READS.load(Ordering::SeqCst),
+            1,
+            "the chain must resolve once, short-circuiting on the winning leg"
+        );
+    }
+
+    /// Unions are OUTSIDE the lane, deliberately and uniformly: the
+    /// shallow walk's `scalar_facets` returns `None` for them, the
+    /// embedder's lane census does not count them, and the deep walk now
+    /// agrees. `any-variant-admits` has no single facet set to judge a
+    /// resolved value against, so judging one would mean picking a
+    /// variant for the user. What must NOT happen is the middle ground
+    /// the wrapper bug produced: resolving the value once per candidate
+    /// variant per fallback leg.
+    #[test]
+    fn union_variants_do_not_each_resolve_the_value() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        READS.store(0, Ordering::SeqCst);
+
+        let s = nml_core::cst::extract_schema(
+            "model svc:\n    port (number(min = 10) | number(min = 20))\n",
+        )
+        .0;
+        let v = SchemaValidator::new(s.models, s.enums, s.oneofs).with_env_resolution(
+            ValueResolver::new(|k| {
+                READS.fetch_add(1, Ordering::SeqCst);
+                (k == "A").then(|| "50".to_string())
+            }),
+        );
+        let _ = v.validate(
+            &nml_core::cst::parse_to_ast("svc A:\n    port = $ENV.A | $ENV.B\n").unwrap(),
+        );
+        assert_eq!(
+            READS.load(Ordering::SeqCst),
+            0,
+            "a union field is outside the lane; no variant may resolve its value"
         );
     }
 }

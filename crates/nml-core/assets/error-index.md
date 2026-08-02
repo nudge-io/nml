@@ -42,8 +42,14 @@ oneof email by kind:
 | `"3000"` (quoted number in a `number`-typed field) | the number literal `3000` | RFC 0017 follow-up |
 | `"true"` (quoted bool in a `bool`-typed field) | the bool literal `true` | RFC 0017 follow-up |
 
-The quoted-literal arms fire only when the de-quoted text parses as the
-field's type — anything else stays the ordinary NML2008 type mismatch.
+The quoted-literal arms accept the type's **coercion grammar** — the
+same grammar `$ENV` values use at runtime — so every spelling that ever
+worked through string coercion gets the migration fix, including ones
+the literal grammar rejects (`"1e-6"`, `"1.5h"`). The suggestion is
+always the **canonical literal** (`0.000001`, `1h30m`), which is valid
+source even when the quoted spelling was not; the "(drop the quotes)"
+hint appears only when de-quoting alone IS the fix. Anything outside
+the coercion grammar stays the ordinary NML2008 type mismatch.
 `$ENV.KEY` references are untouched (they resolve later); only source
 literals migrate.
 
@@ -1364,6 +1370,16 @@ job Sync:
 
 Values are checked after the type check, element-wise for
 collections, and field defaults are held to the same rule.
+
+**The resolved lane** (RFC 0047): at a boundary that owns a file's
+resolution (server boot; the deploy CLI's own files), facets are also
+enforced on what `$ENV.KEY` resolves to. That shape of the message
+names the **variable and the bound, never the resolved content** —
+`'pollInterval' from $ENV.P resolved to a value below the schema's
+min = 60s` — because env-resolved text is secret-provenance; check
+the variable in your environment (`echo $P`) to see the value.
+Boundaries that do not own resolution (the control plane; the editor)
+defer `$ENV` values instead, and deserialization reports them.
 
 **Fix:** change the value to satisfy the constraint, or change the
 schema if the constraint is wrong. Nothing is ever clamped or rounded
