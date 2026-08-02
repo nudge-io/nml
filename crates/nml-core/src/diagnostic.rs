@@ -106,10 +106,46 @@ impl fmt::Display for Code {
 macro_rules! codes {
     ($($(#[$doc:meta])* $name:ident = $num:literal;)+) => {
         $($(#[$doc])* pub const $name: Code = Code($num);)+
-        /// Declaration order, numbers only — the guard's input. Names live
-        /// in the test-only `ALL`; a `u16` slice keeps the release binary
-        /// free of 95 constant names it would never read.
-        const DECLARED: &[u16] = &[$($num),+];
+        /// **The allocation guard, enforced at compile time.** Declarations are
+        /// strictly ascending — one invariant that buys three properties, and
+        /// the reason it is ordering rather than mere uniqueness:
+        ///
+        /// * **Reuse is impossible.** Strictly increasing implies distinct, so
+        ///   the "never reused" half of the stability contract is a compile
+        ///   error rather than a test failure — the code cannot be built, let
+        ///   alone shipped.
+        /// * **The next free code is readable.** It is one past a band's last
+        ///   entry, visible at a glance. Three consecutive allocation
+        ///   collisions (a proposed pair already taken, then a second pair
+        ///   whose lower half was taken by an out-of-order entry) all traced to
+        ///   the same cause: the list was unordered, so "what is free?" meant
+        ///   scanning 200 lines, and scanning misses.
+        /// * **Insertion is self-locating.** A new code goes beside its
+        ///   numeric neighbours, so a mistake is visible on the line being
+        ///   typed rather than in a distant summary.
+        ///
+        /// Gaps are fine and expected (`2056` is one — a retired allocation
+        /// from a corrected collision): bands are allocation convenience, not
+        /// API, and nothing enumerates a contiguous range. Closing a gap would
+        /// mean renumbering, which the contract forbids.
+        const _: () = {
+            const DECLARED: &[u16] = &[$($num),+];
+            let mut i = 0;
+            while i < DECLARED.len() {
+                assert!(
+                    DECLARED[i] >= 1 && DECLARED[i] <= 5999,
+                    "diagnostic code is outside the allocated space (1..=5999)"
+                );
+                assert!(
+                    i == 0 || DECLARED[i - 1] < DECLARED[i],
+                    "diagnostic codes must be declared in strictly ascending order \
+                     (this also proves none is reused) — move the new code beside \
+                     its numeric neighbours; the next free code in a band is one \
+                     past that band's last entry"
+                );
+                i += 1;
+            }
+        };
         #[cfg(test)]
         pub(crate) const ALL: &[(&str, Code)] = &[$((stringify!($name), $name)),+];
     };
@@ -402,46 +438,6 @@ pub mod codes {
         /// A template expression uses a namespace the project does not configure.
         UNKNOWN_TEMPLATE_NAMESPACE = 5004;
     }
-
-    /// **The allocation guard, enforced at compile time.** Declarations are
-    /// strictly ascending — one invariant that buys three properties, and
-    /// the reason it is ordering rather than mere uniqueness:
-    ///
-    /// * **Reuse is impossible.** Strictly increasing implies distinct, so
-    ///   the "never reused" half of the stability contract is a compile
-    ///   error rather than a test failure — the code cannot be built, let
-    ///   alone shipped.
-    /// * **The next free code is readable.** It is one past a band's last
-    ///   entry, visible at a glance. Three consecutive allocation
-    ///   collisions (a proposed pair already taken, then a second pair
-    ///   whose lower half was taken by an out-of-order entry) all traced to
-    ///   the same cause: the list was unordered, so "what is free?" meant
-    ///   scanning 200 lines, and scanning misses.
-    /// * **Insertion is self-locating.** A new code goes beside its
-    ///   numeric neighbours, so a mistake is visible on the line being
-    ///   typed rather than in a distant summary.
-    ///
-    /// Gaps are fine and expected (`2056` is one — a retired allocation
-    /// from a corrected collision): bands are allocation convenience, not
-    /// API, and nothing enumerates a contiguous range. Closing a gap would
-    /// mean renumbering, which the contract forbids.
-    const _: () = {
-        let mut i = 0;
-        while i < DECLARED.len() {
-            assert!(
-                DECLARED[i] >= 1 && DECLARED[i] <= 5999,
-                "diagnostic code is outside the allocated space (1..=5999)"
-            );
-            assert!(
-                i == 0 || DECLARED[i - 1] < DECLARED[i],
-                "diagnostic codes must be declared in strictly ascending order \
-                 (this also proves none is reused) — move the new code beside \
-                 its numeric neighbours; the next free code in a band is one \
-                 past that band's last entry"
-            );
-            i += 1;
-        }
-    };
 }
 
 /// The error index source (`## NML0000` sections) — embedded so explanations

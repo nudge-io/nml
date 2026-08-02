@@ -4965,55 +4965,57 @@ impl LanguageServer for NmlLanguageServer {
                 // Arm-selector position (RFC 0007 §6.1): before `->` inside an
                 // arm-set block — offer enum keys, a string-key snippet,
                 // `@keyword/name` references for model-keyed K, and `else`.
-                if let Some((line, end)) = line_ctx
-                    && !cursor_past_arm_arrow(line, end)
-                    && let Some(key) = find_arm_set_key_at(&file, pos, index, &line_index)
-                {
-                    let tagged_refs = collect_tagged_ref_candidates(&docs);
-                    let selector_items = arm_selector_completion_items(&key, index, &tagged_refs);
-                    return Ok(Some(CompletionResponse::Array(selector_items)));
+                if let Some((line, end)) = line_ctx {
+                    if !cursor_past_arm_arrow(line, end) {
+                        if let Some(key) = find_arm_set_key_at(&file, pos, index, &line_index) {
+                            let tagged_refs = collect_tagged_ref_candidates(&docs);
+                            let selector_items =
+                                arm_selector_completion_items(&key, index, &tagged_refs);
+                            return Ok(Some(CompletionResponse::Array(selector_items)));
+                        }
+                    }
                 }
                 // Arm-target position (RFC 0007): after the `->` on an arm
                 // line, offer declarations of the arm set's target type `V`
                 // instead of field names.
-                if let Some((line, end)) = line_ctx
-                    && cursor_past_arm_arrow(line, end)
-                {
-                    if let Some(target_keywords) =
-                        find_arm_target_types_at(&file, pos, index, &line_index)
-                    {
-                        if let Some(snippet) =
-                            inline_arm_target_snippet_item(&target_keywords, index)
+                if let Some((line, end)) = line_ctx {
+                    if cursor_past_arm_arrow(line, end) {
+                        if let Some(target_keywords) =
+                            find_arm_target_types_at(&file, pos, index, &line_index)
                         {
-                            items.push(snippet);
-                        }
-                        for keyword in &target_keywords {
-                            // Enum-typed arm target (RFC 0030): offer the
-                            // declared variants as values.
-                            if let Some(e) = index.enum_def(keyword) {
-                                for (i, variant) in e.variants.iter().enumerate() {
+                            if let Some(snippet) =
+                                inline_arm_target_snippet_item(&target_keywords, index)
+                            {
+                                items.push(snippet);
+                            }
+                            for keyword in &target_keywords {
+                                // Enum-typed arm target (RFC 0030): offer the
+                                // declared variants as values.
+                                if let Some(e) = index.enum_def(keyword) {
+                                    for (i, variant) in e.variants.iter().enumerate() {
+                                        items.push(CompletionItem {
+                                            label: format!("\"{variant}\""),
+                                            kind: Some(CompletionItemKind::ENUM_MEMBER),
+                                            detail: Some("enum variant".to_string()),
+                                            sort_text: Some(format!("0_{i:03}")),
+                                            ..Default::default()
+                                        });
+                                    }
+                                }
+                                for (name, kw, file_name) in
+                                    collect_declarations_by_keyword(&docs, keyword)
+                                {
                                     items.push(CompletionItem {
-                                        label: format!("\"{variant}\""),
-                                        kind: Some(CompletionItemKind::ENUM_MEMBER),
-                                        detail: Some("enum variant".to_string()),
-                                        sort_text: Some(format!("0_{i:03}")),
+                                        label: name.clone(),
+                                        kind: Some(CompletionItemKind::REFERENCE),
+                                        detail: Some(format!("{kw} (from {file_name})")),
+                                        sort_text: Some(format!("0_{name}")),
                                         ..Default::default()
                                     });
                                 }
                             }
-                            for (name, kw, file_name) in
-                                collect_declarations_by_keyword(&docs, keyword)
-                            {
-                                items.push(CompletionItem {
-                                    label: name.clone(),
-                                    kind: Some(CompletionItemKind::REFERENCE),
-                                    detail: Some(format!("{kw} (from {file_name})")),
-                                    sort_text: Some(format!("0_{name}")),
-                                    ..Default::default()
-                                });
-                            }
+                            return Ok(Some(CompletionResponse::Array(items)));
                         }
-                        return Ok(Some(CompletionResponse::Array(items)));
                     }
                 }
                 // RFC 0015 `as`-position (nominal union): after `<field> as ` on

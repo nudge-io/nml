@@ -7699,7 +7699,9 @@ mod resolved_facet_tests {
         )
         .0;
         let v = SchemaValidator::new(s.models, s.enums, s.oneofs);
-        let file = nml_core::cst::parse_to_ast("deploy:\n    drain_timeout = $ENV.D\n").unwrap();
+        // Blocks are `keyword Name:` — the CLI matches on the keyword
+        // (`block.keyword.name`), never the instance name.
+        let file = nml_core::parse("deploy D:\n    drain_timeout = $ENV.D\n").unwrap();
         let body = match &file.declarations[0].kind {
             nml_core::ast::DeclarationKind::Block(b) => &b.body,
             other => panic!("fixture must parse as a block: {other:?}"),
@@ -7723,7 +7725,7 @@ mod resolved_facet_tests {
 
         // Literal values are the whole-file pass's job — the shallow walk
         // must not double-report them.
-        let file = nml_core::cst::parse_to_ast("deploy:\n    drain_timeout = 900ms\n").unwrap();
+        let file = nml_core::parse("deploy D:\n    drain_timeout = 900ms\n").unwrap();
         let body = match &file.declarations[0].kind {
             nml_core::ast::DeclarationKind::Block(b) => &b.body,
             other => panic!("fixture must parse as a block: {other:?}"),
@@ -7745,8 +7747,7 @@ mod resolved_facet_tests {
         )
         .0;
         let v = SchemaValidator::new(s.models, s.enums, s.oneofs);
-        let file =
-            nml_core::cst::parse_to_ast("deploy:\n    drain_timeout = $ENV.D | 5s\n").unwrap();
+        let file = nml_core::parse("deploy D:\n    drain_timeout = $ENV.D | 5s\n").unwrap();
         let body = match &file.declarations[0].kind {
             nml_core::ast::DeclarationKind::Block(b) => &b.body,
             other => panic!("fixture must parse as a block: {other:?}"),
