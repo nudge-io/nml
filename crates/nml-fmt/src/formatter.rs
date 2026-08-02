@@ -265,6 +265,7 @@ impl<'a> Formatter<'a> {
     fn arm_run(&mut self, entries: &[BodyEntry], depth: usize) {
         let selector_text = |arm: &Arm| match &arm.selector {
             ArmSelector::Role(r) => r.clone(),
+            ArmSelector::Literal(k) => quote_string(k),
             ArmSelector::Else => "else".to_string(),
         };
         let max_w = entries
@@ -288,13 +289,24 @@ impl<'a> Formatter<'a> {
             }
             self.out.push_str(" -> ");
             match &arm.target {
-                ArmTarget::Reference(id) => self.out.push_str(&id.name),
-                // A path/url literal (RFC 0007 §6) renders quoted, like a
-                // `oneof` arm's string key.
-                ArmTarget::Literal { value, .. } => self.out.push_str(&quote_string(value)),
+                ArmTarget::Reference(id) => {
+                    self.out.push_str(&id.name);
+                    self.emit_trailing_comment(arm.target.span().start);
+                    self.out.push('\n');
+                }
+                ArmTarget::Literal { value, .. } => {
+                    self.out.push_str(&quote_string(value));
+                    self.emit_trailing_comment(arm.target.span().start);
+                    self.out.push('\n');
+                }
+                ArmTarget::Inline { name, body } => {
+                    self.out.push_str(&name.name);
+                    self.out.push(':');
+                    self.emit_trailing_comment(name.span.start);
+                    self.out.push('\n');
+                    self.body(body, depth + 1);
+                }
             }
-            self.emit_trailing_comment(arm.target.span().start);
-            self.out.push('\n');
         }
     }
 
@@ -521,6 +533,13 @@ fn quote_string(s: &str) -> String {
 fn format_value(out: &mut String, value: &Value, depth: usize) {
     match value {
         Value::String(s) => format_string(out, s, depth, true),
+        // A resolved env value formats as the REFERENCE that produced it
+        // (`$ENV.KEY`), never its content: the formatter writes source
+        // text, and printing resolved material would embed a secret in a
+        // file. Formatting only ever runs on parser output in-repo, so
+        // this arm is defense-in-depth — and semantically it is the
+        // correct round-trip (back to the authored spelling).
+        Value::Resolved(r) => out.push_str(r.var()),
         Value::TemplateString(segments) => {
             // Braces stay raw: the reparse re-detects the template from
             // them, so the value's TYPE survives the round-trip.
@@ -683,6 +702,25 @@ fn push_value_char(out: &mut String, ch: char) {
 mod tests {
     use super::*;
     use nml_core::parse;
+
+    /// A resolved env value formats as the REFERENCE that produced it —
+    /// the leak-proof round-trip: formatting a resolved tree writes the
+    /// authored `$ENV.KEY` spelling, never the (possibly secret)
+    /// resolved content.
+    #[test]
+    fn resolved_value_formats_as_its_reference() {
+        let mut out = String::new();
+        format_value(
+            &mut out,
+            &nml_core::types::Value::Resolved(nml_core::types::ResolvedText::new(
+                "$ENV.API_KEY",
+                "hunter2",
+            )),
+            0,
+        );
+        assert_eq!(out, "$ENV.API_KEY");
+        assert!(!out.contains("hunter2"));
+    }
 
     fn roundtrip(source: &str) {
         let file = parse(source).unwrap();
@@ -1108,6 +1146,34 @@ mod tests {
         assert!(
             formatted.contains("        else        -> \"default.workflow.nml\"\n"),
             "'else' pads to the widest selector (@role/admin = 11 cols):\n{formatted}"
+        );
+        roundtrip(source);
+        idempotent(source);
+    }
+
+    #[test]
+    fn test_format_arm_inline_targets_roundtrip() {
+        let source = "service App:\n    routing:\n        @role/admin -> adminLanding:\n            label = 4\n        else -> defaultLanding\n";
+        let formatted = format(&parse(source).unwrap());
+        assert!(
+            formatted.contains("@role/admin -> adminLanding:\n"),
+            "inline arm header:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("            label = 4\n"),
+            "inline arm body indented:\n{formatted}"
+        );
+        roundtrip(source);
+        idempotent(source);
+    }
+
+    #[test]
+    fn test_format_arm_string_selector_roundtrip() {
+        let source = "service App:\n    routing:\n        \"plan\" -> \"upsell\"\n        @role/admin -> admin\n";
+        let formatted = format(&parse(source).unwrap());
+        assert!(
+            formatted.contains("\"plan\"") && formatted.contains("-> \"upsell\""),
+            "string selector arm:\n{formatted}"
         );
         roundtrip(source);
         idempotent(source);

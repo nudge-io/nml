@@ -1,0 +1,7 @@
+// Backing schema for the NML0001 quoted-literal migration examples: a
+// number-typed and a bool-typed field, so the quoted spellings `"3000"`
+// and `"true"` each demonstrate the replaced-syntax teaching fix.
+
+model svc:
+    port number
+    admin bool

@@ -39,6 +39,19 @@ oneof email by kind:
 | `=>` (arm arrow) | `->` | RFC 0006 |
 | `&&` (never valid — C-family habit) | `&` | RFC 0014 |
 | `"30s"` (quoted duration in a `duration`-typed field) | the duration literal `30s` | RFC 0017 |
+| `"3000"` (quoted number in a `number`-typed field) | the number literal `3000` | RFC 0017 follow-up |
+| `"true"` (quoted bool in a `bool`-typed field) | the bool literal `true` | RFC 0017 follow-up |
+
+The quoted-literal arms fire only when the de-quoted text parses as the
+field's type — anything else stays the ordinary NML2008 type mismatch.
+`$ENV.KEY` references are untouched (they resolve later); only source
+literals migrate.
+
+```nml check expect-error='[NML0001, NML0001]' schema=docs/errors/schemas/replaced-literals
+svc Api:
+    port = "3000"
+    admin = "true"
+```
 
 Earlier pre-code migrations, for the record: the `!` positional marker
 became `+` (RFC 0005 rev. 1), and the never-implemented angle-bracket
@@ -79,7 +92,7 @@ service Api:
 is echoed with control characters escaped — file content can never
 smuggle raw terminal escapes into your output.
 
-```nml check expect-error='[NML0002, NML0004]'
+```nml check expect-error='[NML0002, NML0002, NML0004]'
 service Api:
     x = ^oops
 ```
@@ -110,7 +123,7 @@ the open columns, so the fix is a straight pick from that list. (NML
 recovers by treating the line's column as a new level, so later lines
 still parse.)
 
-```nml check expect-error='[NML0002, NML0006]'
+```nml check expect-error='[NML0002, NML0002, NML0002, NML0002, NML0006]'
 service Api:
         port = 8080
     host = "0.0.0.0"
@@ -140,7 +153,7 @@ clipping occurs.)
 set elements are *alternatives*, written `set<a | b>`. Machine-fixable:
 the comma becomes `|`.
 
-```nml check expect-error='[NML0002, NML0008]'
+```nml check expect-error='[NML0002, NML0002, NML0008]'
 model deploy:
     regions set<string, number>
 ```
@@ -284,7 +297,7 @@ The fence below is stored with LF endings and converted to lone-CR
 ("old Mac") endings by the docs harness before it runs, so this
 example is executable, not illustrative:
 
-```nml check eol=cr expect-error='[NML0002, NML0016]'
+```nml check eol=cr expect-error='[NML0002, NML0002, NML0016, NML0016]'
 service Api:
     port = 8080
 ```
@@ -435,7 +448,7 @@ service Api:
 **Const/template reference cycle.** `const`/`template` chains must resolve to
 a value; a cycle never does.
 
-```nml check expect-error='[NML1002]'
+```nml check expect-error='[NML1002, NML1002]'
 const A = B
 const B = A
 ```
@@ -617,7 +630,7 @@ oneof thing by kind:
 
 **Inheritance cycle.** `is` chains must be acyclic.
 
-```nml check expect-error='[NML2013]'
+```nml check expect-error='[NML2013, NML2013]'
 model cycleA is cycleB:
     x string?
 model cycleB is cycleA:
@@ -632,7 +645,7 @@ model cycleB is cycleA:
 loop. Legal — recursive configs exist — but often an unintended
 self-reference, so it warns.
 
-```nml check expect-output='[NML2014]'
+```nml check expect-output='[NML2014, NML2014]'
 model node:
     next otherNode?
 model otherNode:
@@ -697,7 +710,7 @@ oneof badType by kind as notAnEnum:
 must equal the enum's variants exactly — no missing variant, no arm outside
 the enum. Both directions report this code.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2019]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2009, NML2019]'
 enum letters:
     - "a"
     - "b"
@@ -713,7 +726,7 @@ oneof exhaustive by kind as letters:
 model or trait (RFC 0011). A typo'd target carries a machine-applicable
 did-you-mean; in the editor it is a one-click fix.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2020]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2009, NML2020]'
 trait auditable:
     auditedBy string?
 
@@ -729,7 +742,7 @@ model/trait.
 **`is` target is not composable.** Only models and traits compose with
 `is`; an enum or a `oneof` cannot be mixed in.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2021]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2009, NML2021]'
 enum sizes:
     - "s"
     - "m"
@@ -748,7 +761,7 @@ they bundle fields for `is`, and never describe a value — not directly,
 in `[]`/`set<>`, in a union, behind a `|` modifier, or in `(K -> V)` arm
 positions.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2022]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2009, NML2022]'
 trait auditable:
     auditedBy string?
 
@@ -765,7 +778,7 @@ declare a `model` if you need a nested value type.
 discriminator dispatch, so every arm must name an instantiable model —
 a trait can never be selected.
 
-```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2023]'
+```nml check schema=docs/errors/schemas-bad expect-error='[NML2009, NML2009, NML2023]'
 trait auditable:
     auditedBy string?
 
@@ -1024,7 +1037,8 @@ service Api:
 ## NML2039
 
 **Arm target mismatch.** A string-literal target (`-> "value"`) requires a
-scalar-capable target type; a model-typed arm set needs a declared name.
+scalar-capable target type; a model-typed arm set needs a declared name or
+an inline block (`-> Name:`). This value is neither.
 
 ```nml check expect-error='[NML2039]'
 model page:
@@ -1038,7 +1052,8 @@ service Api:
         else -> "status"
 ```
 
-**Fix:** point the arm at a declared instance (`-> StatusPage`).
+**Fix:** point the arm at a declared instance (`-> StatusPage`) or write an
+inline block (`-> StatusPage:`).
 
 ## NML2040
 
@@ -1192,8 +1207,8 @@ block form.
 
 **Arm-shorthand mismatch.** A bare scalar item fills an arm-set (`(K -> V)`)
 shorthand field through the canonical `else ->` embedding — so the value
-must be a name or a string (an arm target's two forms). This value is
-neither, and no arm can be synthesized from it.
+must be a name, a string literal, or an inline block (`-> Name:`). This
+value is neither, and no arm can be synthesized from it.
 
 ```nml check expect-error='[NML2050]'
 model page:
@@ -1204,7 +1219,8 @@ model page:
 ```
 
 **Fix:** supply a name or a string (it becomes the `else ->` arm's
-target), or write the item in block form with explicit arms.
+target), write an inline block (`-> Name:`), or write the item in block form
+with explicit arms.
 
 ## NML2051
 
@@ -1338,7 +1354,7 @@ nanoseconds (RFC 0017): `1000ms` satisfies `min = 1s`, and
 `multipleOf` is unit-blind divisibility — `1500ms` is a multiple of
 `250ms` but not of `1s`:
 
-```nml check expect-error='[NML2057]'
+```nml check expect-error='[NML2057, NML2057]'
 model job:
     interval duration(min = 1s, multipleOf = 250ms)
 

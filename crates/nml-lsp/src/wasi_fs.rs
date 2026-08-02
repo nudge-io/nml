@@ -2,6 +2,34 @@
 
 use std::path::Path;
 
+/// Deliberately-leaked listing handles minted so far (the wasi branch of
+/// [`ReadDir`]'s `Drop`). Native builds never increment it — the accessor
+/// and its unit test keep the wiring compiled and observably zero on every
+/// target, so the wasi-only arithmetic cannot rot uncompiled.
+#[cfg(any(target_os = "wasi", test))]
+static LEAKED_HANDLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Budget of deliberately-leaked listing handles before [`read_dir`] starts
+/// refusing (wasi only). What it bounds is MEMORY, not fd space: the
+/// `wasm-wasi-core` host's fd table is a monotonic-counter JS `Map` — no
+/// slot reuse, no ceiling — so the leak can never exhaust that host's fds,
+/// but every forgotten listing pins one host map entry plus the guest `DIR`
+/// heap allocation forever. 4096 caps that otherwise-unbounded tail, and on
+/// WASI hosts that DO enforce fd ceilings it refuses before any plausible
+/// cap is reached. Callers already degrade honestly at a refusal (claims
+/// walk → `Truncated` → `Undetermined`; index walk skips the directory).
+/// Retirement condition: same as the wrapper — delete once a fixed
+/// `wasm-wasi-core` is the supported floor.
+#[cfg(any(target_os = "wasi", test))]
+const LEAKED_HANDLE_BUDGET: usize = 4096;
+
+/// How many listing handles this process has leaked so far — 0 on native,
+/// where `Drop` really disposes.
+#[cfg(any(target_os = "wasi", test))]
+fn leaked_handles() -> usize {
+    LEAKED_HANDLES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Open a directory listing, ABORT-PROOF under `wasm-wasi-core`.
 ///
 /// Rust std's `ReadDir` panics in `Drop` when `closedir` fails
@@ -12,8 +40,11 @@ use std::path::Path;
 /// early-return caps and never materialize a listing — and its own
 /// `Drop` disposes of the inner iterator: dropped normally on native,
 /// deliberately LEAKED (`mem::forget`) on wasi so the panicking
-/// destructor never runs. The cost is one guest fd-table slot per
-/// listing, bounded by listing frequency and strictly better than the
+/// destructor never runs. The leak's cost is MEMORY, not fd space
+/// (`wasm-wasi-core`'s Map-based fd table cannot exhaust — see
+/// `LEAKED_HANDLE_BUDGET`): each forgotten listing pins one host map
+/// entry plus the guest `DIR` heap allocation, counted in
+/// `LEAKED_HANDLES` and capped by the budget — strictly better than the
 /// alternative (the whole server aborts mid-pull, taking every future
 /// diagnostic with it — the failure mode that shipped as an
 /// unexplained E2E timeout).
@@ -25,6 +56,15 @@ use std::path::Path;
 /// issue with the minimal repro). Delete this module — and its source
 /// ratchet test — once a fixed `wasm-wasi-core` is the supported floor.
 pub(crate) fn read_dir(dir: &Path) -> std::io::Result<ReadDir> {
+    // Past the budget, every further listing would leak yet another
+    // handle; refusing converts the unbounded-memory tail into the
+    // bounded-walk degradation callers already handle.
+    #[cfg(target_os = "wasi")]
+    if leaked_handles() > LEAKED_HANDLE_BUDGET {
+        return Err(std::io::Error::other(
+            "wasi fd budget exhausted (leaked-handle cap)",
+        ));
+    }
     Ok(ReadDir(Some(std::fs::read_dir(dir)?)))
 }
 
@@ -41,7 +81,12 @@ impl Drop for ReadDir {
     fn drop(&mut self) {
         if let Some(inner) = self.0.take() {
             #[cfg(target_os = "wasi")]
-            std::mem::forget(inner);
+            {
+                // Each forget is one more entry in the leak ledger the
+                // budget check in `read_dir` reads.
+                LEAKED_HANDLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::mem::forget(inner);
+            }
             #[cfg(not(target_os = "wasi"))]
             drop(inner);
         }
@@ -50,6 +95,28 @@ impl Drop for ReadDir {
 
 #[cfg(test)]
 mod tests {
+    /// The leak ledger's native contract: `Drop` really disposes here, so a
+    /// full open→iterate→drop cycle through the wrapper leaves the counter
+    /// at zero — and the budget wiring stays compiled on every target. The
+    /// wasi increment/refuse branch can only be pinned structurally (it
+    /// needs the wasm-wasi-core host to run), so this is the whole
+    /// native-side observable.
+    #[cfg(not(target_os = "wasi"))]
+    #[test]
+    fn native_drop_disposes_and_leaks_nothing() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let listed = super::read_dir(&src).expect("src listable").count();
+        assert!(listed > 0, "src has entries");
+        assert_eq!(
+            super::leaked_handles(),
+            0,
+            "only the wasi mem::forget branch may count"
+        );
+        // Compile-time: a zero budget would refuse the FIRST listing on
+        // wasi — the wrapper would be worse than the bug it works around.
+        const { assert!(super::LEAKED_HANDLE_BUDGET > 0) };
+    }
+
     /// Everything but code: string/char literals and comments (line, and
     /// nested block) replaced with a space, so the matcher below sees
     /// tokens only. A `"a//b"` literal can no longer mask the rest of its

@@ -201,7 +201,10 @@ pub type DurationFacets = Facets<crate::duration::Duration>;
 /// The facets a primitive field carries, tagged by domain — a `number`
 /// field's bounds are `Number`s, a `duration` field's are `Duration`s,
 /// and the type system keeps the two from ever being compared across
-/// domains. `None` for every other primitive.
+/// domains. `None` means "no facet list authored" — for EVERY primitive,
+/// bare `number`/`duration` fields included: the field's domain is the
+/// type name's job, never this enum's, so a bare field of any type
+/// carries the same variant and the same serialized shape.
 ///
 /// The payloads are boxed: a `Duration` bound stores its canonical
 /// segments inline (~1/8 KiB per facet record), and most fields carry no
@@ -270,6 +273,20 @@ impl<T: FacetDomain> Facets<T> {
     /// about what "violates" means. Comparisons are exact — the
     /// domain's own `Ord` and `is_multiple_of`, never f64.
     pub fn violations(&self, n: &T) -> Vec<String> {
+        self.violation_descriptions(n)
+            .into_iter()
+            .map(|desc| format!("is {n}, {desc}"))
+            .collect()
+    }
+
+    /// The same violations, described WITHOUT rendering `n` — for lanes
+    /// where the value must never be echoed (an `$ENV`-resolved value is
+    /// secret-provenance text; RFC 0047 names the variable and the bound
+    /// instead). `n` still drives which bounds fire and the at/below/above
+    /// relation words; it just never appears in the output. [`Self::violations`]
+    /// is this plus an `is {n}, ` prefix, so the two lanes cannot disagree
+    /// about what "violates" means.
+    pub fn violation_descriptions(&self, n: &T) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(b) = &self.min {
             let fails = if b.exclusive {
@@ -286,7 +303,7 @@ impl<T: FacetDomain> Facets<T> {
                     "below"
                 };
                 out.push(format!(
-                    "is {n}, {relation} the schema's {} = {}",
+                    "{relation} the schema's {} = {}",
                     if b.exclusive { "exclusiveMin" } else { "min" },
                     b.value
                 ));
@@ -305,7 +322,7 @@ impl<T: FacetDomain> Facets<T> {
                     "above"
                 };
                 out.push(format!(
-                    "is {n}, {relation} the schema's {} = {}",
+                    "{relation} the schema's {} = {}",
                     if b.exclusive { "exclusiveMax" } else { "max" },
                     b.value
                 ));
@@ -314,7 +331,7 @@ impl<T: FacetDomain> Facets<T> {
         if let Some(m) = &self.multiple_of {
             if !n.is_multiple_of(&m.value) {
                 out.push(format!(
-                    "is {n}, not a multiple of the schema's multipleOf = {} \
+                    "not a multiple of the schema's multipleOf = {} \
                      (checked exactly -- no float rounding)",
                     m.value
                 ));
@@ -378,7 +395,7 @@ pub enum FieldType {
     /// selectors (`role`, `string`, or an enum; `else` is always legal);
     /// `target` types the arm targets — completion/intent for reference
     /// targets (consumer-resolved, never existence-checked; RFC 0007 §4.1),
-    /// full validation for inline-block targets.
+    /// full validation for inline-block targets (RFC 0007 §6.2).
     Arms {
         key: Box<FieldType>,
         target: Box<FieldType>,
@@ -421,12 +438,14 @@ impl std::fmt::Display for FieldType {
                 f.write_str(p.as_str())?;
                 // RFC 0018: the faceted type IS the contract — hover and
                 // every model-side rendering show it in canonical form.
-                if !facets.is_none() {
-                    let parts = match facets {
-                        PrimitiveFacets::None => Vec::new(),
-                        PrimitiveFacets::Number(fs) => fs.canonical_parts(),
-                        PrimitiveFacets::Duration(fs) => fs.canonical_parts(),
-                    };
+                // A `None` here is empty by definition (extraction never
+                // wraps an empty list), so only the domain arms render.
+                let parts = match facets {
+                    PrimitiveFacets::None => Vec::new(),
+                    PrimitiveFacets::Number(fs) => fs.canonical_parts(),
+                    PrimitiveFacets::Duration(fs) => fs.canonical_parts(),
+                };
+                if !parts.is_empty() {
                     write!(f, "({})", parts.join(", "))?;
                 }
                 Ok(())
@@ -474,6 +493,70 @@ mod facet_tests {
 
     fn n(s: &str) -> Number {
         s.parse().unwrap()
+    }
+
+    /// Representation invariant: `facets` is `None` ⟺ the source authored
+    /// no facet list — for EVERY primitive, faceted domains included. A
+    /// bare `number` field once carried `Number(Facets::NONE)`, giving
+    /// bare number and bare string fields different variants (and
+    /// serialized shapes) for the same "no facets" fact — a downstream
+    /// trap for anyone matching the variant as a domain proxy.
+    #[test]
+    fn bare_fields_carry_none_for_every_domain() {
+        let (schema, diags) =
+            crate::cst::extract_schema("model m:\n    a number\n    b duration\n    c string\n");
+        assert!(diags.is_empty(), "{diags:?}");
+        let fields = &schema.models[0].fields;
+        for field in fields {
+            match &field.field_type {
+                FieldType::Primitive { facets, .. } => assert!(
+                    matches!(facets, PrimitiveFacets::None),
+                    "bare '{}' must carry PrimitiveFacets::None, got {facets:?}",
+                    field.name
+                ),
+                other => panic!("expected primitives, got {other:?}"),
+            }
+        }
+
+        // And the converse: an authored list is never flattened to None.
+        let (schema, diags) = crate::cst::extract_schema(
+            "model m:\n    a number(min = 1)\n    b duration(min = 1s)\n",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        for field in &schema.models[0].fields {
+            match &field.field_type {
+                FieldType::Primitive { facets, .. } => {
+                    assert!(!facets.is_none(), "authored facets must survive extraction")
+                }
+                other => panic!("expected primitives, got {other:?}"),
+            }
+        }
+    }
+
+    /// Wire-shape pin: the serialized form of a bare vs faceted field's
+    /// `facets`. No production consumer reads this JSON today (verified:
+    /// identity hashes cover source bytes; extraction never persists) —
+    /// this pin exists so the NEXT change to the shape is deliberate,
+    /// not incidental.
+    #[test]
+    fn facets_serialized_shape_is_pinned() {
+        let (schema, _) =
+            crate::cst::extract_schema("model m:\n    a number\n    b number(min = 1)\n");
+        let fields = &schema.models[0].fields;
+        let shape = |i: usize| {
+            serde_json::to_value(match &fields[i].field_type {
+                FieldType::Primitive { facets, .. } => facets,
+                other => panic!("expected primitive, got {other:?}"),
+            })
+            .unwrap()
+        };
+        assert_eq!(shape(0), serde_json::json!("None"), "bare field");
+        assert_eq!(
+            shape(1)["Number"]["min"]["value"],
+            serde_json::json!(1),
+            "authored facet carries its bound: {}",
+            shape(1)
+        );
     }
 
     /// `admits` is the non-emitting twin of `violations` and the union

@@ -380,16 +380,33 @@ impl PackageResolver {
         scan
     }
 
-    /// Invalidate cached coverage verdicts. Called on watched-file
-    /// create/delete: a claim is a statement about which files exist under a
-    /// root, and an unchanged package's hash never changes — without this,
-    /// a moved or deleted bound file leaves a stale verdict (wrong directive
-    /// squiggles, or vocabulary silently off) until restart.
+    /// Drop EVERY cached coverage verdict — the blunt instrument, for
+    /// callers without a specific change set (tests, a future reset path).
+    /// The watcher uses [`Self::invalidate_claims_for`], which keeps
+    /// verdicts for untouched roots.
     pub fn invalidate_claims(&self) {
         self.claims_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+    }
+
+    /// Invalidate the cached coverage verdicts that watched-file
+    /// creates/deletes at `paths` could have changed: exactly the entries
+    /// whose ROOT contains a changed path; everything else is retained. A
+    /// claim is a statement about which files exist under a root (names
+    /// against binding globs — content is never read), so a create/delete
+    /// outside a root cannot move that root's verdict — but without
+    /// invalidation a moved or deleted bound file leaves a stale verdict
+    /// (wrong directive squiggles, or vocabulary silently off) until
+    /// restart, because an unchanged package's hash never re-keys the memo.
+    /// An empty `paths` retains everything (the no-op the watcher's
+    /// CHANGED-only batches reduce to).
+    pub fn invalidate_claims_for(&self, paths: &[PathBuf]) {
+        self.claims_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(_, root), _| !paths.iter().any(|path| path.starts_with(root)));
     }
 
     /// Resolve one file. `path` must be absolute.
@@ -1134,7 +1151,7 @@ fn package_claims_file_under(package: &SchemaPackage, root: &Path) -> ClaimScan 
                 // Hidden/`node_modules`/`target` skips are POLICY (those
                 // trees are never claimable), not truncation; only the
                 // depth cap cuts off directories the walk wanted to see.
-                if name.starts_with('.') || name == "node_modules" || name == "target" {
+                if claims_walk_skips_dir(name) {
                     continue;
                 }
                 if depth < MAX_DEPTH {
@@ -1161,6 +1178,51 @@ fn package_claims_file_under(package: &SchemaPackage, root: &Path) -> ClaimScan 
     } else {
         ClaimScan::NoClaim
     }
+}
+
+/// The claims walk's POLICY skip list — directory names it refuses to
+/// descend into because those trees are never claimable. One definition,
+/// shared with the watcher-side relevance filter
+/// ([`watched_path_affects_claims`]), so the walk and its invalidation
+/// filter can never drift apart.
+fn claims_walk_skips_dir(name: &str) -> bool {
+    name.starts_with('.') || name == "node_modules" || name == "target"
+}
+
+/// Could a watched CREATE/DELETE at `path` change any cached claims
+/// verdict? A claim is a function of which files EXIST under a root —
+/// names matched against the package's binding globs; content is never
+/// read — so only `.nml` paths a claims walk could actually SEE matter:
+/// anything under a policy-skipped segment ([`claims_walk_skips_dir`]) is
+/// invisible to every walk and cannot move a verdict. Segments are judged
+/// ROOT-relative, exactly like the walk (which only ever tests names below
+/// its root): a workspace parked under a dotted ancestor (`~/.config/ws`)
+/// must still get its events. Dot-FILES pass — the walk skips dot
+/// directories, not files. Outside every workspace root there is nothing
+/// to keep fresh: cached roots live under the workspace, and the client's
+/// watcher is scoped to it anyway.
+pub(crate) fn watched_path_affects_claims(path: &Path, roots: &[PathBuf]) -> bool {
+    if !path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".nml"))
+    {
+        return false;
+    }
+    roots.iter().any(|root| {
+        path.strip_prefix(root).is_ok_and(|rel| {
+            rel.parent().is_some_and(|dirs| {
+                !dirs.components().any(|component| match component {
+                    // Non-UTF-8 names mirror the walk: it renders them as ""
+                    // and descends, so they never count as skipped here.
+                    std::path::Component::Normal(name) => {
+                        name.to_str().is_some_and(claims_walk_skips_dir)
+                    }
+                    _ => false,
+                })
+            })
+        })
+    })
 }
 
 fn manifest_stem(path: &Path) -> Option<&str> {
@@ -1391,6 +1453,131 @@ mod tests {
         assert!(matches!(
             package_claims_file_under(&package, &missing),
             ClaimScan::Truncated
+        ));
+    }
+
+    /// Watcher contract (`server::did_change_watched_files`): CHANGED events
+    /// are filtered out before invalidation — claims are functions of file
+    /// existence, names, and globs, never content, and a changed manifest
+    /// re-keys the memo via its content hash — so a save-storm batch reaches
+    /// the resolver as an EMPTY path set, which must be a no-op, not a
+    /// clear. The seeded verdict is one a fresh walk could not produce (the
+    /// root does not exist, so a walk would answer `Truncated`): a `Claims`
+    /// answer afterwards can only have come from the memo.
+    #[test]
+    fn changed_only_watch_batch_leaves_claims_memo_intact() {
+        let resolver = PackageResolver::new(None, test_events().0);
+        let package = demo_package_versioned("0.0.1");
+        let hash = package.content_hash();
+        let def = Definition {
+            package: Arc::new(package),
+            hash: hash.clone(),
+            source: DefinitionSource::InBinary,
+        };
+        let root = PathBuf::from("/claims-memo/never-walked");
+        resolver
+            .claims_cache
+            .lock()
+            .unwrap()
+            .insert((hash, root.clone()), ClaimScan::Claims);
+        resolver.invalidate_claims_for(&[]);
+        assert!(
+            matches!(
+                resolver.package_claims_cached(&def, &root),
+                ClaimScan::Claims
+            ),
+            "an empty filtered set must retain every memoized verdict"
+        );
+    }
+
+    /// CREATED under root A drops A's verdicts and ONLY A's: containment is
+    /// component-wise (`/ws/a` never swallows `/ws/ab`), and untouched roots
+    /// keep answering from the memo instead of re-walking.
+    #[test]
+    fn create_under_one_root_invalidates_that_root_only() {
+        let resolver = PackageResolver::new(None, test_events().0);
+        let hash = demo_package_versioned("0.0.2").content_hash();
+        let root_a = PathBuf::from("/claims-inv/a");
+        let root_ab = PathBuf::from("/claims-inv/ab");
+        let root_b = PathBuf::from("/claims-inv/b");
+        {
+            let mut cache = resolver.claims_cache.lock().unwrap();
+            for root in [&root_a, &root_ab, &root_b] {
+                cache.insert((hash.clone(), (*root).clone()), ClaimScan::NoClaim);
+            }
+        }
+        resolver.invalidate_claims_for(&[root_a.join("sub").join("new.nml")]);
+        let cache = resolver.claims_cache.lock().unwrap();
+        assert!(
+            !cache.contains_key(&(hash.clone(), root_a.clone())),
+            "the root containing the created file must drop its verdict"
+        );
+        assert!(
+            cache.contains_key(&(hash.clone(), root_ab.clone())),
+            "string-prefix sibling (/a vs /ab) must be untouched"
+        );
+        assert!(
+            cache.contains_key(&(hash, root_b)),
+            "an unrelated root keeps its memo"
+        );
+    }
+
+    /// The blunt instrument stays available for callers without a change
+    /// set: a full clear drops every root's verdict at once.
+    #[test]
+    fn invalidate_claims_full_clear_drops_all_roots() {
+        let resolver = PackageResolver::new(None, test_events().0);
+        let hash = demo_package_versioned("0.0.3").content_hash();
+        {
+            let mut cache = resolver.claims_cache.lock().unwrap();
+            cache.insert((hash.clone(), PathBuf::from("/x/a")), ClaimScan::Claims);
+            cache.insert((hash, PathBuf::from("/x/b")), ClaimScan::Truncated);
+        }
+        resolver.invalidate_claims();
+        assert!(resolver.claims_cache.lock().unwrap().is_empty());
+    }
+
+    /// The watcher-side relevance filter mirrors the walk's policy exactly:
+    /// `.nml` only, no policy-skipped segment BELOW the containing root —
+    /// judged root-relative, so a workspace parked under a dotted ancestor
+    /// still gets its events — and dot-FILES pass (the walk skips dot
+    /// directories, not files).
+    #[test]
+    fn watched_path_filter_mirrors_walk_policy() {
+        let roots = [PathBuf::from("/home/u/.dotfiles/ws")];
+        let root = &roots[0];
+        assert!(watched_path_affects_claims(
+            &root.join("apps/site/app.nml"),
+            &roots
+        ));
+        // Dotted ancestors ABOVE the root never disqualify: the walk only
+        // tests names below its root.
+        assert!(watched_path_affects_claims(&root.join("a.nml"), &roots));
+        // A dot-file is listed by the walk, so it stays relevant.
+        assert!(watched_path_affects_claims(
+            &root.join(".hidden.nml"),
+            &roots
+        ));
+        for skipped in [
+            "node_modules/pkg/a.nml",
+            "target/debug/a.nml",
+            ".git/x.nml",
+            "deep/.cache/x.nml",
+        ] {
+            assert!(
+                !watched_path_affects_claims(&root.join(skipped), &roots),
+                "{skipped} is invisible to the walk"
+            );
+        }
+        // Non-.nml never matters (the watch is `**/*.nml` on both sides
+        // anyway), and outside every root there is nothing to keep fresh.
+        assert!(!watched_path_affects_claims(
+            &root.join("README.md"),
+            &roots
+        ));
+        assert!(!watched_path_affects_claims(
+            Path::new("/elsewhere/x.nml"),
+            &roots
         ));
     }
 

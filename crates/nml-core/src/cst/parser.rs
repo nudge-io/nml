@@ -521,6 +521,11 @@ impl<'a> Parser<'a> {
             SyntaxKind::Role if matches!(self.nth(1), SyntaxKind::Arrow | SyntaxKind::FatArrow) => {
                 self.arm()
             }
+            SyntaxKind::String
+                if matches!(self.nth(1), SyntaxKind::Arrow | SyntaxKind::FatArrow) =>
+            {
+                self.arm()
+            }
             SyntaxKind::Ident
                 if self.current_text() == "else"
                     && matches!(self.nth(1), SyntaxKind::Arrow | SyntaxKind::FatArrow) =>
@@ -535,27 +540,49 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `(@selector | else) -> Target` — a routing arm (RFC 0006 arrow). The
-    /// selector is a `Role` token or the `else` keyword; the RHS is a target
-    /// identifier (`-> Name`, a declared-item reference) or a string literal
-    /// (`-> "workflows/pro.workflow.nml"` — RFC 0007 §6, for flat routers
-    /// whose targets are paths/URLs). The grammar is permissive about *where*
-    /// arms appear — the schema restricts them (e.g. RFC 0018's `denial:`
-    /// block) and validates the selector and target shapes.
+    /// `(@selector | "key" | else) -> Target` — a routing arm (RFC 0006 arrow).
+    /// The selector is a `Role` token, a quoted string key, or `else`; the RHS
+    /// is a reference (`-> Name`), a string literal (`-> "path"`), or an inline
+    /// instance (`-> Name:` + indented body, RFC 0007 §6.2). The grammar is
+    /// permissive about *where* arms appear — the schema restricts them.
     fn arm(&mut self) {
         let m = self.start();
-        // selector: a role token (`@plan/Pro`) or `else` (a plain ident).
-        self.bump();
+        self.bump(); // selector
         self.expect_arrow();
-        if matches!(self.current(), SyntaxKind::Ident | SyntaxKind::String) {
-            self.bump();
-        } else {
-            self.expected(
+        match self.current() {
+            SyntaxKind::Ident => {
+                self.bump();
+                if self.eat(SyntaxKind::Colon) {
+                    self.body();
+                }
+            }
+            SyntaxKind::String => {
+                self.bump();
+                if self.eat(SyntaxKind::Colon) {
+                    let found = self.toks.get(self.pos).map(|t| crate::error::FoundToken {
+                        kind: t.kind,
+                        text: crate::error::echo_capture(t.text),
+                    });
+                    self.error_kind(crate::error::ParseErrorKind::Expected {
+                        expected: vec![crate::error::ExpectedItem::Desc(
+                            "an arm target (a name or a string)",
+                        )],
+                        found,
+                        context: Some(
+                            "after a string-literal arm target; an inline block uses an \
+                             unquoted name ('-> Name:')",
+                        ),
+                    });
+                    // Do not call `body()` here — a recovered body under the
+                    // Arm node would mis-lead lowering into `Inline`.
+                }
+            }
+            _ => self.expected(
                 vec![crate::error::ExpectedItem::Desc(
                     "an arm target (a name or a string)",
                 )],
                 None,
-            );
+            ),
         }
         m.complete(self, SyntaxKind::Arm);
     }

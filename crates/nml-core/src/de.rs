@@ -816,60 +816,84 @@ impl<'de> MapAccess<'de> for NamedItemMapAccess<'de> {
 // Value deserializer
 // ---------------------------------------------------------------------------
 
-/// Coerce a Value to a number. Native numbers pass through; string-typed
-/// values parse via the liberal, **exact** coercion grammar (RFC 0016
-/// §1.4 — Postel for machine-emitted data): env vars resolve to
-/// `Value::String`, so `$ENV.PORT = "9007199254740993"` must survive
-/// exactly, and `$ENV.RATE = "1e-6"` now arrives exact instead of
-/// f64-rounded. Failures embed the numeric core's *reason* but never the
-/// value: the resolver erases provenance (`resolve.rs`: resolved secrets
-/// become plain `Value::String`s), so ANY coerced string could be a
-/// resolved secret — echoing content here would leak credentials into
-/// logs. The span/key context callers attach is the locator; the reason
-/// text is the diagnosis.
+/// The typed-coercion family's provenance rule, in one place: which
+/// string-shaped values may parse into a typed target.
+///
+/// - [`Value::Resolved`] — YES. This is the lane the family exists for:
+///   env vars arrive as text (`$ENV.PORT = "9007199254740993"` must
+///   survive exactly; `$ENV.RATE = "1e-6"` arrives exact, RFC 0016 §1.4),
+///   and the resolver stamps that provenance onto the value. Failures
+///   NAME the variable (`$ENV.KEY`, source-visible) and the parse reason,
+///   never the content — the payload may be a credential.
+/// - [`Value::String`] — NO. Post-provenance, a plain string can only be
+///   a source-authored quoted literal: the replaced spelling the schema
+///   validator already rejects (NML0001, "drop the quotes"). The same
+///   teaching lands here so raw-serde embedders get verdict parity with
+///   validated surfaces instead of a silent coercion the server refuses.
+/// - [`Value::Secret`] — NO. An unresolved `$ENV.KEY` reaching a typed
+///   target means the caller used a non-resolving entry point; say so.
+fn coercion_provenance_error(target: &str, value: &Value) -> Error {
+    match value {
+        Value::String(_) => Error::De(format!(
+            "expected {target}, got a quoted string literal — the quoted spelling was \
+             replaced by the typed literal (drop the quotes); only `$ENV.KEY`-resolved \
+             text coerces into typed fields"
+        )),
+        Value::Secret(s) => Error::De(format!(
+            "expected {target}, got the unresolved reference `{s}` — this entry point \
+             does not resolve `$ENV`; deserialize through a resolving entry point \
+             (`from_body_resolved`/`from_body_defaulted`)"
+        )),
+        other => Error::De(format!("expected {target}, got {}", other.type_name())),
+    }
+}
+
+/// Coerce a Value to a number. Native numbers pass through; env-resolved
+/// text parses via the liberal, **exact** coercion grammar (RFC 0016
+/// §1.4 — Postel for machine-emitted data). Source-literal strings and
+/// unresolved references get [`coercion_provenance_error`]'s teaching —
+/// never a parse attempt. Failures embed the numeric core's *reason* and
+/// the `$ENV` variable NAME, never the value (it may be a credential).
 fn coerce_to_number(value: &Value, target: &'static str) -> Result<Number, Error> {
-    let (s, kind) = match value {
+    let r = match value {
         Value::Number(n) => return Ok(*n),
-        Value::String(s) => (s, "string"),
-        Value::Secret(s) => (s, "secret"),
-        other => {
-            return Err(Error::De(format!(
-                "expected {target}, got {}",
-                other.type_name()
-            )));
-        }
+        Value::Resolved(r) => r,
+        other => return Err(coercion_provenance_error(target, other)),
     };
-    Number::parse_coercion(s).map_err(|e| Error::De(format!("expected {target}, got {kind} ({e})")))
+    Number::parse_coercion(r.as_str()).map_err(|e| {
+        Error::De(format!(
+            "expected {target}: {} resolved to text that is not {target} syntax ({e})",
+            r.var()
+        ))
+    })
 }
 
 /// Coerce a Value to a duration (RFC 0017 §3.1). Typed durations pass
-/// through; string-typed values parse via [`Duration::parse_text`] — the
-/// same reason this family exists for numbers and bools: env vars resolve
-/// to `Value::String`, so `sessionTtl = $ENV.TTL` must arrive typed at a
-/// duration target. Failures embed the parse's *reason* but never the
-/// value — the resolver erases provenance, so ANY coerced string could be
-/// a resolved secret, and echoing content here would leak credentials
-/// into logs (the family's never-echo rule, inherited).
+/// through; env-resolved text parses via [`Duration::parse_text`] — the
+/// lane this family exists for (`sessionTtl = $ENV.TTL` must arrive
+/// typed). Source-literal strings and unresolved references get the
+/// provenance teaching; failures name the `$ENV` variable and the parse
+/// reason, never the content.
 fn coerce_to_duration(value: &Value) -> Result<crate::duration::Duration, Error> {
-    let (s, kind) = match value {
+    let r = match value {
         Value::Duration(d) => return Ok(*d),
-        Value::String(s) => (s, "string"),
-        Value::Secret(s) => (s, "secret"),
-        other => {
-            return Err(Error::De(format!(
-                "expected duration, got {}",
-                other.type_name()
-            )));
-        }
+        Value::Resolved(r) => r,
+        other => return Err(coercion_provenance_error("duration", other)),
     };
-    crate::duration::Duration::parse_text(s)
-        .map_err(|e| Error::De(format!("expected duration, got {kind} ({e})")))
+    crate::duration::Duration::parse_text(r.as_str()).map_err(|e| {
+        Error::De(format!(
+            "expected duration: {} resolved to text that is not duration syntax ({e})",
+            r.var()
+        ))
+    })
 }
 
-/// Coerce a string-typed Value to bool if it matches common truthy/falsy strings.
+/// Coerce env-resolved text to bool if it matches common truthy/falsy
+/// strings — ops convention (`FLAG=1`, `FLAG=yes`) for the resolved lane
+/// ONLY; source literals write `true`/`false` unquoted.
 fn coerce_to_bool(value: &Value) -> Option<bool> {
     match value {
-        Value::String(s) | Value::Secret(s) => match s.as_str() {
+        Value::Resolved(r) => match r.as_str() {
             "true" | "1" | "yes" => Some(true),
             "false" | "0" | "no" => Some(false),
             _ => None,
@@ -888,6 +912,11 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::String(s) => visitor.visit_str(s),
+            // Env-resolved text is string-shaped for every
+            // self-describing consumer — buffered contexts (flatten,
+            // untagged/internally-tagged enums) copy it into owned
+            // Content exactly like a String visit.
+            Value::Resolved(r) => visitor.visit_str(r.as_str()),
             Value::TemplateString(segs) => {
                 let s = template::segments_to_string(segs);
                 visitor.visit_string(s)
@@ -942,13 +971,15 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::Bool(b) => visitor.visit_bool(*b),
-            _ => match coerce_to_bool(self.value) {
+            Value::Resolved(r) => match coerce_to_bool(self.value) {
                 Some(b) => visitor.visit_bool(b),
                 None => Err(Error::De(format!(
-                    "expected bool, got {}",
-                    self.value.type_name()
+                    "expected bool: {} resolved to text that is not a bool \
+                     (accepted: true/1/yes, false/0/no)",
+                    r.var()
                 ))),
             },
+            other => Err(coercion_provenance_error("bool", other)),
         }
     }
 
@@ -978,6 +1009,7 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
     fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
         match self.value {
             Value::String(s) => visitor.visit_str(s),
+            Value::Resolved(r) => visitor.visit_str(r.as_str()),
             Value::TemplateString(segs) => visitor.visit_string(template::segments_to_string(segs)),
             Value::Secret(s) => visitor.visit_str(s),
             Value::Reference(s) | Value::Role(s) => visitor.visit_str(s),
@@ -1042,6 +1074,11 @@ impl<'de> de::Deserializer<'de> for ValueDeserializer<'de> {
         match self.value {
             Value::String(s) | Value::Secret(s) | Value::Role(s) | Value::Reference(s) => {
                 visitor.visit_enum(de::value::StrDeserializer::<Error>::new(s))
+            }
+            // Env-resolved discriminants select variants like any string
+            // (`mode = $ENV.MODE`).
+            Value::Resolved(r) => {
+                visitor.visit_enum(de::value::StrDeserializer::<Error>::new(r.as_str()))
             }
             Value::TemplateString(segs) => visitor.visit_enum(
                 de::value::StringDeserializer::<Error>::new(template::segments_to_string(segs)),
@@ -2001,17 +2038,25 @@ workflow W:
     }
 
     #[test]
-    fn string_coerces_to_u16() {
+    fn quoted_number_literal_is_the_replaced_spelling() {
         #[derive(Deserialize, Debug)]
         struct Config {
+            #[expect(
+                dead_code,
+                reason = "deserialization target only — the test asserts the error"
+            )]
             port: u16,
         }
+        // Post-provenance, a plain string can only be a source-authored
+        // quoted literal: the replaced spelling. The teaching matches the
+        // validator's NML0001 posture; only `$ENV`-resolved text coerces.
         let source = "server S:\n    port = \"3000\"\n";
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "S").body().unwrap();
-        let config: Config = from_body(body).unwrap();
-        assert_eq!(config.port, 3000);
+        let err = from_body::<Config>(body).unwrap_err().to_string();
+        assert!(err.contains("drop the quotes"), "{err}");
+        assert!(err.contains("$ENV.KEY"), "names the resolved lane: {err}");
     }
 
     #[test]
@@ -2054,17 +2099,46 @@ workflow W:
     }
 
     #[test]
-    fn string_coerces_to_bool() {
+    fn quoted_bool_literal_is_the_replaced_spelling() {
         #[derive(Deserialize, Debug)]
         struct Config {
+            #[expect(
+                dead_code,
+                reason = "deserialization target only — the test asserts the error"
+            )]
             enabled: bool,
         }
         let source = "server S:\n    enabled = \"true\"\n";
         let file = parse_to_ast(source).unwrap();
         let doc = Document::new(&file);
         let body = doc.block("server", "S").body().unwrap();
-        let config: Config = from_body(body).unwrap();
+        let err = from_body::<Config>(body).unwrap_err().to_string();
+        assert!(err.contains("drop the quotes"), "{err}");
+    }
+
+    /// The ops-convention truthy table (`FLAG=1`, `FLAG=yes`) lives on
+    /// the RESOLVED lane only — env text coerces, source literals write
+    /// `true`/`false` unquoted.
+    #[test]
+    fn resolved_env_var_coerces_to_bool() {
+        use crate::resolve::ValueResolver;
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            enabled: bool,
+            verbose: bool,
+        }
+        let source = "server S:\n    enabled = $ENV.FLAG\n    verbose = $ENV.V\n";
+        let file = parse_to_ast(source).unwrap();
+        let resolver = ValueResolver::new(|key| match key {
+            "FLAG" => Some("yes".into()),
+            "V" => Some("0".into()),
+            _ => None,
+        });
+        let doc = Document::new(&file);
+        let body = doc.block("server", "S").body().unwrap();
+        let config: Config = crate::de::from_body_resolved(body, &resolver).unwrap();
         assert!(config.enabled);
+        assert!(!config.verbose);
     }
 
     #[test]
@@ -2368,13 +2442,20 @@ workflow W:
             neg_scale: crate::types::Number,
             extreme: crate::types::Number,
         }
-        // String properties follow the §1.4 liberal coercion grammar,
-        // like every other numeric target.
-        let source = "service App:\n    rate = 2.50\n    env_like = \"1e-6\"\n    big = 18446744073709551617\n    neg_scale = \"2e38\"\n    extreme = \"1e-6176\"\n";
+        // Env-RESOLVED properties follow the §1.4 liberal coercion
+        // grammar, like every other numeric target; source literals are
+        // typed at parse (quoted spellings are the replaced syntax).
+        let source = "service App:\n    rate = 2.50\n    env_like = $ENV.RATE\n    big = 18446744073709551617\n    neg_scale = $ENV.SCALE\n    extreme = $ENV.EXTREME\n";
         let file = parse_to_ast(source).unwrap();
+        let resolver = crate::resolve::ValueResolver::new(|key| match key {
+            "RATE" => Some("1e-6".into()),
+            "SCALE" => Some("2e38".into()),
+            "EXTREME" => Some("1e-6176".into()),
+            _ => None,
+        });
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let p: P = from_body(body).unwrap();
+        let p: P = crate::de::from_body_resolved(body, &resolver).unwrap();
         assert_eq!(
             (p.rate.coeff(), p.rate.scale()),
             (250, 2),
@@ -2564,17 +2645,24 @@ workflow W:
             compound: std::time::Duration,
             postel: std::time::Duration,
         }
-        // `resolved` is a plain string — exactly what `resolve.rs` leaves
-        // behind for `$ENV.TTL` — and must coerce identically. `retries`
-        // exercises the seq × handshake composition: every array element
-        // routes through the same `deserialize_struct` path. `compound`
-        // and `postel` are the RFC 0017 §10 forms: an authored compound
-        // literal and the spaced coercion-text spelling.
-        let source = "service App:\n    timeout = 90m\n    resolved = \"1500ms\"\n    label = 250ms\n    opt = 2h\n    retries = [1s, 1500ms]\n    fine = 750ns\n    grouped = \"1_000_000ns\"\n    compound = 1h30m45s\n    postel = \"1h 30m\"\n";
+        // `resolved`/`grouped`/`postel` arrive as provenance-stamped env
+        // text (`Value::Resolved` — what `resolve.rs` mints for
+        // `$ENV.TTL`) and must coerce identically to typed literals.
+        // `retries` exercises the seq × handshake composition: every
+        // array element routes through the same `deserialize_struct`
+        // path. `compound` is the authored RFC 0017 §10 compound literal;
+        // `postel` the spaced coercion-text spelling, resolved lane.
+        let source = "service App:\n    timeout = 90m\n    resolved = $ENV.TTL\n    label = 250ms\n    opt = 2h\n    retries = [1s, 1500ms]\n    fine = 750ns\n    grouped = $ENV.GROUPED\n    compound = 1h30m45s\n    postel = $ENV.POSTEL\n";
         let file = parse_to_ast(source).unwrap();
+        let resolver = crate::resolve::ValueResolver::new(|key| match key {
+            "TTL" => Some("1500ms".into()),
+            "GROUPED" => Some("1_000_000ns".into()),
+            "POSTEL" => Some("1h 30m".into()),
+            _ => None,
+        });
         let doc = Document::new(&file);
         let body = doc.block("service", "App").body().unwrap();
-        let c: C = from_body(body).unwrap();
+        let c: C = crate::de::from_body_resolved(body, &resolver).unwrap();
         assert_eq!(c.timeout, std::time::Duration::from_secs(90 * 60));
         assert_eq!(c.resolved, std::time::Duration::from_millis(1500));
         assert_eq!(c.label, "250ms");
@@ -2709,14 +2797,185 @@ workflow W:
 
     #[test]
     fn test_large_integer_string_coercion_exact() {
-        // Env vars resolve to strings; the string -> integer path must
-        // also avoid the f64 detour.
-        let v = Value::String("9007199254740993".into());
+        // Env vars resolve to provenance-stamped text; the resolved ->
+        // integer path must also avoid the f64 detour.
+        let v = Value::Resolved(crate::types::ResolvedText::new(
+            "$ENV.BIG",
+            "9007199254740993",
+        ));
         let n: i64 = from_value(&v).unwrap();
         assert_eq!(n, 9_007_199_254_740_993);
-        let v = Value::String("9223372036854775807".into());
+        let v = Value::Resolved(crate::types::ResolvedText::new(
+            "$ENV.MAX",
+            "9223372036854775807",
+        ));
         let n: u64 = from_value(&v).unwrap();
         assert_eq!(n, i64::MAX as u64);
+    }
+
+    // ── Value::Resolved contract matrix (typed resolution) ─────────
+
+    /// Env-resolved discriminants select enum variants like any string.
+    #[test]
+    fn resolved_env_var_selects_enum_variant() {
+        use crate::resolve::ValueResolver;
+        #[derive(Deserialize, Debug, PartialEq)]
+        #[serde(rename_all = "lowercase")]
+        enum Mode {
+            Spa,
+            Static,
+        }
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            mode: Mode,
+        }
+        let source = "server S:\n    mode = $ENV.MODE\n";
+        let file = parse_to_ast(source).unwrap();
+        let resolver = ValueResolver::new(|k| (k == "MODE").then(|| "spa".into()));
+        let doc = Document::new(&file);
+        let body = doc.block("server", "S").body().unwrap();
+        let config: Config = crate::de::from_body_resolved(body, &resolver).unwrap();
+        assert_eq!(config.mode, Mode::Spa);
+    }
+
+    /// Buffered contexts (internally-tagged enums route through serde
+    /// Content and `deserialize_any`): env-resolved STRING fields must
+    /// keep working — `Resolved` visits `visit_str` exactly like String.
+    #[test]
+    fn resolved_env_var_survives_tagged_enum_buffering() {
+        use crate::resolve::ValueResolver;
+        #[derive(Deserialize, Debug, PartialEq)]
+        #[serde(tag = "kind", rename_all = "lowercase")]
+        enum Backend {
+            Postgres { url: String },
+        }
+        let source = "store S:\n    kind = \"postgres\"\n    url = $ENV.DB_URL\n";
+        let file = parse_to_ast(source).unwrap();
+        let resolver = ValueResolver::new(|k| (k == "DB_URL").then(|| "postgres://h/db".into()));
+        let doc = Document::new(&file);
+        let body = doc.block("store", "S").body().unwrap();
+        let b: Backend = crate::de::from_body_resolved(body, &resolver).unwrap();
+        assert_eq!(
+            b,
+            Backend::Postgres {
+                url: "postgres://h/db".into()
+            }
+        );
+    }
+
+    /// A raw (unresolved) `$ENV` reference reaching a TYPED target names
+    /// the real defect — the caller used a non-resolving entry point —
+    /// instead of a baffling parse error on the reference text.
+    #[test]
+    fn raw_secret_in_typed_position_names_the_entry_point() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            #[expect(
+                dead_code,
+                reason = "deserialization target only — the test asserts the error"
+            )]
+            timeout: std::time::Duration,
+        }
+        let source = "server S:\n    timeout = $ENV.TIMEOUT\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("server", "S").body().unwrap();
+        let err = from_body::<Config>(body).unwrap_err().to_string();
+        assert!(err.contains("unresolved"), "{err}");
+        assert!(err.contains("$ENV.TIMEOUT"), "names the reference: {err}");
+        assert!(err.contains("from_body_resolved"), "names the fix: {err}");
+    }
+
+    /// A coercion failure on resolved text names the VARIABLE (the
+    /// actionable, source-visible half) and the parse reason — never the
+    /// resolved content, which may be a credential.
+    #[test]
+    fn resolved_coercion_failure_names_the_variable_not_the_value() {
+        use crate::resolve::ValueResolver;
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            #[expect(
+                dead_code,
+                reason = "deserialization target only — the test asserts the error"
+            )]
+            timeout: std::time::Duration,
+        }
+        let source = "server S:\n    timeout = $ENV.TIMEOUT\n";
+        let file = parse_to_ast(source).unwrap();
+        let resolver = ValueResolver::new(|k| (k == "TIMEOUT").then(|| "hunter2".into()));
+        let doc = Document::new(&file);
+        let body = doc.block("server", "S").body().unwrap();
+        let err = crate::de::from_body_resolved::<Config>(body, &resolver)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("$ENV.TIMEOUT"), "names the knob: {err}");
+        assert!(!err.contains("hunter2"), "never the content: {err}");
+    }
+
+    /// Same leak-safety on the NUMBER lane (a separate coercer): a
+    /// resolved value that fails numeric parsing names the variable and
+    /// the reason, never the content. The numeric error type is
+    /// provenance-erasing by construction (digit counts, not the input),
+    /// but the lane is pinned independently of the duration one.
+    #[test]
+    fn resolved_number_coercion_failure_names_the_variable_not_the_value() {
+        use crate::resolve::ValueResolver;
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            #[expect(
+                dead_code,
+                reason = "deserialization target only — the test asserts the error"
+            )]
+            port: u16,
+        }
+        let source = "server S:\n    port = $ENV.PORT\n";
+        let file = parse_to_ast(source).unwrap();
+        let resolver = ValueResolver::new(|k| (k == "PORT").then(|| "s3cr3t-not-a-number".into()));
+        let doc = Document::new(&file);
+        let body = doc.block("server", "S").body().unwrap();
+        let err = crate::de::from_body_resolved::<Config>(body, &resolver)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("$ENV.PORT"), "names the knob: {err}");
+        assert!(!err.contains("s3cr3t"), "never the content: {err}");
+    }
+
+    /// The empty-credential hazard is structurally impossible: an env
+    /// var set to empty is treated as unset at the mint site, so a
+    /// `Value::Resolved` can NEVER carry empty text — the
+    /// `resolved.as_str().unwrap_or_default()` consumer pattern cannot be
+    /// silently fed "". A resolving load of an empty var errors instead.
+    #[test]
+    fn empty_env_never_mints_resolved() {
+        use crate::resolve::{ResolveError, ValueResolver};
+        let resolver = ValueResolver::new(|k| (k == "EMPTY").then(String::new));
+        let err = resolver
+            .resolve(&Value::Secret("$ENV.EMPTY".into()))
+            .unwrap_err();
+        assert!(
+            matches!(err, ResolveError::EnvNotSet(_)),
+            "empty env is unset, never a Resolved: {err:?}"
+        );
+    }
+
+    /// Quoted duration literal: the de-layer teaching mirrors the
+    /// validator's NML0001 posture for raw-serde embedders.
+    #[test]
+    fn quoted_duration_literal_is_the_replaced_spelling() {
+        #[derive(Deserialize, Debug)]
+        struct Config {
+            #[expect(
+                dead_code,
+                reason = "deserialization target only — the test asserts the error"
+            )]
+            timeout: std::time::Duration,
+        }
+        let source = "server S:\n    timeout = \"30s\"\n";
+        let file = parse_to_ast(source).unwrap();
+        let doc = Document::new(&file);
+        let body = doc.block("server", "S").body().unwrap();
+        let err = from_body::<Config>(body).unwrap_err().to_string();
+        assert!(err.contains("drop the quotes"), "{err}");
     }
 
     #[test]

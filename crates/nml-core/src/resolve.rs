@@ -26,12 +26,14 @@ use crate::types::{SpannedValue, Value};
 /// ```
 /// Pluggable variable lookup: maps a `$ENV.KEY` name to its value, or
 /// `None` when unset (which triggers the fallback chain, if any).
-type VarLookup = Box<dyn Fn(&str) -> Option<String>>;
+/// `Send + Sync` so a resolver can live inside shared long-lived state —
+/// validators are held in `Arc`s (LSP caches) and `LazyLock` statics.
+type VarLookup = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// Pluggable `const` lookup: maps a `Value::Reference` name to the value the
 /// `const` declares, or `None` when the name is not a known `const` (in which
 /// case the reference resolves to its literal name).
-type SymbolLookup = Box<dyn Fn(&str) -> Option<Value>>;
+type SymbolLookup = Box<dyn Fn(&str) -> Option<Value> + Send + Sync>;
 
 /// Bounds reference-chain recursion. Const cycles are normally rejected up front
 /// by `SymbolTable::find_const_cycles`; this is defense-in-depth so the resolver
@@ -45,6 +47,19 @@ pub struct ValueResolver {
     symbol_resolver: Option<SymbolLookup>,
 }
 
+/// Structural only — a resolver's lookups are opaque closures and its
+/// resolutions are secrets, so Debug reports which lanes are configured
+/// and nothing else. Required so embedders (e.g. `SchemaValidator`) can
+/// keep deriving `Debug` while holding a resolver.
+impl std::fmt::Debug for ValueResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValueResolver")
+            .field("env", &self.var_resolver.is_some())
+            .field("symbols", &self.symbol_resolver.is_some())
+            .finish()
+    }
+}
+
 impl ValueResolver {
     /// Create a resolver that reads `$ENV.KEY` from `std::env::var`.
     pub fn env() -> Self {
@@ -55,7 +70,7 @@ impl ValueResolver {
     }
 
     /// Create a resolver with a custom variable lookup function.
-    pub fn new(resolver: impl Fn(&str) -> Option<String> + 'static) -> Self {
+    pub fn new(resolver: impl Fn(&str) -> Option<String> + Send + Sync + 'static) -> Self {
         Self {
             var_resolver: Some(Box::new(resolver)),
             symbol_resolver: None,
@@ -79,7 +94,10 @@ impl ValueResolver {
     /// resolves to fixpoint in this single pass. An unknown reference is left
     /// as-is (it deserializes as its literal name), matching the workflow
     /// parser's `resolve_string` fallback.
-    pub fn with_symbols(mut self, lookup: impl Fn(&str) -> Option<Value> + 'static) -> Self {
+    pub fn with_symbols(
+        mut self,
+        lookup: impl Fn(&str) -> Option<Value> + Send + Sync + 'static,
+    ) -> Self {
         self.symbol_resolver = Some(Box::new(lookup));
         self
     }
@@ -92,8 +110,12 @@ impl ValueResolver {
     /// an empty `PORT=""` almost always means "not configured", and
     /// silently resolving to `""` would bypass explicit defaults.
     ///
-    /// Resolved secrets become plain [`Value::String`]s; callers must not
-    /// log or serialize resolved bodies that may contain secret material.
+    /// Resolved secrets become [`Value::Resolved`] — provenance-stamped
+    /// text whose payload REFUSES to print or serialize its content
+    /// (redacting `Debug`/`Serialize`), so a resolved body is
+    /// leak-resistant by construction, not by caller discipline. The
+    /// variant is also what unlocks typed string coercion downstream:
+    /// only env-resolved text coerces into number/bool/duration fields.
     pub fn resolve(&self, value: &Value) -> Result<Value, ResolveError> {
         self.resolve_at(value, 0)
     }
@@ -118,7 +140,16 @@ impl ValueResolver {
                     return Err(ResolveError::EnvDisabled(s.clone()));
                 };
                 match var_resolver(key) {
-                    Some(val) if !val.is_empty() => Ok(Value::String(val)),
+                    // THE mint site — the only line in the codebase that
+                    // constructs `Value::Resolved`. The variant carries its
+                    // provenance (`$ENV.KEY` source spelling) so downstream
+                    // diagnostics can name the knob while the payload's
+                    // redacting Debug/Serialize keep the value unprintable.
+                    // Typed coercions key on this variant: env text stays
+                    // coercible, source-literal strings do not.
+                    Some(val) if !val.is_empty() => {
+                        Ok(Value::Resolved(crate::types::ResolvedText::new(s, val)))
+                    }
                     _ => Err(ResolveError::EnvNotSet(key.to_string())),
                 }
             }
@@ -196,13 +227,9 @@ impl ValueResolver {
                 BodyEntryKind::SharedProperty(self.resolve_shared_property(sp)?)
             }
             BodyEntryKind::ListItem(item) => BodyEntryKind::ListItem(self.resolve_list_item(item)?),
-            // Arms carry only literal selector/target tokens — nothing to
-            // template-resolve — so they pass through unchanged, like modifiers.
-            BodyEntryKind::Modifier(_)
-            | BodyEntryKind::FieldDefinition(_)
-            | BodyEntryKind::Arm(_) => {
-                return Ok(entry.clone());
-            }
+            BodyEntryKind::Modifier(_) => return Ok(entry.clone()),
+            BodyEntryKind::FieldDefinition(_) => return Ok(entry.clone()),
+            BodyEntryKind::Arm(arm) => BodyEntryKind::Arm(self.resolve_arm(arm)?),
         };
         Ok(BodyEntry {
             kind,
@@ -236,6 +263,20 @@ impl ValueResolver {
         Ok(SpannedValue {
             value: self.resolve(&sv.value)?,
             span: sv.span,
+        })
+    }
+
+    fn resolve_arm(&self, arm: &Arm) -> Result<Arm, ResolveError> {
+        Ok(Arm {
+            selector: arm.selector.clone(),
+            selector_span: arm.selector_span,
+            target: match &arm.target {
+                ArmTarget::Reference(_) | ArmTarget::Literal { .. } => arm.target.clone(),
+                ArmTarget::Inline { name, body } => ArmTarget::Inline {
+                    name: name.clone(),
+                    body: self.resolve_body(body)?,
+                },
+            },
         })
     }
 
@@ -331,6 +372,23 @@ pub fn apply_shared_properties(body: &Body) -> Body {
                 }),
                 span: entry.span,
             }),
+            BodyEntryKind::Arm(arm) => {
+                let resolved = match &arm.target {
+                    ArmTarget::Inline { name, body } => Arm {
+                        selector: arm.selector.clone(),
+                        selector_span: arm.selector_span,
+                        target: ArmTarget::Inline {
+                            name: name.clone(),
+                            body: apply_shared_properties(body),
+                        },
+                    },
+                    _ => arm.clone(),
+                };
+                Some(BodyEntry {
+                    kind: BodyEntryKind::Arm(resolved),
+                    span: entry.span,
+                })
+            }
             _ => Some(entry.clone()),
         })
         .collect();
@@ -504,6 +562,12 @@ fn merge_shared_block_into_nested(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The expected mint: env text stamped with the reference that
+    /// produced it (redacting payload — see `ResolvedText`).
+    fn resolved_v(var: &str, text: &str) -> Value {
+        Value::Resolved(crate::types::ResolvedText::new(var, text))
+    }
     use crate::cst::parse_to_ast;
 
     #[test]
@@ -524,8 +588,8 @@ mod tests {
         let Value::Array(resolved) = r.resolve(&arr).unwrap() else {
             panic!("expected array");
         };
-        assert_eq!(resolved[0].value, Value::String("alpha".into()));
-        assert_eq!(resolved[1].value, Value::String("beta".into()));
+        assert_eq!(resolved[0].value, resolved_v("$ENV.A", "alpha"));
+        assert_eq!(resolved[1].value, resolved_v("$ENV.B", "beta"));
         assert_eq!(resolved[2].value, Value::String("lit".into()));
     }
 
@@ -600,7 +664,7 @@ mod tests {
             }
         });
         let result = r.resolve(&Value::Secret("$ENV.MY_PORT".into()));
-        assert_eq!(result.unwrap(), Value::String("9090".into()));
+        assert_eq!(result.unwrap(), resolved_v("$ENV.MY_PORT", "9090"));
     }
 
     #[test]
@@ -629,7 +693,7 @@ mod tests {
                 crate::span::Span::empty(0),
             )),
         );
-        assert_eq!(r.resolve(&val).unwrap(), Value::String("8080".into()));
+        assert_eq!(r.resolve(&val).unwrap(), resolved_v("$ENV.PORT", "8080"));
     }
 
     #[test]
@@ -707,7 +771,7 @@ mod tests {
             .with_symbols(|name| (name == "base").then(|| Value::Secret("$ENV.B".into())));
         assert_eq!(
             r.resolve(&Value::Reference("base".into())).unwrap(),
-            Value::String("envval".into())
+            resolved_v("$ENV.B", "envval")
         );
     }
 
@@ -765,7 +829,7 @@ mod tests {
 
         // Check host resolved
         if let BodyEntryKind::Property(p) = &resolved.entries[0].kind {
-            assert_eq!(p.value.value, Value::String("localhost".into()));
+            assert_eq!(p.value.value, resolved_v("$ENV.HOST", "localhost"));
         } else {
             panic!("expected property");
         }
@@ -1233,11 +1297,96 @@ workflow W:
                     BodyEntryKind::Property(p) if p.name.name == "port" => Some(&p.value.value),
                     _ => None,
                 });
-                assert_eq!(port, Some(&Value::String("9090".into())));
+                assert_eq!(port, Some(&resolved_v("$ENV.PORT", "9090")));
             }
         } else {
             panic!("expected list item");
         }
+    }
+
+    #[test]
+    fn resolve_env_inside_inline_arm_target_body() {
+        let r = ValueResolver::new(|key| {
+            if key == "TOKEN" {
+                Some("secret".into())
+            } else {
+                None
+            }
+        });
+        let nml = "service Api:\n    routing:\n        @role/admin -> adminLanding:\n            token = $ENV.TOKEN\n";
+        let file = parse_to_ast(nml).unwrap();
+        let body = match &file.declarations[0].kind {
+            DeclarationKind::Block(b) => &b.body,
+            _ => panic!("expected block"),
+        };
+        let resolved = r.resolve_body(body).expect("resolve");
+        let inline_body = resolved
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::NestedBlock(nb) if nb.name.name == "routing" => {
+                    nb.body.entries.iter().find_map(|e| match &e.kind {
+                        BodyEntryKind::Arm(arm) => match &arm.target {
+                            ArmTarget::Inline { body, .. } => Some(body),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("inline arm body");
+        let token = inline_body.entries.iter().find_map(|e| match &e.kind {
+            BodyEntryKind::Property(p) if p.name.name == "token" => Some(&p.value.value),
+            _ => None,
+        });
+        assert_eq!(token, Some(&resolved_v("$ENV.TOKEN", "secret")));
+    }
+
+    #[test]
+    fn shared_property_inside_inline_arm_body_is_consumed() {
+        let nml = r#"
+service S:
+    routing:
+        @role/admin -> adminLanding:
+            .port = 9090
+            label = 4
+"#;
+        let file = parse_to_ast(nml).unwrap();
+        let body = match &file.declarations[0].kind {
+            DeclarationKind::Block(b) => &b.body.clone(),
+            _ => panic!("expected block"),
+        };
+        let merged = apply_shared_properties(body);
+        let inline_body = merged
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::NestedBlock(nb) if nb.name.name == "routing" => {
+                    nb.body.entries.iter().find_map(|e| match &e.kind {
+                        BodyEntryKind::Arm(arm) => match &arm.target {
+                            ArmTarget::Inline { body, .. } => Some(body),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .expect("inline arm body");
+        assert!(
+            inline_body
+                .entries
+                .iter()
+                .all(|e| !matches!(&e.kind, BodyEntryKind::SharedProperty(_))),
+            "shared properties inside inline arm bodies must be processed: {:?}",
+            inline_body.entries
+        );
+        assert!(
+            inline_body.entries.iter().any(|e| {
+                matches!(&e.kind, BodyEntryKind::Property(p) if p.name.name == "label")
+            })
+        );
     }
 
     #[test]
@@ -1260,7 +1409,7 @@ workflow W:
         if let BodyEntryKind::NestedBlock(a) = &resolved.entries[0].kind {
             if let BodyEntryKind::NestedBlock(b) = &a.body.entries[0].kind {
                 if let BodyEntryKind::Property(p) = &b.body.entries[0].kind {
-                    assert_eq!(p.value.value, Value::String("localhost".into()));
+                    assert_eq!(p.value.value, resolved_v("$ENV.HOST", "localhost"));
                 }
             }
         }

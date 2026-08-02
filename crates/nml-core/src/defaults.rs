@@ -360,15 +360,26 @@ impl<'a> Defaulter<'a> {
         match self.index.resolve_field(field) {
             FieldTarget::Model(m) => self.model_body(m, nb_body, depth + 1),
             FieldTarget::OneOf(o) => self.oneof_body(o, nb_body, depth + 1),
-            // Arm bodies carry only selectors and reference targets (RFC
-            // 0007) — nothing to default.
+            FieldTarget::Arms { target, .. } => self.arm_set_body(target, nb_body, depth + 1),
+            // Arm bodies with reference/literal targets carry nothing to default;
+            // inline targets are recursed in `arm_set_body`.
             FieldTarget::ListOf(_, _)
             | FieldTarget::SetOf(_, _)
             | FieldTarget::Object
             | FieldTarget::Union(_)
-            | FieldTarget::Arms { .. }
             | FieldTarget::Leaf(_) => nb_body.clone(),
         }
+    }
+
+    /// Default each inline arm target inside an arm-set body against `V`.
+    fn arm_set_body(&self, v: &FieldType, body: &Body, depth: u32) -> Body {
+        crate::identity::map_inline_arm_bodies(
+            v,
+            body,
+            self.index,
+            depth,
+            |target, inline_body, depth| self.default_against(target, inline_body, depth),
+        )
     }
 
     /// Default each named item of a list field against its inner type, selecting
@@ -396,10 +407,8 @@ impl<'a> Defaulter<'a> {
                     _ => item_body.clone(),
                 })
             }
-            FieldTarget::Object
-            | FieldTarget::Union(_)
-            | FieldTarget::Arms { .. }
-            | FieldTarget::Leaf(_) => body.clone(),
+            FieldTarget::Arms { target, .. } => self.arm_set_body(target, body, depth),
+            FieldTarget::Object | FieldTarget::Union(_) | FieldTarget::Leaf(_) => body.clone(),
         }
     }
 
@@ -829,6 +838,63 @@ mod tests {
         let listy = item(parallel, "Listy").expect("Listy item");
         let sub = item(listy, "Sub").expect("Sub item under Listy");
         assert_eq!(prop(sub, "retries"), Some(&Value::number(crate::num!(3.0))));
+    }
+
+    #[test]
+    fn inline_arm_target_body_gets_target_model_defaults() {
+        let idx = index_from(
+            "model landingPage:\n    label number = 1\nmodel service:\n    routing (role -> landingPage)?\n",
+        );
+        let out = apply_defaults(
+            &idx,
+            "service",
+            &body_of("service Api:\n    routing:\n        @role/admin -> adminLanding:\n"),
+        );
+        let routing = nested(&out, "routing").expect("routing block");
+        let inline_body = routing
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::Arm(arm) => match &arm.target {
+                    ArmTarget::Inline { body, .. } => Some(body),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("inline arm body");
+        assert_eq!(
+            prop(inline_body, "label"),
+            Some(&Value::number(crate::num!(1.0)))
+        );
+    }
+
+    #[test]
+    fn inline_arm_target_materializes_name_before_defaults() {
+        let idx = index_from(
+            "model worker:\n    name string = \"default\"\n    host string?\nmodel service:\n    routing (role -> worker)?\n",
+        );
+        let out = apply_defaults(
+            &idx,
+            "service",
+            &body_of("service Api:\n    routing:\n        @role/admin -> adminWorker:\n"),
+        );
+        let routing = nested(&out, "routing").expect("routing block");
+        let inline_body = routing
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::Arm(arm) => match &arm.target {
+                    ArmTarget::Inline { body, .. } => Some(body),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("inline arm body");
+        assert_eq!(
+            prop(inline_body, "name"),
+            Some(&Value::String("adminWorker".into())),
+            "arm header identity must beat schema default on `name`"
+        );
     }
 
     /// The RFC 0015 END-TO-END guarantee, through the REAL pipeline

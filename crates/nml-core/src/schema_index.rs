@@ -170,6 +170,64 @@ impl SchemaIndex {
         self.oneof_pos.get(name).map(|&i| &self.oneofs[i])
     }
 
+    /// Whether an inline arm target (`-> Name:` + body) is admissible for `V`
+    /// — true for a model, a `oneof`, or a union with any such variant; false
+    /// for scalars and arm sets. Shared by validation and LSP completion.
+    pub fn field_type_admits_inline(&self, ty: &FieldType) -> bool {
+        match ty {
+            FieldType::ModelRef(name) => self.model(name).is_some() || self.oneof(name).is_some(),
+            FieldType::Modifier(inner) => self.field_type_admits_inline(inner),
+            FieldType::Union(variants) => variants.iter().any(|v| self.field_type_admits_inline(v)),
+            FieldType::List(_) | FieldType::Set(_) | FieldType::Arms { .. } => false,
+            FieldType::Primitive { .. } => false,
+        }
+    }
+
+    /// Whether a string-literal arm target (`-> "…"`) is admissible for `V` —
+    /// true for a primitive, an enum reference, an unknown name (consumer leaf),
+    /// or a union with any such variant; false for model/`oneof`/list/arms `V`.
+    /// Shared by validation and LSP completion.
+    pub fn field_type_admits_a_literal(&self, ty: &FieldType) -> bool {
+        match ty {
+            FieldType::Primitive { .. } => true,
+            FieldType::Modifier(inner) => self.field_type_admits_a_literal(inner),
+            FieldType::Union(variants) => {
+                variants.iter().any(|v| self.field_type_admits_a_literal(v))
+            }
+            FieldType::ModelRef(name) => self.model(name).is_none() && self.oneof(name).is_none(),
+            FieldType::List(_) | FieldType::Set(_) | FieldType::Arms { .. } => false,
+        }
+    }
+
+    /// When `K` is an enum type (possibly under a modifier or union), return
+    /// its definition for arm-key validation and LSP selector completion.
+    pub fn arm_key_enum_def(&self, key: &FieldType) -> Option<&EnumDef> {
+        match key {
+            FieldType::ModelRef(name) => self.enum_def(name),
+            FieldType::Modifier(inner) => self.arm_key_enum_def(inner),
+            FieldType::Union(variants) => variants.iter().find_map(|v| self.arm_key_enum_def(v)),
+            _ => None,
+        }
+    }
+
+    /// Whether a string-literal arm selector conforms to declared key type `K`.
+    pub fn arm_literal_key_admits(&self, key: &FieldType, selector: &str) -> bool {
+        match key {
+            FieldType::Primitive {
+                ty: PrimitiveType::String,
+                ..
+            } => true,
+            FieldType::ModelRef(name) => self
+                .enum_def(name)
+                .is_some_and(|e| e.variants.iter().any(|v| v == selector)),
+            FieldType::Modifier(inner) => self.arm_literal_key_admits(inner, selector),
+            FieldType::Union(variants) => variants
+                .iter()
+                .any(|v| self.arm_literal_key_admits(v, selector)),
+            _ => false,
+        }
+    }
+
     /// Definitions in source order, for order-sensitive passes (cycle and
     /// duplicate reporting).
     pub fn models(&self) -> &[ModelDef] {
@@ -376,10 +434,10 @@ fn first_wins<T>(items: &[T], name: impl Fn(&T) -> &str) -> HashMap<String, usiz
 
 #[cfg(test)]
 mod tests {
-    use crate::model::PrimitiveFacets;
+    use crate::model::{EnumDef, ModelKind, PrimitiveFacets};
+    use crate::types::PrimitiveType;
 
     use super::*;
-    use crate::model::ModelKind;
     use crate::span::Span;
 
     fn model(name: &str, fields: Vec<FieldDef>) -> ModelDef {
@@ -738,5 +796,63 @@ mod tests {
             idx.nameable_variant_names(variants),
             vec!["modelA", "modelB"]
         );
+    }
+
+    #[test]
+    fn field_type_admits_inline_for_model_oneof_union_and_rejects_scalars() {
+        let idx = SchemaIndex::build(
+            vec![model("page", vec![])],
+            vec![],
+            vec![OneOfDef {
+                name: "email".into(),
+                discriminator: "provider".into(),
+                discriminator_type: None,
+                default_discriminator: None,
+                variants: vec![],
+                source: None,
+                span: Span::empty(0),
+            }],
+        );
+        let union = FieldType::Union(vec![
+            FieldType::ModelRef("page".into()),
+            FieldType::Primitive {
+                ty: PrimitiveType::String,
+                facets: PrimitiveFacets::None,
+            },
+        ]);
+        assert!(idx.field_type_admits_inline(&FieldType::ModelRef("page".into())));
+        assert!(idx.field_type_admits_inline(&FieldType::ModelRef("email".into())));
+        assert!(idx.field_type_admits_inline(&union));
+        assert!(!idx.field_type_admits_inline(&FieldType::Primitive {
+            ty: PrimitiveType::String,
+            facets: PrimitiveFacets::None,
+        }));
+        assert!(!idx.field_type_admits_inline(&FieldType::Arms {
+            key: Box::new(FieldType::ModelRef("role".into())),
+            target: Box::new(FieldType::ModelRef("page".into())),
+        }));
+    }
+
+    #[test]
+    fn field_type_admits_a_literal_and_arm_key_helpers() {
+        let idx = SchemaIndex::build(
+            vec![model("page", vec![])],
+            vec![EnumDef {
+                name: "planKind".into(),
+                variants: vec!["free".into(), "pro".into()],
+                source: None,
+                span: Span::empty(0),
+            }],
+            vec![],
+        );
+        assert!(idx.field_type_admits_a_literal(&FieldType::Primitive {
+            ty: PrimitiveType::String,
+            facets: PrimitiveFacets::None,
+        }));
+        assert!(!idx.field_type_admits_a_literal(&FieldType::ModelRef("page".into())));
+        let key = FieldType::ModelRef("planKind".into());
+        assert!(idx.arm_literal_key_admits(&key, "pro"));
+        assert!(!idx.arm_literal_key_admits(&key, "enterprise"));
+        assert_eq!(idx.arm_key_enum_def(&key).unwrap().name, "planKind");
     }
 }

@@ -259,15 +259,28 @@ fn resolve_field_type(te: &TypeExpr) -> FieldType {
                     // from `extract_schema` itself); dropping them here
                     // keeps the model claim literal, so enforcement can
                     // never fire a facet on a type-mismatched value.
-                    // (Field evaluated before `ty` because the check
-                    // borrows `prim`.)
+                    // A BARE faceted-domain field carries `None` exactly
+                    // like a bare string field: `None` means "no facet
+                    // list authored", never "not a faceted domain" — the
+                    // domain is the type name's job. (Field evaluated
+                    // before `ty` because the check borrows `prim`.)
                     facets: match prim {
-                        PrimitiveType::Number => crate::model::PrimitiveFacets::Number(Box::new(
-                            extract_facets_as(te, decode_number_facet),
-                        )),
-                        PrimitiveType::Duration => crate::model::PrimitiveFacets::Duration(
-                            Box::new(extract_facets_as(te, decode_duration_facet)),
-                        ),
+                        PrimitiveType::Number => {
+                            let facets = extract_facets_as(te, decode_number_facet);
+                            if facets.is_none() {
+                                crate::model::PrimitiveFacets::None
+                            } else {
+                                crate::model::PrimitiveFacets::Number(Box::new(facets))
+                            }
+                        }
+                        PrimitiveType::Duration => {
+                            let facets = extract_facets_as(te, decode_duration_facet);
+                            if facets.is_none() {
+                                crate::model::PrimitiveFacets::None
+                            } else {
+                                crate::model::PrimitiveFacets::Duration(Box::new(facets))
+                            }
+                        }
                         _ => crate::model::PrimitiveFacets::None,
                     },
                     ty: prim,

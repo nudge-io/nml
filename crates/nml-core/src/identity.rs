@@ -154,6 +154,68 @@ pub fn materialize_item(item: &ListItem, model: &ModelDef) -> Materialized {
     }
 }
 
+/// Materialize an inline arm target's identity into its body against `model`.
+/// Shared by validation and consumer hand-parsers — the arm analogue of
+/// [`materialize_named`] for list-item inline instances.
+pub fn materialize_arm_inline(name: &Identifier, body: &Body, model: &ModelDef) -> Materialized {
+    materialize_named(name, body, model)
+}
+
+/// Recurse into each inline arm target inside an arm-set body — shared by the
+/// positional and defaulting passes so depth accounting and `resolve_type_in_body`
+/// selection stay identical.
+pub fn map_inline_arm_bodies(
+    v: &FieldType,
+    body: &Body,
+    index: &SchemaIndex,
+    depth: u32,
+    mut recurse: impl FnMut(FieldTarget<'_>, &Body, u32) -> Body,
+) -> Body {
+    map_arm_bodies(body, |arm| {
+        let ArmTarget::Inline {
+            name,
+            body: inline_body,
+        } = &arm.target
+        else {
+            return arm.clone();
+        };
+        let elem = index.resolve_type_in_body(v, inline_body);
+        // Materialize the arm-header identity before defaults/positional
+        // recursion — inline arms have no de-time NamedItemDeserializer to
+        // recover the header token after schema defaults run.
+        let body_for_recurse = match &elem {
+            FieldTarget::Model(m) => materialize_arm_inline(name, inline_body, m).body,
+            _ => inline_body.clone(),
+        };
+        let recursed = recurse(elem, &body_for_recurse, depth + 1);
+        Arm {
+            target: ArmTarget::Inline {
+                name: name.clone(),
+                body: recursed,
+            },
+            ..arm.clone()
+        }
+    })
+}
+
+/// Apply `transform` to every routing arm in `body`, leaving other entries
+/// untouched. Shared by the positional and defaulting passes when recursing
+/// into arm-set fields with inline targets.
+pub fn map_arm_bodies(body: &Body, mut transform: impl FnMut(&Arm) -> Arm) -> Body {
+    let entries = body
+        .entries
+        .iter()
+        .map(|entry| match &entry.kind {
+            BodyEntryKind::Arm(arm) => BodyEntry {
+                span: entry.span,
+                kind: BodyEntryKind::Arm(transform(arm)),
+            },
+            _ => entry.clone(),
+        })
+        .collect();
+    body.with_entries(entries)
+}
+
 /// Append `field = value` to a clone of `body` — **unless `body` already sets
 /// `field`**, in which case the explicit value wins and the body is returned
 /// unchanged. This is **lenient by design**: the identity token (a named key, block
@@ -318,6 +380,7 @@ impl Positionalizer<'_> {
             return match self.index.resolve_type_in_body(&field.field_type, body) {
                 FieldTarget::Model(m) => self.model_body(m, body, depth + 1),
                 FieldTarget::OneOf(o) => self.oneof_body(o, body, depth + 1),
+                FieldTarget::Arms { target, .. } => self.arm_set_body(target, body, depth + 1),
                 FieldTarget::ListOf(_, _) => {
                     match variants.iter().find(|v| matches!(v, FieldType::List(_))) {
                         Some(FieldType::List(inner)) => self.list_body(inner, body, depth + 1),
@@ -330,6 +393,23 @@ impl Positionalizer<'_> {
         match self.index.resolve_field(field) {
             FieldTarget::Model(m) => self.model_body(m, body, depth + 1),
             FieldTarget::OneOf(o) => self.oneof_body(o, body, depth + 1),
+            FieldTarget::Arms { target, .. } => self.arm_set_body(target, body, depth + 1),
+            _ => body.clone(),
+        }
+    }
+
+    /// Recurse into inline arm targets inside an arm-set body, applying
+    /// positional materialization to each inline body's nested lists.
+    fn arm_set_body(&self, v: &FieldType, body: &Body, depth: u32) -> Body {
+        map_inline_arm_bodies(v, body, self.index, depth, |target, inline_body, depth| {
+            self.positional_against(target, inline_body, depth)
+        })
+    }
+
+    fn positional_against(&self, target: FieldTarget<'_>, body: &Body, depth: u32) -> Body {
+        match target {
+            FieldTarget::Model(m) => self.model_body(m, body, depth),
+            FieldTarget::OneOf(o) => self.oneof_body(o, body, depth),
             _ => body.clone(),
         }
     }
@@ -692,5 +772,111 @@ mod tests {
         let d = &r.diagnostics[0];
         assert!(d.message.contains("no shorthand field"), "{}", d.message);
         assert_eq!(d.code, Some(crate::diagnostic::codes::DROPPED_ITEM_KEY));
+    }
+
+    #[test]
+    fn inline_arm_header_materializes_name_in_positional_pass() {
+        use crate::cst::parse_to_ast;
+        let schema_src = "model worker:\n    name string = \"default\"\n    host string?\nmodel service:\n    routing (role -> worker)?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema_src);
+        assert!(errs.is_empty(), "{errs:?}");
+        let index = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let source = "service Api:\n    routing:\n        @role/admin -> adminWorker:\n";
+        let file = parse_to_ast(source).unwrap();
+        let body = match &file.declarations[0].kind {
+            crate::ast::DeclarationKind::Block(b) => &b.body,
+            _ => panic!("block"),
+        };
+        let out = apply_positional(&index, "service", body);
+        let routing = out
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::NestedBlock(nb) if nb.name.name == "routing" => Some(&nb.body),
+                _ => None,
+            })
+            .expect("routing");
+        let inline_body = routing
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::Arm(arm) => match &arm.target {
+                    ArmTarget::Inline { body, .. } => Some(body),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("inline arm");
+        let name = inline_body.entries.iter().find_map(|e| match &e.kind {
+            BodyEntryKind::Property(p) if p.name.name == "name" => Some(&p.value.value),
+            _ => None,
+        });
+        assert_eq!(name, Some(&Value::String("adminWorker".into())));
+    }
+
+    #[test]
+    fn positional_recurses_into_inline_arm_bodies() {
+        use crate::cst::parse_to_ast;
+        let schema_src = "model step:\n    path string+\nmodel landingPage:\n    steps []step\nmodel server:\n    routing (role -> landingPage)?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema_src);
+        assert!(errs.is_empty(), "{errs:?}");
+        let index = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let source = "server Api:\n    routing:\n        @role/admin -> adminLanding:\n            steps:\n                - \"/api\"\n";
+        let file = parse_to_ast(source).unwrap();
+        let body = match &file.declarations[0].kind {
+            crate::ast::DeclarationKind::Block(b) => &b.body,
+            _ => panic!("block"),
+        };
+        let out = apply_positional(&index, "server", body);
+        let routing = out
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::NestedBlock(nb) if nb.name.name == "routing" => Some(&nb.body),
+                _ => None,
+            })
+            .expect("routing block");
+        let arm = routing
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::Arm(a) => Some(a),
+                _ => None,
+            })
+            .expect("arm");
+        let ArmTarget::Inline { body: inline, .. } = &arm.target else {
+            panic!("inline arm");
+        };
+        let steps = inline
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::NestedBlock(nb) if nb.name.name == "steps" => Some(&nb.body),
+                _ => None,
+            })
+            .expect("steps block");
+        let item = steps
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::ListItem(i) => Some(i),
+                _ => None,
+            })
+            .expect("list item");
+        let ListItemKind::Shorthand {
+            body: item_body, ..
+        } = &item.kind
+        else {
+            panic!("shorthand item");
+        };
+        let path = item_body.as_ref().and_then(|b| {
+            b.entries.iter().find_map(|e| match &e.kind {
+                BodyEntryKind::Property(p) if p.name.name == "path" => {
+                    Some(p.value.value.as_str().map(String::from))
+                }
+                _ => None,
+            })
+        });
+        assert_eq!(path.flatten().as_deref(), Some("/api"));
     }
 }

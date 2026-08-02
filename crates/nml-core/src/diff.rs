@@ -246,6 +246,9 @@ fn render_key(v: &Value) -> String {
         // `$ENV` variable name, so a future `set<secret>`/`[]secret` cannot turn
         // a path into a leak.
         Value::Secret(_) => "‹secret›".to_string(),
+        // Unreachable today (the differ is source-side), but this file is
+        // secret-safe BY CONSTRUCTION: resolved env text never prints.
+        Value::Resolved(_) => "‹resolved›".to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -1115,9 +1118,12 @@ fn diff_bodies(
             diff_collections(index, field, &[], &new_elems, path, depth, out);
         }
         diff_arms(
+            index,
+            arm_set_target_type(field),
             &old_arms.unwrap_or_default(),
             &new_arms.unwrap_or_default(),
             path,
+            depth,
             out,
         );
         return;
@@ -1766,11 +1772,12 @@ fn diff_collections(
 /// Canonical single-arm rendering ("sel -> target") — shared by the wholesale
 /// arms diff and the structural body equality, so the two can never disagree
 /// about what an arm "is".
-fn arm_selector_str(a: &crate::ast::Arm) -> &str {
+fn arm_selector_str(a: &crate::ast::Arm) -> String {
     use crate::ast::ArmSelector;
     match &a.selector {
-        ArmSelector::Role(r) => r.as_str(),
-        ArmSelector::Else => "else",
+        ArmSelector::Role(r) => r.clone(),
+        ArmSelector::Literal(k) => format!("{k:?}"),
+        ArmSelector::Else => "else".to_string(),
     }
 }
 
@@ -1779,7 +1786,24 @@ fn arm_target_str(a: &crate::ast::Arm) -> String {
     match &a.target {
         ArmTarget::Reference(id) => id.name.clone(),
         ArmTarget::Literal { value, .. } => format!("{value:?}"),
+        ArmTarget::Inline { name, .. } => format!("{}:", name.name),
     }
+}
+
+fn arm_target_eq(a: &crate::ast::ArmTarget, b: &crate::ast::ArmTarget, depth: u32) -> bool {
+    use crate::ast::ArmTarget;
+    match (a, b) {
+        (ArmTarget::Reference(x), ArmTarget::Reference(y)) => x.name == y.name,
+        (ArmTarget::Literal { value: av, .. }, ArmTarget::Literal { value: bv, .. }) => av == bv,
+        (ArmTarget::Inline { name: an, body: ab }, ArmTarget::Inline { name: bn, body: bb }) => {
+            an.name == bn.name && body_eq_bounded(ab, bb, depth + 1)
+        }
+        _ => false,
+    }
+}
+
+fn arm_structural_eq(a: &crate::ast::Arm, b: &crate::ast::Arm, depth: u32) -> bool {
+    a.selector == b.selector && arm_target_eq(&a.target, &b.target, depth)
 }
 
 /// The one arm rendering (`sel -> target`) — every consumer (wholesale eq,
@@ -1790,7 +1814,7 @@ fn format_arm(selector: &str, target: &str) -> String {
 }
 
 fn render_arm(a: &crate::ast::Arm) -> String {
-    format_arm(arm_selector_str(a), &arm_target_str(a))
+    format_arm(&arm_selector_str(a), &arm_target_str(a))
 }
 
 /// Span-ignoring structural equality over config-instance bodies — the
@@ -1859,7 +1883,7 @@ fn entry_structural_eq(a: &BodyEntry, b: &BodyEntry, depth: u32) -> bool {
                     }
             }
             (BodyEntryKind::ListItem(x), BodyEntryKind::ListItem(y)) => list_item_eq(x, y, depth),
-            (BodyEntryKind::Arm(x), BodyEntryKind::Arm(y)) => render_arm(x) == render_arm(y),
+            (BodyEntryKind::Arm(x), BodyEntryKind::Arm(y)) => arm_structural_eq(x, y, depth),
             // Authoring constructs carry no config values.
             (BodyEntryKind::FieldDefinition(_), BodyEntryKind::FieldDefinition(_)) => true,
             _ => false,
@@ -1912,7 +1936,7 @@ fn list_item_eq(a: &ListItem, b: &ListItem, depth: u32) -> bool {
 /// winning file) so per-arm changes carry real file:line.
 struct ArmEntry {
     selector: String,
-    target: String,
+    arm: crate::ast::Arm,
     origin: Origin,
 }
 
@@ -1933,8 +1957,8 @@ fn collect_arm_entries(e: &Effective) -> Option<Vec<ArmEntry>> {
     for entry in &body.entries {
         if let BodyEntryKind::Arm(a) = &entry.kind {
             arms.push(ArmEntry {
-                selector: arm_selector_str(a).to_string(),
-                target: arm_target_str(a),
+                selector: arm_selector_str(a),
+                arm: a.clone(),
                 origin: Origin::File {
                     file: file.clone(),
                     span: a.selector_span,
@@ -1945,6 +1969,17 @@ fn collect_arm_entries(e: &Effective) -> Option<Vec<ArmEntry>> {
     Some(arms)
 }
 
+fn arm_set_target_type(field: &FieldDef) -> &FieldType {
+    match &field.field_type {
+        FieldType::Arms { target, .. } => target.as_ref(),
+        FieldType::Modifier(inner) => match inner.as_ref() {
+            FieldType::Arms { target, .. } => target.as_ref(),
+            other => other,
+        },
+        other => other,
+    }
+}
+
 /// Per-arm diff of a routing block (RFC 0007): arms pair by SELECTOR — unique
 /// by validation (duplicate arm keys and duplicate `else` are rejected) — via
 /// the same deterministic LCS the ordered lists use, so order stays meaning:
@@ -1953,19 +1988,48 @@ fn collect_arm_entries(e: &Effective) -> Option<Vec<ArmEntry>> {
 /// * an unpaired arm → `Added`/`Removed` carrying the FULL `sel -> target`
 ///   rendering, so a MOVED arm reads as a -/+ pair of identical text at its
 ///   two file:lines (deterministic — a security report never guesses).
-fn diff_arms(old: &[ArmEntry], new: &[ArmEntry], path: &FieldPath, out: &mut Vec<FieldChange>) {
+fn diff_arms(
+    index: &SchemaIndex,
+    target_v: &FieldType,
+    old: &[ArmEntry],
+    new: &[ArmEntry],
+    path: &FieldPath,
+    depth: u32,
+    out: &mut Vec<FieldChange>,
+) {
     let matched = lcs_pairs_by(old, new, |a, b| a.selector == b.selector);
     for &(i, j) in &matched {
-        if old[i].target != new[j].target {
-            push(
-                &path.appended(PathSeg::Element(ElemKey::Name(new[j].selector.clone()))),
+        if arm_structural_eq(&old[i].arm, &new[j].arm, depth) {
+            continue;
+        }
+        let arm_path = path.appended(PathSeg::Element(ElemKey::Name(new[j].selector.clone())));
+        match (&old[i].arm.target, &new[j].arm.target) {
+            (
+                crate::ast::ArmTarget::Inline { body: ob, .. },
+                crate::ast::ArmTarget::Inline { body: nb, .. },
+            ) => {
+                diff_inline_arm_bodies(
+                    index,
+                    InlineArmBodyDiff {
+                        target_v,
+                        old: ob,
+                        new: nb,
+                        path: &arm_path,
+                        origin: new[j].origin.clone(),
+                        depth: depth + 1,
+                    },
+                    out,
+                );
+            }
+            _ => push(
+                &arm_path,
                 ChangeKind::Modified {
-                    old: Value::String(old[i].target.clone()),
-                    new: Value::String(new[j].target.clone()),
+                    old: arm_target_diff_value(&old[i].arm),
+                    new: arm_target_diff_value(&new[j].arm),
                 },
                 new[j].origin.clone(),
                 out,
-            );
+            ),
         }
     }
     for (j, a) in new.iter().enumerate() {
@@ -1973,7 +2037,7 @@ fn diff_arms(old: &[ArmEntry], new: &[ArmEntry], path: &FieldPath, out: &mut Vec
             push(
                 &path.appended(PathSeg::Element(ElemKey::Name(a.selector.clone()))),
                 ChangeKind::Added {
-                    new: Value::String(format_arm(&a.selector, &a.target)),
+                    new: Value::String(render_arm(&a.arm)),
                 },
                 a.origin.clone(),
                 out,
@@ -1985,13 +2049,100 @@ fn diff_arms(old: &[ArmEntry], new: &[ArmEntry], path: &FieldPath, out: &mut Vec
             push(
                 &path.appended(PathSeg::Element(ElemKey::Name(a.selector.clone()))),
                 ChangeKind::Removed {
-                    old: Value::String(format_arm(&a.selector, &a.target)),
+                    old: Value::String(render_arm(&a.arm)),
                 },
                 a.origin.clone(),
                 out,
             );
         }
     }
+}
+
+/// Context for field-level diff inside an inline arm target's body.
+struct InlineArmBodyDiff<'a> {
+    target_v: &'a FieldType,
+    old: &'a Body,
+    new: &'a Body,
+    path: &'a FieldPath,
+    origin: Origin,
+    depth: u32,
+}
+
+/// Field-level diff inside an inline arm target's body — full model/oneof
+/// recursion when `V` resolves to a describable target, so nested blocks and
+/// properties both diff granularly.
+fn diff_inline_arm_bodies(
+    index: &SchemaIndex,
+    ctx: InlineArmBodyDiff<'_>,
+    out: &mut Vec<FieldChange>,
+) {
+    if body_eq_bounded(ctx.old, ctx.new, ctx.depth) {
+        return;
+    }
+    let file = match &ctx.origin {
+        Origin::File { file, .. } => file.clone(),
+        _ => PathBuf::new(),
+    };
+    let old_files = vec![(file.clone(), ctx.old)];
+    let new_files = vec![(file, ctx.new)];
+    let empty: Vec<(PathBuf, &Body)> = Vec::new();
+    let empty_body = Body::fresh(Vec::new());
+    let old_target = resolve_diff_target(index, ctx.target_v, &old_files, &empty, &empty_body);
+    let new_target = resolve_diff_target(index, ctx.target_v, &new_files, &empty, &empty_body);
+    if diff_variant_switch(
+        index,
+        (&old_target, &new_target),
+        &old_files,
+        &new_files,
+        ctx.path,
+        ctx.depth,
+        out,
+    ) {
+        return;
+    }
+    match resolve_diff_target(index, ctx.target_v, &new_files, &old_files, &empty_body) {
+        FieldTarget::Model(m) => {
+            diff_model(
+                index,
+                ModelCtx {
+                    model: m,
+                    exempt: None,
+                },
+                &old_files,
+                &new_files,
+                ctx.path,
+                ctx.depth,
+                out,
+            );
+        }
+        FieldTarget::OneOf(of) => {
+            diff_oneof_instance(index, of, &old_files, &new_files, ctx.path, ctx.depth, out);
+        }
+        _ => {
+            push(
+                ctx.path,
+                ChangeKind::Modified {
+                    old: Value::String(render_arm_body_summary(ctx.old)),
+                    new: Value::String(render_arm_body_summary(ctx.new)),
+                },
+                ctx.origin,
+                out,
+            );
+        }
+    }
+}
+
+fn arm_target_diff_value(arm: &crate::ast::Arm) -> Value {
+    use crate::ast::ArmTarget;
+    match &arm.target {
+        ArmTarget::Reference(id) => Value::String(id.name.clone()),
+        ArmTarget::Literal { value, .. } => Value::String(value.clone()),
+        ArmTarget::Inline { name, .. } => Value::String(format!("{}:", name.name)),
+    }
+}
+
+fn render_arm_body_summary(body: &Body) -> String {
+    format!("{{{} entries}}", body.entries.len())
 }
 
 fn lcs_pairs(old: &[Elem<'_>], new: &[Elem<'_>]) -> Vec<(usize, usize)> {
@@ -2490,6 +2641,61 @@ mod tests {
         assert!(
             matches!(&d[0].kind, ChangeKind::Added { new: Value::String(s) } if s == "@role/b -> W"),
             "{d:?}"
+        );
+    }
+
+    /// Inline arm targets diff field-level inside the arm body (RFC 0007 §6.2).
+    #[test]
+    fn inline_arm_targets_diff_granular_field_changes() {
+        let schema = "model landingPage:\n    label number\nmodel server:\n    routing (role -> landingPage)?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let diff2 = |o: &str, n: &str| {
+            let (of, nf) = (parse_doc(o), parse_doc(n));
+            diff_config(
+                &idx,
+                "server",
+                &[(PathBuf::from("f.nml"), server_body(&of))],
+                &[(PathBuf::from("f.nml"), server_body(&nf))],
+            )
+        };
+        let base = "server Api:\n    routing:\n        @role/admin -> adminLanding:\n            label = 4\n";
+        let changed = "server Api:\n    routing:\n        @role/admin -> adminLanding:\n            label = 5\n";
+        let d = diff2(base, changed);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            matches!(&d[0].kind, ChangeKind::Modified { old, new }
+                if matches!(old, Value::Number(n) if *n == 4)
+                    && matches!(new, Value::Number(n) if *n == 5)),
+            "granular label change inside inline arm: {d:?}"
+        );
+    }
+
+    #[test]
+    fn string_selector_arms_diff_target_changes() {
+        let schema = "enum planKind:\n    - \"free\"\n    - \"pro\"\nmodel server:\n    routing (planKind -> string)?\n";
+        let (sch, errs) = crate::cst::extract_schema(schema);
+        assert!(errs.is_empty(), "{errs:?}");
+        let idx = SchemaIndex::build(sch.models, sch.enums, sch.oneofs);
+        let diff2 = |o: &str, n: &str| {
+            let (of, nf) = (parse_doc(o), parse_doc(n));
+            diff_config(
+                &idx,
+                "server",
+                &[(PathBuf::from("f.nml"), server_body(&of))],
+                &[(PathBuf::from("f.nml"), server_body(&nf))],
+            )
+        };
+        let base = "server Api:\n    routing:\n        \"pro\" -> \"a\"\n";
+        let changed = "server Api:\n    routing:\n        \"pro\" -> \"b\"\n";
+        let d = diff2(base, changed);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            matches!(&d[0].kind, ChangeKind::Modified { old, new }
+                if matches!(old, Value::String(s) if s == "a")
+                    && matches!(new, Value::String(s) if s == "b")),
+            "selector-paired target retarget: {d:?}"
         );
     }
 
