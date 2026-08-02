@@ -26,12 +26,14 @@ use crate::types::{SpannedValue, Value};
 /// ```
 /// Pluggable variable lookup: maps a `$ENV.KEY` name to its value, or
 /// `None` when unset (which triggers the fallback chain, if any).
-type VarLookup = Box<dyn Fn(&str) -> Option<String>>;
+/// `Send + Sync` so a resolver can live inside shared long-lived state —
+/// validators are held in `Arc`s (LSP caches) and `LazyLock` statics.
+type VarLookup = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// Pluggable `const` lookup: maps a `Value::Reference` name to the value the
 /// `const` declares, or `None` when the name is not a known `const` (in which
 /// case the reference resolves to its literal name).
-type SymbolLookup = Box<dyn Fn(&str) -> Option<Value>>;
+type SymbolLookup = Box<dyn Fn(&str) -> Option<Value> + Send + Sync>;
 
 /// Bounds reference-chain recursion. Const cycles are normally rejected up front
 /// by `SymbolTable::find_const_cycles`; this is defense-in-depth so the resolver
@@ -45,6 +47,19 @@ pub struct ValueResolver {
     symbol_resolver: Option<SymbolLookup>,
 }
 
+/// Structural only — a resolver's lookups are opaque closures and its
+/// resolutions are secrets, so Debug reports which lanes are configured
+/// and nothing else. Required so embedders (e.g. `SchemaValidator`) can
+/// keep deriving `Debug` while holding a resolver.
+impl std::fmt::Debug for ValueResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValueResolver")
+            .field("env", &self.var_resolver.is_some())
+            .field("symbols", &self.symbol_resolver.is_some())
+            .finish()
+    }
+}
+
 impl ValueResolver {
     /// Create a resolver that reads `$ENV.KEY` from `std::env::var`.
     pub fn env() -> Self {
@@ -55,7 +70,7 @@ impl ValueResolver {
     }
 
     /// Create a resolver with a custom variable lookup function.
-    pub fn new(resolver: impl Fn(&str) -> Option<String> + 'static) -> Self {
+    pub fn new(resolver: impl Fn(&str) -> Option<String> + Send + Sync + 'static) -> Self {
         Self {
             var_resolver: Some(Box::new(resolver)),
             symbol_resolver: None,
@@ -79,7 +94,10 @@ impl ValueResolver {
     /// resolves to fixpoint in this single pass. An unknown reference is left
     /// as-is (it deserializes as its literal name), matching the workflow
     /// parser's `resolve_string` fallback.
-    pub fn with_symbols(mut self, lookup: impl Fn(&str) -> Option<Value> + 'static) -> Self {
+    pub fn with_symbols(
+        mut self,
+        lookup: impl Fn(&str) -> Option<Value> + Send + Sync + 'static,
+    ) -> Self {
         self.symbol_resolver = Some(Box::new(lookup));
         self
     }

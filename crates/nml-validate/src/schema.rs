@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef, PrimitiveFacets};
+use nml_core::resolve::ValueResolver;
 use nml_core::schema::{ExtractedSchema, report_graph_cycles};
 use nml_core::schema_index::{BodyShape, FieldTarget, SchemaIndex};
 use nml_core::span::Span;
@@ -55,6 +56,13 @@ pub struct SchemaValidator {
     /// wall. Set only by [`crate::package::SchemaPackage::validator`]
     /// (authority follows provenance; there is no user-facing knob).
     closed_vocabulary: bool,
+    /// RFC 0047 resolved lane: when set, deferred values (`$ENV.KEY`,
+    /// fallback chains) on FACETED fields are resolved during validation
+    /// and their facets enforced — diagnostics name the variable and the
+    /// bound, never the resolved content. `None` (the default) keeps
+    /// deferral: literals are judged everywhere, `$ENV` where it exists.
+    /// See [`Self::with_env_resolution`] for the lane-ownership rules.
+    env_resolution: Option<ValueResolver>,
 }
 
 /// Opt-in configuration for embedders that model membership / access-control
@@ -90,6 +98,17 @@ impl From<ExtractedSchema> for SchemaValidator {
 struct ElemLabel<'a> {
     field: &'a str,
     container: &'a str,
+}
+
+/// Inputs shared by list items and inline arm targets when validating an
+/// inline instance body against a resolved target.
+struct InlineBodyValidation<'a> {
+    name: Option<&'a Identifier>,
+    body: &'a Body,
+    elem: &'a FieldTarget<'a>,
+    label: ElemLabel<'a>,
+    depth: u32,
+    header_span: Option<Span>,
 }
 
 impl<'a> ElemLabel<'a> {
@@ -131,6 +150,7 @@ impl SchemaValidator {
             membership: MembershipSemantics::default(),
             composition_checked_at_load: false,
             closed_vocabulary: false,
+            env_resolution: None,
         }
     }
 
@@ -193,6 +213,35 @@ impl SchemaValidator {
     /// references inside modifier rules.
     pub fn with_membership_semantics(mut self, membership: MembershipSemantics) -> Self {
         self.membership = membership;
+        self
+    }
+
+    /// RFC 0047 resolved lane: resolve deferred values (`$ENV.KEY` and
+    /// fallback chains) during validation and enforce declared facets on
+    /// what they resolve to. Diagnostics name the VARIABLE and the bound
+    /// (`'pollInterval' from $ENV.P resolved to a value below the schema's
+    /// min = 60s`) — never the resolved content, which is
+    /// secret-provenance text.
+    ///
+    /// **Lane ownership is a security property, not a preference.** Set
+    /// this only at the boundary whose deserialization will use the SAME
+    /// resolver — the process that owns the file's resolution (a tenant
+    /// child booting its own `nudge.nml`; a deploy CLI baking its own
+    /// deploy config). A tenant-facing surface that resolved against its
+    /// own environment would hand tenants an existence oracle over
+    /// operator variables ("does `$ENV.OPERATOR_SECRET` exist?" answered
+    /// by whether a facet diagnostic appears). Resolver-free validators
+    /// (the default) keep deferral: literals are judged everywhere,
+    /// `$ENV` values where they exist, which is only the owning boundary.
+    ///
+    /// Unset variables stay silent here — a missing variable is
+    /// deserialization's error to report (with its fallback semantics),
+    /// not a validation failure. Text that does not parse as the field's
+    /// domain is likewise left to deserialization's provenance-aware
+    /// coercion errors; this lane adds exactly the facet checks that
+    /// pre-resolution validation must defer.
+    pub fn with_env_resolution(mut self, resolver: ValueResolver) -> Self {
+        self.env_resolution = Some(resolver);
         self
     }
 
@@ -548,6 +597,60 @@ impl SchemaValidator {
         self.index.oneof(name)
     }
 
+    /// RFC 0047 wiring for callers that own the resolution of SOME blocks
+    /// of a file but not others: enforce `model_name`'s Number/Duration
+    /// facets on what `body`'s deferred values (`$ENV.KEY`, fallback
+    /// chains) resolve to under `resolver`. The deploy CLI is the shape
+    /// this exists for — `build:`/`deploy:` blocks are CLI-baked (the
+    /// CLI's environment IS the authority) while the same file's server
+    /// blocks are child-authoritative, so a whole-file
+    /// [`Self::with_env_resolution`] pass would judge foreign lanes
+    /// against the wrong environment.
+    ///
+    /// Same leaf as the whole-file resolved lane, so the two wirings
+    /// cannot diverge: variable-naming, content-redacting diagnostics;
+    /// silent on unset variables and unparseable text (deserialization's
+    /// errors); literal values skipped (the resolver-free whole-file pass
+    /// already judged them, including facet checks on literal fallback
+    /// legs).
+    ///
+    /// The walk is deliberately SHALLOW — top-level properties only. Its
+    /// contract is models whose faceted fields are all top-level scalars;
+    /// the embedder pins that shape (nudge-schemas' flatness pin), so a
+    /// future nested faceted field fails a test instead of silently
+    /// escaping the walk.
+    pub fn validate_resolved_facets(
+        &self,
+        body: &Body,
+        model_name: &str,
+        resolver: &ValueResolver,
+    ) -> Vec<Diagnostic> {
+        let mut diags = Vec::new();
+        let Some(model) = self.find_model(model_name) else {
+            return diags;
+        };
+        for entry in &body.entries {
+            let BodyEntryKind::Property(prop) = &entry.kind else {
+                continue;
+            };
+            let Some(field) = model.fields.iter().find(|f| f.name == prop.name.name) else {
+                continue;
+            };
+            let Some(facets) = scalar_facets(&field.field_type) else {
+                continue;
+            };
+            check_resolved_facets(
+                resolver,
+                facets,
+                &prop.value.value,
+                &field.name,
+                prop.value.span,
+                &mut diags,
+            );
+        }
+        diags
+    }
+
     /// Validate the file's **definition-side** facts: the same body pass
     /// `check` runs over `model`/`trait`/`enum` declarations (field
     /// defaults vs declared types, RFC 0007 §4.3 type-shape rules,
@@ -899,12 +1002,14 @@ impl SchemaValidator {
             FieldTarget::Model(m) => match &item.kind {
                 K::Named { name, body } => {
                     self.validate_inline_body(
-                        Some(name),
-                        body,
-                        &FieldTarget::Model(m),
-                        label,
-                        depth,
-                        header,
+                        InlineBodyValidation {
+                            name: Some(name),
+                            body,
+                            elem: &FieldTarget::Model(m),
+                            label,
+                            depth,
+                            header_span: header,
+                        },
                         diags,
                     );
                 }
@@ -916,7 +1021,17 @@ impl SchemaValidator {
             },
             FieldTarget::OneOf(_) => match &item.kind {
                 K::Named { name, body } => {
-                    self.validate_inline_body(Some(name), body, elem, label, depth, header, diags);
+                    self.validate_inline_body(
+                        InlineBodyValidation {
+                            name: Some(name),
+                            body,
+                            elem,
+                            label,
+                            depth,
+                            header_span: header,
+                        },
+                        diags,
+                    );
                 }
                 // A scalar can only fill a model's `+` field; on a union its
                 // variant isn't yet known, so it is out of scope — flagged.
@@ -1534,53 +1649,51 @@ impl SchemaValidator {
 
     /// Validate an inline instance body against a resolved target — shared by
     /// list items and inline arm targets so both spellings agree by construction.
-    fn validate_inline_body(
-        &self,
-        name: Option<&Identifier>,
-        body: &Body,
-        elem: &FieldTarget,
-        label: ElemLabel<'_>,
-        depth: u32,
-        header_span: Option<Span>,
-        diags: &mut Vec<Diagnostic>,
-    ) {
-        match elem {
+    fn validate_inline_body(&self, ctx: InlineBodyValidation<'_>, diags: &mut Vec<Diagnostic>) {
+        match ctx.elem {
             FieldTarget::Model(m) => {
-                let result = match name {
-                    Some(name) => nml_core::identity::materialize_arm_inline(name, body, m),
+                let result = match ctx.name {
+                    Some(name) => nml_core::identity::materialize_arm_inline(name, ctx.body, m),
                     None => nml_core::identity::Materialized {
-                        body: body.clone(),
+                        body: ctx.body.clone(),
                         diagnostics: Vec::new(),
                         validatable: true,
                     },
                 };
-                self.validate_materialized(result, m, depth, header_span, diags);
+                self.validate_materialized(result, m, ctx.depth, ctx.header_span, diags);
             }
             FieldTarget::OneOf(_) => {
-                self.validate_target_instance(elem, body, depth, header_span, label, diags);
+                self.validate_target_instance(
+                    ctx.elem,
+                    ctx.body,
+                    ctx.depth,
+                    ctx.header_span,
+                    ctx.label,
+                    diags,
+                );
             }
             FieldTarget::Leaf(ty) | FieldTarget::Union(ty) => {
-                if !body.entries.is_empty() {
+                if !ctx.body.entries.is_empty() {
                     diags.push(
                         Diagnostic::error(format!(
                             "this {}'s body has nowhere to go: the element type \
                              `{ty}` has no fields to fill",
-                            label.field
+                            ctx.label.field
                         ))
                         .with_code(codes::DROPPED_ITEM_BODY)
-                        .with_span(header_span.unwrap_or_else(|| Span::empty(0))),
+                        .with_span(ctx.header_span.unwrap_or_else(|| Span::empty(0))),
                     );
                 }
             }
             _ => {
-                if !body.entries.is_empty() {
+                if !ctx.body.entries.is_empty() {
                     diags.push(
                         Diagnostic::error(format!(
                             "this {} requires a model or oneof element type",
-                            label.field
+                            ctx.label.field
                         ))
                         .with_code(codes::ARM_TARGET_MISMATCH)
-                        .with_span(header_span.unwrap_or_else(|| Span::empty(0))),
+                        .with_span(ctx.header_span.unwrap_or_else(|| Span::empty(0))),
                     );
                 }
             }
@@ -1639,15 +1752,17 @@ impl SchemaValidator {
                 }
                 let elem = self.index.resolve_type_in_body(v, body);
                 self.validate_inline_body(
-                    Some(name),
-                    body,
-                    &elem,
-                    ElemLabel {
-                        field: "arm target",
-                        container: "for",
+                    InlineBodyValidation {
+                        name: Some(name),
+                        body,
+                        elem: &elem,
+                        label: ElemLabel {
+                            field: "arm target",
+                            container: "for",
+                        },
+                        depth,
+                        header_span: Some(name.span),
                     },
-                    depth,
-                    Some(name.span),
                     diags,
                 );
             }
@@ -2190,6 +2305,20 @@ impl SchemaValidator {
                     (PrimitiveFacets::Duration(fs), Value::Duration(d)) => {
                         validate_facets(fs, d, field_name, span, diags);
                     }
+                    // The resolved lane (RFC 0047): a deferred value on a
+                    // faceted field is checkable here only when this
+                    // validator owns the file's resolution (boot; the
+                    // deploy CLI's own files). A `secret`-typed field can
+                    // never enter this arm — it carries no facets — so
+                    // credentials are structurally outside the lane.
+                    (
+                        PrimitiveFacets::Number(_) | PrimitiveFacets::Duration(_),
+                        Value::Secret(_) | Value::Reference(_),
+                    ) => {
+                        if let Some(resolver) = &self.env_resolution {
+                            check_resolved_facets(resolver, facets, value, field_name, span, diags);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2442,17 +2571,30 @@ impl SchemaValidator {
                 // engine), not a type mismatch. Machine-applicable: the
                 // replacement spans the WHOLE quoted string (quotes
                 // removed), yielding the canonical literal, and `nml fix`
-                // applies it in bulk. A string that is not duration text
-                // falls through to the ordinary mismatch below.
+                // applies it in bulk. The acceptance grammar is
+                // `parse_text` — the SAME coercion grammar the de-layer
+                // used to type these strings — so every spelling that
+                // ever worked gets the migration fix; text outside it
+                // falls through to the ordinary mismatch below. The
+                // "drop the quotes" hint appears only when de-quoting IS
+                // the whole fix (canonical Display == the quoted text);
+                // for coercion-only spellings ("1.5h" → 1h30m) the
+                // suggestion carries the rewrite and the hint would lie.
                 if let Ok(d) = nml_core::duration::Duration::parse_text(text) {
+                    let canonical = d.to_string();
+                    let hint = if canonical == *text {
+                        " (drop the quotes)"
+                    } else {
+                        ""
+                    };
                     diags.push(
                         Diagnostic::error(format!(
                             "duration field '{field_name}': a quoted duration was \
-                             replaced by the duration literal (drop the quotes)"
+                             replaced by the duration literal{hint}"
                         ))
                         .with_code(codes::REPLACED_SYNTAX)
                         .with_span(span)
-                        .with_suggestion(d.to_string(), span),
+                        .with_suggestion(canonical, span),
                     );
                     return;
                 }
@@ -2462,20 +2604,30 @@ impl SchemaValidator {
         // quoted number or bool against its typed field is the legacy
         // spelling, not a mere mismatch — the generic NML2008 told an
         // author WHAT failed but not the one-keystroke fix. Same
-        // machine-applicable shape as the duration arm: fire only when
-        // the de-quoted text parses as the target type; anything else
-        // falls through to the ordinary mismatch.
+        // machine-applicable shape as the duration arm, including the
+        // grammar: `parse_coercion` (RFC 0016 §1.4) is what the de-layer
+        // used to type these strings, so exponent spellings ("1e-6")
+        // that worked through the old coercion get the migration fix too
+        // — the suggestion is the canonical literal (Display folds the
+        // exponent away), which is always valid source. Anything outside
+        // the coercion grammar falls through to the ordinary mismatch.
         if *prim == PrimitiveType::Number {
             if let Value::String(text) = value {
-                if let Ok(n) = text.parse::<nml_core::types::Number>() {
+                if let Ok(n) = nml_core::types::Number::parse_coercion(text) {
+                    let canonical = n.to_string();
+                    let hint = if canonical == *text {
+                        " (drop the quotes)"
+                    } else {
+                        ""
+                    };
                     diags.push(
                         Diagnostic::error(format!(
                             "number field '{field_name}': a quoted number was \
-                             replaced by the number literal (drop the quotes)"
+                             replaced by the number literal{hint}"
                         ))
                         .with_code(codes::REPLACED_SYNTAX)
                         .with_span(span)
-                        .with_suggestion(n.to_string(), span),
+                        .with_suggestion(canonical, span),
                     );
                     return;
                 }
@@ -3074,6 +3226,85 @@ fn validate_facets<T: nml_core::model::FacetDomain>(
                 .with_code(codes::FACET_VIOLATION)
                 .with_span(span),
         );
+    }
+}
+
+/// The RFC 0047 resolved-lane leaf, shared by the whole-file walk (the
+/// facet hook above, via [`SchemaValidator::with_env_resolution`]) and the
+/// per-model shallow walk ([`SchemaValidator::validate_resolved_facets`]).
+///
+/// Resolves `value` with the caller's resolver and, when that yields
+/// env-provenance text, interprets the text with the SAME parsers the
+/// de-layer's typed coercions use — `Number::parse_coercion` /
+/// `Duration::parse_text` (RFC 0016 §1.4's machine-data grammar) — so
+/// validation and the runtime can never disagree about which env values
+/// are valid or what they denote. Anything else stays silent by design:
+/// unset variables and unparseable text are deserialization's errors
+/// (which name the variable), literals were judged by the normal facet
+/// arm, and an unresolvable reference is still deferred.
+fn check_resolved_facets(
+    resolver: &ValueResolver,
+    facets: &PrimitiveFacets,
+    value: &Value,
+    field_name: &str,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Ok(resolved) = resolver.resolve(value) else {
+        return;
+    };
+    let Value::Resolved(text) = resolved else {
+        return;
+    };
+    match facets {
+        PrimitiveFacets::Number(fs) => {
+            if let Ok(n) = nml_core::types::Number::parse_coercion(text.as_str()) {
+                validate_facets_resolved(fs, &n, text.var(), field_name, span, diags);
+            }
+        }
+        PrimitiveFacets::Duration(fs) => {
+            if let Ok(d) = nml_core::duration::Duration::parse_text(text.as_str()) {
+                validate_facets_resolved(fs, &d, text.var(), field_name, span, diags);
+            }
+        }
+        PrimitiveFacets::None => {}
+    }
+}
+
+/// [`validate_facets`]' provenance-redacting twin: the value drives the
+/// comparison (via `violation_descriptions`) but never appears in the
+/// message — resolved env content is secret-provenance text, so the
+/// diagnostic names the variable and the violated bound instead. Fully
+/// actionable (`echo $VAR` shows the operator their value) without
+/// reopening per-message "is echoing safe here?" reasoning.
+fn validate_facets_resolved<T: nml_core::model::FacetDomain>(
+    facets: &nml_core::model::Facets<T>,
+    value: &T,
+    var: &str,
+    field_name: &str,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for desc in facets.violation_descriptions(value) {
+        diags.push(
+            Diagnostic::error(format!(
+                "'{field_name}' from {var} resolved to a value {desc}"
+            ))
+            .with_code(codes::FACET_VIOLATION)
+            .with_span(span),
+        );
+    }
+}
+
+/// The facets of a field whose declared type is a scalar primitive at top
+/// level (through wrapper layers) — the positions the shallow resolved
+/// walk covers. Anything structured returns `None` and is skipped there;
+/// the embedder's flatness pin keeps that skip vacuous.
+fn scalar_facets(ty: &FieldType) -> Option<&PrimitiveFacets> {
+    match ty {
+        FieldType::Primitive { facets, .. } => Some(facets),
+        FieldType::Modifier(inner) => scalar_facets(inner),
+        _ => None,
     }
 }
 
@@ -7206,6 +7437,328 @@ mod replaced_literal_tests {
         assert!(
             diags.is_empty(),
             "an $ENV reference on a typed field is deferred, never taught: {diags:?}"
+        );
+    }
+
+    /// The teaching grammar is the de-layer's COERCION grammar, not the
+    /// literal grammar: spellings that only the old string coercion
+    /// accepted ("1e-6", "1.5h") are still the replaced spelling and get
+    /// the migration fix — as the CANONICAL literal (always valid
+    /// source), with the "(drop the quotes)" hint withheld because
+    /// de-quoting alone would not produce it.
+    #[test]
+    fn coercion_only_spellings_teach_the_canonical_literal() {
+        for (schema, body, fix) in [
+            (
+                "model svc:\n    port number\n",
+                "svc A:\n    port = \"1e-6\"\n",
+                "0.000001",
+            ),
+            (
+                "model svc:\n    timeout duration\n",
+                "svc A:\n    timeout = \"1.5h\"\n",
+                "1h30m",
+            ),
+        ] {
+            let diags = diags_for(schema, body);
+            let hit = diags
+                .iter()
+                .find(|d| code_of(d).as_deref() == Some("NML0001"))
+                .unwrap_or_else(|| panic!("{body:?} must teach the literal: {diags:?}"));
+            assert!(
+                !hit.message.contains("drop the quotes"),
+                "de-quoting is NOT the fix here; the hint would lie: {}",
+                hit.message
+            );
+            assert_eq!(
+                hit.suggestions.first().map(|s| s.replacement.as_str()),
+                Some(fix),
+                "{body:?}"
+            );
+        }
+    }
+
+    /// Design #2 regression pin: the validator judges EACH leg of a
+    /// fallback chain, so the quoted-literal fallback (`$ENV.PORT |
+    /// "3000"`) fails at validation time with the machine fix — at every
+    /// boundary that validates, whether or not the variable is set. The
+    /// bare typed fallback stays clean. This is the property that makes
+    /// the quoted-fallback asymmetry a teaching error instead of a
+    /// production sharp edge.
+    #[test]
+    fn quoted_fallback_leg_teaches_while_bare_fallback_stays_clean() {
+        let diags = diags_for(
+            "model svc:\n    port number\n",
+            "svc A:\n    port = $ENV.PORT | \"3000\"\n",
+        );
+        let hit = diags
+            .iter()
+            .find(|d| code_of(d).as_deref() == Some("NML0001"))
+            .unwrap_or_else(|| panic!("quoted fallback leg must teach: {diags:?}"));
+        assert_eq!(
+            hit.suggestions.first().map(|s| s.replacement.as_str()),
+            Some("3000")
+        );
+
+        let diags = diags_for(
+            "model svc:\n    port number\n",
+            "svc A:\n    port = $ENV.PORT | 3000\n",
+        );
+        assert!(
+            diags.is_empty(),
+            "the typed fallback spelling is the supported form: {diags:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolved_facet_tests {
+    //! RFC 0047 resolved lane: a validator that owns a file's resolution
+    //! (`with_env_resolution`) enforces Number/Duration facets on what
+    //! `$ENV` values resolve to — with diagnostics that name the variable
+    //! and the bound, never the resolved content. Everything else about
+    //! deferral is unchanged, and resolver-free validators behave exactly
+    //! as before (pinned by `env_reference_on_typed_field_is_deferred_not_taught`).
+
+    use nml_core::resolve::ValueResolver;
+
+    use super::*;
+
+    fn fixed(pairs: &'static [(&'static str, &'static str)]) -> ValueResolver {
+        ValueResolver::new(move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_string())
+        })
+    }
+
+    fn diags_with_env(
+        schema: &str,
+        body: &str,
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> Vec<Diagnostic> {
+        let s = nml_core::cst::extract_schema(schema).0;
+        let v = SchemaValidator::new(s.models, s.enums, s.oneofs).with_env_resolution(fixed(pairs));
+        v.validate(&nml_core::cst::parse_to_ast(body).unwrap())
+    }
+
+    fn facet_errors(diags: &[Diagnostic]) -> Vec<&Diagnostic> {
+        diags
+            .iter()
+            .filter(|d| d.code == Some(codes::FACET_VIOLATION))
+            .collect()
+    }
+
+    /// The headline case — the regression the duration migration
+    /// introduced: `pollInterval`'s old post-resolution clamp is gone and
+    /// the facet replacing it could not see `$ENV`. Now it can, and the
+    /// diagnostic names the knob (`$ENV.P`), the relation, and the bound
+    /// — NEVER the resolved text (secret-provenance redaction is the
+    /// no-echo posture, pinned here).
+    #[test]
+    fn resolved_env_facet_violation_names_the_variable_not_the_value() {
+        let diags = diags_with_env(
+            "model svc:\n    pollInterval duration(min = 60s)\n",
+            "svc A:\n    pollInterval = $ENV.P\n",
+            &[("P", "1s")],
+        );
+        let errs = facet_errors(&diags);
+        assert_eq!(errs.len(), 1, "{diags:?}");
+        let msg = &errs[0].message;
+        assert!(
+            msg.contains("$ENV.P") && msg.contains("below the schema's min = 60s"),
+            "must name the variable and the bound: {msg}"
+        );
+        assert!(
+            !msg.contains("1s,") && !msg.contains("is 1s"),
+            "must never echo the resolved value: {msg}"
+        );
+    }
+
+    /// Number lane, coercion-grammar parity: "1e-6" is exactly what the
+    /// de-layer's `parse_coercion` will accept at runtime, so validation
+    /// must judge the same value — not reject the spelling (literal
+    /// grammar) or skip it.
+    #[test]
+    fn resolved_env_number_uses_the_coercion_grammar() {
+        let diags = diags_with_env(
+            "model svc:\n    port number(min = 1)\n",
+            "svc A:\n    port = $ENV.PORT\n",
+            &[("PORT", "1e-6")],
+        );
+        let errs = facet_errors(&diags);
+        assert_eq!(errs.len(), 1, "{diags:?}");
+        assert!(
+            errs[0].message.contains("$ENV.PORT")
+                && errs[0].message.contains("below the schema's min = 1"),
+            "{}",
+            errs[0].message
+        );
+    }
+
+    /// The wire-granularity case the CLI's hand guard used to own:
+    /// `multipleOf = 1s` now fires on the `$ENV` lane too.
+    #[test]
+    fn resolved_env_subsecond_violates_whole_second_facet() {
+        let diags = diags_with_env(
+            "model svc:\n    drain duration(multipleOf = 1s)?\n",
+            "svc A:\n    drain = $ENV.D\n",
+            &[("D", "900ms")],
+        );
+        let errs = facet_errors(&diags);
+        assert_eq!(errs.len(), 1, "{diags:?}");
+        assert!(
+            errs[0].message.contains("$ENV.D")
+                && errs[0].message.contains("multipleOf = 1s")
+                && !errs[0].message.contains("900ms"),
+            "{}",
+            errs[0].message
+        );
+    }
+
+    /// In-range resolutions are silent — the lane adds checks, never noise.
+    #[test]
+    fn resolved_env_within_facets_is_silent() {
+        let diags = diags_with_env(
+            "model svc:\n    pollInterval duration(min = 60s)\n    port number(min = 1)\n",
+            "svc A:\n    pollInterval = $ENV.P\n    port = $ENV.PORT\n",
+            &[("P", "5m"), ("PORT", "8080")],
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    /// Unset variables defer exactly as without a resolver: a missing
+    /// variable is deserialization's business (fallbacks, its own error),
+    /// never a validation failure — the no-false-reject property.
+    #[test]
+    fn unset_env_defers_silently() {
+        let diags = diags_with_env(
+            "model svc:\n    pollInterval duration(min = 60s)\n",
+            "svc A:\n    pollInterval = $ENV.UNSET\n",
+            &[],
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    /// Text outside the domain's coercion grammar is left to the
+    /// de-layer's provenance-aware coercion error (which names the
+    /// variable); the facet lane must not double-report or guess.
+    #[test]
+    fn unparseable_env_text_is_deserializations_business() {
+        let diags = diags_with_env(
+            "model svc:\n    pollInterval duration(min = 60s)\n",
+            "svc A:\n    pollInterval = $ENV.P\n",
+            &[("P", "banana")],
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    /// A fallback whose primary resolves is judged on the RESOLVED value;
+    /// the literal legs were already judged by the normal facet arm
+    /// (leg-splitting), so `$ENV.D | 5s` with a bad `D` errors on the
+    /// resolved lane while the same chain with `D` unset is clean.
+    #[test]
+    fn fallback_primary_is_checked_when_it_resolves() {
+        let schema = "model svc:\n    drain duration(multipleOf = 1s)?\n";
+        let body = "svc A:\n    drain = $ENV.D | 5s\n";
+        let diags = diags_with_env(schema, body, &[("D", "900ms")]);
+        assert_eq!(facet_errors(&diags).len(), 1, "{diags:?}");
+
+        let diags = diags_with_env(schema, body, &[]);
+        assert!(
+            diags.is_empty(),
+            "unset primary → literal fallback lane: {diags:?}"
+        );
+    }
+
+    /// `secret`-typed fields carry no facets (`PrimitiveFacets::None`), so
+    /// the resolved lane is structurally unable to touch credentials —
+    /// with a resolver configured and the variable SET, a secret field
+    /// stays diagnostic-free.
+    #[test]
+    fn secret_fields_never_enter_the_resolved_lane() {
+        let diags = diags_with_env(
+            "model svc:\n    apiKey secret\n",
+            "svc A:\n    apiKey = $ENV.KEY\n",
+            &[("KEY", "hunter2")],
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+        // Belt-and-braces: nothing anywhere in any diagnostic may carry
+        // the resolved content.
+        assert!(diags.iter().all(|d| !d.message.contains("hunter2")));
+    }
+
+    /// Wiring 2 — the per-model shallow walk for split-ownership files
+    /// (the deploy CLI's `build:`/`deploy:` blocks): same leaf, same
+    /// no-echo posture, driven by an explicit resolver argument.
+    #[test]
+    fn shallow_walk_checks_resolved_properties_against_the_named_model() {
+        let s = nml_core::cst::extract_schema(
+            "model deploy:\n    drain_timeout duration(max = 5m, multipleOf = 1s)?\n",
+        )
+        .0;
+        let v = SchemaValidator::new(s.models, s.enums, s.oneofs);
+        let file = nml_core::cst::parse_to_ast("deploy:\n    drain_timeout = $ENV.D\n").unwrap();
+        let body = match &file.declarations[0].kind {
+            nml_core::ast::DeclarationKind::Block(b) => &b.body,
+            other => panic!("fixture must parse as a block: {other:?}"),
+        };
+
+        let diags = v.validate_resolved_facets(body, "deploy", &fixed(&[("D", "900ms")]));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0].message.contains("$ENV.D")
+                && diags[0].message.contains("multipleOf = 1s")
+                && !diags[0].message.contains("900ms"),
+            "{}",
+            diags[0].message
+        );
+
+        // Unset variable: silent (deserialization's business).
+        assert!(
+            v.validate_resolved_facets(body, "deploy", &fixed(&[]))
+                .is_empty()
+        );
+
+        // Literal values are the whole-file pass's job — the shallow walk
+        // must not double-report them.
+        let file = nml_core::cst::parse_to_ast("deploy:\n    drain_timeout = 900ms\n").unwrap();
+        let body = match &file.declarations[0].kind {
+            nml_core::ast::DeclarationKind::Block(b) => &b.body,
+            other => panic!("fixture must parse as a block: {other:?}"),
+        };
+        assert!(
+            v.validate_resolved_facets(body, "deploy", &fixed(&[("D", "900ms")]))
+                .is_empty()
+        );
+    }
+
+    /// The shallow walk resolves the WHOLE property value, so fallback
+    /// chains behave exactly like deserialization: primary set-and-bad →
+    /// error; primary unset → the literal leg (already judged by the
+    /// whole-file pass) and silence here.
+    #[test]
+    fn shallow_walk_resolves_fallback_chains_like_deserialization() {
+        let s = nml_core::cst::extract_schema(
+            "model deploy:\n    drain_timeout duration(multipleOf = 1s)?\n",
+        )
+        .0;
+        let v = SchemaValidator::new(s.models, s.enums, s.oneofs);
+        let file =
+            nml_core::cst::parse_to_ast("deploy:\n    drain_timeout = $ENV.D | 5s\n").unwrap();
+        let body = match &file.declarations[0].kind {
+            nml_core::ast::DeclarationKind::Block(b) => &b.body,
+            other => panic!("fixture must parse as a block: {other:?}"),
+        };
+        assert_eq!(
+            v.validate_resolved_facets(body, "deploy", &fixed(&[("D", "900ms")]))
+                .len(),
+            1
+        );
+        assert!(
+            v.validate_resolved_facets(body, "deploy", &fixed(&[]))
+                .is_empty()
         );
     }
 }

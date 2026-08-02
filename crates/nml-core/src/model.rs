@@ -273,6 +273,20 @@ impl<T: FacetDomain> Facets<T> {
     /// about what "violates" means. Comparisons are exact — the
     /// domain's own `Ord` and `is_multiple_of`, never f64.
     pub fn violations(&self, n: &T) -> Vec<String> {
+        self.violation_descriptions(n)
+            .into_iter()
+            .map(|desc| format!("is {n}, {desc}"))
+            .collect()
+    }
+
+    /// The same violations, described WITHOUT rendering `n` — for lanes
+    /// where the value must never be echoed (an `$ENV`-resolved value is
+    /// secret-provenance text; RFC 0047 names the variable and the bound
+    /// instead). `n` still drives which bounds fire and the at/below/above
+    /// relation words; it just never appears in the output. [`Self::violations`]
+    /// is this plus an `is {n}, ` prefix, so the two lanes cannot disagree
+    /// about what "violates" means.
+    pub fn violation_descriptions(&self, n: &T) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(b) = &self.min {
             let fails = if b.exclusive {
@@ -289,7 +303,7 @@ impl<T: FacetDomain> Facets<T> {
                     "below"
                 };
                 out.push(format!(
-                    "is {n}, {relation} the schema's {} = {}",
+                    "{relation} the schema's {} = {}",
                     if b.exclusive { "exclusiveMin" } else { "min" },
                     b.value
                 ));
@@ -308,7 +322,7 @@ impl<T: FacetDomain> Facets<T> {
                     "above"
                 };
                 out.push(format!(
-                    "is {n}, {relation} the schema's {} = {}",
+                    "{relation} the schema's {} = {}",
                     if b.exclusive { "exclusiveMax" } else { "max" },
                     b.value
                 ));
@@ -317,7 +331,7 @@ impl<T: FacetDomain> Facets<T> {
         if let Some(m) = &self.multiple_of {
             if !n.is_multiple_of(&m.value) {
                 out.push(format!(
-                    "is {n}, not a multiple of the schema's multipleOf = {} \
+                    "not a multiple of the schema's multipleOf = {} \
                      (checked exactly -- no float rounding)",
                     m.value
                 ));

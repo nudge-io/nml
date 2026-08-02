@@ -180,15 +180,20 @@ impl Lower {
                             span: token_span(&t),
                         }
                     }
-                    Some(_) if let Some(body) = a.inline_body() => ArmTarget::Inline {
-                        name: ident_of(a.target()),
-                        body: self.lower_body(body),
-                    },
-                    Some(_) if a.has_colon() => {
-                        let name = ident_of(a.target());
-                        ArmTarget::Inline {
-                            name,
-                            body: Body::fresh(Vec::new()),
+                    Some(_) => {
+                        if let Some(body) = a.inline_body() {
+                            ArmTarget::Inline {
+                                name: ident_of(a.target()),
+                                body: self.lower_body(body),
+                            }
+                        } else if a.has_colon() {
+                            let name = ident_of(a.target());
+                            ArmTarget::Inline {
+                                name,
+                                body: Body::fresh(Vec::new()),
+                            }
+                        } else {
+                            ArmTarget::Reference(ident_of(a.target()))
                         }
                     }
                     other => ArmTarget::Reference(ident_of(other)),

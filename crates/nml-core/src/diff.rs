@@ -2010,12 +2010,14 @@ fn diff_arms(
             ) => {
                 diff_inline_arm_bodies(
                     index,
-                    target_v,
-                    ob,
-                    nb,
-                    &arm_path,
-                    new[j].origin.clone(),
-                    depth + 1,
+                    InlineArmBodyDiff {
+                        target_v,
+                        old: ob,
+                        new: nb,
+                        path: &arm_path,
+                        origin: new[j].origin.clone(),
+                        depth: depth + 1,
+                    },
                     out,
                 );
             }
@@ -2056,44 +2058,49 @@ fn diff_arms(
     }
 }
 
+/// Context for field-level diff inside an inline arm target's body.
+struct InlineArmBodyDiff<'a> {
+    target_v: &'a FieldType,
+    old: &'a Body,
+    new: &'a Body,
+    path: &'a FieldPath,
+    origin: Origin,
+    depth: u32,
+}
+
 /// Field-level diff inside an inline arm target's body — full model/oneof
 /// recursion when `V` resolves to a describable target, so nested blocks and
 /// properties both diff granularly.
 fn diff_inline_arm_bodies(
     index: &SchemaIndex,
-    v: &FieldType,
-    old: &Body,
-    new: &Body,
-    path: &FieldPath,
-    origin: Origin,
-    depth: u32,
+    ctx: InlineArmBodyDiff<'_>,
     out: &mut Vec<FieldChange>,
 ) {
-    if body_eq_bounded(old, new, depth) {
+    if body_eq_bounded(ctx.old, ctx.new, ctx.depth) {
         return;
     }
-    let file = match &origin {
+    let file = match &ctx.origin {
         Origin::File { file, .. } => file.clone(),
         _ => PathBuf::new(),
     };
-    let old_files = vec![(file.clone(), old)];
-    let new_files = vec![(file, new)];
+    let old_files = vec![(file.clone(), ctx.old)];
+    let new_files = vec![(file, ctx.new)];
     let empty: Vec<(PathBuf, &Body)> = Vec::new();
     let empty_body = Body::fresh(Vec::new());
-    let old_target = resolve_diff_target(index, v, &old_files, &empty, &empty_body);
-    let new_target = resolve_diff_target(index, v, &new_files, &empty, &empty_body);
+    let old_target = resolve_diff_target(index, ctx.target_v, &old_files, &empty, &empty_body);
+    let new_target = resolve_diff_target(index, ctx.target_v, &new_files, &empty, &empty_body);
     if diff_variant_switch(
         index,
         (&old_target, &new_target),
         &old_files,
         &new_files,
-        path,
-        depth,
+        ctx.path,
+        ctx.depth,
         out,
     ) {
         return;
     }
-    match resolve_diff_target(index, v, &new_files, &old_files, &empty_body) {
+    match resolve_diff_target(index, ctx.target_v, &new_files, &old_files, &empty_body) {
         FieldTarget::Model(m) => {
             diff_model(
                 index,
@@ -2103,22 +2110,22 @@ fn diff_inline_arm_bodies(
                 },
                 &old_files,
                 &new_files,
-                path,
-                depth,
+                ctx.path,
+                ctx.depth,
                 out,
             );
         }
         FieldTarget::OneOf(of) => {
-            diff_oneof_instance(index, of, &old_files, &new_files, path, depth, out);
+            diff_oneof_instance(index, of, &old_files, &new_files, ctx.path, ctx.depth, out);
         }
         _ => {
             push(
-                path,
+                ctx.path,
                 ChangeKind::Modified {
-                    old: Value::String(render_arm_body_summary(old)),
-                    new: Value::String(render_arm_body_summary(new)),
+                    old: Value::String(render_arm_body_summary(ctx.old)),
+                    new: Value::String(render_arm_body_summary(ctx.new)),
                 },
-                origin,
+                ctx.origin,
                 out,
             );
         }
