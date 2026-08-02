@@ -4,17 +4,42 @@
 
 ### Changed
 
-- **Duration LSP tooling (RFC 0017 §10)** — compound duration literals
-  are a first-class CST node; hover, highlight, unit completion,
-  inlay hints, semantic tokens, and selection ranges all query the same
-  `DurationLiteral` seam (UTF-16 positions, tight component spans).
-  Hover shows the component breakdown with its human respelling and the
-  normalized total; unit suffixes carry a dedicated `durationUnit`
-  semantic-token type (`superType: number`) for theming; highlights
-  include a leading facet sign (`-5s`), while hover/hints/completions
-  stay silent on signed literals (durations are unsigned).
-  Mid-compound completion ranks only finer units; `NML3005`/`NML3007`
-  quick-fixes and `NML3008` related-information are wired end-to-end.
+- **Quoted-literal migration teaching extended (NML0001)** — quoted
+  numbers (`port = "3000"`) and quoted bools (`admin = "true"`) against
+  their typed fields now get the same replaced-syntax teaching error the
+  quoted-duration migration ships: the machine-applicable de-quote fix,
+  instead of the generic NML2008 mismatch. Fires only when the de-quoted
+  text parses as the field's type; `$ENV.*` references are untouched.
+
+- **Docs harness `expect-error` counts findings (multiset)** — the
+  bracketed code contract upgraded from set to MULTISET equality:
+  repetition is the count syntax (`[NML2057, NML2057]` = exactly two
+  findings). The flip immediately surfaced 13 error-index fences whose
+  samples demonstrated two same-code findings while declaring one — the
+  drift class set-equality structurally hid; all are now declared true.
+
+- **Bare faceted-domain fields carry `PrimitiveFacets::None`** — a bare
+  `number`/`duration` field now serializes and matches exactly like a
+  bare `string` field ("no facet list authored"); the domain is the type
+  name's job. Audited safe in advance: package identity hashes source
+  bytes only, extraction is never persisted or wire-crossed, and every
+  behavioral consumer routes through `is_none()`. Representation pinned
+  by a wire-shape test plus a `None ⟺ no authored list` invariant test.
+
+- **LSP claims invalidation tightened; wasi leak budget** — watched-file
+  CHANGED events no longer clear the package-claims memo (claim verdicts
+  are functions of file existence, names, and manifest-hashed globs —
+  never content), and invalidation is root-scoped to the changed paths.
+  The wasi `read_dir` leak workaround now counts forgotten handles and
+  refuses past a documented budget — bounding the memory tail under
+  `wasm-wasi-core`'s reuse-free fd table and any fd-capped host, with
+  callers degrading to the existing honest `Truncated` path.
+
+- **Inline arm targets (RFC 0007 §6.2)** — `@selector -> Name:` + indented body is a
+  first-class arm RHS form, fully validated against `V`, recursed by identity/
+  defaults/diff, with LSP descent, document symbols, inline-target completion
+  snippets, string/enum arm-selector completion, and a parse-time diagnostic for
+  the `-> "name":` mistake.
 
 - **Compound duration literals (RFC 0017 amendment)** — durations now
   support attached compound syntax (`1h30m`, `5m2s`) and inline-spaced

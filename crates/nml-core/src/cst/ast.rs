@@ -329,23 +329,36 @@ ast_node!(/// `(@selector | else) -> Target`
     Arm => Arm);
 
 impl Arm {
-    /// The selector token — a `Role` (`@plan/Pro`) or the `else` keyword (an
-    /// `Ident`), whichever comes first, before the arrow. The caller inspects
-    /// its kind/text to tell a role selector from the `else` catch-all.
+    /// The selector token — a `Role` (`@plan/Pro`), a `String` key (`"plan"`),
+    /// or the `else` keyword (an `Ident`), whichever comes first, before the
+    /// arrow.
     pub fn selector(&self) -> Option<SyntaxToken> {
         self.0
             .children_with_tokens()
             .filter_map(|e| e.into_token())
-            .find(|t| matches!(t.kind(), SyntaxKind::Role | SyntaxKind::Ident))
+            .find(|t| {
+                matches!(
+                    t.kind(),
+                    SyntaxKind::Role | SyntaxKind::String | SyntaxKind::Ident
+                )
+            })
     }
-    /// The target token — the first `Ident` (a declared-name reference) or
-    /// `String` (a path/url literal, RFC 0007 §6) *after* the arrow, so it is
-    /// never confused with an `else` selector's `Ident`.
+    /// The target token — the first `Ident` (reference or inline header) or
+    /// `String` (path/url literal, RFC 0007 §6) *after* the arrow.
     pub fn target(&self) -> Option<SyntaxToken> {
         let mut toks = self.0.children_with_tokens().filter_map(|e| e.into_token());
         toks.by_ref()
             .find(|t| matches!(t.kind(), SyntaxKind::Arrow | SyntaxKind::FatArrow))?;
         toks.find(|t| matches!(t.kind(), SyntaxKind::Ident | SyntaxKind::String))
+    }
+    /// The inline target body (`-> Name:` + indented entries), if any.
+    pub fn inline_body(&self) -> Option<Body> {
+        child(&self.0)
+    }
+    /// Whether the target carries a trailing colon (`-> Name:`). Distinguishes
+    /// an inline instance with an empty body from a bare reference (`-> Name`).
+    pub fn has_colon(&self) -> bool {
+        token(&self.0, SyntaxKind::Colon).is_some()
     }
 }
 

@@ -10,9 +10,14 @@ Tag grammar (the fence info string after the language word):
     ```nml check schema=<dir>           block must validate    (nml check --schema <dir>)
     ```nml check strict                 adds --strict (unknowns become errors)
     ```nml check expect-error=<text>    block must FAIL and the output must
-                                        contain <text> (spaces: use expect-error="a b")
+                                        contain <text> (spaces: use expect-error="a b").
+                                        Bracketed form = code-MULTISET equality:
+                                        expect-error='[NML2057, NML2057]' declares
+                                        EXACTLY two NML2057 findings — repetition is
+                                        the count syntax, order ignored
     ```nml check expect-output=<text>   check must pass AND the output must
-                                        contain <text> (warning examples)
+                                        contain <text> (warning examples); the
+                                        bracketed form is the warning-side multiset
     ```nml check eol=crlf|cr            re-transcribe the block's line endings
                                         before running (fences are stored LF)
                                         so line-ending claims are executable
@@ -64,6 +69,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 OPT_OUT = False  # flip when the guide rewrite lands (see module docstring)
@@ -214,17 +220,26 @@ def extract_blocks(path: Path) -> list[Block]:
     return blocks
 
 
-def sample_codes(output: str, sample: Path, severity: str) -> set[str]:
-    """The distinct `severity[NML####]` codes on the SAMPLE's own output
-    lines. Path-scoped so a `schema=` dir's own findings are context, not
-    part of the example's claim — the shared extraction behind both
-    `expect-error` and `expect-output` code-set contracts."""
-    return {
+def sample_codes(output: str, sample: Path, severity: str) -> Counter[str]:
+    """The `severity[NML####]` codes on the SAMPLE's own output lines, as a
+    MULTISET — one count per finding, so an example that regresses from
+    demonstrating two same-code findings to one fails instead of collapsing
+    into an equal set. Path-scoped so a `schema=` dir's own findings are
+    context, not part of the example's claim — the shared extraction behind
+    both `expect-error` and `expect-output` code contracts."""
+    return Counter(
         code
         for line in output.splitlines()
         if str(sample) in line
         for code in re.findall(rf"{severity}\[(NML\d{{4}})\]", line)
-    }
+    )
+
+
+def render_counts(counts: Counter[str]) -> str:
+    """`NML2057×2, NML2058` — the multiset, human-readable, sorted."""
+    return ", ".join(
+        code if n == 1 else f"{code}×{n}" for code, n in sorted(counts.items())
+    )
 
 
 # The bracketed code-list spelling (`[NML2057]`, `[NML2057, NML2058]`) that
@@ -294,12 +309,15 @@ def run_check(block: Block) -> tuple[bool, str]:
                 return False, "expect-error= is empty — declare a code list or message text"
             if proc.returncode == 0:
                 return False, "expected an error, but the check passed"
-            # Code-SET equality, not containment: the annotation declares the
-            # complete set of distinct error codes the EXAMPLE produces
-            # (`[NML2057]`, or `[NML2057, NML2058]` for multi-code examples).
-            # Containment let an example silently start producing ADDITIONAL
-            # errors — documentation drift that twice needed catching by
-            # hand. Scoped to the sample's own findings (line-path prefix):
+            # Code-MULTISET equality, not containment and not a set: the
+            # annotation declares the complete list of error codes the
+            # EXAMPLE produces, counts included — repetition IS the count
+            # syntax (`[NML2057, NML2057]` = exactly two findings).
+            # Containment let an example silently start producing
+            # ADDITIONAL errors; set equality let one that demonstrated two
+            # same-code findings quietly degrade to one — both are the
+            # documentation drift this harness exists to catch. Scoped to
+            # the sample's own findings (line-path prefix):
             # `schema=docs/errors/schemas-bad` fences deliberately load a
             # broken schema dir whose OWN errors are context, not the
             # example's claim. Warnings are exempt (they render
@@ -308,7 +326,7 @@ def run_check(block: Block) -> tuple[bool, str]:
             declared = declared_codes(expected_error)
             if not declared:
                 # Prose expectation (`expect-error='tabs are not permitted'`):
-                # a message-TEXT claim, asserted by containment — the code-set
+                # a message-TEXT claim, asserted by containment — the code
                 # contract below only governs code-list annotations.
                 if expected_error not in output:
                     return False, (
@@ -317,10 +335,10 @@ def run_check(block: Block) -> tuple[bool, str]:
                     )
                 return True, ""
             produced = sample_codes(output, sample, "error")
-            if produced != set(declared):
+            if produced != Counter(declared):
                 return False, (
-                    f"example's error codes {sorted(produced)} != declared"
-                    f" {sorted(set(declared))}; got:\n{output.strip()}"
+                    f"example's error codes [{render_counts(produced)}] != declared"
+                    f" [{render_counts(Counter(declared))}]; got:\n{output.strip()}"
                 )
             return True, ""
         expected_output = block.value("expect-output")
@@ -348,13 +366,13 @@ def run_check(block: Block) -> tuple[bool, str]:
                     )
                 return True, ""
             # Code-list mode is the WARNING-side twin of `expect-error`'s
-            # set contract: the sample's warning-code set must equal the
-            # declared list.
+            # multiset contract: the sample's warning-code multiset must
+            # equal the declared list, counts included.
             produced = sample_codes(output, sample, "warning")
-            if produced != set(declared):
+            if produced != Counter(declared):
                 return False, (
-                    f"example's warning codes {sorted(produced)} != declared"
-                    f" {sorted(set(declared))}; got:\n{output.strip()}"
+                    f"example's warning codes [{render_counts(produced)}] != declared"
+                    f" [{render_counts(Counter(declared))}]; got:\n{output.strip()}"
                 )
             return True, ""
         if proc.returncode != 0:

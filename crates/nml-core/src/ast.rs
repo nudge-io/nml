@@ -185,20 +185,31 @@ pub struct Arm {
     pub selector: ArmSelector,
     /// Span of the selector token (for diagnostics).
     pub selector_span: Span,
-    /// The arm's target (a declared name, or a string/path/url literal).
+    /// The arm's target — a reference, string/path literal, or inline block
+    /// ([`ArmTarget`]).
     pub target: ArmTarget,
 }
 
 /// An [`Arm`]'s right-hand side (RFC 0007 §6): a **reference** to a declared
-/// item (`-> ProUpsell`, consumer-resolved), or a **literal** (`-> "workflows/
+/// item (`-> ProUpsell`, consumer-resolved), a **literal** (`-> "workflows/
 /// pro.workflow.nml"`) for flat routers whose targets are paths/URLs rather
-/// than declared names. Which form a schema accepts follows from `V`:
-/// a reference needs a referenceable `V`, a literal needs a scalar-capable
-/// `V` (checked by nml-validate).
+/// than declared names, or an **inline instance** (`-> adminLanding:` + body)
+/// validated structurally against `V`. Which form a schema accepts follows
+/// from `V`: a reference needs a referenceable `V`, a literal needs a
+/// scalar-capable `V`, an inline body needs a model/`oneof` `V` (checked by
+/// nml-validate).
 #[derive(Debug, Clone, Serialize)]
 pub enum ArmTarget {
     Reference(Identifier),
-    Literal { value: String, span: Span },
+    Literal {
+        value: String,
+        span: Span,
+    },
+    /// `-> Name:` followed by an indented body — an inline instance of `V`.
+    Inline {
+        name: Identifier,
+        body: Body,
+    },
 }
 
 impl ArmTarget {
@@ -207,16 +218,21 @@ impl ArmTarget {
         match self {
             ArmTarget::Reference(id) => id.span,
             ArmTarget::Literal { span, .. } => *span,
+            ArmTarget::Inline { name, .. } => name.span,
         }
     }
 }
 
-/// An [`Arm`] selector: a reference token or the `else` catch-all.
-#[derive(Debug, Clone, Serialize)]
+/// An [`Arm`] selector: a role reference, a string literal key, or the `else`
+/// catch-all.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub enum ArmSelector {
     /// A selector token, e.g. `@plan/Pro` — stored verbatim (with the leading
     /// `@`), matching [`ListItemKind::Role`]; the consumer parses its shape.
     Role(String),
+    /// A string-literal key, e.g. `"plan"` (RFC 0007 §6) for `(string -> V)`
+    /// arm sets — decoded like a `oneof` arm value.
+    Literal(String),
     /// The `else` catch-all (a contextual keyword, never a role).
     Else,
 }

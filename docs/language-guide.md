@@ -259,6 +259,45 @@ The union pipe and the arm arrow live **inside** their parentheses. That is
 what keeps the field suffixes unambiguous — in `landing (string | (role ->
 string))?`, the `?` can only be describing the field.
 
+Arm targets take three forms: a reference (`-> StatusPage`), a string
+literal for scalar targets (`-> "fallback"`), or an inline model instance
+(`-> adminLanding:` followed by an indented body). Selectors may be roles
+(`@role/admin`), the `else` catch-all, or a string key (`"plan"`).
+
+```
+model landingPage:
+    label number
+
+model service:
+    routing (role -> landingPage)?
+
+service Api:
+    routing:
+        @role/admin -> adminLanding:
+            label = 4
+        "plan" -> "upsell"
+```
+
+Enum-typed selectors use the same string-key form — `"pro" -> Target` when
+`K` is an enum:
+
+```
+enum planKind:
+    - "free"
+    - "pro"
+
+model service:
+    routing (planKind -> string)?
+
+service Api:
+    routing:
+        "pro" -> "upsell"
+```
+
+The validator resolves `V` against whichever form you choose; a quoted name
+after `->` is always a literal, never an inline block (`-> "name":` is a
+parse error).
+
 ### Reference Types
 
 | Syntax | Meaning |

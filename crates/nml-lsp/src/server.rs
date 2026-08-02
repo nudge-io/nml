@@ -11,7 +11,7 @@ use nml_core::ast::*;
 use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
 use nml_core::schema_index::{BodyShape, NameableVariant};
 use nml_core::span::Span;
-use nml_core::types::Value;
+use nml_core::types::{PrimitiveType, Value};
 use nml_core::{FieldTarget, SchemaIndex};
 use nml_validate::schema::MembershipSemantics;
 
@@ -1131,6 +1131,27 @@ fn watched_file_is_eligible(path: &Path, roots: &[PathBuf]) -> bool {
     }
 }
 
+/// A watched-change path in the resolver's namespace. Roots are
+/// canonicalized at initialize and resolved document paths follow suit, so
+/// claims-cache roots are canonical too — an un-canonicalized event path
+/// would fail every `starts_with` (macOS `/tmp` → `/private/tmp`, symlinked
+/// checkouts) and silently retain a verdict that should have been dropped.
+/// DELETED paths no longer exist, so fall back to canonicalizing the parent
+/// (which usually still does) and re-appending the name; failing both, the
+/// raw path — a mismatch then merely retains a memo, it never fabricates
+/// one.
+fn canonicalize_watched_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = dunce::canonicalize(path) {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => dunce::canonicalize(parent)
+            .map(|dir| dir.join(name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    }
+}
+
 // ── Role ref resolution (free functions for testability) ──────
 
 fn find_tagged_ref_definition_in_docs(
@@ -1769,10 +1790,50 @@ fn build_body_symbols(body: &Body, line_index: &LineIndex) -> Vec<DocumentSymbol
                     ));
                 }
             }
+            BodyEntryKind::Arm(arm) => {
+                let (label, children) = match &arm.target {
+                    ArmTarget::Inline { name, body } => (
+                        format!("{} -> {}", arm_selector_label(&arm.selector), name.name),
+                        build_body_symbols(body, line_index),
+                    ),
+                    _ => (
+                        format!(
+                            "{} -> {}",
+                            arm_selector_label(&arm.selector),
+                            arm_target_label(&arm.target)
+                        ),
+                        Vec::new(),
+                    ),
+                };
+                symbols.push(document_symbol(
+                    label,
+                    Some("arm".into()),
+                    SymbolKind::ENUM_MEMBER,
+                    span_to_range(entry.span, line_index),
+                    span_to_range(arm.selector_span, line_index),
+                    children,
+                ));
+            }
             _ => {}
         }
     }
     symbols
+}
+
+fn arm_selector_label(selector: &ArmSelector) -> String {
+    match selector {
+        ArmSelector::Role(r) => r.clone(),
+        ArmSelector::Literal(k) => quote_nml_string(k),
+        ArmSelector::Else => "else".into(),
+    }
+}
+
+fn arm_target_label(target: &ArmTarget) -> String {
+    match target {
+        ArmTarget::Reference(id) => id.name.clone(),
+        ArmTarget::Literal { value, .. } => format!("{value:?}"),
+        ArmTarget::Inline { name, .. } => format!("{}:", name.name),
+    }
 }
 
 fn build_array_body_symbols(body: &ArrayBody, line_index: &LineIndex) -> Vec<DocumentSymbol> {
@@ -2472,19 +2533,55 @@ fn find_arm_target_types_at(
     index: &SchemaIndex,
     line_index: &LineIndex,
 ) -> Option<Vec<String>> {
-    let block = file.declarations.iter().find_map(|decl| {
-        let range = span_to_range(decl.span, line_index);
-        if pos.line > range.start.line && pos.line <= range.end.line {
-            if let DeclarationKind::Block(b) = &decl.kind {
-                return Some(b);
-            }
-        }
-        None
-    })?;
+    let block = enclosing_top_block(file, pos, line_index)?;
     let Some(FieldTarget::Model(model)) = index.resolve_ref(&block.keyword.name) else {
         return None;
     };
     arm_target_descend(model, &block.body, pos, index, line_index)
+}
+
+/// RFC 0007 §6.1 arm-selector completion: when `pos` sits inside an arm-set
+/// block (but not inside an inline arm target body), return the declared key
+/// type `K` from `(K -> V)`.
+fn find_arm_set_key_at(
+    file: &File,
+    pos: Position,
+    index: &SchemaIndex,
+    line_index: &LineIndex,
+) -> Option<FieldType> {
+    let block = enclosing_top_block(file, pos, line_index)?;
+    let Some(FieldTarget::Model(model)) = index.resolve_ref(&block.keyword.name) else {
+        return None;
+    };
+    arm_set_key_descend(model, &block.body, pos, index, line_index)
+}
+
+fn arm_set_key_descend(
+    model: &ModelDef,
+    body: &Body,
+    pos: Position,
+    index: &SchemaIndex,
+    line_index: &LineIndex,
+) -> Option<FieldType> {
+    let idx = owned_entry_index(body.entries.as_slice(), pos, line_index, |e| {
+        nested_block_header_line(e, line_index)
+    })?;
+    let BodyEntryKind::NestedBlock(nested) = &body.entries[idx].kind else {
+        return None;
+    };
+    let field = model.fields.iter().find(|f| f.name == nested.name.name)?;
+    match index.resolve_type_in_body(&field.field_type, &nested.body) {
+        FieldTarget::Arms { key, .. } => {
+            if inline_arm_body_at(&nested.body.entries, pos, line_index).is_some() {
+                return None;
+            }
+            Some(key.clone())
+        }
+        FieldTarget::Model(child) => {
+            arm_set_key_descend(child, &nested.body, pos, index, line_index)
+        }
+        _ => None,
+    }
 }
 
 /// The descent half of [`find_arm_target_types_at`]: walk nested blocks to the
@@ -2498,24 +2595,35 @@ fn arm_target_descend(
     index: &SchemaIndex,
     line_index: &LineIndex,
 ) -> Option<Vec<String>> {
-    for entry in &body.entries {
-        let BodyEntryKind::NestedBlock(nested) = &entry.kind else {
-            continue;
-        };
-        let range = span_to_range(entry.span, line_index);
-        if pos.line <= range.start.line || pos.line > range.end.line {
-            continue;
-        }
-        let field = model.fields.iter().find(|f| f.name == nested.name.name)?;
-        return match index.resolve_type_in_body(&field.field_type, &nested.body) {
-            FieldTarget::Arms { target, .. } => Some(named_type_names(target)),
-            FieldTarget::Model(child) => {
-                arm_target_descend(child, &nested.body, pos, index, line_index)
+    let idx = owned_entry_index(body.entries.as_slice(), pos, line_index, |e| {
+        nested_block_header_line(e, line_index)
+    })?;
+    let BodyEntryKind::NestedBlock(nested) = &body.entries[idx].kind else {
+        return None;
+    };
+    let field = model.fields.iter().find(|f| f.name == nested.name.name)?;
+    match index.resolve_type_in_body(&field.field_type, &nested.body) {
+        FieldTarget::Arms { target, .. } => {
+            if let Some(inline_body) = inline_arm_body_at(&nested.body.entries, pos, line_index) {
+                match index.resolve_type_in_body(target, inline_body) {
+                    FieldTarget::Model(child) => {
+                        return arm_target_descend(child, inline_body, pos, index, line_index);
+                    }
+                    FieldTarget::OneOf(o) => {
+                        if let Some(child) = resolve_oneof_variant(o, inline_body, index) {
+                            return arm_target_descend(child, inline_body, pos, index, line_index);
+                        }
+                    }
+                    _ => {}
+                }
             }
-            _ => None,
-        };
+            Some(named_type_names(target))
+        }
+        FieldTarget::Model(child) => {
+            arm_target_descend(child, &nested.body, pos, index, line_index)
+        }
+        _ => None,
     }
-    None
 }
 
 /// The named type references inside a type expression: a ref is itself, a
@@ -2620,6 +2728,214 @@ fn ambiguous_candidates<'i>(
     None
 }
 
+/// Quote a string as an NML literal for outline labels — same escaping as fmt.
+fn quote_nml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// True when the cursor sits at or after the end of the last `->` token on
+/// the line — the arm **target** side (RFC 0007). Mid-selector typing must
+/// not trigger target completion just because `->` appears later on the line.
+fn cursor_past_arm_arrow(line: &str, byte_end: usize) -> bool {
+    let before = &line[..byte_end.min(line.len())];
+    before
+        .rfind("->")
+        .is_some_and(|arrow| byte_end >= arrow + 2)
+}
+
+/// The workspace's tagged-ref candidates (`@keyword/name` for every block
+/// declaration) — the SAME universe [`find_tagged_ref_definition_in_docs`]
+/// resolves, so completion and go-to-definition agree by construction.
+fn collect_tagged_ref_candidates(docs: &HashMap<Url, String>) -> Vec<(String, String)> {
+    let mut refs = Vec::new();
+    for source in docs.values() {
+        let file = nml_core::cst::parse_best_effort(source);
+        for decl in &file.declarations {
+            if let DeclarationKind::Block(block) = &decl.kind {
+                refs.push((block.keyword.name.clone(), block.name.name.clone()));
+            }
+        }
+    }
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
+/// Completion items for arm selectors before `->` (RFC 0007 §6.1): enum
+/// variant keys, a string-key snippet, `@keyword/name` tagged refs for a
+/// role-typed `K` (the validator's exact admission rule), and the `else`
+/// catch-all.
+fn arm_selector_completion_items(
+    key: &FieldType,
+    index: &SchemaIndex,
+    tagged_refs: &[(String, String)],
+) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
+    if let Some(enum_def) = index.arm_key_enum_def(key) {
+        for (i, variant) in enum_def.variants.iter().enumerate() {
+            items.push(CompletionItem {
+                label: format!("\"{variant}\""),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some("arm selector key".to_string()),
+                insert_text: Some(format!("\"{variant}\" -> ")),
+                sort_text: Some(format!("0_{i:03}")),
+                ..Default::default()
+            });
+        }
+    } else if matches!(
+        key,
+        FieldType::Primitive {
+            ty: PrimitiveType::String,
+            ..
+        }
+    ) {
+        items.push(CompletionItem {
+            label: "\"key\"".to_string(),
+            kind: Some(CompletionItemKind::TEXT),
+            detail: Some("string arm selector key".to_string()),
+            insert_text: Some("\"key\" -> ".to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            sort_text: Some("!000".to_string()),
+            ..Default::default()
+        });
+    } else if matches!(
+        key,
+        FieldType::Primitive {
+            ty: PrimitiveType::Role,
+            ..
+        }
+    ) {
+        // A role-typed `K` (`(role -> denial)`) selects by tagged reference —
+        // the same K-admission rule the validator enforces for
+        // `ArmSelector::Role`.
+        for (i, (keyword, name)) in tagged_refs.iter().enumerate() {
+            let selector = format!("@{keyword}/{name}");
+            items.push(CompletionItem {
+                label: selector.clone(),
+                kind: Some(CompletionItemKind::REFERENCE),
+                detail: Some("arm selector".to_string()),
+                insert_text: Some(format!("{selector} -> ")),
+                sort_text: Some(format!("0_{i:03}_{selector}")),
+                ..Default::default()
+            });
+        }
+    }
+    items.push(CompletionItem {
+        label: "else".to_string(),
+        kind: Some(CompletionItemKind::KEYWORD),
+        detail: Some("catch-all arm selector".to_string()),
+        insert_text: Some("else -> ".to_string()),
+        sort_text: Some("!001".to_string()),
+        ..Default::default()
+    });
+    items
+}
+
+/// Completion item for an inline arm target when `V` admits one (RFC 0007 §6.2).
+fn inline_arm_target_snippet_item(
+    target_keywords: &[String],
+    index: &SchemaIndex,
+) -> Option<CompletionItem> {
+    let admits_inline = target_keywords
+        .iter()
+        .any(|keyword| index.field_type_admits_inline(&FieldType::ModelRef(keyword.clone())));
+    if !admits_inline {
+        return None;
+    }
+    Some(CompletionItem {
+        label: "name:".to_string(),
+        kind: Some(CompletionItemKind::TEXT),
+        detail: Some("inline arm target (RFC 0007 §6.2)".to_string()),
+        insert_text: Some("name:\n    $0".to_string()),
+        insert_text_format: Some(InsertTextFormat::SNIPPET),
+        sort_text: Some("!000".to_string()),
+        ..Default::default()
+    })
+}
+
+/// The last entry in `entries` whose header line is strictly above `pos.line`
+/// and whose content region includes `pos.line` (bounded by the next entry's
+/// header). Editor-grade ownership — not strict span containment.
+fn owned_entry_index(
+    entries: &[BodyEntry],
+    pos: Position,
+    _line_index: &LineIndex,
+    header_line: impl Fn(&BodyEntry) -> Option<u32>,
+) -> Option<usize> {
+    let mut owned = None;
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(start) = header_line(entry) else {
+            continue;
+        };
+        if pos.line <= start {
+            continue;
+        }
+        let next_start = entries.get(i + 1).and_then(&header_line);
+        let bounded = match next_start {
+            Some(next) => pos.line < next,
+            None => true,
+        };
+        if bounded {
+            owned = Some(i);
+        }
+    }
+    owned
+}
+
+fn nested_block_header_line(entry: &BodyEntry, line_index: &LineIndex) -> Option<u32> {
+    match &entry.kind {
+        BodyEntryKind::NestedBlock(_) => Some(span_to_range(entry.span, line_index).start.line),
+        _ => None,
+    }
+}
+
+fn list_item_header_line(entry: &BodyEntry, line_index: &LineIndex) -> Option<u32> {
+    match &entry.kind {
+        BodyEntryKind::ListItem(_) => Some(span_to_range(entry.span, line_index).start.line),
+        _ => None,
+    }
+}
+
+fn inline_arm_header_line(entry: &BodyEntry, line_index: &LineIndex) -> Option<u32> {
+    match &entry.kind {
+        BodyEntryKind::Arm(arm) => match &arm.target {
+            ArmTarget::Inline { name, .. } => Some(span_to_range(name.span, line_index).start.line),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The inline arm target body owning `pos`, when the cursor sits below its header.
+fn inline_arm_body_at<'a>(
+    entries: &'a [BodyEntry],
+    pos: Position,
+    line_index: &LineIndex,
+) -> Option<&'a Body> {
+    let idx = owned_entry_index(entries, pos, line_index, |e| {
+        inline_arm_header_line(e, line_index)
+    })?;
+    let BodyEntryKind::Arm(arm) = &entries[idx].kind else {
+        return None;
+    };
+    match &arm.target {
+        ArmTarget::Inline { body, .. } => Some(body),
+        _ => None,
+    }
+}
+
 /// From a `(model, body)` known to contain the cursor, descend to the
 /// innermost body the cursor is in and the target governing it. Recurses
 /// through nested model-typed fields, list/set items, oneof variants, and
@@ -2641,28 +2957,13 @@ fn descend_to_cursor<'i, 'f>(
     // content span, so strict span containment would resolve to the parent
     // exactly where completion matters most. Ownership: the last nested block
     // starting before the cursor, bounded by the next sibling's start.
-    let mut owned: Option<&nml_core::ast::NestedBlock> = None;
-    for (i, entry) in body.entries.iter().enumerate() {
-        let BodyEntryKind::NestedBlock(nested) = &entry.kind else {
-            continue;
+    let owned_idx = owned_entry_index(body.entries.as_slice(), pos, line_index, |e| {
+        nested_block_header_line(e, line_index)
+    });
+    if let Some(i) = owned_idx {
+        let BodyEntryKind::NestedBlock(nested) = &body.entries[i].kind else {
+            return None;
         };
-        let range = span_to_range(entry.span, line_index);
-        if pos.line <= range.start.line {
-            continue;
-        }
-        let next_start = body
-            .entries
-            .get(i + 1)
-            .map(|e| span_to_range(e.span, line_index).start.line);
-        let bounded = match next_start {
-            Some(next) => pos.line < next,
-            None => true,
-        };
-        if bounded {
-            owned = Some(nested);
-        }
-    }
-    if let Some(nested) = owned {
         let field = model.fields.iter().find(|f| f.name == nested.name.name)?;
         return match index.resolve_field(field) {
             FieldTarget::Model(child) => {
@@ -2681,29 +2982,13 @@ fn descend_to_cursor<'i, 'f>(
                 let (FieldType::List(elem_ty) | FieldType::Set(elem_ty)) = base else {
                     return None;
                 };
-                let mut item_owner: Option<&ListItem> = None;
-                for (i, e) in nested.body.entries.iter().enumerate() {
-                    let BodyEntryKind::ListItem(item) = &e.kind else {
-                        continue;
-                    };
-                    let r = span_to_range(e.span, line_index);
-                    if pos.line <= r.start.line {
-                        continue;
-                    }
-                    let next_start = nested
-                        .body
-                        .entries
-                        .get(i + 1)
-                        .map(|e| span_to_range(e.span, line_index).start.line);
-                    let bounded = match next_start {
-                        Some(next) => pos.line < next,
-                        None => true,
-                    };
-                    if bounded {
-                        item_owner = Some(item);
-                    }
-                }
-                let item = item_owner?;
+                let item_idx =
+                    owned_entry_index(nested.body.entries.as_slice(), pos, line_index, |e| {
+                        list_item_header_line(e, line_index)
+                    })?;
+                let BodyEntryKind::ListItem(item) = &nested.body.entries[item_idx].kind else {
+                    return None;
+                };
                 let ListItemKind::Named {
                     name: item_name,
                     body: item_body,
@@ -2741,6 +3026,37 @@ fn descend_to_cursor<'i, 'f>(
                     _ => return None,
                 };
                 descend_to_cursor(item_model, item_body, pos, index, line_index, item_via)
+            }
+            // An arm-set field: descend into an inline arm target's body when
+            // the cursor sits below the arm header line.
+            FieldTarget::Arms { target, .. } => {
+                let idx =
+                    owned_entry_index(nested.body.entries.as_slice(), pos, line_index, |e| {
+                        inline_arm_header_line(e, line_index)
+                    })?;
+                let BodyEntryKind::Arm(arm) = &nested.body.entries[idx].kind else {
+                    return None;
+                };
+                let ArmTarget::Inline {
+                    name,
+                    body: inline_body,
+                } = &arm.target
+                else {
+                    return None;
+                };
+                let header = (name.name.clone(), name.span);
+                match index.resolve_type_in_body(target, inline_body) {
+                    FieldTarget::Model(m) => {
+                        descend_to_cursor(m, inline_body, pos, index, line_index, None)
+                    }
+                    FieldTarget::OneOf(o) => match resolve_oneof_variant(o, inline_body, index) {
+                        Some(m) => {
+                            descend_to_cursor(m, inline_body, pos, index, line_index, Some(o))
+                        }
+                        None => Some(unresolved_oneof_target(o, inline_body, Some(header))),
+                    },
+                    _ => None,
+                }
             }
             // A `oneof` field: select the variant from the body's discriminator and descend
             // into the same body as that variant model. This is variant-field completion.
@@ -4287,10 +4603,40 @@ impl LanguageServer for NmlLanguageServer {
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         // File create/delete changes what a package's binding globs can
         // claim under a root — cached coverage verdicts are statements
-        // about existing files, so any watched change invalidates them
-        // (cheap to recompute; wrong-until-restart is not acceptable).
-        if !params.changes.is_empty() {
-            self.resolver.invalidate_claims();
+        // about which files EXIST (names against globs; no content is ever
+        // read), so those events invalidate the verdicts of the roots
+        // containing the touched paths (cheap to recompute;
+        // wrong-until-restart is not acceptable). CHANGED events are
+        // skipped entirely: an existence/name/glob function cannot move on
+        // content — a changed manifest re-keys the memo via its content
+        // hash — and CHANGED-storms during typing used to force a full
+        // re-walk of every root per save. Both the registration in
+        // `initialized` and the client's watcher pin the watch to
+        // `**/*.nml`, so nothing broader arrives here; paths the claims
+        // walk could never see (policy-skipped dot-dir/`node_modules`/
+        // `target` segments) are filtered with the same predicate the walk
+        // uses.
+        let claim_changes: Vec<PathBuf> = {
+            let roots = self
+                .workspace_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            params
+                .changes
+                .iter()
+                .filter(|change| {
+                    matches!(
+                        change.typ,
+                        FileChangeType::CREATED | FileChangeType::DELETED
+                    )
+                })
+                .filter_map(|change| change.uri.to_file_path().ok())
+                .map(|path| canonicalize_watched_path(&path))
+                .filter(|path| packages::watched_path_affects_claims(path, &roots))
+                .collect()
+        };
+        if !claim_changes.is_empty() {
+            self.resolver.invalidate_claims_for(&claim_changes);
         }
         for change in params.changes {
             // LSP spec: after didOpen the CLIENT buffer is the sole source of
@@ -4612,19 +4958,35 @@ impl LanguageServer for NmlLanguageServer {
                 let file = nml_core::cst::parse_best_effort(source);
                 let index: &SchemaIndex = handle.index();
                 let line_index = LineIndex::new(source);
+                let line_ctx = position::line_at(source, pos.line).map(|line| {
+                    let end = position::utf16_to_byte(line, pos.character);
+                    (line, end)
+                });
+                // Arm-selector position (RFC 0007 §6.1): before `->` inside an
+                // arm-set block — offer enum keys, a string-key snippet,
+                // `@keyword/name` references for model-keyed K, and `else`.
+                if let Some((line, end)) = line_ctx
+                    && !cursor_past_arm_arrow(line, end)
+                    && let Some(key) = find_arm_set_key_at(&file, pos, index, &line_index)
+                {
+                    let tagged_refs = collect_tagged_ref_candidates(&docs);
+                    let selector_items = arm_selector_completion_items(&key, index, &tagged_refs);
+                    return Ok(Some(CompletionResponse::Array(selector_items)));
+                }
                 // Arm-target position (RFC 0007): after the `->` on an arm
                 // line, offer declarations of the arm set's target type `V`
                 // instead of field names.
-                let after_arrow = position::line_at(source, pos.line)
-                    .map(|line| {
-                        let end = position::utf16_to_byte(line, pos.character);
-                        line[..end].contains("->")
-                    })
-                    .unwrap_or(false);
-                if after_arrow {
+                if let Some((line, end)) = line_ctx
+                    && cursor_past_arm_arrow(line, end)
+                {
                     if let Some(target_keywords) =
                         find_arm_target_types_at(&file, pos, index, &line_index)
                     {
+                        if let Some(snippet) =
+                            inline_arm_target_snippet_item(&target_keywords, index)
+                        {
+                            items.push(snippet);
+                        }
                         for keyword in &target_keywords {
                             // Enum-typed arm target (RFC 0030): offer the
                             // declared variants as values.
@@ -8208,6 +8570,113 @@ workflow VoiceAgent:
             find_arm_target_types_at(&file, Position::new(3, 22), &index, &line_index).unwrap();
         assert_eq!(targets, vec!["denial".to_string()]);
         // The scalar `string` union member contributes no reference keyword.
+    }
+
+    #[test]
+    fn inline_arm_body_field_completion_descends() {
+        let index = field_index(
+            "model landingPage:\n    label number\nmodel service:\n    routing (role -> landingPage)?\n",
+        );
+        let source = "service Api:\n    routing:\n        @role/admin -> adminLanding:\n            label = 4\n";
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
+        let line_index = LineIndex::new(source);
+        let landing = find_model_body_at(&file, Position::new(3, 12), &index, &line_index)
+            .expect("cursor inside inline arm body");
+        assert_eq!(landing.0.name, "landingPage");
+    }
+
+    #[test]
+    fn arm_target_completion_offers_inline_snippet_when_v_admits_inline() {
+        let index = field_index(
+            "model landingPage:\n    label number\nmodel service:\n    routing (role -> landingPage)?\n",
+        );
+        let source = "service Api:\n    routing:\n        @role/admin -> Landing\n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let line_index = LineIndex::new(source);
+        let targets =
+            find_arm_target_types_at(&file, Position::new(2, 28), &index, &line_index).unwrap();
+        assert!(targets.contains(&"landingPage".to_string()));
+        let snippet = inline_arm_target_snippet_item(&targets, &index).expect("snippet");
+        assert_eq!(snippet.label, "name:");
+        assert_eq!(snippet.insert_text.as_deref(), Some("name:\n    $0"));
+        assert_eq!(snippet.insert_text_format, Some(InsertTextFormat::SNIPPET));
+    }
+
+    #[test]
+    fn cursor_past_arm_arrow_distinguishes_selector_and_target() {
+        let line = "@role/admin -> Landing";
+        assert!(
+            !cursor_past_arm_arrow(line, 6),
+            "mid-selector is selector side"
+        );
+        assert!(
+            !cursor_past_arm_arrow(line, 13),
+            "between `-` and `>` is still selector side"
+        );
+        assert!(
+            cursor_past_arm_arrow(line, 14),
+            "immediately after `->` is target side"
+        );
+        assert!(cursor_past_arm_arrow(line, 18));
+        assert!(!cursor_past_arm_arrow("no arrow here", 5));
+    }
+
+    #[test]
+    fn arm_selector_completion_offers_enum_keys() {
+        let index = field_index(
+            "enum planKind:\n    - \"free\"\n    - \"pro\"\nmodel service:\n    routing (planKind -> string)?\n",
+        );
+        let source = "service Api:\n    routing:\n        \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let line_index = LineIndex::new(source);
+        let key = find_arm_set_key_at(&file, Position::new(2, 8), &index, &line_index)
+            .expect("arm-set key");
+        let items = arm_selector_completion_items(&key, &index, &[]);
+        assert!(items.iter().any(|i| i.label == "\"pro\""));
+        assert!(items.iter().any(|i| i.label == "else"));
+        let pro = items.iter().find(|i| i.label == "\"pro\"").unwrap();
+        assert_eq!(pro.insert_text.as_deref(), Some("\"pro\" -> "));
+    }
+
+    #[test]
+    fn arm_selector_completion_offers_tagged_refs_for_role_typed_k() {
+        // The flagship consumer shape (`(role -> denial)`): a role-typed K
+        // completes as `@keyword/name` tagged refs from workspace
+        // declarations — the validator's exact K-admission rule — not just
+        // `else`.
+        let index = field_index(
+            "model denialCard:\n    title string?\nmodel service:\n    routing (role -> denialCard)?\n",
+        );
+        let source = "service Api:\n    routing:\n        \n";
+        let file = nml_core::cst::parse_best_effort(source);
+        let line_index = LineIndex::new(source);
+        let key = find_arm_set_key_at(&file, Position::new(2, 8), &index, &line_index)
+            .expect("arm-set key");
+        let tagged = vec![
+            ("plan".to_string(), "Pro".to_string()),
+            ("role".to_string(), "admin".to_string()),
+        ];
+        let items = arm_selector_completion_items(&key, &index, &tagged);
+        let admin = items
+            .iter()
+            .find(|i| i.label == "@role/admin")
+            .expect("@role/admin offered");
+        assert_eq!(admin.insert_text.as_deref(), Some("@role/admin -> "));
+        assert!(items.iter().any(|i| i.label == "@plan/Pro"));
+        assert!(items.iter().any(|i| i.label == "else"));
+    }
+
+    #[test]
+    fn collect_tagged_ref_candidates_covers_block_declarations() {
+        let mut docs = HashMap::new();
+        docs.insert(
+            make_uri("nudge.nml"),
+            "role admin:\n    description = \"Admin\"\n\nplan Pro:\n    description = \"Pro\"\n"
+                .to_string(),
+        );
+        let refs = collect_tagged_ref_candidates(&docs);
+        assert!(refs.contains(&("role".to_string(), "admin".to_string())));
+        assert!(refs.contains(&("plan".to_string(), "Pro".to_string())));
     }
 
     #[test]

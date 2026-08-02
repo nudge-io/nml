@@ -897,15 +897,26 @@ impl SchemaValidator {
             // `+` field); reference/role items are links — resolved by the
             // consumer, never validated as inline instances.
             FieldTarget::Model(m) => match &item.kind {
-                K::Named { .. } | K::Shorthand { .. } => {
+                K::Named { name, body } => {
+                    self.validate_inline_body(
+                        Some(name),
+                        body,
+                        &FieldTarget::Model(m),
+                        label,
+                        depth,
+                        header,
+                        diags,
+                    );
+                }
+                K::Shorthand { .. } => {
                     let result = nml_core::identity::materialize_item(item, m);
                     self.validate_materialized(result, m, depth, header, diags);
                 }
                 K::Reference(_) | K::Role(_) => {}
             },
             FieldTarget::OneOf(_) => match &item.kind {
-                K::Named { body, .. } => {
-                    self.validate_target_instance(elem, body, depth, header, label, diags);
+                K::Named { name, body } => {
+                    self.validate_inline_body(Some(name), body, elem, label, depth, header, diags);
                 }
                 // A scalar can only fill a model's `+` field; on a union its
                 // variant isn't yet known, so it is out of scope — flagged.
@@ -1386,7 +1397,7 @@ impl SchemaValidator {
                 true
             }
             FieldTarget::Arms { key, target } => {
-                self.validate_instance_against_arms(body, key, target, diags);
+                self.validate_instance_against_arms(body, key, target, depth, diags);
                 true
             }
             FieldTarget::Object | FieldTarget::Union(_) | FieldTarget::Leaf(_) => false,
@@ -1407,8 +1418,13 @@ impl SchemaValidator {
         body: &Body,
         key: &FieldType,
         target: &FieldType,
+        depth: u32,
         diags: &mut Vec<Diagnostic>,
     ) {
+        if depth >= MAX_VALIDATION_DEPTH {
+            diags.push(truncation_advisory(body, None));
+            return;
+        }
         let mut else_seen = false;
         let mut keys_seen: Vec<&str> = Vec::new();
         for entry in &body.entries {
@@ -1423,7 +1439,7 @@ impl SchemaValidator {
                 );
                 continue;
             };
-            self.validate_arm_target(&arm.target, target, diags);
+            self.validate_arm_target(&arm.target, target, depth + 1, diags);
             match &arm.selector {
                 ArmSelector::Else => {
                     if else_seen {
@@ -1474,6 +1490,99 @@ impl SchemaValidator {
                     }
                     keys_seen.push(selector);
                 }
+                ArmSelector::Literal(selector) => {
+                    if else_seen {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "arm '{selector:?}' is unreachable: arms match first-to-last, \
+                                 so 'else' must be the final arm"
+                            ))
+                            .with_code(codes::UNREACHABLE_ARM)
+                            .with_span(arm.selector_span),
+                        );
+                    }
+                    if let Some(enum_def) = self.index.arm_key_enum_def(key) {
+                        self.validate_enum_value(
+                            &Value::String(selector.clone()),
+                            enum_def,
+                            "arm key",
+                            arm.selector_span,
+                            diags,
+                        );
+                    } else if !self.index.arm_literal_key_admits(key, selector) {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "arm key {selector:?} does not conform to the declared key \
+                                 type '{key}'"
+                            ))
+                            .with_code(codes::ARM_KEY_MISMATCH)
+                            .with_span(arm.selector_span),
+                        );
+                    }
+                    if keys_seen.contains(&selector.as_str()) {
+                        diags.push(
+                            Diagnostic::error(format!("duplicate arm key '{selector}'"))
+                                .with_code(codes::DUPLICATE_ARM)
+                                .with_span(arm.selector_span),
+                        );
+                    }
+                    keys_seen.push(selector);
+                }
+            }
+        }
+    }
+
+    /// Validate an inline instance body against a resolved target — shared by
+    /// list items and inline arm targets so both spellings agree by construction.
+    fn validate_inline_body(
+        &self,
+        name: Option<&Identifier>,
+        body: &Body,
+        elem: &FieldTarget,
+        label: ElemLabel<'_>,
+        depth: u32,
+        header_span: Option<Span>,
+        diags: &mut Vec<Diagnostic>,
+    ) {
+        match elem {
+            FieldTarget::Model(m) => {
+                let result = match name {
+                    Some(name) => nml_core::identity::materialize_arm_inline(name, body, m),
+                    None => nml_core::identity::Materialized {
+                        body: body.clone(),
+                        diagnostics: Vec::new(),
+                        validatable: true,
+                    },
+                };
+                self.validate_materialized(result, m, depth, header_span, diags);
+            }
+            FieldTarget::OneOf(_) => {
+                self.validate_target_instance(elem, body, depth, header_span, label, diags);
+            }
+            FieldTarget::Leaf(ty) | FieldTarget::Union(ty) => {
+                if !body.entries.is_empty() {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "this {}'s body has nowhere to go: the element type \
+                             `{ty}` has no fields to fill",
+                            label.field
+                        ))
+                        .with_code(codes::DROPPED_ITEM_BODY)
+                        .with_span(header_span.unwrap_or_else(|| Span::empty(0))),
+                    );
+                }
+            }
+            _ => {
+                if !body.entries.is_empty() {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "this {} requires a model or oneof element type",
+                            label.field
+                        ))
+                        .with_code(codes::ARM_TARGET_MISMATCH)
+                        .with_span(header_span.unwrap_or_else(|| Span::empty(0))),
+                    );
+                }
             }
         }
     }
@@ -1481,55 +1590,67 @@ impl SchemaValidator {
     /// Validate one arm target against the arm set's `V` (RFC 0007 §6):
     /// - a **reference** (`-> Name`) is never existence-checked (§4.1,
     ///   consumer-resolved cross-scope) — its form is legal for any `V`;
-    /// - a **literal** (`-> "path/url"`) requires a *scalar-capable* `V` (you
-    ///   cannot write a string where a model instance is expected), and its
-    ///   string value is checked against a concrete primitive/enum `V`.
+    /// - a **literal** (`-> "path/url"`) requires a *scalar-capable* `V`;
+    /// - an **inline** (`-> Name:` + body) requires a model/`oneof` `V` and
+    ///   is fully validated against it (§4.1, §6.2).
     fn validate_arm_target(
         &self,
         arm_target: &ArmTarget,
         v: &FieldType,
+        depth: u32,
         diags: &mut Vec<Diagnostic>,
     ) {
-        let ArmTarget::Literal { value, span } = arm_target else {
-            return; // a reference is shape-legal for any V
-        };
-        if self.field_type_admits_a_literal(v) {
-            // Concrete scalar/enum V → type-check the literal string value.
-            self.validate_value_against_type(
-                &Value::String(value.clone()),
-                v,
-                "arm target",
-                "for",
-                *span,
-                diags,
-            );
-        } else {
-            diags.push(
-                Diagnostic::error(format!(
-                    "a string-literal arm target requires a scalar target type, but this arm \
-                     set targets '{v}'; use a declared name ('-> {v}Name') instead"
-                ))
-                .with_code(codes::ARM_TARGET_MISMATCH)
-                .with_span(*span),
-            );
-        }
-    }
-
-    /// Whether a string-literal arm target is admissible for `V` — true for a
-    /// primitive, an enum reference, an unknown name (consumer-resolved leaf),
-    /// or a union with any such variant; false for a model/`oneof`/list/arms
-    /// `V` (a literal can't stand in for a declared instance).
-    fn field_type_admits_a_literal(&self, v: &FieldType) -> bool {
-        match v {
-            FieldType::Primitive { .. } => true,
-            FieldType::Modifier(inner) => self.field_type_admits_a_literal(inner),
-            FieldType::Union(variants) => {
-                variants.iter().any(|t| self.field_type_admits_a_literal(t))
+        match arm_target {
+            ArmTarget::Reference(_) => {}
+            ArmTarget::Literal { value, span } => {
+                if self.index.field_type_admits_a_literal(v) {
+                    self.validate_value_against_type(
+                        &Value::String(value.clone()),
+                        v,
+                        "arm target",
+                        "for",
+                        *span,
+                        diags,
+                    );
+                } else {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "a string-literal arm target requires a scalar target type, but \
+                             this arm set targets '{v}'; use a declared name ('-> Name') or an \
+                             inline block ('-> Name:')"
+                        ))
+                        .with_code(codes::ARM_TARGET_MISMATCH)
+                        .with_span(*span),
+                    );
+                }
             }
-            FieldType::ModelRef(name) => {
-                self.find_model(name).is_none() && self.find_oneof(name).is_none()
+            ArmTarget::Inline { name, body } => {
+                if !self.index.field_type_admits_inline(v) {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "an inline arm target requires a model or oneof target type, but \
+                             this arm set targets '{v}'; use a reference ('-> Name') or a \
+                             string literal ('-> \"…\"') instead"
+                        ))
+                        .with_code(codes::ARM_TARGET_MISMATCH)
+                        .with_span(name.span),
+                    );
+                    return;
+                }
+                let elem = self.index.resolve_type_in_body(v, body);
+                self.validate_inline_body(
+                    Some(name),
+                    body,
+                    &elem,
+                    ElemLabel {
+                        field: "arm target",
+                        container: "for",
+                    },
+                    depth,
+                    Some(name.span),
+                    diags,
+                );
             }
-            FieldType::List(_) | FieldType::Set(_) | FieldType::Arms { .. } => false,
         }
     }
 
@@ -1689,7 +1810,13 @@ impl SchemaValidator {
                                 push_duplicate_set_items(&items, diags);
                             }
                             FieldType::Arms { key, target } => {
-                                self.validate_instance_against_arms(&nb.body, key, target, diags);
+                                self.validate_instance_against_arms(
+                                    &nb.body,
+                                    key,
+                                    target,
+                                    depth + 1,
+                                    diags,
+                                );
                             }
                             // Union fields — plain or modifier-wrapped — were
                             // dispatched by `union_variants` above, before this
@@ -2326,6 +2453,45 @@ impl SchemaValidator {
                         .with_code(codes::REPLACED_SYNTAX)
                         .with_span(span)
                         .with_suggestion(d.to_string(), span),
+                    );
+                    return;
+                }
+            }
+        }
+        // The same migration teaching for the OTHER typed literals: a
+        // quoted number or bool against its typed field is the legacy
+        // spelling, not a mere mismatch — the generic NML2008 told an
+        // author WHAT failed but not the one-keystroke fix. Same
+        // machine-applicable shape as the duration arm: fire only when
+        // the de-quoted text parses as the target type; anything else
+        // falls through to the ordinary mismatch.
+        if *prim == PrimitiveType::Number {
+            if let Value::String(text) = value {
+                if let Ok(n) = text.parse::<nml_core::types::Number>() {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "number field '{field_name}': a quoted number was \
+                             replaced by the number literal (drop the quotes)"
+                        ))
+                        .with_code(codes::REPLACED_SYNTAX)
+                        .with_span(span)
+                        .with_suggestion(n.to_string(), span),
+                    );
+                    return;
+                }
+            }
+        }
+        if *prim == PrimitiveType::Bool {
+            if let Value::String(text) = value {
+                if matches!(text.as_str(), "true" | "false") {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "bool field '{field_name}': a quoted bool was \
+                             replaced by the bool literal (drop the quotes)"
+                        ))
+                        .with_code(codes::REPLACED_SYNTAX)
+                        .with_span(span)
+                        .with_suggestion(text.clone(), span),
                     );
                     return;
                 }
@@ -2974,6 +3140,10 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Reference(_) => "reference",
         Value::Array(_) => "array",
         Value::Fallback(_, _) => "fallback",
+        // Unreachable in practice — validation runs on the raw AST and
+        // only the resolver mints Resolved — but the defensive answer is
+        // its string shape.
+        Value::Resolved(_) => "string",
     }
 }
 
@@ -5877,6 +6047,81 @@ workflow W:
         assert!(good.is_empty(), "reference target on a oneof V: {good:?}");
     }
 
+    /// RFC 0007 §6.2: inline arm targets validate structurally against model `V`.
+    #[test]
+    fn arm_inline_targets_validate_against_model_v() {
+        let schema = "model landingPage:\n    label number\nmodel service:\n    routing (role -> landingPage)?\n";
+        let ok = diags(
+            schema,
+            "service Api:\n    routing:\n        @role/admin -> adminLanding:\n            label = 4\n",
+        );
+        assert!(ok.is_empty(), "happy-path inline arm: {ok:?}");
+
+        let bad_field = diags(
+            schema,
+            "service Api:\n    routing:\n        @role/admin -> adminLanding:\n            label = \"nope\"\n",
+        );
+        assert!(
+            bad_field.iter().any(|d| d.message.contains("label")),
+            "wrong field type in inline body: {bad_field:?}"
+        );
+
+        let bad_scalar_v = diags(
+            "model service:\n    routing (role -> string)?\n",
+            "service Api:\n    routing:\n        @role/admin -> adminLanding:\n            label = 4\n",
+        );
+        assert!(
+            bad_scalar_v
+                .iter()
+                .any(|d| d.message.contains("inline arm target requires a model")),
+            "{bad_scalar_v:?}"
+        );
+    }
+
+    /// RFC 0007 §6.1: string-literal selectors validate against enum-typed `K`.
+    #[test]
+    fn arm_string_selector_validates_against_enum_key() {
+        let schema = "enum planKind:\n    - \"free\"\n    - \"pro\"\nmodel service:\n    routing (planKind -> string)?\n";
+        let validator = make_validator(schema);
+        let enum_def = validator
+            .find_enum("planKind")
+            .expect("planKind enum in schema");
+        assert!(enum_def.variants.iter().any(|v| v == "pro"));
+        let ok = diags(
+            schema,
+            "service Api:\n    routing:\n        \"pro\" -> \"upsell\"\n",
+        );
+        assert!(ok.is_empty(), "valid enum key: {ok:?}");
+
+        let bad = diags(
+            schema,
+            "service Api:\n    routing:\n        \"enterprise\" -> \"upsell\"\n",
+        );
+        assert!(
+            bad.iter()
+                .any(|d| d.message.contains("invalid value \"enterprise\"")),
+            "unknown enum variant key: {bad:?}"
+        );
+    }
+
+    /// Parser + validator: `-> "name":` is not an inline block — quotes mean literal.
+    #[test]
+    fn arm_quoted_target_with_colon_errors() {
+        let schema = "model landingPage:\n    label number\nmodel service:\n    routing (role -> landingPage)?\n";
+        let _ = schema;
+        let parse = nml_core::cst::parse(
+            "service Api:\n    routing:\n        @role/admin -> \"adminLanding\":\n            label = 4\n",
+        );
+        assert!(
+            parse
+                .errors()
+                .iter()
+                .any(|e| e.message().contains("inline block uses an unquoted name")),
+            "parse should teach the quoted-colon mistake: {:?}",
+            parse.errors()
+        );
+    }
+
     /// §4.2 placement: an arm inside a model-typed block (not arm-typed)
     /// errors instead of silently doing nothing.
     #[test]
@@ -6837,6 +7082,114 @@ mod duration_tests {
             "clarifier names the earlier spelling: {}",
             hit.message
         );
+    }
+}
+
+#[cfg(test)]
+mod replaced_literal_tests {
+    //! The quoted-literal migration teaching, extended beyond durations:
+    //! a quoted number/bool against its typed field is the legacy
+    //! spelling and gets NML0001 with the de-quoted machine fix — found
+    //! empirically when `port = $ENV.PORT | "3000"` produced only the
+    //! generic NML2008 while the duration twin taught the fix. Strings
+    //! that do NOT parse as the target type stay NML2008 (never a
+    //! special case), and string-typed fields are untouched.
+
+    use super::*;
+
+    fn diags_for(schema: &str, body: &str) -> Vec<Diagnostic> {
+        let s = nml_core::cst::extract_schema(schema).0;
+        let v = SchemaValidator::new(s.models, s.enums, s.oneofs);
+        v.validate(&nml_core::cst::parse_to_ast(body).unwrap())
+    }
+
+    fn code_of(d: &Diagnostic) -> Option<String> {
+        d.code.map(|c| c.to_string())
+    }
+
+    #[test]
+    fn quoted_number_and_bool_teach_the_literal() {
+        for (schema, body, fix) in [
+            (
+                "model svc:\n    port number\n",
+                "svc A:\n    port = \"3000\"\n",
+                "3000",
+            ),
+            (
+                "model svc:\n    port number\n",
+                "svc A:\n    port = \"1.5\"\n",
+                "1.5",
+            ),
+            (
+                "model svc:\n    admin bool\n",
+                "svc A:\n    admin = \"true\"\n",
+                "true",
+            ),
+            (
+                "model svc:\n    admin bool\n",
+                "svc A:\n    admin = \"false\"\n",
+                "false",
+            ),
+        ] {
+            let diags = diags_for(schema, body);
+            let hit = diags
+                .iter()
+                .find(|d| code_of(d).as_deref() == Some("NML0001"))
+                .unwrap_or_else(|| panic!("{body:?} must teach the literal: {diags:?}"));
+            assert!(
+                hit.message.contains("drop the quotes"),
+                "teaching text: {}",
+                hit.message
+            );
+            assert_eq!(
+                hit.suggestions.first().map(|s| s.replacement.as_str()),
+                Some(fix),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_literal_strings_stay_ordinary_mismatches() {
+        for (schema, body) in [
+            (
+                "model svc:\n    port number\n",
+                "svc A:\n    port = \"high\"\n",
+            ),
+            (
+                "model svc:\n    admin bool\n",
+                "svc A:\n    admin = \"yes\"\n",
+            ),
+            (
+                "model svc:\n    admin bool\n",
+                "svc A:\n    admin = \"1\"\n",
+            ),
+        ] {
+            let diags = diags_for(schema, body);
+            assert!(
+                diags
+                    .iter()
+                    .any(|d| code_of(d).as_deref() == Some("NML2008")),
+                "{body:?} must stay NML2008 (no invented coercion): {diags:?}"
+            );
+            assert!(
+                diags
+                    .iter()
+                    .all(|d| code_of(d).as_deref() != Some("NML0001")),
+                "{body:?} must not claim a migration fix: {diags:?}"
+            );
+        }
+    }
+
+    /// String-typed fields take strings — the teaching arms must never
+    /// reach them, and a plain string stays diagnostics-free.
+    #[test]
+    fn string_fields_are_untouched() {
+        let diags = diags_for(
+            "model svc:\n    name string\n",
+            "svc A:\n    name = \"3000\"\n",
+        );
+        assert!(diags.is_empty(), "{diags:?}");
     }
 }
 

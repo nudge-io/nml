@@ -54,6 +54,67 @@ pub enum Value {
     Reference(String),
     Array(Vec<SpannedValue>),
     Fallback(Box<SpannedValue>, Box<SpannedValue>),
+    /// Environment-resolved text, minted EXCLUSIVELY by
+    /// [`crate::ValueResolver`]'s `$ENV` substitution — no other code
+    /// constructs it, so holding one IS proof the text came from the
+    /// environment, not from a source literal. That provenance is what
+    /// gates the typed string coercions (string→number/bool/duration):
+    /// they fire for `Resolved` and never for a source-authored quoted
+    /// literal, which gets the same replaced-syntax teaching the schema
+    /// validator gives. String-shaped everywhere else (string fields,
+    /// enum discriminants, buffered serde contexts).
+    Resolved(ResolvedText),
+}
+
+/// The payload of [`Value::Resolved`]: env-resolved text plus the
+/// reference that produced it (`$ENV.KEY`, source spelling). The value is
+/// frequently secret material, so leak-resistance is STRUCTURAL, not
+/// convention: `Debug` prints `‹resolved $ENV.KEY›` (the reference is
+/// source-visible; the content never prints) and `Serialize` emits the
+/// bare marker `‹resolved›` — any future `dbg!`, error interpolation, or
+/// stray serialization of a resolved tree is safe by construction.
+/// Diagnostics NAME the variable (`$ENV.KEY is not duration syntax`)
+/// while redacting the value — actionable and leak-free at once.
+#[derive(Clone, PartialEq)]
+pub struct ResolvedText {
+    text: String,
+    var: String,
+}
+
+impl ResolvedText {
+    /// `var` is the full source spelling of the reference (`$ENV.KEY`);
+    /// `text` is what it resolved to.
+    pub fn new(var: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            var: var.into(),
+        }
+    }
+
+    /// The resolved text. Handle like the secret it may be: never log,
+    /// never serialize — the blanket impls on this type already refuse.
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// The `$ENV.KEY` reference that produced this value — safe in any
+    /// diagnostic (it is source text), and the actionable half of an
+    /// error: it names the knob to fix.
+    pub fn var(&self) -> &str {
+        &self.var
+    }
+}
+
+impl std::fmt::Debug for ResolvedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "‹resolved {}›", self.var)
+    }
+}
+
+impl Serialize for ResolvedText {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str("‹resolved›")
+    }
 }
 
 /// A value with its source location.
@@ -229,7 +290,7 @@ impl Value {
     /// Returns a human-readable name for the value's variant.
     pub fn type_name(&self) -> &'static str {
         match self {
-            Value::String(_) | Value::TemplateString(_) => "string",
+            Value::String(_) | Value::TemplateString(_) | Value::Resolved(_) => "string",
             Value::Number(_) => "number",
             Value::Money(_) => "money",
             Value::Duration(_) => "duration",
@@ -242,12 +303,18 @@ impl Value {
         }
     }
 
-    /// Extract as a string slice (String, Secret, Reference, Role).
+    /// Extract as a string slice (String, Secret, Reference, Role, and
+    /// env-Resolved text). The Resolved arm is LOAD-BEARING: consumer
+    /// code resolves secrets and reads them back through here
+    /// (`resolved.as_str().unwrap_or_default()` is a live pattern) — a
+    /// `None` for Resolved would silently turn every such credential
+    /// into the empty string.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(s) | Value::Secret(s) | Value::Reference(s) | Value::Role(s) => {
                 Some(s.as_str())
             }
+            Value::Resolved(r) => Some(r.as_str()),
             _ => None,
         }
     }
@@ -320,6 +387,9 @@ impl TryFrom<&Value> for String {
             Value::TemplateString(segs) => Ok(crate::template::segments_to_string(segs)),
             Value::Secret(s) => Ok(s.clone()),
             Value::Reference(s) | Value::Role(s) => Ok(s.clone()),
+            // Env-resolved text is string-shaped for every string
+            // destination (same load-bearing rule as `as_str`).
+            Value::Resolved(r) => Ok(r.as_str().to_owned()),
             _ => Err(ValueTypeError {
                 expected: "string",
                 actual: value.type_name(),
@@ -439,6 +509,51 @@ impl TryFrom<&Value> for Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Value::Resolved / ResolvedText contract pins ────────────────
+
+    /// Leak-resistance is STRUCTURAL: `Debug` names the variable (source
+    /// text, safe) and never the content; `Serialize` emits the bare
+    /// marker. A future `dbg!` or stray serialization of a resolved tree
+    /// cannot leak — pinned here so a derive ever replacing the manual
+    /// impls fails loudly.
+    #[test]
+    fn resolved_text_debug_and_serialize_redact_content() {
+        let v = Value::Resolved(ResolvedText::new("$ENV.API_KEY", "hunter2"));
+        let dbg = format!("{v:?}");
+        assert!(dbg.contains("$ENV.API_KEY"), "names the knob: {dbg}");
+        assert!(!dbg.contains("hunter2"), "never the content: {dbg}");
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json, serde_json::json!({ "Resolved": "‹resolved›" }));
+    }
+
+    /// The load-bearing string-shape pins: consumer code reads resolved
+    /// credentials back through `as_str`/`TryFrom<String>` — a `None`/
+    /// `Err` here silently turns every such credential into the empty
+    /// string (`resolved.as_str().unwrap_or_default()` is a live
+    /// pattern in consumers).
+    #[test]
+    fn resolved_is_string_shaped_for_extraction() {
+        let v = Value::Resolved(ResolvedText::new("$ENV.TOKEN", "tok-123"));
+        assert_eq!(v.as_str(), Some("tok-123"));
+        assert_eq!(String::try_from(&v).unwrap(), "tok-123");
+        assert_eq!(v.type_name(), "string");
+    }
+
+    /// Provenance is semantically real: resolved text never equals a
+    /// source literal with the same content (one unlocks coercion, the
+    /// other does not), and two Resolved values are equal only with the
+    /// same variable AND text. No live comparator sees mixed trees — the
+    /// differ is source-side — so this is a contract pin, not a behavior
+    /// change.
+    #[test]
+    fn resolved_equality_is_provenance_aware() {
+        let r = Value::Resolved(ResolvedText::new("$ENV.A", "5m"));
+        assert_ne!(r, Value::String("5m".into()));
+        assert!(!r.semantic_eq(&Value::String("5m".into())));
+        assert_eq!(r, Value::Resolved(ResolvedText::new("$ENV.A", "5m")));
+        assert_ne!(r, Value::Resolved(ResolvedText::new("$ENV.B", "5m")));
+    }
 
     #[test]
     fn test_primitive_type_object() {

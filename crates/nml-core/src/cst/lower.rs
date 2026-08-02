@@ -161,22 +161,34 @@ impl Lower {
             ast::Entry::FieldDef(f) => BodyEntryKind::FieldDefinition(self.field_def(&f)),
             ast::Entry::Arm(a) => {
                 let selector_tok = a.selector();
-                // A `Role` token is a `@…` selector (stored verbatim); anything
-                // else at that position is the `else` catch-all keyword.
                 let selector = match &selector_tok {
                     Some(t) if t.kind() == crate::cst::syntax::SyntaxKind::Role => {
                         ArmSelector::Role(t.text().to_string())
                     }
+                    Some(t) if t.kind() == crate::cst::syntax::SyntaxKind::String => {
+                        ArmSelector::Literal(self.string_token(t))
+                    }
                     _ => ArmSelector::Else,
                 };
-                // Target: a `String` token is a path/url LITERAL (RFC 0007
-                // §6, decoded like a oneof arm value); anything else is a
-                // declared-name reference.
                 let target = match a.target() {
+                    // String after `->` is ALWAYS a literal — even when error
+                    // recovery attached a body child under the Arm node for the
+                    // `-> "name":` mistake (RFC 0007 §6.2).
                     Some(t) if t.kind() == crate::cst::syntax::SyntaxKind::String => {
                         ArmTarget::Literal {
                             value: self.string_token(&t),
                             span: token_span(&t),
+                        }
+                    }
+                    Some(_) if let Some(body) = a.inline_body() => ArmTarget::Inline {
+                        name: ident_of(a.target()),
+                        body: self.lower_body(body),
+                    },
+                    Some(_) if a.has_colon() => {
+                        let name = ident_of(a.target());
+                        ArmTarget::Inline {
+                            name,
+                            body: Body::fresh(Vec::new()),
                         }
                     }
                     other => ArmTarget::Reference(ident_of(other)),
@@ -880,6 +892,85 @@ mod tests {
             &b.body.entries[0].kind,
             BodyEntryKind::Property(p) if p.name.name == "else"
         ));
+    }
+
+    /// RFC 0007 §6.2: inline arm targets (`-> Name:` + body) and string-keyed
+    /// selectors (`"key" -> Target`).
+    #[test]
+    fn arms_lower_with_inline_target_and_string_selector() {
+        use crate::ast::{ArmSelector, ArmTarget, BodyEntryKind, DeclarationKind};
+        let file = cst_ast(
+            "service App:\n    routing:\n        @role/admin -> adminLanding:\n            label = 4\n        \"plan\" -> \"upsell\"\n",
+        );
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("block");
+        };
+        let BodyEntryKind::NestedBlock(nb) = &block.body.entries[0].kind else {
+            panic!("nested block");
+        };
+        let arms: Vec<_> = nb
+            .body
+            .entries
+            .iter()
+            .map(|e| match &e.kind {
+                BodyEntryKind::Arm(a) => a,
+                other => panic!("expected arm, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(arms.len(), 2);
+        assert!(matches!(&arms[0].selector, ArmSelector::Role(r) if r == "@role/admin"));
+        assert!(matches!(
+            &arms[0].target,
+            ArmTarget::Inline { name, body } if name.name == "adminLanding"
+                && matches!(&body.entries[0].kind, BodyEntryKind::Property(p) if p.name.name == "label")
+        ));
+        assert!(matches!(&arms[1].selector, ArmSelector::Literal(k) if k == "plan"));
+        assert!(matches!(
+            &arms[1].target,
+            ArmTarget::Literal { value, .. } if value == "upsell"
+        ));
+    }
+
+    /// Error-recovery CST for `-> "name":` must still lower the target as
+    /// `Literal`, never `Inline` (RFC 0007 §6.2).
+    #[test]
+    fn arms_lower_quoted_target_with_colon_is_literal_not_inline() {
+        use crate::ast::{ArmTarget, BodyEntryKind, DeclarationKind};
+        let parse = parse(
+            "service Api:\n    routing:\n        @role/admin -> \"adminLanding\":\n            label = 4\n",
+        );
+        assert!(
+            parse
+                .errors()
+                .iter()
+                .any(|e| e.message().contains("inline block uses an unquoted name")),
+            "parse should teach the quoted-colon mistake: {:?}",
+            parse.errors()
+        );
+        let file = to_ast(&ast::Root::cast(parse.syntax()).unwrap());
+        let DeclarationKind::Block(block) = &file.declarations[0].kind else {
+            panic!("block");
+        };
+        let BodyEntryKind::NestedBlock(nb) = &block.body.entries[0].kind else {
+            panic!("nested block");
+        };
+        let arm = nb
+            .body
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::Arm(a) => Some(a),
+                _ => None,
+            })
+            .expect("arm");
+        assert!(
+            matches!(
+                &arm.target,
+                ArmTarget::Literal { value, .. } if value == "adminLanding"
+            ),
+            "quoted target must lower as Literal, not Inline: {:?}",
+            arm.target
+        );
     }
 
     /// RFC 0007 arm-set field types: `(K -> V)` lowers to `FieldTypeExpr::Arms`,
