@@ -143,6 +143,13 @@ AND semantics (for nudge: the identity must match every atom). Arm
 selectors (`@selector -> target`) name exactly one selector — conjunctions
 are not accepted there.
 
+A selector VALUE that itself contains ` & ` cannot be a bare role token
+(the token charset has no space or quote); it is authored as a string
+entry using the consumer's quoted-value form (nudge, RFC 0055 D11):
+`|allow = ["@user/\"fred & wilma@example.com\""]` — the `\"` here is the
+NML string escape, and the consumer's splitter treats the quoted span as
+literal.
+
 ## Modeling Access Control
 
 The `accessControlled` trait captures the `|allow` / `|deny` pattern for reuse

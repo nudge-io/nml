@@ -2719,6 +2719,36 @@ impl SchemaValidator {
         }
         if *prim == PrimitiveType::Role {
             if let Value::String(s) = value {
+                // The did-you-mean is offered ONLY when its result would be
+                // a valid bare role token. A value carrying characters
+                // outside the RolePath charset (spaces, quotes,
+                // backslashes) splits two ways:
+                // * `@`-prefixed — the consumer's quoted-value form (e.g.
+                //   nudge RFC 0055 D11 `@user/"fred & wilma@example.com"`):
+                //   DELIBERATELY string-form, the only possible spelling —
+                //   no diagnostic at all. A warning would also echo the
+                //   value through the suggestion into consumer boot logs,
+                //   and these values can be PII-class (mailboxes).
+                // * anything else — still worth teaching, but with NO
+                //   suggestion: prepending `@` to a non-token value would
+                //   suggest an unlexable spelling AND echo the (possibly
+                //   PII-class) value.
+                let bare_expressible = s.chars().all(|c| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, '_' | '/' | ':' | '@' | '{' | '}' | '.' | '+' | '-')
+                });
+                if !bare_expressible {
+                    if !s.starts_with('@') {
+                        diags.push(
+                            Diagnostic::warning(format!(
+                                "role field '{field_name}': roles are references, not strings"
+                            ))
+                            .with_code(codes::ROLE_LITERAL)
+                            .with_span(span),
+                        );
+                    }
+                    return;
+                }
                 // Machine-fixable: the replacement spans the WHOLE quoted
                 // string (quotes removed), yielding the bare role reference.
                 let replacement = if s.starts_with('@') {
@@ -5556,6 +5586,57 @@ workflow W:
                     && d.suggestions.first().map(|s| s.replacement.as_str()) == Some("@admin")),
             "should suggest adding @ prefix for role field; diags: {:?}",
             diags
+        );
+    }
+
+    /// A selector string that CANNOT be a bare role token (spaces/quotes —
+    /// a consumer's quoted-value form, e.g. nudge RFC 0055 D11) is the
+    /// deliberate, only-possible spelling: no warning, and crucially no
+    /// suggestion echoing the (possibly PII-class) value into consumer
+    /// boot logs.
+    #[test]
+    fn test_role_type_quoted_selector_string_is_deliberate() {
+        let schema = "model service:\n    access role?\n";
+        let validator = make_validator(schema);
+
+        let source = "service Svc:\n    access = \"@user/\\\"fred & wilma@example.com\\\"\"\n";
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
+        let diags = validator.validate(&file);
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.message.contains("roles are references, not strings")),
+            "the string form is the only spelling — no warning; diags: {diags:?}"
+        );
+        assert!(
+            !format!("{diags:?}").contains("wilma"),
+            "no diagnostic may echo the mailbox: {diags:?}"
+        );
+    }
+
+    /// The sibling arm of the same leak class: a NON-`@` string that cannot
+    /// be a bare token (a raw mailbox pasted into a role field) still gets
+    /// the teaching warning, but with NO suggestion — prepending `@` would
+    /// suggest an unlexable spelling AND echo the PII-class value.
+    #[test]
+    fn test_role_type_nontoken_string_warns_without_echo() {
+        let schema = "model service:\n    access role?\n";
+        let validator = make_validator(schema);
+
+        let source = "service Svc:\n    access = \"fred & wilma@example.com\"\n";
+        let file = nml_core::cst::parse_to_ast(source).unwrap();
+        let diags = validator.validate(&file);
+        let warn = diags
+            .iter()
+            .find(|d| d.message.contains("roles are references, not strings"))
+            .expect("still teaches");
+        assert!(
+            warn.suggestions.is_empty(),
+            "no suggestion for an unlexable fix: {warn:?}"
+        );
+        assert!(
+            !format!("{diags:?}").contains("wilma"),
+            "no diagnostic may echo the mailbox: {diags:?}"
         );
     }
 
