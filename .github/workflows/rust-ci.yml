@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The file names the channel AND components (rustfmt, clippy).
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # Rustdoc is a build product (docs.rs renders it at publish): broken
@@ -62,7 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       - run: cargo test --workspace --locked
 
   # The MSRV contract (docs/stability.md): the workspace compiles — every
@@ -100,11 +100,11 @@ jobs:
           # var outranks the pin file; every later step in this job now
           # really runs the floor toolchain.
           echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (SHA-pinned; channel via toolchain input)
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
           targets: wasm32-wasip1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       - run: cargo check --workspace --all-targets --locked
       # Cross-compilation is host-independent — once is enough.
       - if: matrix.os == 'ubuntu-latest'
@@ -125,7 +125,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       - run: cargo package --workspace --exclude 'nml-tutorial-*' --exclude nml-cookbook --locked
 
   # Declared version bounds are promises (`serde = "1"` claims we build
@@ -144,10 +144,10 @@ jobs:
       - run: rustup toolchain install
       # …plus nightly, reached ONLY via explicit `cargo +nightly` (the
       # resolver flag needs it; the pin file governs everything else).
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (SHA-pinned; channel via toolchain input)
         with:
           toolchain: nightly
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       - run: cargo +nightly update -Zdirect-minimal-versions
       - run: cargo check --workspace --all-targets
 
@@ -162,10 +162,10 @@ jobs:
       # pass over the RFC 0016 targets — a short bounded run per target so
       # a panic/invariant regression fails CI, while deep fuzzing stays a
       # scheduled/local activity.
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (SHA-pinned; channel via toolchain input)
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (SHA-pinned; channel via toolchain input)
         with:
           toolchain: nightly
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
         with:
           workspaces: fuzz
       # Version-pinned like every other tool in this workflow (the repo
