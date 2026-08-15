@@ -25,3 +25,4 @@ overrides:
   serialize-javascript: ^7.0.7
   vscode-jsonrpc: ^9.0.1
   diff: '>=8.0.3'
+  js-yaml: ^4.3.1

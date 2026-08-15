@@ -304,7 +304,11 @@ joined with `" & "` — single spaces, regardless of source spacing. The
 value layer lowers to this form and the formatter re-renders from it;
 anything that prints selectors emits it, so a printed selector is always
 valid source. The language carries the expression opaquely; consumers
-assign the AND semantics.
+assign the AND semantics. (Consumers may additionally define a
+quoted-value form for selector values that literally contain ` & ` —
+nudge does, RFC 0055 D11 — but that form is only expressible as an NML
+*string* value: the role-token charset has no space or quote, so bare
+tokens and this canonical form are unaffected.)
 
 Malformed conjunctions are parse errors with targeted guidance: a
 dangling `&` ("expected a selector after '&'") and `&&` ("'&' is the
