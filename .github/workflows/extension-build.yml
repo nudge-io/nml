@@ -26,7 +26,7 @@ jobs:
       # either for any other named toolchain (e.g. `stable`) leaves the one
       # cargo actually uses target-less (E0463 "can't find crate for core").
       - run: rustup toolchain install && rustup target add wasm32-wasip1
-      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Build the WASM neutral server
         # --locked: this wasm ships inside the VSIX — the release artifact
         # must be built from exactly the dependency set the gates verified.
