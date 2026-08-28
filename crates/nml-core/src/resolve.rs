@@ -389,6 +389,26 @@ pub fn apply_shared_properties(body: &Body) -> Body {
                     span: entry.span,
                 })
             }
+            // A block-form modifier is a list like any other spelling
+            // (RFC 0019's spelling-equivalence doctrine): its items' own
+            // bodies are scopes too, or a `.shared` inside a `|deny:`
+            // item survives as a raw SharedProperty into composed output
+            // while the block spelling merges it.
+            BodyEntryKind::Modifier(m) => match &m.value {
+                ModifierValue::Block(items) => Some(BodyEntry {
+                    kind: BodyEntryKind::Modifier(Modifier {
+                        name: m.name.clone(),
+                        value: ModifierValue::Block(
+                            items
+                                .iter()
+                                .map(|item| apply_shared_in_item(item.clone()))
+                                .collect(),
+                        ),
+                    }),
+                    span: entry.span,
+                }),
+                _ => Some(entry.clone()),
+            },
             _ => Some(entry.clone()),
         })
         .collect();

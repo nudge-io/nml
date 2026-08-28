@@ -1593,7 +1593,10 @@ grant does not admit — name the entering ref (the root clause's own
 listed token, whose span anchors the diagnostic in the checked file);
 the stack-level allow-miss form also withholds the denied layer's
 *instance name* (author-chosen, so it too must not leak through a
-denial the author never spelled).
+denial the author never spelled). Every form carries the denial
+family's contract tail: the binding AND its manifest file named, the
+change stated as an operator's, and a closing `nml binding <file>`
+pointer with the checked file's real path.
 
 **Fix:** an operator widens `allowRefs` (or removes the deny rule) on
 the governing binding; the message names which.
@@ -1701,10 +1704,12 @@ advisory.
 **No consistent linearization.** The `uses` DAG's declared orders
 contradict, and the C3 merge refuses rather than guessing (RFC 0019) —
 stack order decides which assignment holds a seal, so it is never
-resolved by heuristic. Two shapes: a listed layer is a transitive base
-of an earlier-listed layer (the clause asks for it both above and below
-its dependent), or two listed layers' own stacks order a shared pair
-oppositely. The diagnostic names the contradicting pair and its cause;
+resolved by heuristic. Three shapes: a listed layer is a transitive
+base of an earlier-listed layer (the clause asks for it both above and
+below its dependent); two listed layers' own stacks order a shared pair
+oppositely; or the orders ROTATE across three or more clauses — the
+diagnostic names the cycle's pairwise steps and which clause forces
+each. The diagnostic names the contradicting pair and its cause;
 the transitive-base shape carries a machine-applicable remove-the-ref
 fix (`nml fix` applies it, separator included), and the sibling shape
 offers both reorderings as hints. Note redundancy and contradiction

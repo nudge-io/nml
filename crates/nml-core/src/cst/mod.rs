@@ -2082,6 +2082,40 @@ service App is Base:
     }
 
     #[test]
+    fn header_clauses_never_continue_across_newlines() {
+        // Regression: the clause-ref path lacked the same-line rule every
+        // other header decision has, so a trailing comma (or a dangling
+        // `uses`/`is`) consumed the NEXT declaration's tokens as refs —
+        // silently, in the `uses X,\nY:` shape (zero diagnostics, Y
+        // swallowed as a ref, its body attached to the wrong block).
+        for src in [
+            "service A uses X,\nY:\n    port = 1\n",
+            "service A uses\nservice B:\n    port = 1\n",
+            "service A uses X,\r\nY:\r\n    port = 1\r\n",
+            "service A is\nservice B:\n    port = 1\n",
+        ] {
+            let (file, diags) = parse_to_ast_all(src);
+            assert!(!diags.is_empty(), "must error loudly: {src:?}");
+            // The next-line tokens survive as their OWN declaration —
+            // never as refs of the dangling clause.
+            let refs: Vec<String> = file
+                .declarations
+                .iter()
+                .filter_map(|d| match &d.kind {
+                    crate::ast::DeclarationKind::Block(b) => Some(b),
+                    _ => None,
+                })
+                .flat_map(|b| b.uses.iter().chain(b.extends.iter()))
+                .map(|r| r.name.clone())
+                .collect();
+            assert!(
+                !refs.iter().any(|r| r == "Y" || r == "service" || r == "B"),
+                "next-line tokens are never clause refs: {refs:?} in {src:?}"
+            );
+        }
+    }
+
+    #[test]
     fn valid_edge_cases_parse_clean() {
         let corpus = [
             "service App:\n",                                        // empty body

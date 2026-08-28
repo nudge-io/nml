@@ -216,13 +216,40 @@ pub fn compute(
                     }
                 }
             }
-            if !models.is_empty() || !enums.is_empty() || !oneofs.is_empty() {
+            if models.is_empty() && enums.is_empty() && oneofs.is_empty() {
+                // No schema anywhere — but `check` still composes
+                // STRUCTURALLY (NML2059/2061/2062/2077 need no schema),
+                // so the editor must too or a schema-less buffer goes
+                // dark on a typo'd `uses` ref the CLI catches.
+                let empty = nml_core::schema_index::SchemaIndex::build(vec![], vec![], vec![]);
+                let composed = nml_core::layers::compose_file(
+                    &empty,
+                    &source_name,
+                    &file,
+                    &nml_core::layers::OpenContext,
+                );
+                for diag in composed.diagnostics {
+                    push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
+                }
+            } else {
                 let mut schema = nml_core::schema::ExtractedSchema {
                     models,
                     enums,
                     oneofs,
                 };
                 nml_core::schema::resolve_model_inheritance(&mut schema);
+                // Mixed `.nml` buffers get their schema-load lints
+                // (NML2068 is an ERROR) here — the load pass only covers
+                // `.model.nml` URIs, so without this the documented
+                // error-index repros squiggle nowhere in the editor.
+                if !config.uri_is_registry_source {
+                    for diag in nml_core::layers::validate_merge_policies_over(
+                        &schema.models,
+                        &schema.oneofs,
+                    ) {
+                        push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
+                    }
+                }
                 let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
                     .with_modifiers(config.modifiers.clone())
                     .with_membership_semantics(config.membership.clone());
@@ -271,13 +298,22 @@ pub fn compute(
         .collect();
     validate_templates(&file, &ns, uri, &line_index, &mut diagnostics);
 
-    // Editor flood cap: a hostile or badly broken buffer can yield tens
-    // of thousands of findings (one per unmatched list item), and
-    // serializing them all on EVERY keystroke is a client-side DoS. The
-    // first N tell the story; the tail is summarized in one row. The CLI
-    // is uncapped — a one-shot terminal run is the place for the full
-    // list.
-    const MAX_DIAGNOSTICS: usize = 500;
+    cap_diagnostics(&mut diagnostics);
+
+    diagnostics
+}
+
+/// Editor flood cap: a hostile or badly broken buffer can yield tens of
+/// thousands of findings (one per unmatched list item), and serializing
+/// them all on EVERY keystroke is a client-side DoS. The first
+/// [`MAX_DIAGNOSTICS`] tell the story; the tail is summarized in one row.
+/// The CLI is uncapped — a one-shot terminal run is the place for the
+/// full list. Note this bounds SERIALIZATION, not compute: the analysis
+/// above already ran over everything (fine while it stays linear; do not
+/// lean on this cap as a compute guard).
+const MAX_DIAGNOSTICS: usize = 500;
+
+fn cap_diagnostics(diagnostics: &mut Vec<Diagnostic>) {
     if diagnostics.len() > MAX_DIAGNOSTICS {
         let elided = diagnostics.len() - MAX_DIAGNOSTICS;
         diagnostics.truncate(MAX_DIAGNOSTICS);
@@ -290,8 +326,6 @@ pub fn compute(
             ..Default::default()
         });
     }
-
-    diagnostics
 }
 
 /// Lower one core diagnostic to LSP form — **the** converter (RFC 0008):
@@ -808,6 +842,85 @@ mod tests {
                     "NML2060".to_string()
                 ))),
             "compose findings reach the buffer: {sealed:?}"
+        );
+    }
+
+    /// Editor parity with `check`'s structural compose: a buffer with NO
+    /// schema anywhere still composes structurally, so a typo'd `uses`
+    /// ref squiggles instead of going dark.
+    #[test]
+    fn schemaless_buffers_compose_structurally() {
+        let diags = compute(
+            "flow memberLookup:\n    entrypoint = \"x\"\n\nflow t uses memberLookop:\n    entrypoint = \"y\"\n",
+            &SchemaMode::Registry {
+                models: &[],
+                enums: &[],
+                oneofs: &[],
+            },
+            &default_config(),
+            None,
+        );
+        assert!(
+            diags.iter().any(|d| d.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "NML2059".to_string()
+                ))
+                && d.message.contains("did you mean 'memberLookup'")),
+            "structural NML2059 with hint reaches the buffer: {diags:?}"
+        );
+    }
+
+    /// Mixed `.nml` buffers get schema-load merge-policy lints — NML2068
+    /// is an ERROR the CLI reports; the load pass covers only
+    /// `.model.nml` URIs, so this arm must carry it.
+    #[test]
+    fn mixed_buffers_get_merge_policy_lints() {
+        let schema = nml_core::cst::extract_schema("model m:\n    xs []string\n").0;
+        let diags = compute(
+            "model bad:\n    xs []string #sealed #append\n\nm i:\n    xs = [\"a\"]\n",
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            None,
+        );
+        assert!(
+            diags.iter().any(|d| d.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "NML2068".to_string()
+                ))),
+            "the incoherent-policy ERROR squiggles in the editor: {diags:?}"
+        );
+    }
+
+    /// The cap boundary is exact: AT the cap nothing changes (no phantom
+    /// summary row); one past it truncates and appends the summary with
+    /// an accurate count.
+    #[test]
+    fn diagnostic_cap_boundary_is_exact() {
+        let row = |i: usize| Diagnostic {
+            message: format!("finding {i}"),
+            ..Default::default()
+        };
+        let mut at_cap: Vec<Diagnostic> = (0..MAX_DIAGNOSTICS).map(row).collect();
+        cap_diagnostics(&mut at_cap);
+        assert_eq!(at_cap.len(), MAX_DIAGNOSTICS, "at the cap: untouched");
+        assert!(
+            !at_cap.last().unwrap().message.contains("not shown"),
+            "no phantom summary at the boundary"
+        );
+        let mut over: Vec<Diagnostic> = (0..MAX_DIAGNOSTICS + 1).map(row).collect();
+        cap_diagnostics(&mut over);
+        assert_eq!(over.len(), MAX_DIAGNOSTICS + 1, "tranche plus summary");
+        assert!(
+            over.last()
+                .unwrap()
+                .message
+                .starts_with("1 further finding"),
+            "accurate elided count: {}",
+            over.last().unwrap().message
         );
     }
 

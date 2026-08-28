@@ -556,6 +556,11 @@ struct Linearizer<'a, 'p> {
     /// and lets NML2061 render the full cycle (`a -> b -> a`), matching
     /// the house cycle-diagnostic vocabulary.
     in_progress: Vec<InstanceId<'a>>,
+    /// One-home guard for the discovery-depth NML2066: the guard fires
+    /// once per frame otherwise (one chain, N over-cap instances, N
+    /// identical-cause errors), and the clause-level depth report usually
+    /// follows anyway.
+    depth_reported: bool,
 }
 
 impl<'a, 'p> Linearizer<'a, 'p> {
@@ -570,10 +575,18 @@ impl<'a, 'p> Linearizer<'a, 'p> {
         // length (RFC 0019: "a runaway generator cannot stack-bomb the
         // checker"). `in_progress` is exactly the live recursion path.
         if self.in_progress.len() as u32 >= MAX_STACK_DEPTH {
-            self.diags.push(
-                layer_bound_exceeded(LayerBound::Discovery { instance: id.name })
-                    .with_source(id.source_path.to_string()),
-            );
+            if !self.depth_reported {
+                self.depth_reported = true;
+                let mut d = layer_bound_exceeded(LayerBound::Discovery { instance: id.name })
+                    .with_source(id.source_path.to_string());
+                // Anchor at the instance whose clause the recursion was
+                // entering — a span-less diagnostic renders 0:0 in the
+                // CLI and is DROPPED by the editor's span policy.
+                if let Some(block) = self.instances.get(id) {
+                    d = d.with_span(block.name.span);
+                }
+                self.diags.push(d);
+            }
             return None;
         }
         if self.in_progress.contains(&id) {
@@ -600,9 +613,22 @@ impl<'a, 'p> Linearizer<'a, 'p> {
                 .collect();
             path.push(cycle[pivot].name);
             let anchor = cycle[pivot];
-            let mut d = Diagnostic::error(format!("`uses` reference cycle: {}", path.join(" -> ")))
-                .with_code(codes::LAYER_CYCLE)
-                .with_source(anchor.source_path.to_string());
+            let teach = if cycle.len() == 1 {
+                format!(
+                    "'{}' must not `uses` itself; remove the self-reference",
+                    anchor.name
+                )
+            } else {
+                "one of these is the base and must not `uses` the other(s); \
+                 break the cycle"
+                    .to_string()
+            };
+            let mut d = Diagnostic::error(format!(
+                "`uses` reference cycle: {} — {teach}",
+                path.join(" -> ")
+            ))
+            .with_code(codes::LAYER_CYCLE)
+            .with_source(anchor.source_path.to_string());
             if let Some(block) = self.instances.get(anchor) {
                 d = d.with_span(block.name.span);
             }
@@ -617,7 +643,20 @@ impl<'a, 'p> Linearizer<'a, 'p> {
     }
 
     fn linearize_inner(&mut self, id: InstanceId<'a>) -> Option<Vec<InstanceId<'a>>> {
-        let block = self.instances.get(id)?;
+        let Some(block) = self.instances.get(id) else {
+            // The one failure the resolve path could previously return
+            // WITHOUT a diagnostic — a vanishing instance with no
+            // explanation. Unreachable through `compose_file` (it
+            // resolves refs first), but `resolve_layers` is the
+            // documented embedder entry point and its contract is
+            // "every diagnostic in one pass".
+            self.diags.push(
+                Diagnostic::error(format!("layer '{}' is not in the instance index", id.name))
+                    .with_code(codes::UNRESOLVED_LAYER_REF)
+                    .with_source(id.source_path.to_string()),
+            );
+            return None;
+        };
         // Every layer must declare the same model keyword (NML2062).
         if block.keyword.name != self.declaring_keyword {
             self.diags.push(
@@ -836,6 +875,45 @@ impl<'a, 'p> Linearizer<'a, 'p> {
                 }
             }
         }
+        // Case 3: neither two-clause pattern holds — the pairwise orders
+        // ROTATE across three or more clauses. A C3 failure guarantees a
+        // cycle in the union "x above y" constraint graph (no valid head
+        // = every candidate has an incoming edge), so name it: the old
+        // generic fallback asserted the two patterns just ruled out,
+        // misleading exactly the reader who reached it.
+        let mut edges: HashMap<(&str, &str), &str> = HashMap::new();
+        for r in deduped {
+            if let Some(Some(lin)) = self.memo.get(r) {
+                for (i, x) in lin.iter().enumerate() {
+                    for y in &lin[i + 1..] {
+                        edges.entry((x.name, y.name)).or_insert(r.name);
+                    }
+                }
+            }
+        }
+        for (i, lo) in deduped.iter().enumerate() {
+            for hi in &deduped[i + 1..] {
+                // Listing order: later-listed sits above earlier-listed.
+                edges.entry((hi.name, lo.name)).or_insert(id.name);
+            }
+        }
+        if let Some(cycle) = find_order_cycle(&edges) {
+            let steps: Vec<String> = cycle
+                .windows(2)
+                .map(|w| {
+                    let src = edges.get(&(w[0], w[1])).copied().unwrap_or(id.name);
+                    format!("'{}' above '{}' (per '{}')", w[0], w[1], src)
+                })
+                .collect();
+            return Diagnostic::error(format!(
+                "no consistent linearization for '{}' — the listed stacks' \
+                 orders rotate: {}; no listing order can satisfy them all — \
+                 drop one ref or align the contradicting stacks",
+                id.name,
+                steps.join(", ")
+            ))
+            .with_code(codes::INCONSISTENT_LINEARIZATION);
+        }
         let listed: Vec<&str> = deduped.iter().map(|r| r.name).collect();
         inconsistent_linearization(id.name, &listed)
     }
@@ -866,9 +944,19 @@ impl<'a, 'p> Linearizer<'a, 'p> {
                 ok = false;
                 continue;
             };
-            if let GrantLookup::Granted { grant, binding, .. } = &site {
+            if let GrantLookup::Granted {
+                grant,
+                binding,
+                manifest,
+            } = &site
+            {
                 let decision = self.grants.ref_decision(grant, target.source_path);
-                if let Some(d) = ref_denial(decision, &r.name, binding, Denial::Site) {
+                let gref = GrantRef {
+                    binding,
+                    manifest,
+                    file: id.source_path,
+                };
+                if let Some(d) = ref_denial(decision, &r.name, &gref, Denial::Site) {
                     self.diags
                         .push(d.with_span(r.span).with_source(id.source_path.to_string()));
                     ok = false;
@@ -1114,6 +1202,63 @@ fn inconsistent_linearization(name: &str, listed: &[&str]) -> Diagnostic {
 /// One NML2065 emission for both denial modes, shared by every check site
 /// (site-level, declaring-clause, stack-level) so the wording — and the
 /// disclosure rules riding on it — cannot drift per site.
+/// First cycle in a pairwise-order constraint graph, rendered as the node
+/// path with the closing node repeated (`[x, y, z, x]`). Bounded tiny:
+/// nodes ≤ the 16-layer cap.
+fn find_order_cycle<'n>(edges: &HashMap<(&'n str, &'n str), &'n str>) -> Option<Vec<&'n str>> {
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (above, below) in edges.keys() {
+        adj.entry(above).or_default().push(below);
+    }
+    fn dfs<'n>(
+        node: &'n str,
+        adj: &HashMap<&'n str, Vec<&'n str>>,
+        path: &mut Vec<&'n str>,
+        done: &mut HashSet<&'n str>,
+    ) -> Option<Vec<&'n str>> {
+        if let Some(start) = path.iter().position(|n| *n == node) {
+            let mut cycle: Vec<&str> = path[start..].to_vec();
+            cycle.push(node);
+            return Some(cycle);
+        }
+        if done.contains(node) {
+            return None;
+        }
+        path.push(node);
+        if let Some(nexts) = adj.get(node) {
+            for next in nexts {
+                if let Some(c) = dfs(next, adj, path, done) {
+                    return Some(c);
+                }
+            }
+        }
+        path.pop();
+        done.insert(node);
+        None
+    }
+    let mut done: HashSet<&str> = HashSet::new();
+    let mut nodes: Vec<&str> = adj.keys().copied().collect();
+    nodes.sort_unstable();
+    for n in nodes {
+        if let Some(c) = dfs(n, &adj, &mut Vec::new(), &mut done) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// The governing grant's identity, for the denial family's contract
+/// tail (RFC 0019, "recovery paths are part of the contract"): every
+/// denial names the binding AND its manifest file, states plainly that
+/// the change is an operator's, and ends by pointing at
+/// `nml binding <file>`.
+struct GrantRef<'a> {
+    binding: &'a str,
+    manifest: &'a str,
+    /// The checked file — interpolated into the recovery pointer.
+    file: &'a str,
+}
+
 /// Where a `uses` denial was raised — a named scope beats the earlier
 /// `Option<Option<&str>>`, which a reader had to decode as
 /// site / stack-anonymous / stack-with-entering-ref.
@@ -1130,9 +1275,14 @@ enum Denial<'a> {
 fn ref_denial(
     decision: RefDecision,
     ref_name: &str,
-    binding: &str,
+    grant: &GrantRef<'_>,
     scope: Denial<'_>,
 ) -> Option<Diagnostic> {
+    let GrantRef {
+        binding,
+        manifest,
+        file,
+    } = grant;
     // Stack-level denials name the ENTERING ref — the root clause's
     // listed ref whose stack pulls the denied layer in — so the author
     // knows which ref to remove (the denied layer itself may sit several
@@ -1149,11 +1299,14 @@ fn ref_denial(
         }
         Denial::Site => String::new(),
     };
+    // The denial family's contract tail (RFC 0019): binding AND manifest
+    // named, operator ownership stated, recovery pointer last.
+    let tail = format!(" — an operator change, not fixable here; run `nml binding {file}`");
     let msg = match decision {
         RefDecision::Allowed => return None,
         RefDecision::DenyVeto(i) => format!(
             "`uses` ref '{ref_name}' denied by denyRefs[{i}] of binding \
-             '{binding}'{suffix}"
+             '{binding}' ({manifest}){suffix}{tail}"
         ),
         // Allow-miss discloses the BINDING, never the missed target: at
         // the site level the ref name is the author's own token, but a
@@ -1164,11 +1317,11 @@ fn ref_denial(
         RefDecision::AllowMiss => match scope {
             Denial::Site => format!(
                 "`uses` ref '{ref_name}' denied: no allowRefs entry of \
-                 binding '{binding}' admits this layer"
+                 binding '{binding}' ({manifest}) admits this layer{tail}"
             ),
             Denial::Stack { .. } => format!(
                 "`uses` stack denied: no allowRefs entry of binding \
-                 '{binding}' admits a composed layer{suffix}"
+                 '{binding}' ({manifest}) admits a composed layer{suffix}{tail}"
             ),
         },
     };
@@ -1187,29 +1340,32 @@ fn deny_diagnostic(
             .with_span(block.name.span)
             .with_source(id.source_path.to_string())
     };
+    // The recovery pointer names the CHECKED file — a literal `<file>`
+    // placeholder when the emitter knows the path is a wall, not a
+    // doorway.
+    let file = id.source_path;
     match lookup {
         GrantLookup::Granted { .. } | GrantLookup::Unbound { open_context: true } => None,
         GrantLookup::NoGrant { binding, manifest } => Some(base(format!(
             "composition not permitted: binding '{binding}' ({manifest}) \
              carries no `layers:` grant — an operator change, not fixable \
-             from a content file; run `nml binding <file>` to see the \
+             from a content file; run `nml binding {file}` to see the \
              effective grant"
         ))),
         GrantLookup::Ambiguous { manifests } => Some(base(format!(
             "composition not permitted: {} manifests claim this file ({}) — \
              an ambiguously-claimed file is denied; remove or narrow one \
-             claim, then run `nml binding <file>`",
+             claim, then run `nml binding {file}`",
             manifests.len(),
             manifests.join(", ")
         ))),
         GrantLookup::Unbound {
             open_context: false,
-        } => Some(base(
+        } => Some(base(format!(
             "composition not permitted: no binding governs this file in a \
              closed universe — add a `files` glob that claims it (an \
-             operator change), then run `nml binding <file>`"
-                .to_string(),
-        )),
+             operator change), then run `nml binding {file}`"
+        ))),
     }
 }
 
@@ -1634,6 +1790,19 @@ fn normalize_spellings(
                         }
                         _ => entry.kind.clone(),
                     },
+                    // The block-form empty modifier is a zero-item list
+                    // entry like every other spelling — the RFC's "always
+                    // diagnosed, never silently ignored" admits no
+                    // spelling exception.
+                    ModifierValue::Block(items) if items.is_empty() => {
+                        let list_like = field_map
+                            .get(m.name.name.as_str())
+                            .is_none_or(|f| is_list_like(effective_type(&f.field_type)));
+                        if list_like {
+                            diags.push(zero_item_warning(&m.name.name, entry.span, source_path));
+                        }
+                        entry.kind.clone()
+                    }
                     _ => entry.kind.clone(),
                 },
                 BodyEntryKind::NestedBlock(nb) => {
@@ -1794,6 +1963,7 @@ pub fn resolve_layers(
         diags: Vec::new(),
         memo: HashMap::new(),
         in_progress: Vec::new(),
+        depth_reported: false,
     };
     // The declaring clause's own site check + listed-ref resolution.
     let site = grants.grant_for(declaring.source_path);
@@ -1803,10 +1973,20 @@ pub fn resolve_layers(
     }
     // Site-check the declaring clause's listed refs against the root grant.
     let mut site_ok = true;
-    if let GrantLookup::Granted { grant, binding, .. } = &site {
+    if let GrantLookup::Granted {
+        grant,
+        binding,
+        manifest,
+    } = &site
+    {
+        let gref = GrantRef {
+            binding,
+            manifest,
+            file: declaring.source_path,
+        };
         for r in refs {
             let decision = grants.ref_decision(grant, r.source_path);
-            if let Some(d) = ref_denial(decision, r.name, binding, Denial::Site) {
+            if let Some(d) = ref_denial(decision, r.name, &gref, Denial::Site) {
                 // Anchor at the denied ref's own token — the same anchor
                 // transitive-clause denials use — not the block name.
                 let span = declaring_block
@@ -1868,7 +2048,17 @@ pub fn resolve_layers(
     }
     // Stack-level authorization: the root grant bounds every composed
     // layer (the declaring instance excepted).
-    if let GrantLookup::Granted { grant, binding, .. } = &site {
+    if let GrantLookup::Granted {
+        grant,
+        binding,
+        manifest,
+    } = &site
+    {
+        let gref = GrantRef {
+            binding,
+            manifest,
+            file: declaring.source_path,
+        };
         let mut stack_ok = true;
         for layer in stack.iter().filter(|l| **l != declaring) {
             let decision = grants.ref_decision(grant, layer.source_path);
@@ -1895,7 +2085,7 @@ pub fn resolve_layers(
             if let Some(d) = ref_denial(
                 decision,
                 layer.name,
-                binding,
+                &gref,
                 Denial::Stack {
                     entering: entering.map(|e| e.name),
                 },
@@ -2021,7 +2211,10 @@ pub fn compose_file(
         }
         any_uses = true;
         if crate::symbols::is_schema_keyword(&block.keyword.name) {
-            diagnostics.push(schema_def_uses_denial(block, source_path));
+            let d = schema_def_uses_denial(block, source_path);
+            if seen.insert(finding_key(&d)) {
+                diagnostics.push(d);
+            }
             // NOT pushed to `failed`: a definition stays in the validation
             // view (its definition-side findings and `is`-target resolution
             // must survive); only failed INSTANCE composes are removed,
@@ -2038,11 +2231,17 @@ pub fn compose_file(
             match instances.resolve_ref(&r.name) {
                 Some(id) => refs.push(id),
                 None => {
-                    diagnostics.push(
+                    // Through `seen` like every other finding — a direct
+                    // push bypassing the one-home dedup re-reports the
+                    // same defect when a DEPENDENT block's compose
+                    // re-encounters this clause.
+                    let d =
                         unresolved_ref(&instances, &block.name.name, &block.keyword.name, &r.name)
                             .with_span(r.span)
-                            .with_source(source_path.to_string()),
-                    );
+                            .with_source(source_path.to_string());
+                    if seen.insert(finding_key(&d)) {
+                        diagnostics.push(d);
+                    }
                     refs_ok = false;
                 }
             }
@@ -2310,23 +2509,39 @@ impl<'a, 'd> Merger<'a, 'd> {
             if !is_write(&c.entry.kind) {
                 continue;
             }
-            let equal = match (&first.entry.kind, &c.entry.kind) {
-                (BodyEntryKind::Property(a), BodyEntryKind::Property(b)) => {
-                    a.value.value.semantic_eq(&b.value.value)
-                }
+            // Equal-value detection spans the scalar SPELLINGS — the
+            // promised deletion fix must not vanish because one side was
+            // modifier-spelled.
+            let scalar_of = |kind: &BodyEntryKind| match kind {
+                BodyEntryKind::Property(p) => Some(p.value.value.clone()),
+                BodyEntryKind::Modifier(m) => match &m.value {
+                    ModifierValue::Inline(sv) => Some(sv.value.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let equal = match (scalar_of(&first.entry.kind), scalar_of(&c.entry.kind)) {
+                (Some(a), Some(b)) => a.semantic_eq(&b),
                 _ => false,
+            };
+            // "A lower layer" reads wrong when both entries sit in ONE
+            // body — name the real relationship.
+            let by = if first.layer == c.layer {
+                "an earlier assignment in this same layer"
+            } else {
+                "a lower layer"
             };
             let mut d = if equal {
                 Diagnostic::error(format!(
-                    "'{path}' is already sealed to this same value by a \
-                     lower layer; restating it would silently decouple if \
-                     the base changes — delete this assignment"
+                    "'{path}' is already sealed to this same value by \
+                     {by}; restating it would silently decouple if the \
+                     base changes — delete this assignment"
                 ))
                 .with_suggestion("", c.entry.span)
             } else {
                 Diagnostic::error(format!(
-                    "assignment to `#sealed` field '{path}' — a lower layer \
-                     already fixed it"
+                    "assignment to `#sealed` field '{path}' — {by} already \
+                     fixed it"
                 ))
             };
             d = d
@@ -2381,17 +2596,19 @@ impl<'a, 'd> Merger<'a, 'd> {
         // whether EVERY contribution is nested let a scalar/modifier
         // spelling (`cfg = "gone"`, invalid for an object field) drop the
         // group into scalar-overlay and discard a sealed nested body.
-        // Route by TARGET instead: gather the nested bodies, deep-merge
-        // them, and let any non-object spelling surface as an ordinary
-        // type error on the resolved body — it can never win the field.
+        // Route by TARGET instead: gather the nested bodies and
+        // deep-merge them. A dropped non-nested spelling is currently
+        // SILENT (the substituted validation view never sees it —
+        // tracked as the scalar-on-object validator gap); it still can
+        // never win the field.
+        let nested: Vec<(InstanceId<'a>, &NestedBlock)> = contributions
+            .iter()
+            .filter_map(|c| match &c.entry.kind {
+                BodyEntryKind::NestedBlock(nb) => Some((c.layer, nb)),
+                _ => None,
+            })
+            .collect();
         if let Some(FieldType::ModelRef(type_name)) = target {
-            let nested: Vec<(InstanceId<'a>, &NestedBlock)> = contributions
-                .iter()
-                .filter_map(|c| match &c.entry.kind {
-                    BodyEntryKind::NestedBlock(nb) => Some((c.layer, nb)),
-                    _ => None,
-                })
-                .collect();
             let is_object =
                 self.index.model(type_name).is_some() || self.index.oneof(type_name).is_some();
             if is_object && !nested.is_empty() {
@@ -2414,6 +2631,54 @@ impl<'a, 'd> Merger<'a, 'd> {
                     }),
                 });
             }
+        }
+        // All-nested groups WITHOUT a resolvable object target — the
+        // structural (no-schema) mode, an undeclared field, a dangling
+        // type name — still deep-merge, name-keyed and model-less:
+        // wholesale replacement here silently discarded every lower
+        // layer's nested data (and the structural mode is a documented,
+        // fixture-pinned capability). Two carve-outs keep this honest:
+        // a RESOLVABLE non-object target keeps plain last-wins — a
+        // scalar-typed field holding nested garbage is invalid either
+        // way (deep-merging just reshapes the garbage), and UNION-typed
+        // fields deliberately take the same path until the union-compose
+        // slice lands RFC 0015's variant rules (including its seal
+        // backstop — last-wins there today is the pre-existing,
+        // spec-acknowledged gap, not something this fallback owns); and
+        // ITEM-BEARING groups follow the bare-list rule below.
+        let unresolvable_target = matches!(target, None | Some(FieldType::ModelRef(_)));
+        if unresolvable_target && !nested.is_empty() && nested.len() == contributions.len() {
+            // The bare-list rule (RFC 0019: an un-granted list "replaces
+            // wholesale") binds structural mode too: deep-merging an
+            // item-bearing group would CONCATENATE the layers' items and
+            // duplicate restated identities — silent artifact corruption.
+            let item_bearing = nested.iter().any(|(_, nb)| {
+                nb.body
+                    .entries
+                    .iter()
+                    .any(|e| matches!(e.kind, BodyEntryKind::ListItem(_)))
+            });
+            if item_bearing {
+                let winner = contributions
+                    .iter()
+                    .rev()
+                    .find(|c| items_of(&c.entry.kind).is_some_and(|v| !v.is_empty()))
+                    .or_else(|| contributions.last())?;
+                self.record(path, winner.layer, winner.entry.span);
+                return Some(winner.entry.clone());
+            }
+            let sub: Vec<(InstanceId<'a>, Body)> =
+                nested.iter().map(|(l, nb)| (*l, nb.body.clone())).collect();
+            let (base_layer, base_nb) = nested[0];
+            let merged = self.merge_model_bodies(path, None, &sub);
+            self.record(path, base_layer, base_nb.name.span);
+            return Some(BodyEntry {
+                span: base_nb.name.span,
+                kind: BodyEntryKind::NestedBlock(NestedBlock {
+                    name: base_nb.name.clone(),
+                    body: merged,
+                }),
+            });
         }
         // Scalar overlay: later wins; a dead delta warns (NML2084).
         let winner = contributions.last()?;
@@ -2486,7 +2751,12 @@ impl<'a, 'd> Merger<'a, 'd> {
                         matches!(&c.entry.kind, BodyEntryKind::Modifier(m)
                             if !matches!(m.value, ModifierValue::TypeAnnotation { .. }))
                     })
-                })?;
+                })
+                // An all-annotation group still composes: the annotation
+                // is the field's authored declaration and must survive
+                // into the composed body — returning None silently
+                // DELETED the entry.
+                .or_else(|| contributions.last())?;
             self.record(path, winner.layer, winner.entry.span);
             return Some(winner.entry.clone());
         }
@@ -2508,7 +2778,14 @@ impl<'a, 'd> Merger<'a, 'd> {
                 _ => items_per_layer.push((c.layer, c.entry.span, &m.name, items)),
             }
         }
-        let (base_layer, base_span, name, _) = items_per_layer.first()?;
+        let Some((base_layer, base_span, name, _)) = items_per_layer.first() else {
+            // No item-bearing contribution at all (e.g. only a
+            // type-annotation form): keep the last entry rather than
+            // silently deleting the field from the composed body.
+            let last = contributions.last()?;
+            self.record(path, last.layer, last.entry.span);
+            return Some(last.entry.clone());
+        };
         let (item_model, item_oneof) = self.item_targets(field);
         let merged = self.merge_items(
             path,
@@ -2888,13 +3165,29 @@ impl<'a, 'd> Merger<'a, 'd> {
                                     (ListItemKind::Reference(_), ListItemKind::Reference(_))
                                     | (ListItemKind::Role(_), ListItemKind::Role(_)) => {}
                                     _ => {
+                                        // Believed unreachable: `same()`
+                                        // matched first, the cross-kind
+                                        // guard above exits with NML2063,
+                                        // and the four same-kind pairs
+                                        // are covered. But this engine
+                                        // processes UNTRUSTED input and
+                                        // ten review rounds have watched
+                                        // "can't happen" invariants break
+                                        // under later edits — so fail
+                                        // SAFE (the cross-kind wording,
+                                        // debug-asserted), never abort.
+                                        debug_assert!(
+                                            false,
+                                            "identity merge saw a \
+                                             cross-kind pair past the \
+                                             same-kind guard"
+                                        );
                                         self.diags.push(
                                             Diagnostic::error(format!(
-                                                "item redefines a bodiless \
-                                                 (reference/role) identity \
-                                                 in '{path}' — those items \
-                                                 are immutable under \
-                                                 `#identity`"
+                                                "item matches an existing \
+                                                 identity in '{path}' \
+                                                 across item kinds — match \
+                                                 the base's spelling"
                                             ))
                                             .with_code(codes::IDENTITY_REDEFINITION)
                                             .with_span(item.span)
@@ -3016,7 +3309,15 @@ impl<'a, 'd> Merger<'a, 'd> {
                             .with_source(layer.source_path.to_string())
                             .with_related(
                                 seal_span,
-                                format!("sealed here (in {})", seal_layer.source_path),
+                                // Name the file only when it differs from
+                                // the diagnostic's own — a same-file
+                                // parenthetical is noise the plain seal
+                                // form doesn't carry.
+                                if seal_layer.source_path == layer.source_path {
+                                    "sealed here".to_string()
+                                } else {
+                                    format!("sealed here (in {})", seal_layer.source_path)
+                                },
                             ),
                     );
                     // Switch rejected: this layer contributes nothing.
@@ -3143,11 +3444,20 @@ fn seal_scan_body<'a>(
         }
     };
     // One name→fields map per scan level (the per-entry vocab scan was
-    // the same quadratic width axis as the merge's field lookup).
+    // the same quadratic width axis as the merge's field lookup). Two
+    // multiplicities, deliberately different: ACROSS vocab models
+    // (candidate arms) every model contributes — the fail-closed union;
+    // WITHIN one model a duplicate field name is FIRST-wins, exactly the
+    // policy the merge resolves — an any-sealed read here made the
+    // backstop refuse switches over a field the merge itself treats as
+    // open, the engine disagreeing with itself about one declaration.
     let mut field_map: HashMap<&str, Vec<&FieldDef>> = HashMap::new();
     for m in vocab {
+        let mut in_model: HashSet<&str> = HashSet::new();
         for f in &m.fields {
-            field_map.entry(f.name.as_str()).or_default().push(f);
+            if in_model.insert(f.name.as_str()) {
+                field_map.entry(f.name.as_str()).or_default().push(f);
+            }
         }
     }
     let lookup =
@@ -4146,9 +4456,24 @@ thing t uses base:
         assert!(resolved.is_none());
         assert!(codes_of(&diags).contains(&codes::LAYER_REF_DENIED));
         assert!(diags[0].message.contains("no allowRefs entry"));
+        // The denial CLAUSE never names the denied target's path; the
+        // recovery tail names the CHECKED file (the author's own — the
+        // contract's `nml binding <file>` pointer), which in this
+        // single-file harness is the same string — so split the tail off
+        // before asserting non-disclosure.
+        let clause = diags[0]
+            .message
+            .split(" — an operator change")
+            .next()
+            .unwrap();
         assert!(
-            !diags[0].message.contains("main.nml"),
-            "allow-miss never names the path"
+            !clause.contains("main.nml"),
+            "allow-miss never names the denied path: {clause}"
+        );
+        assert!(
+            diags[0].message.ends_with("run `nml binding main.nml`"),
+            "recovery pointer names the checked file: {}",
+            diags[0].message
         );
     }
 
@@ -5672,10 +5997,15 @@ thing b uses a:
         // never the denied layer's author-chosen instance name (that
         // would leak through the denial); site-level names the author's
         // own listed token. Deny-veto may name (the allow admitted it).
+        let gref = GrantRef {
+            binding: "tenantFlows",
+            manifest: "site/nml.binding.toml",
+            file: "tenants/cu-x/a.flow.nml",
+        };
         let d = ref_denial(
             RefDecision::AllowMiss,
             "secretName",
-            "tenantFlows",
+            &gref,
             Denial::Stack {
                 entering: Some("vendorBase"),
             },
@@ -5690,7 +6020,20 @@ thing b uses a:
             d.message
                 .contains("'vendorBase' in this clause pulls it in")
         );
-        let d = ref_denial(RefDecision::AllowMiss, "ownRef", "b", Denial::Site).unwrap();
+        // The denial-family contract tail: binding AND manifest named,
+        // operator ownership stated, recovery pointer with the real path.
+        assert!(
+            d.message.contains("(site/nml.binding.toml)"),
+            "manifest named: {}",
+            d.message
+        );
+        assert!(
+            d.message
+                .ends_with("run `nml binding tenants/cu-x/a.flow.nml`"),
+            "recovery pointer last, real path: {}",
+            d.message
+        );
+        let d = ref_denial(RefDecision::AllowMiss, "ownRef", &gref, Denial::Site).unwrap();
         assert!(
             d.message.contains("ownRef"),
             "site names the author's token"
@@ -5698,7 +6041,7 @@ thing b uses a:
         let d = ref_denial(
             RefDecision::DenyVeto(2),
             "x",
-            "b",
+            &gref,
             Denial::Stack { entering: None },
         )
         .unwrap();
@@ -6104,6 +6447,563 @@ oneof po by pk = \"a\":
     \"a\" -> armA
     \"b\" -> armB
 ";
+
+    // ── round-9 review pins ──────────────────────────────────────────────
+
+    #[test]
+    fn schemaless_nested_groups_still_deep_merge() {
+        // Structural (no-schema) composition is a documented,
+        // fixture-pinned capability: all-nested groups with no resolvable
+        // object target — no schema, an undeclared field, a dangling
+        // type — deep-merge name-keyed. The target-routed object path
+        // must not drop them to wholesale replacement (silently
+        // discarding every lower layer's nested data).
+        let src = "\
+box base:
+    cfg:
+        x = \"1\"
+        sub:
+            deep = \"d\"
+
+box t uses base:
+    cfg:
+        y = \"2\"
+";
+        // No schema at all: compose structurally.
+        let (resolved, diags) = compose("", src, "box", "t");
+        assert!(diags.is_empty(), "structural compose is clean: {diags:?}");
+        let body = resolved.unwrap().body;
+        assert_eq!(
+            nested_scalar(&body, "cfg", "x"),
+            Some(&Value::String("1".into())),
+            "the base's nested data survives"
+        );
+        assert_eq!(
+            nested_scalar(&body, "cfg", "y"),
+            Some(&Value::String("2".into())),
+            "the overlay deep-merges in"
+        );
+        let sub_deep = body.entries.iter().find_map(|e| match &e.kind {
+            BodyEntryKind::NestedBlock(nb) if nb.name.name == "cfg" => {
+                nested_scalar(&nb.body, "sub", "deep")
+            }
+            _ => None,
+        });
+        assert_eq!(
+            sub_deep,
+            Some(&Value::String("d".into())),
+            "recursively, not just one level"
+        );
+        // Dangling type name: same contract.
+        let schema = "model box:\n    cfg ghost\n";
+        let (resolved, _) = compose(schema, src, "box", "t");
+        let body = resolved.unwrap().body;
+        assert_eq!(
+            nested_scalar(&body, "cfg", "x"),
+            Some(&Value::String("1".into()))
+        );
+        assert_eq!(
+            nested_scalar(&body, "cfg", "y"),
+            Some(&Value::String("2".into()))
+        );
+    }
+
+    #[test]
+    fn dependent_composes_do_not_rereport_a_clause_finding() {
+        // The declaring-clause NML2059 goes through the one-home dedup
+        // like every other finding — a dependent block's compose
+        // re-encounters the same clause and must not re-report it.
+        let schema = "model thing:\n    v string\n";
+        let src = "\
+thing bad uses missing:
+    v = \"b\"
+
+thing good2 uses bad:
+    v = \"g\"
+";
+        let index = index_from(schema);
+        let file = file_of(src);
+        let out = compose_file(&index, "main.nml", &file, &OpenContext);
+        let n = out
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == Some(codes::UNRESOLVED_LAYER_REF))
+            .count();
+        assert_eq!(n, 1, "one defect, one finding: {:?}", out.diagnostics);
+    }
+
+    #[test]
+    fn unindexed_refs_never_fail_silently() {
+        // `resolve_layers` is the documented embedder entry point: every
+        // failure carries a diagnostic — a bare (None, []) is a vanishing
+        // instance with no explanation.
+        let schema = "model thing:\n    v string\n";
+        let index = index_from(schema);
+        let file = file_of("thing t:\n    v = \"t\"\n");
+        let instances = InstanceIndex::from_file("main.nml", &file);
+        let declaring = instances.resolve_ref("t").unwrap();
+        let ghost = InstanceId {
+            source_path: "main.nml",
+            name: "doesNotExist",
+        };
+        let (resolved, diags) = resolve_layers(
+            &index,
+            &instances,
+            declaring,
+            "thing",
+            &[ghost],
+            &instances.get(declaring).unwrap().body,
+            &OpenContext,
+        );
+        assert!(resolved.is_none());
+        assert!(
+            codes_of(&diags).contains(&codes::UNRESOLVED_LAYER_REF),
+            "the failure explains itself: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn type_annotation_modifiers_survive_composition() {
+        // An all-annotation group is the field's authored declaration —
+        // deleting the entry from the composed body was silent data loss.
+        let src = "\
+box base:
+    |x []string
+    label = \"a\"
+
+box t uses base:
+    label = \"b\"
+";
+        let (resolved, _) = compose("", src, "box", "t");
+        let body = resolved.unwrap().body;
+        assert!(
+            body.entries.iter().any(|e| matches!(&e.kind,
+                BodyEntryKind::Modifier(m) if m.name.name == "x")),
+            "the annotation entry survives: {body:?}"
+        );
+    }
+
+    #[test]
+    fn block_form_empty_modifier_draws_nml2079() {
+        // The one zero-item spelling that escaped: `|deny:` with no items
+        // — "always diagnosed, never silently ignored" admits no spelling
+        // exception.
+        let schema = "\
+model m:
+    |deny []string #append
+";
+        let src = "\
+m base:
+    |deny:
+        - \"a\"
+
+m t uses base:
+    |deny:
+";
+        let (resolved, diags) = compose(schema, src, "m", "t");
+        assert!(
+            codes_of(&diags).contains(&codes::ZERO_ITEM_LAYER_ENTRY),
+            "block-form empty modifier is a warned no-op: {diags:?}"
+        );
+        let body = resolved.unwrap().body;
+        let items = body
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                BodyEntryKind::Modifier(m) if m.name.name == "deny" => match &m.value {
+                    ModifierValue::Block(items) => Some(items.len()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap_or(0);
+        assert_eq!(items, 1, "and the base's items survive: {body:?}");
+    }
+
+    #[test]
+    fn equal_value_seal_detection_spans_spellings() {
+        let schema = "\
+model m:
+    a string #sealed
+";
+        let src = "\
+m base:
+    a = \"x\"
+
+m t uses base:
+    |a = \"x\"
+";
+        let (_, diags) = compose(schema, src, "m", "t");
+        let d = diags
+            .iter()
+            .find(|d| d.code == Some(codes::SEALED_FIELD_VIOLATION))
+            .expect("seal fires");
+        assert!(
+            d.message.contains("delete this assignment"),
+            "the equal-value form (and its machine fix) survives the \
+             modifier spelling: {}",
+            d.message
+        );
+        assert!(!d.suggestions.is_empty());
+    }
+
+    #[test]
+    fn same_layer_sealed_duplicates_read_correctly() {
+        let schema = "\
+model m:
+    a string #sealed
+";
+        let src = "\
+m base:
+    v0 = \"x\"
+
+m t uses base:
+    a = \"x\"
+    a = \"y\"
+";
+        let (_, diags) = compose(schema, src, "m", "t");
+        let d = diags
+            .iter()
+            .find(|d| d.code == Some(codes::SEALED_FIELD_VIOLATION))
+            .expect("seal fires");
+        assert!(
+            d.message.contains("in this same layer"),
+            "same-body duplicates name the real relationship: {}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn schemaless_item_bearing_groups_replace_wholesale() {
+        // The bare-list rule binds structural mode: deep-merging an
+        // item-bearing nested group concatenates layers' items and
+        // duplicates restated identities (base a,b + overlay a → a,b,a).
+        let src = "\
+box base:
+    steps:
+        - \"a\"
+        - \"b\"
+
+box t uses base:
+    steps:
+        - \"a\"
+";
+        let (resolved, _) = compose("", src, "box", "t");
+        let body = resolved.unwrap().body;
+        assert_eq!(
+            list_names(&body, "steps").len(),
+            1,
+            "the supplying overlay replaces wholesale — no concatenation, \
+             no duplicated identity: {body:?}"
+        );
+        // Named restatement: the overlay's item wins alone, never both.
+        let src2 = "\
+box base:
+    steps:
+        - s1:
+            v = \"1\"
+
+box t uses base:
+    steps:
+        - s1:
+            v = \"2\"
+";
+        let (resolved, _) = compose("", src2, "box", "t");
+        let body = resolved.unwrap().body;
+        assert_eq!(list_names(&body, "steps"), vec!["s1"]);
+    }
+
+    #[test]
+    fn nml2077_names_a_rotation_across_three_clauses() {
+        // Neither a transitive-base pair nor an opposed shared pair — the
+        // orders rotate. The fallback used to assert exactly the two
+        // causes that were just ruled out; now it names the cycle.
+        let schema = "model thing:\n    v string\n";
+        let src = "\
+thing p:
+    v = \"p\"
+
+thing q:
+    v = \"q\"
+
+thing r:
+    v = \"r\"
+
+thing a uses q, p:
+    v = \"a\"
+
+thing b uses r, q:
+    v = \"b\"
+
+thing c uses p, r:
+    v = \"c\"
+
+thing top uses a, b, c:
+    v = \"t\"
+";
+        let (_, diags) = compose(schema, src, "thing", "top");
+        let d = diags
+            .iter()
+            .find(|d| d.code == Some(codes::INCONSISTENT_LINEARIZATION))
+            .expect("NML2077 fires");
+        assert!(
+            d.message.contains("orders rotate"),
+            "the rotation shape is named, not the ruled-out patterns: {}",
+            d.message
+        );
+        assert!(
+            d.message.contains("above"),
+            "renders the cycle's pairwise steps: {}",
+            d.message
+        );
+    }
+
+    #[test]
+    fn duplicate_field_names_are_coherent_everywhere() {
+        // ONE policy governs a duplicate field name — the FIRST
+        // declaration's — in the merge AND the backstop scan. Previously
+        // the scan read any-sealed: the engine refused switches to
+        // protect a seal it did not itself enforce.
+        let schema = "\
+model ara:
+    kind string
+    v string
+    v string #sealed
+
+model arb:
+    kind string
+    other string
+
+oneof cf by kind = \"a\":
+    \"a\" -> ara
+    \"b\" -> arb
+
+model box3:
+    cfg cf
+";
+        // Open-first duplicate: restating v composes (first-wins, open)…
+        let src = "\
+box3 base:
+    cfg:
+        v = \"x\"
+
+box3 t uses base:
+    cfg:
+        kind = \"b\"
+        other = \"y\"
+";
+        let (resolved, diags) = compose(schema, src, "box3", "t");
+        assert!(
+            !codes_of(&diags).contains(&codes::SEALED_FIELD_VIOLATION),
+            "…so the switch over it must be legal too: {diags:?}"
+        );
+        assert_eq!(
+            nested_scalar(&resolved.unwrap().body, "cfg", "kind"),
+            Some(&Value::String("b".into()))
+        );
+        // Sealed-first duplicate: both sides enforce.
+        let schema_sealed_first = schema.replace(
+            "    v string\n    v string #sealed",
+            "    v string #sealed\n    v string",
+        );
+        let (_, diags) = compose(&schema_sealed_first, src, "box3", "t");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(codes::SEALED_FIELD_VIOLATION)
+                    && d.message.contains("cannot launder")),
+            "sealed-first governs in the backstop too: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn rejected_parent_switch_keeps_nested_plans_aligned() {
+        // A REJECTED parent switch (not just an accepted one) must leave
+        // nested positions planned over the true surviving membership.
+        let src = "\
+po base:
+    pk = \"b\"
+    sub:
+        sk = \"sx\"
+        v = \"one\"
+
+po mid uses base:
+    pk = \"a\"
+    note = \"n\"
+
+po top uses mid:
+    sub:
+        sk = \"sx\"
+        v = \"two\"
+";
+        // mid's switch a→ (from b) discards base's sub carrying the
+        // sealed v — rejected. Survivors: base, top (mid contributes
+        // nothing). top's restatement of v must then hit base's seal.
+        let (_, diags) = compose(NESTED_UNDER_PARENT_SCHEMA, src, "po", "top");
+        let seals: Vec<_> = diags
+            .iter()
+            .filter(|d| d.code == Some(codes::SEALED_FIELD_VIOLATION))
+            .collect();
+        assert!(
+            seals.iter().any(|d| d.message.contains("cannot launder")),
+            "mid's switch is rejected: {diags:?}"
+        );
+        assert!(
+            seals
+                .iter()
+                .any(|d| d.message.contains("sub.v") && !d.message.contains("launder")),
+            "top's restatement hits base's seal through the surviving \
+             group: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn token_prehash_covers_every_scalar_kind() {
+        use crate::duration::Duration;
+        let h = |v: Value| token_prehash(&ItemKey::Scalar(v));
+        // Durations: semantic equals collide, distinct scatter.
+        let d = |s: &str| Value::Duration(Duration::parse_text(s).unwrap());
+        assert_eq!(h(d("90m")), h(d("1h30m")), "equal durations share a bucket");
+        assert_ne!(h(d("90m")), h(d("91m")), "distinct durations scatter");
+        // Bools.
+        assert_ne!(h(Value::Bool(true)), h(Value::Bool(false)));
+        // Money: (amount, currency) is the identity.
+        let m = |amount, cur: &str| {
+            Value::Money(crate::money::Money {
+                amount,
+                currency: cur.into(),
+                exponent: 2,
+            })
+        };
+        assert_eq!(h(m(150, "USD")), h(m(150, "USD")));
+        assert_ne!(h(m(150, "USD")), h(m(151, "USD")));
+        assert_ne!(h(m(150, "USD")), h(m(150, "EUR")));
+    }
+
+    #[test]
+    fn strip_resolves_the_stated_arm_for_oneof_items() {
+        // The + token strip must follow the item's STATED (non-default)
+        // arm — resolving only the default arm would miss the token and
+        // draw a spurious dead-delta.
+        let schema = "\
+model spArm:
+    ikind string
+    note string
+
+model ptArm:
+    name string+
+    ikind string
+    note string
+
+oneof istep by ikind = \"sp\":
+    \"sp\" -> spArm
+    \"pt\" -> ptArm
+
+model flow:
+    steps []istep #identity
+";
+        let src = "\
+flow base:
+    steps:
+        - \"s1\":
+            ikind = \"pt\"
+            note = \"a\"
+
+flow t uses base:
+    steps:
+        - \"s1\":
+            ikind = \"pt\"
+            note = \"b\"
+";
+        let (_, diags) = compose(schema, src, "flow", "t");
+        assert!(
+            !codes_of(&diags).contains(&codes::DEAD_DELTA),
+            "the stated arm's + token is pairing machinery: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_spelling_sibling_pools_group_item_seals() {
+        // Base block-spelled, overlay modifier-spelled — one field, one
+        // identity pool: the backstop must still see the sealed item
+        // write across the spellings.
+        let src = "\
+box base:
+    cfg:
+        steps:
+            - s1:
+                act = \"x\"
+
+box t uses base:
+    cfg:
+        skind = \"b\"
+        other = \"y\"
+";
+        let (_, diags) = compose(MODIFIER_ITEM_SEAL_SCHEMA, src, "box", "t");
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == Some(codes::SEALED_FIELD_VIOLATION)
+                    && d.message.contains("cannot launder")),
+            "block-spelled item seal blocks the switch: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn misaligned_plan_traces_fall_back_to_a_local_refold() {
+        // Defensive rail: a planned trace that does not align
+        // entry-for-entry with the merge's contributions (impossible
+        // today by construction; possible if normalization ever changes
+        // entry counts) must be DISCARDED in favor of recomputing — a
+        // misapplied stale decision is a silent wrong arm.
+        let schema = "\
+model ga:
+    kind string
+    path string
+
+model gb:
+    kind string
+    url string
+
+oneof gcf by kind = \"a\":
+    \"a\" -> ga
+    \"b\" -> gb
+";
+        let index = index_from(schema);
+        let file = file_of(
+            "gcf base:\n    path = \"p\"\n\ngcf t uses base:\n    kind = \"b\"\n    url = \"u\"\n",
+        );
+        let instances = InstanceIndex::from_file("main.nml", &file);
+        let base = instances.resolve_ref("base").unwrap();
+        let t = instances.resolve_ref("t").unwrap();
+        let layers: Vec<(InstanceId, Body)> = vec![
+            (base, instances.get(base).unwrap().body.clone()),
+            (t, instances.get(t).unwrap().body.clone()),
+        ];
+        // A plan whose root trace has the WRONG length (one bogus entry).
+        let mut bogus = ArmPlan::default();
+        bogus
+            .decisions
+            .insert(String::new(), vec![(base, ArmDecision::Join)]);
+        let mut diags = Vec::new();
+        let mut merger = Merger {
+            index: &index,
+            diags: &mut diags,
+            origins: Vec::new(),
+            plan: &bogus,
+        };
+        let oneof = index.oneof("gcf").unwrap().clone();
+        let merged = merger.merge_oneof_bodies("", &oneof, &layers);
+        let kind = merged.entries.iter().find_map(|e| match &e.kind {
+            BodyEntryKind::Property(p) if p.name.name == "kind" => Some(&p.value.value),
+            _ => None,
+        });
+        assert_eq!(
+            kind,
+            Some(&Value::String("b".into())),
+            "the local refold applies the real switch, not the bogus Join"
+        );
+    }
 
     #[test]
     fn numeric_keyed_items_scatter_across_buckets() {

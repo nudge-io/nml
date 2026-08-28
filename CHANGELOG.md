@@ -46,10 +46,24 @@
   bucket by canonical value, not by type); the editor caps its
   per-keystroke diagnostic stream with a summary row. Object-typed
   fields always deep-merge their nested contributions, so no scalar or
-  modifier spelling can discard a sealed nested body; the plan keys
-  each path by the same first-wins field the merge resolves; and the
-  seal backstop judges a write through the one shared predicate across
-  every spelling.
+  modifier spelling can discard a sealed nested body (schema-less and
+  dangling-target nested groups still deep-merge structurally); the
+  plan keys each path by the same first-wins field the merge resolves;
+  and the seal backstop judges a write through the one shared predicate
+  across every spelling — one coherent first-wins policy per duplicate
+  field name everywhere. Diagnostics honor the denial family's full
+  recovery contract (binding + manifest + `nml binding <file>` with the
+  real path), NML2077 names order ROTATIONS across three or more
+  clauses, NML2061 teaches its fix inline, the discovery-depth NML2066
+  reports once with a real span, and the editor composes schema-less
+  buffers structurally and carries the schema-load lints for mixed
+  buffers. Header clauses never continue across newlines (a trailing
+  comma errors and consumes nothing — the next declaration survives);
+  `.shared` distributes into modifier-spelled item bodies like every
+  other spelling; type-annotation modifiers survive composition; the
+  block-form empty modifier draws NML2079 like its sibling spellings;
+  clause findings dedup across dependent composes; and every
+  `resolve_layers` failure carries a diagnostic.
 
 ### Changed
 

@@ -540,7 +540,10 @@ impl<'a> Parser<'a> {
         let m = self.start();
         self.bump(); // is
         self.expect_parent_name();
-        while self.eat(SyntaxKind::Comma) {
+        // Same-line discipline: a header clause never continues onto the
+        // next line (see `uses_clause`).
+        while self.at(SyntaxKind::Comma) && !self.newline_before() {
+            self.bump();
             self.expect_parent_name();
         }
         m.complete(self, SyntaxKind::Extends);
@@ -554,7 +557,14 @@ impl<'a> Parser<'a> {
         let m = self.start();
         self.bump(); // uses
         self.expect_layer_ref();
-        while self.eat(SyntaxKind::Comma) {
+        // Same-line discipline: a header clause never continues onto the
+        // next line. A trailing comma (or a dangling `uses`) must error
+        // and consume NOTHING — continuing across the newline swallowed
+        // the NEXT declaration's tokens as refs, silently in the
+        // `uses X,\nY:` shape (zero diagnostics, Y consumed as a ref,
+        // its body attached to the wrong block).
+        while self.at(SyntaxKind::Comma) && !self.newline_before() {
+            self.bump();
             self.expect_layer_ref();
         }
         m.complete(self, SyntaxKind::Uses);
@@ -577,7 +587,14 @@ impl<'a> Parser<'a> {
             self.expected(vec![crate::error::ExpectedItem::Desc(desc)], Some(ctx));
             return; // leave `as` for the annotation rejection
         }
-        self.expect_desc(SyntaxKind::Ident, desc);
+        // Same-line rule, same as every other header decision: an ident on
+        // the NEXT line is the next entry, never this clause's ref —
+        // error and consume nothing so it survives recovery.
+        if self.at(SyntaxKind::Ident) && !self.newline_before() {
+            self.bump();
+        } else {
+            self.expected(vec![crate::error::ExpectedItem::Desc(desc)], Some(ctx));
+        }
     }
 
     /// A parent name in an `is` clause — but NEVER the contextual keyword `as`:
