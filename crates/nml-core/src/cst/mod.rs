@@ -2018,6 +2018,69 @@ service App is Base:
         );
     }
 
+    fn block_of(src: &str) -> crate::ast::BlockDecl {
+        let (file, diags) = parse_to_ast_all(src);
+        assert!(
+            diags.is_empty(),
+            "unexpected diagnostics for {src:?}: {diags:?}"
+        );
+        match &file.declarations[0].kind {
+            crate::ast::DeclarationKind::Block(b) => b.clone(),
+            other => panic!("expected block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uses_clause_lowers_in_authored_order() {
+        let b = block_of("flow F uses alpha, beta:\n    a = 1\n");
+        let refs: Vec<&str> = b.uses.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(refs, ["alpha", "beta"]);
+        assert!(b.extends.is_empty());
+    }
+
+    #[test]
+    fn uses_clause_with_is_keeps_both() {
+        let b = block_of("flow F is T uses base:\n    a = 1\n");
+        assert_eq!(b.extends.len(), 1);
+        assert_eq!(b.uses.len(), 1);
+        assert_eq!(b.uses[0].name, "base");
+    }
+
+    #[test]
+    fn uses_ref_named_as_is_rejected_loudly() {
+        // `flow F uses as base:` — `as` is never a layer ref; the annotation
+        // rejection claims it and the parse errors instead of misbinding.
+        let p = parse("flow F uses as base:\n    a = 1\n");
+        assert!(
+            !p.errors().is_empty(),
+            "expected a parse error for `uses as`"
+        );
+    }
+
+    #[test]
+    fn bodyless_uses_declaration_parses_clean() {
+        let b = block_of("flow F uses base\n");
+        assert_eq!(b.uses[0].name, "base");
+        assert!(b.body.entries.is_empty());
+    }
+
+    #[test]
+    fn repeated_or_misordered_header_clauses_error_loudly() {
+        // Regression class: any stray header clause used to fall through
+        // the missing-colon leniency into a SILENT declaration split (the
+        // body landing on a bogus block) — which `nml fmt` then wrote to
+        // disk. The clause loop makes every shape loud.
+        for src in [
+            "flow F uses base is T:\n    x = 1\n", // is after uses
+            "flow F uses a uses b:\n    x = 1\n",  // repeated uses
+            "flow F is A is B:\n    x = 1\n",      // repeated is
+            "[]x ys uses base:\n    - one\n",      // clause on array decl
+        ] {
+            let p = parse(src);
+            assert!(!p.errors().is_empty(), "must error loudly: {src:?}");
+        }
+    }
+
     #[test]
     fn valid_edge_cases_parse_clean() {
         let corpus = [
@@ -2030,6 +2093,11 @@ service App is Base:
             "service App:\n    items = [1, 2, 3,]\n",    // trailing comma in array
             "const C = a | b | c\n",                     // const with fallback chain
             "[]x ys:\n    .shared = 1\n    - One:\n        a = 1\n", // array decl: shared + named item
+            "flow F uses base:\n    a = 1\n",                        // RFC 0019 uses clause
+            "flow F uses a, b, c:\n    x = 1\n",                     // multi-ref uses
+            "flow F uses base\n", // pure stack assembly (no colon)
+            "flow F is T uses base:\n    a = 1\n", // is + uses, canonical order
+            "model M:\n    uses string\n", // `uses` stays a legal field name
         ];
         for src in corpus {
             parse_ok(src);

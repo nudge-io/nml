@@ -72,6 +72,7 @@ pub mod diff;
 pub mod duration;
 pub mod error;
 pub mod identity;
+pub mod layers;
 pub mod model;
 pub mod money;
 pub mod project;

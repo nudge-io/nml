@@ -740,3 +740,339 @@ fn test_strict_with_nothing_to_enforce_is_a_usage_error() {
     );
     assert!(combined.contains("nothing to enforce"), "{combined}");
 }
+
+// ── RFC 0019: layer composition through `nml check` ─────────────────────
+
+fn check_fixture(file: &str) -> std::process::Output {
+    nml_bin()
+        .args(["check", file])
+        .output()
+        .expect("failed to run nml")
+}
+
+#[test]
+fn layers_summary_example_checks_clean() {
+    let out = check_fixture("tests/fixtures/layers/summary.nml");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn layers_pure_stack_assembly_checks_clean() {
+    let out = check_fixture("tests/fixtures/layers/pure-stack-assembly.nml");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn layers_sealed_violation_is_nml2060_with_related_note() {
+    let out = check_fixture("tests/fixtures/layers/sealed-violation.nml");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NML2060"), "{stderr}");
+    assert!(stderr.contains("sealed here"), "{stderr}");
+    assert!(stderr.contains("nml explain NML2060"), "{stderr}");
+}
+
+#[test]
+fn layers_linearization_contradiction_is_nml2077() {
+    let out = check_fixture("tests/fixtures/layers/linearization-contradiction.nml");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NML2077"), "{stderr}");
+    // The teaching shape: the contradicting pair is NAMED, with the fix.
+    assert!(
+        stderr.contains("'base' is already a transitive base of 'mid'"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("list it before"), "{stderr}");
+}
+
+#[test]
+fn layers_unmatched_item_is_nml2067_with_hint() {
+    let out = check_fixture("tests/fixtures/layers/unmatched-item.nml");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NML2067"), "{stderr}");
+    assert!(stderr.contains("submitSearch"), "did-you-mean: {stderr}");
+}
+
+#[test]
+fn layers_structural_errors_fire_without_schema() {
+    let out = check_fixture("tests/fixtures/layers/no-schema-structural.nml");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NML2059"), "{stderr}");
+}
+
+#[test]
+fn layers_is_after_uses_is_a_loud_parse_error() {
+    // Regression: `flow F uses base is T:` used to silently split into a
+    // bodyless declaration plus a bogus `is T:` block that swallowed the
+    // body — and `nml fmt` then canonicalized the corruption.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("is-after-uses.nml");
+    std::fs::write(&f, "flow F uses base is T:\n    entrypoint = \"x\"\n").unwrap();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    assert!(!out.status.success(), "must not parse clean");
+}
+
+#[test]
+fn validate_and_check_agree_on_merge_policy_errors() {
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("bad-policy.nml");
+    std::fs::write(&f, "model m:\n    xs []string #identity\n").unwrap();
+    for verb in ["validate", "check"] {
+        let out = nml_bin()
+            .args([verb, f.to_str().unwrap()])
+            .output()
+            .expect("failed to run nml");
+        assert!(!out.status.success(), "{verb} must reject NML2068");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("NML2068"), "{verb}: {stderr}");
+    }
+}
+
+#[test]
+fn validate_and_check_agree_on_unresolved_uses_refs() {
+    // `validate` does not compose, but its "unresolved references"
+    // contract covers the header clause — same NML2059, same wording.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("unresolved-uses.nml");
+    std::fs::write(&f, "flow t uses missingLayer:\n    entrypoint = \"x\"\n").unwrap();
+    for verb in ["validate", "check"] {
+        let out = nml_bin()
+            .args([verb, f.to_str().unwrap()])
+            .output()
+            .expect("failed to run nml");
+        assert!(!out.status.success(), "{verb} must reject the dangling ref");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("NML2059"), "{verb}: {stderr}");
+        assert!(stderr.contains("does not resolve"), "{verb}: {stderr}");
+    }
+}
+
+#[test]
+fn wide_uses_clause_is_rejected_quickly() {
+    // Security: the 16-layer cap must reject BEFORE the C3 merge — a
+    // multi-thousand-ref clause used to buy minutes of cubic CPU from
+    // kilobytes of input before the post-merge depth check saw it.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("wide-clause.nml");
+    let mut src = String::from(
+        "model thing:\n    v string\n\nthing a:\n    v = \"a\"\n\nthing b:\n    v = \"b\"\n\n",
+    );
+    for i in 0..1500 {
+        src.push_str(&format!("thing base{i} uses a, b:\n    v = \"x\"\n\n"));
+    }
+    src.push_str("thing top uses ");
+    src.push_str(
+        &(0..1500)
+            .map(|i| format!("base{i}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    src.push_str(":\n    v = \"t\"\n");
+    std::fs::write(&f, src).unwrap();
+    let start = std::time::Instant::now();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let elapsed = start.elapsed();
+    assert!(!out.status.success(), "over-cap stack must be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NML2066"), "{stderr}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "rejection is pre-merge and near-linear, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn validate_flags_uses_on_schema_definitions() {
+    // NML2062's schema-definition form is definition-intrinsic, so
+    // `validate` owns it with `check`'s exact wording.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("schema-def-uses.nml");
+    std::fs::write(&f, "model m uses other:\n    x string\n").unwrap();
+    for verb in ["validate", "check"] {
+        let out = nml_bin()
+            .args([verb, f.to_str().unwrap()])
+            .output()
+            .expect("failed to run nml");
+        assert!(!out.status.success(), "{verb} must reject the clause");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("NML2062"), "{verb}: {stderr}");
+        assert!(stderr.contains("delete the clause"), "{verb}: {stderr}");
+    }
+}
+
+#[test]
+fn fix_applies_the_sealed_equal_value_deletion() {
+    // The fixer composes (RFC 0019): the equal-value NML2060's deletion
+    // suggestion is advertised as `nml fix`-eligible, and without
+    // composing the diagnostic never exists in the fixer's world.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("fix-sealed-restatement.nml");
+    let src = "model flow:\n    entrypoint string #sealed\n\nflow base:\n    entrypoint = \"search\"\n\nflow t uses base:\n    entrypoint = \"search\"\n";
+    std::fs::write(&f, src).unwrap();
+    let out = nml_bin()
+        .args(["fix", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let fixed = std::fs::read_to_string(&f).unwrap();
+    assert!(
+        !fixed.contains("flow t uses base:\n    entrypoint"),
+        "the restated assignment is deleted\nstdout: {stdout}\nstderr: {stderr}\nfile:\n{fixed}"
+    );
+    // And the fixed file now checks clean.
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    assert!(
+        out.status.success(),
+        "post-fix file is clean: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn wide_model_compose_is_not_quadratic() {
+    // Security: per-entry linear scans of wide models made compose
+    // O(width²) across layers — tens of seconds from a sub-megabyte
+    // hostile file. Field lookups are mapped now; a wide fully-populated
+    // stack must compose fast.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("wide-model.nml");
+    let width = 250;
+    let mut src = String::from("model wide:\n");
+    for i in 0..width {
+        src.push_str(&format!("    f{i} string\n"));
+    }
+    src.push_str("\nwide base:\n");
+    for i in 0..width {
+        src.push_str(&format!("    f{i} = \"b\"\n"));
+    }
+    let mut prev = "base".to_string();
+    for l in 0..15 {
+        src.push_str(&format!("\nwide l{l} uses {prev}:\n"));
+        for i in 0..width {
+            src.push_str(&format!("    f{i} = \"v{l}\"\n"));
+        }
+        prev = format!("l{l}");
+    }
+    std::fs::write(&f, src).unwrap();
+    let start = std::time::Instant::now();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let elapsed = start.elapsed();
+    assert!(
+        out.status.success(),
+        "wide stack composes clean: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "compose is near-linear in width, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn large_identity_lists_compose_fast() {
+    // Security: per-item linear scans over the resolved list and the
+    // sibling item pool were O(items²) — seconds of CPU from sub-megabyte
+    // hostile lists. Both lookups are bucketed now.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("large-list.nml");
+    let n = 8000;
+    let mut src = String::from(
+        "model item:\n    name string+\n    v string\n\nmodel flow:\n    items []item #identity\n\nflow base:\n    items:\n",
+    );
+    for i in 0..n {
+        src.push_str(&format!("        - n{i}:\n            v = \"x\"\n"));
+    }
+    src.push_str("\nflow t uses base:\n    items:\n");
+    for i in 0..n {
+        src.push_str(&format!("        - n{i}:\n            v = \"y\"\n"));
+    }
+    std::fs::write(&f, src).unwrap();
+    let start = std::time::Instant::now();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let elapsed = start.elapsed();
+    assert!(
+        out.status.success(),
+        "large identity stack composes clean: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "item merge and seal scan are near-linear, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn base_defect_reports_once_across_overlays() {
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("dedup.nml");
+    std::fs::write(
+        &f,
+        "model m:\n    label string\n\nm base:\n    label = \"x\"\n    typo = 1\n\nm o1 uses base:\n    label = \"y\"\n\nm o2 uses base:\n    label = \"z\"\n",
+    )
+    .unwrap();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let count = stderr.matches("unknown property 'typo'").count();
+    assert_eq!(count, 1, "one home per finding: {stderr}");
+}
+
+#[test]
+fn failed_compose_does_not_cascade_schema_errors() {
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("cycle-cascade.nml");
+    std::fs::write(
+        &f,
+        "model m:\n    region string\n    label string\n\nm a uses b:\n    label = \"a\"\n\nm b uses a:\n    label = \"b\"\n",
+    )
+    .unwrap();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NML2061"), "{stderr}");
+    assert!(
+        !stderr.contains("NML2007"),
+        "no missing-required cascade on engine refusal: {stderr}"
+    );
+}

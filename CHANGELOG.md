@@ -2,6 +2,55 @@
 
 ## [0.1.0] - Unreleased
 
+### Added
+
+- **RFC 0019: instance layer composition (`uses`) and sealed fields** —
+  slice 1 (the language kernel). An instance block may declare
+  `uses <ref>, …` in its header; the stack linearizes by C3 (in NML's
+  reversed orientation — an inconsistent order is NML2077, never a
+  heuristic) and composes bottom-up under schema-declared merge
+  policies: `#sealed` (write-once from the bottom, equal-value
+  restatement included, with the oneof arm-switch seal backstop —
+  union `as` and arm-set forms arrive with the union-compose slice),
+  `#identity` (merge list items by the four-kind identity pair),
+  `#append` (additions only), and the sanctioned `#identity #append`
+  pair. `nml check` composes same-file stacks before validation
+  (default on; overlays validate their *resolved* body) under the open
+  developer context; binding-governed layer grants land with the shared
+  resolver core. Schema load now validates policy declarations
+  (NML2068) and warns on seals that cannot engage (NML2076, three
+  shapes). New diagnostics NML2059–NML2068, NML2076–NML2077, NML2079,
+  NML2084, each with an `nml explain` entry; `nml fmt` emits the new
+  clause with round-trip coverage. `nml validate` covers `uses` clause
+  refs under its unresolved-references contract (same NML2059 wording
+  as `check`); compose-blind deserialization of a `uses`-bearing block
+  fails closed (the raw body is not the effective config; the
+  document-level entry included); and the 16-instance stack cap rejects
+  over-wide clauses *before* the linearization merge, in linear time.
+  One field is one field across its spellings: a modifier-declared
+  field's property/block spellings merge (and seal) together with it.
+  `nml fix` composes, so compose-side machine fixes (the equal-value
+  NML2060 deletion, NML2077's remove-the-ref) actually apply; `nml
+  validate` also owns NML2062's schema-definition form. The editor
+  composes too: LSP diagnostics validate the RESOLVED body, so overlays
+  show `check`'s findings, not phantom missing-required errors. Arm
+  decisions have ONE authority — the pre-pass fold (seal backstop
+  included, judged over displaced-arm-normalized bodies) records a
+  per-layer trace the merge replays positionally, nested positions
+  planned over the surviving parent group — and oneof-typed list
+  elements merge arm-aware (seal enforcement inside identity items,
+  through the modifier spelling too, with `+` tokens materializing
+  through the item's arm). Item identity scopes pair by full identity
+  (kind + token). Field and item lookups are mapped/bucketed, keeping
+  compose near-linear in body width and list length (numeric item keys
+  bucket by canonical value, not by type); the editor caps its
+  per-keystroke diagnostic stream with a summary row. Object-typed
+  fields always deep-merge their nested contributions, so no scalar or
+  modifier spelling can discard a sealed nested body; the plan keys
+  each path by the same first-wins field the merge resolves; and the
+  seal backstop judges a write through the one shared predicate across
+  every spelling.
+
 ### Changed
 
 - **Quoted-literal migration teaching extended (NML0001)** — quoted

@@ -408,14 +408,52 @@ pub fn synthesize_config_root(root_name: &str, fields: &[ConfigRootField]) -> Mo
 /// via `apply_array_shared_properties`) so the differ sees real values (RFC
 /// 0032 P3 contract). `$ENV` is left UNresolved — secret values never transit
 /// the diff (`Value::Secret` compares by variable name).
+/// The synthetic key carrying a block's `uses` refs in the diffable view
+/// (RFC 0019). A NON-identifier spelling the parser can never produce, so
+/// a real field named `uses` cannot collide; consumers that enumerate
+/// diff paths recognize base-layer swaps by this constant.
+pub const USES_DIFF_KEY: &str = "(uses)";
+
 pub fn wrap_file_as_body(file: &File) -> Body {
     let mut entries = Vec::new();
     for decl in &file.declarations {
         let (name, body) = match &decl.kind {
-            DeclarationKind::Block(b) => (
-                b.keyword.clone(),
-                crate::resolve::apply_shared_properties(&b.body),
-            ),
+            DeclarationKind::Block(b) => {
+                let mut body = crate::resolve::apply_shared_properties(&b.body);
+                // RFC 0019: the `uses` clause is part of the block's
+                // effective configuration — swapping a base layer swaps
+                // every inherited value, so the reload differ must see it.
+                // Keyed by a NON-identifier name (`(uses)`) the parser can
+                // never produce, so a real field named `uses` cannot
+                // collide.
+                if !b.uses.is_empty() {
+                    let refs = b
+                        .uses
+                        .iter()
+                        .map(|r| crate::types::SpannedValue {
+                            value: crate::types::Value::Reference(r.name.clone()),
+                            span: r.span,
+                        })
+                        .collect();
+                    body.entries.insert(
+                        0,
+                        BodyEntry {
+                            span: decl.span,
+                            kind: BodyEntryKind::Property(crate::ast::Property {
+                                name: crate::ast::Identifier {
+                                    name: USES_DIFF_KEY.to_string(),
+                                    span: decl.span,
+                                },
+                                value: crate::types::SpannedValue {
+                                    value: crate::types::Value::Array(refs),
+                                    span: decl.span,
+                                },
+                            }),
+                        },
+                    );
+                }
+                (b.keyword.clone(), body)
+            }
             DeclarationKind::Array(a) => {
                 // The synth root models an array as `List(item)`, so its
                 // diffable content is its ELEMENTS (shared properties merged in).
@@ -2241,6 +2279,34 @@ fn push(path: &FieldPath, kind: ChangeKind, origin: Origin, out: &mut Vec<FieldC
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn uses_clause_change_is_visible_to_the_differ() {
+        // RFC 0019: swapping a base layer must never classify as a no-op —
+        // it swaps every inherited value.
+        let parse = |src: &str| crate::cst::parse_to_ast(src).unwrap();
+        let v1 = parse("flow tenant uses prodBase:\n    label = \"x\"\n");
+        let v2 = parse("flow tenant uses devBase:\n    label = \"x\"\n");
+        let same = parse("flow tenant uses prodBase:\n    label = \"x\"\n");
+        let b1 = wrap_file_as_body(&v1);
+        let b2 = wrap_file_as_body(&v2);
+        let b3 = wrap_file_as_body(&same);
+        assert_ne!(
+            serde_json::to_string(&b1).unwrap(),
+            serde_json::to_string(&b2).unwrap(),
+            "base swap must change the diffable body"
+        );
+        assert_eq!(
+            serde_json::to_string(&b1).unwrap(),
+            serde_json::to_string(&b3).unwrap(),
+            "identical uses must not change it"
+        );
+        // A real field named `uses` cannot collide with the synthetic key.
+        let with_field = parse("flow t:\n    uses = \"a\"\n");
+        let wf = wrap_file_as_body(&with_field);
+        assert!(!serde_json::to_string(&wf).unwrap().contains(USES_DIFF_KEY));
+    }
+
     use super::*;
     use crate::ast::DeclarationKind;
 

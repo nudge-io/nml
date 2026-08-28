@@ -145,8 +145,17 @@ impl<'a> Formatter<'a> {
                         self.out.push_str(&parent.name);
                     }
                 }
+                if !block.uses.is_empty() {
+                    self.out.push_str(" uses ");
+                    for (i, layer_ref) in block.uses.iter().enumerate() {
+                        if i > 0 {
+                            self.out.push_str(", ");
+                        }
+                        self.out.push_str(&layer_ref.name);
+                    }
+                }
                 let body_empty = block.body.entries.is_empty();
-                if body_empty && !block.extends.is_empty() {
+                if body_empty && (!block.extends.is_empty() || !block.uses.is_empty()) {
                     self.emit_trailing_comment(decl.span.start);
                     self.out.push('\n');
                 } else {
@@ -1233,6 +1242,40 @@ mod tests {
     #[test]
     fn roundtrip_simple_block() {
         roundtrip("service App:\n    port = 8080\n    host = \"localhost\"\n");
+    }
+
+    #[test]
+    fn roundtrip_uses_clause() {
+        roundtrip("flow F uses base:\n    a = 1\n");
+    }
+
+    #[test]
+    fn roundtrip_uses_multi_ref() {
+        roundtrip("flow F uses alpha, beta, gamma:\n    a = 1\n");
+    }
+
+    #[test]
+    fn roundtrip_uses_bodyless_no_colon() {
+        // Pure stack assembly formats without a colon, mirroring `is`.
+        let file = parse("flow F uses base\n").unwrap();
+        assert_eq!(format(&file), "flow F uses base\n");
+        roundtrip("flow F uses base\n");
+    }
+
+    #[test]
+    fn roundtrip_is_and_uses() {
+        roundtrip("flow F is T uses base:\n    a = 1\n");
+    }
+
+    #[test]
+    fn uses_clause_survives_format() {
+        // The silent-drop hazard: an unemitted clause is DELETED by fmt.
+        let file = parse("flow F uses base:\n    a = 1\n").unwrap();
+        let formatted = format(&file);
+        assert!(
+            formatted.contains("uses base"),
+            "clause dropped: {formatted}"
+        );
     }
 
     #[test]

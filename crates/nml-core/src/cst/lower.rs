@@ -71,6 +71,10 @@ impl Lower {
                 .extends()
                 .map(|e| e.parents().map(ident).collect())
                 .unwrap_or_default(),
+            uses: b
+                .uses()
+                .map(|u| u.refs().map(ident).collect())
+                .unwrap_or_default(),
             body: self.body_of(b.body()),
         }
     }

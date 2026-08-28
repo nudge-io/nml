@@ -178,6 +178,13 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
     let mut errors = symbols.find_duplicates();
     errors.extend(symbols.find_unresolved_references(&file));
     errors.extend(symbols.find_const_cycles());
+    // `uses` clause refs are references too (RFC 0019): `validate` does
+    // not compose, but its "unresolved references" contract covers the
+    // header clause — same NML2059 wording as `check`'s composing path.
+    errors.extend(nml_core::layers::check_uses_refs(
+        &path.display().to_string(),
+        &file,
+    ));
     // Schema definitions in the file get the full loader pipeline (RFC 0011):
     // reserved/duplicate definition names, `is` composition, trait usage,
     // oneof integrity, positional arity, cycles — the same findings loading
@@ -190,6 +197,8 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
     // type-shape rules, misplaced arms/field definitions) — one code path,
     // so the definition verbs can never disagree.
     if !schema.is_empty() {
+        // Merge-policy findings (RFC 0019: NML2068/NML2076) arrive from
+        // the loader itself — the single owner — inside schema_diags above.
         errors.extend(
             SchemaValidator::from(schema)
                 .composition_checked_at_load()
@@ -376,19 +385,59 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
         );
     }
 
-    if !schema.is_empty() {
-        // Definition composition is covered by the single load above —
-        // instance-only here, so no finding is ever reported twice.
-        let mut validator = SchemaValidator::from(schema).composition_checked_at_load();
-        // --strict: unknown properties and unmodeled keywords become
-        // errors (CI posture; the same profile package bindings can set).
-        if strict {
-            validator = validator.strict();
-        }
-        for diag in validator.validate(&file) {
-            first_code = first_code.or(report(&path, &source_map, &diag));
+    {
+        // RFC 0019: compose `uses` stacks before validation (default on).
+        // Same-file stacks in the open developer context; binding-governed
+        // grants arrive with the resolver-core slice. Blocks that compose
+        // validate their RESOLVED body (an overlay alone is deliberately
+        // partial); everything else validates as authored. The pass runs
+        // even with no schema universe: NML2059/2061/2062/2077 are
+        // structural, not schema-dependent. The validator is built FIRST
+        // and its index shared with the layers engine — one index build,
+        // zero schema clones, and the merge-policy pass and the validator
+        // can never see different schemas.
+        let validator = (!schema.is_empty()).then(|| {
+            let mut v = SchemaValidator::from(schema).composition_checked_at_load();
+            if strict {
+                v = v.strict();
+            }
+            v
+        });
+        let empty_index = nml_core::schema_index::SchemaIndex::build(vec![], vec![], vec![]);
+        let index = validator.as_ref().map_or(&empty_index, |v| v.index());
+        let source_name = path.display().to_string();
+        let composed = nml_core::layers::compose_file(
+            index,
+            &source_name,
+            &file,
+            &nml_core::layers::OpenContext,
+        );
+        for diag in &composed.diagnostics {
+            first_code = first_code.or(report(&path, &source_map, diag));
             if matches!(diag.severity, Severity::Error) {
                 error_count += 1;
+            }
+        }
+        let validation_file = composed.validation_file;
+
+        if let Some(validator) = &validator {
+            // Definition composition is covered by the single load above —
+            // instance-only here, so no finding is ever reported twice
+            // across passes; and one home per finding within this pass — a
+            // resolved overlay body carries clones of base entries at their
+            // authored spans, so a base defect would otherwise report once
+            // as authored and once per overlay. Identical (code, span,
+            // message) triples collapse to one.
+            let mut seen: std::collections::HashSet<nml_core::layers::FindingKey> =
+                std::collections::HashSet::new();
+            for diag in validator.validate(validation_file.as_ref().unwrap_or(&file)) {
+                if !seen.insert(nml_core::layers::finding_key(&diag)) {
+                    continue;
+                }
+                first_code = first_code.or(report(&path, &source_map, &diag));
+                if matches!(diag.severity, Severity::Error) {
+                    error_count += 1;
+                }
             }
         }
     }

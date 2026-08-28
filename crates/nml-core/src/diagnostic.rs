@@ -90,7 +90,7 @@ pub struct Suggestion {
 /// consumers (the CLI's `error[NML0042]` prefix and the LSP's string `code`
 /// field) want the formatted form; a numeric getter would be speculative API
 /// until something needs it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Code(u16);
 
 impl fmt::Display for Code {
@@ -392,6 +392,62 @@ pub mod codes {
         /// violates its own facets reports as the VIOLATION code
         /// through the shared enforcement pass.)
         FACET_DEFINITION = 2058;
+        /// RFC 0019: a `uses` layer ref does not resolve to an in-scope
+        /// instance (did-you-mean over in-scope same-keyword instances).
+        UNRESOLVED_LAYER_REF = 2059;
+        /// RFC 0019: a `#sealed` field a lower layer already fixed is
+        /// violated — by a differing assignment, an equal-value restatement
+        /// (drift hazard), or a variant switch discarding the sealed body
+        /// (the seal backstop).
+        SEALED_FIELD_VIOLATION = 2060;
+        /// RFC 0019: a `uses` reference cycle.
+        LAYER_CYCLE = 2061;
+        /// RFC 0019: a `uses` target declares a different model keyword than
+        /// the composing block, or a `uses` clause sits on a schema
+        /// definition (`model`/`trait`/`enum`).
+        LAYER_KEYWORD_MISMATCH = 2062;
+        /// RFC 0019: illegal identity redefinition — under `#append` without
+        /// `#identity`; a cross-kind match at an equal token; replacing a
+        /// bodiless reference/role item; or a duplicate identity within one
+        /// layer's list.
+        IDENTITY_REDEFINITION = 2063;
+        /// RFC 0019: composition not permitted — the governing binding has no
+        /// `layers:` grant, the file is ambiguously claimed, or no binding
+        /// governs it in a closed universe.
+        COMPOSITION_DENIED = 2064;
+        /// RFC 0019: a `uses` ref denied by the layer grant — a `denyRefs`
+        /// veto (named by index) or an allow-miss (no `allowRefs` entry
+        /// admits the layer).
+        LAYER_REF_DENIED = 2065;
+        /// RFC 0019: a composition bound exceeded — the grant's
+        /// `maxStackDepth`, the language stack cap (16), or the
+        /// import-closure cap (256 files). The message names which.
+        LAYER_BOUND_EXCEEDED = 2066;
+        /// RFC 0019: an overlay item matches no base identity in an
+        /// `#identity` list without `#append` (did-you-mean over the base's
+        /// NAMED identities only — scalar-keyed tokens are never echoed).
+        UNMATCHED_OVERLAY_ITEM = 2067;
+        /// RFC 0019: invalid merge-policy declaration at schema load —
+        /// `#identity` with no mergeable identity (plain scalar lists,
+        /// `set<T>`), or an incoherent combination (`#sealed` with any
+        /// other; list policies on non-collections).
+        INVALID_MERGE_POLICY = 2068;
+        /// RFC 0019 (warning): a seal that cannot engage — `#sealed` item
+        /// fields under a bare-overlay list, a oneof (field-typed or
+        /// instance-rooted) with sealed arm fields and an unsealed
+        /// discriminator, or `#sealed` on a field with a schema default.
+        UNREACHABLE_SEAL = 2076;
+        /// RFC 0019: no consistent linearization — the `uses` DAG's declared
+        /// orders contradict (C3 merge failure).
+        INCONSISTENT_LINEARIZATION = 2077;
+        /// RFC 0019 (warning): a composing layer's list entry normalizes to
+        /// zero items — it does not supply the list, and "empty the base
+        /// list" has no merge spelling.
+        ZERO_ITEM_LAYER_ENTRY = 2079;
+        /// RFC 0019 (warning): an overlay assignment restates the effective
+        /// lower value unchanged (`semantic_eq`) — a dead delta. Overlay- or
+        /// sealed-policy scalar/object fields only.
+        DEAD_DELTA = 2084;
 
         /// A money literal is malformed (unparseable amount or fraction).
         INVALID_MONEY = 3000;
@@ -705,11 +761,16 @@ fn write_sanitized(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
 impl fmt::Display for Rendered<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_sanitized(f, &self.0.message)?;
+        // An empty replacement is a machine-applicable DELETION (e.g.
+        // NML2060's "delete this assignment"); rendering it as
+        // `(did you mean ""?)` reads as nonsense, and the deletion
+        // producers already state the action in `message` — so empty
+        // replacements stay structural (for `nml fix`) and render nothing.
         let dym: Vec<&Suggestion> = self
             .0
             .suggestions
             .iter()
-            .filter(|s| s.kind == SuggestionKind::DidYouMean)
+            .filter(|s| s.kind == SuggestionKind::DidYouMean && !s.replacement.is_empty())
             .collect();
         let fixes: Vec<&Suggestion> = self
             .0
@@ -848,6 +909,22 @@ mod tests {
             diag.to_string(),
             "error: invalid value \"wran\" (did you mean \"warn\"?)"
         );
+    }
+
+    #[test]
+    fn empty_replacement_suggestion_renders_no_hint() {
+        // An empty replacement is a machine-applicable DELETION (NML2060's
+        // "delete this assignment"); `(did you mean ""?)` is nonsense to a
+        // human, so the hint is suppressed — the suggestion stays
+        // structural for `nml fix`, and the producer's message names the
+        // action.
+        let diag = Diagnostic::error("'x' is sealed — delete this assignment")
+            .with_suggestion("", Span::new(1, 5));
+        assert_eq!(
+            diag.rendered_message(),
+            "'x' is sealed — delete this assignment"
+        );
+        assert_eq!(diag.suggestions.len(), 1, "the machine fix survives");
     }
 
     #[test]

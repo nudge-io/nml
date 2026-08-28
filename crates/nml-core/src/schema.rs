@@ -106,7 +106,13 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
             // fields (`|kind`) are distinct authoring and do not shadow.
             if let Some(m) = schema.models.iter().find(|m| &m.name == model) {
                 if m.fields.iter().any(|f| {
-                    f.name == oneof.discriminator && !matches!(f.field_type, FieldType::Modifier(_))
+                    f.name == oneof.discriminator
+                        && !matches!(f.field_type, FieldType::Modifier(_))
+                        // `#sealed` on the discriminator-named field is RFC
+                        // 0019's sanctioned spelling for "this oneof forbids
+                        // arm switching" — the field being unsettable is the
+                        // point, not an accident worth warning about.
+                        && !f.directives.iter().any(|d| d.name == "sealed")
                 }) {
                     errors.push(at_def(
                         Diagnostic::warning(format!(
@@ -1279,6 +1285,18 @@ mod tests {
                 .iter()
                 .all(|e| e.code != Some(crate::diagnostic::codes::SHADOWED_DISCRIMINATOR)),
             "modifier-form fields do not shadow"
+        );
+        // `#sealed` on the discriminator-named field is RFC 0019's
+        // sanctioned no-arm-switching spelling — being unsettable is the
+        // point, so the advisory must not fire.
+        let schema3 = extract_src(
+            "model logM:\n    kind string? #sealed\n\noneof mail by kind:\n    \"log\" -> logM\n",
+        );
+        assert!(
+            find_oneof_errors(&schema3)
+                .iter()
+                .all(|e| e.code != Some(crate::diagnostic::codes::SHADOWED_DISCRIMINATOR)),
+            "the sealed-discriminator spelling draws no NML2054 noise"
         );
     }
 

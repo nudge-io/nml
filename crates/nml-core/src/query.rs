@@ -46,14 +46,27 @@ impl<'a> Document<'a> {
     ///
     /// Returns a [`BlockQuery`] for further drilling into properties and nested blocks.
     pub fn block(&self, keyword: &str, name: &str) -> BlockQuery<'a> {
-        for decl in &self.file.declarations {
-            if let DeclarationKind::Block(block) = &decl.kind {
-                if block.keyword.name == keyword && block.name.name == name {
-                    return BlockQuery::Found(&block.body);
-                }
-            }
+        match self.block_decl(keyword, name) {
+            Some(block) => BlockQuery::Found(&block.body),
+            None => BlockQuery::NotFound,
         }
-        BlockQuery::NotFound
+    }
+
+    /// The full declaration for `keyword name`, when present — for callers
+    /// that need header facts (the `uses` clause, spans) rather than just
+    /// the body. `block()` is this with the header dropped.
+    pub fn block_decl(&self, keyword: &str, name: &str) -> Option<&'a BlockDecl> {
+        self.file
+            .declarations
+            .iter()
+            .find_map(|decl| match &decl.kind {
+                DeclarationKind::Block(block)
+                    if block.keyword.name == keyword && block.name.name == name =>
+                {
+                    Some(block)
+                }
+                _ => None,
+            })
     }
 
     /// Iterate over all block declarations matching a keyword.

@@ -1,0 +1,17 @@
+// NML2067: typo'd identity under #identity without #append.
+model step:
+    name string+
+    locator string
+
+model flow:
+    steps []step #identity
+
+flow base:
+    steps:
+        - submitSearch:
+            locator = "#submit"
+
+flow t uses base:
+    steps:
+        - submitSaerch:
+            locator = "#x"

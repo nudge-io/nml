@@ -17,6 +17,14 @@ use crate::span::Span;
 use crate::types::Value;
 
 /// Tracks named declarations for cross-reference resolution.
+/// Schema-definition keywords — block declarations that define vocabulary
+/// (`model` / `trait` / `enum`) rather than declaring instances; they can
+/// never be layer refs or carry `uses` (NML2062, RFC 0019). THE one owner
+/// of this language fact — engine, validator, CLI, and LSP all ask here.
+pub fn is_schema_keyword(kw: &str) -> bool {
+    matches!(kw, "model" | "trait" | "enum")
+}
+
 #[derive(Debug, Default)]
 pub struct SymbolTable {
     declarations: HashMap<String, Vec<DeclInfo>>,

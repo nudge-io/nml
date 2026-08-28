@@ -51,6 +51,38 @@ pub enum SchemaMode<'a> {
 }
 
 /// Compute diagnostics for an NML source document.
+/// Compose the buffer's same-file `uses` stacks and validate the
+/// RESOLVED view — the editor and `nml check` must agree on every
+/// uses-bearing file: validating a raw overlay body reports phantom
+/// missing-required errors on files `check` accepts, and misses every
+/// compose finding (NML2059–NML2084). Mirrors `cmd_check` exactly:
+/// compose diagnostics first, then the validator over the substituted
+/// validation view, deduplicated by `FindingKey` (a base defect cloned
+/// into every overlay's resolved body is one finding, not one per
+/// overlay). Slice-1 grants: the open developer context, same as the
+/// CLI.
+fn composed_validate(
+    validator: &SchemaValidator,
+    file: &nml_core::ast::File,
+    source_name: &str,
+) -> Vec<nml_core::diagnostic::Diagnostic> {
+    let composed = nml_core::layers::compose_file(
+        validator.index(),
+        source_name,
+        file,
+        &nml_core::layers::OpenContext,
+    );
+    let mut out = composed.diagnostics;
+    let mut seen: std::collections::HashSet<nml_core::layers::FindingKey> =
+        out.iter().map(nml_core::layers::finding_key).collect();
+    for diag in validator.validate(composed.validation_file.as_ref().unwrap_or(file)) {
+        if seen.insert(nml_core::layers::finding_key(&diag)) {
+            out.push(diag);
+        }
+    }
+    out
+}
+
 pub fn compute(
     source: &str,
     mode: &SchemaMode<'_>,
@@ -59,6 +91,7 @@ pub fn compute(
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let line_index = LineIndex::new(source);
+    let source_name = uri.map(|u| u.path().to_string()).unwrap_or_default();
 
     // Resilient parse: always yields a best-effort AST plus the full set of
     // syntactic + semantic errors (position-sorted, bounded). Reporting every
@@ -193,7 +226,7 @@ pub fn compute(
                 let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
                     .with_modifiers(config.modifiers.clone())
                     .with_membership_semantics(config.membership.clone());
-                for diag in validator.validate(&file) {
+                for diag in composed_validate(&validator, &file, &source_name) {
                     // A `.model.nml` buffer's mixin (`is`) targets are judged
                     // by the SCHEMA LOAD PASS against the buffer's TRUE
                     // universe — its covering package's sources (workspace,
@@ -225,7 +258,7 @@ pub fn compute(
             validator,
             identity,
         } => {
-            for diag in validator.validate(&file) {
+            for diag in composed_validate(validator, &file, &source_name) {
                 push_diagnostic(diag, Some(identity), uri, &line_index, &mut diagnostics);
             }
         }
@@ -237,6 +270,26 @@ pub fn compute(
         .map(|s| s.as_str())
         .collect();
     validate_templates(&file, &ns, uri, &line_index, &mut diagnostics);
+
+    // Editor flood cap: a hostile or badly broken buffer can yield tens
+    // of thousands of findings (one per unmatched list item), and
+    // serializing them all on EVERY keystroke is a client-side DoS. The
+    // first N tell the story; the tail is summarized in one row. The CLI
+    // is uncapped — a one-shot terminal run is the place for the full
+    // list.
+    const MAX_DIAGNOSTICS: usize = 500;
+    if diagnostics.len() > MAX_DIAGNOSTICS {
+        let elided = diagnostics.len() - MAX_DIAGNOSTICS;
+        diagnostics.truncate(MAX_DIAGNOSTICS);
+        diagnostics.push(Diagnostic {
+            severity: Some(DiagnosticSeverity::INFORMATION),
+            message: format!(
+                "{elided} further finding(s) not shown — resolve the above, \
+                 or run `nml check` for the full list"
+            ),
+            ..Default::default()
+        });
+    }
 
     diagnostics
 }
@@ -711,6 +764,89 @@ mod tests {
 
     fn default_config() -> DiagnosticConfig {
         DiagnosticConfig::default()
+    }
+
+    /// RFC 0019: the editor composes same-file `uses` stacks exactly as
+    /// `nml check` does — an overlay whose base supplies a required field
+    /// gets no phantom missing-required error, and compose findings
+    /// (here a sealed-field violation) surface in the buffer.
+    #[test]
+    fn editor_composes_uses_stacks_like_check() {
+        let schema = nml_core::cst::extract_schema(
+            "model flow:\n    entrypoint string #sealed\n    label string\n",
+        )
+        .0;
+        let clean = compute(
+            "flow base:\n    entrypoint = \"search\"\n    label = \"x\"\n\n\
+             flow t uses base:\n    label = \"y\"\n",
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            None,
+        );
+        assert!(
+            clean.is_empty(),
+            "the overlay validates through its RESOLVED body: {clean:?}"
+        );
+        let sealed = compute(
+            "flow base:\n    entrypoint = \"search\"\n    label = \"x\"\n\n\
+             flow t uses base:\n    entrypoint = \"admin\"\n",
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            None,
+        );
+        assert!(
+            sealed.iter().any(|d| d.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "NML2060".to_string()
+                ))),
+            "compose findings reach the buffer: {sealed:?}"
+        );
+    }
+
+    /// A hostile or badly broken buffer must not stream tens of
+    /// thousands of diagnostics to the client per keystroke: the cap
+    /// keeps the first tranche and summarizes the tail.
+    #[test]
+    fn diagnostic_flood_is_capped_with_a_summary_row() {
+        let schema = nml_core::cst::extract_schema(
+            "model item:\n    name string+\n    v string\n\nmodel flow:\n    items []item #identity\n",
+        )
+        .0;
+        let mut src = String::from(
+            "flow base:\n    items:\n        - b0:\n            v = \"x\"\n\nflow t uses base:\n    items:\n",
+        );
+        for i in 0..1200 {
+            src.push_str(&format!("        - g{i}:\n            v = \"y\"\n"));
+        }
+        let diags = compute(
+            &src,
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            None,
+        );
+        assert!(
+            diags.len() <= 501,
+            "capped at the tranche plus one summary: {}",
+            diags.len()
+        );
+        let last = diags.last().expect("non-empty");
+        assert!(
+            last.message.contains("not shown"),
+            "the tail is summarized: {}",
+            last.message
+        );
     }
 
     /// RFC 0030: package-bound documents validate through the package's

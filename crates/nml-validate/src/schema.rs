@@ -662,7 +662,7 @@ impl SchemaValidator {
         for decl in &file.declarations {
             if let DeclarationKind::Block(block) = &decl.kind {
                 let keyword = block.keyword.name.as_str();
-                if matches!(keyword, "model" | "trait" | "enum") {
+                if nml_core::symbols::is_schema_keyword(keyword) {
                     self.validate_body(&block.body, true, keyword, &mut diagnostics);
                     if matches!(keyword, "model" | "trait") {
                         // Declared defaults are NOT checked here. Both
@@ -745,7 +745,7 @@ impl SchemaValidator {
         diags: &mut Vec<Diagnostic>,
     ) {
         let keyword = &block.keyword.name;
-        let is_schema_def = matches!(keyword.as_str(), "model" | "enum" | "trait");
+        let is_schema_def = nml_core::symbols::is_schema_keyword(keyword.as_str());
 
         if is_schema_def && self.closed_vocabulary {
             diags.push(self.ineffective_definition(keyword, block.keyword.span));
@@ -865,7 +865,7 @@ impl SchemaValidator {
         }
 
         let keyword = &arr.item_keyword.name;
-        let is_schema_def = matches!(keyword.as_str(), "model" | "enum" | "trait");
+        let is_schema_def = nml_core::symbols::is_schema_keyword(keyword.as_str());
         // Traits are never element types either (RFC 0011): report once at
         // the keyword and skip item validation — the declaration is already
         // in error, and its items have no model to validate against.
@@ -6654,6 +6654,7 @@ workflow W:
                     keyword: Identifier::new("tree", span),
                     name: Identifier::new("Root", span),
                     extends: vec![],
+                    uses: vec![],
                     body,
                 }),
                 span,

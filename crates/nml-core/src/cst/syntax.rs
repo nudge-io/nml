@@ -82,6 +82,9 @@ pub enum SyntaxKind {
     OneOfArm,
     Name,
     Extends,
+    /// RFC 0019: the `uses <LayerRef> (, <LayerRef>)*` header clause on an
+    /// instance declaration — layer composition refs, sibling of `Extends`.
+    Uses,
     // bodies & entries
     Body,
     Property,
@@ -165,6 +168,7 @@ impl SyntaxKind {
             OneOfArm => "a oneof arm",
             Name => "a name",
             Extends => "an `is` clause",
+            Uses => "a `uses` clause",
             Body => "a block body",
             Property => "a property",
             NestedBlock => "a nested block",

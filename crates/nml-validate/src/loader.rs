@@ -144,6 +144,15 @@ pub fn load_schema(sources: &[(&str, &str)]) -> (ExtractedSchema, Vec<Diagnostic
     // Severity travels with the diagnostic (warning at the source).
     diagnostics.extend(find_model_cycles(&schema));
 
+    // RFC 0019 merge-policy declarations (NML2068) and unreachable-seal
+    // lints (NML2076) — owned HERE so every consumer of the loader (both
+    // CLI verbs, the LSP's schema passes, embedders) inherits them with
+    // per-source attribution; no verb can forget the call.
+    diagnostics.extend(nml_core::layers::validate_merge_policies_over(
+        &schema.models,
+        &schema.oneofs,
+    ));
+
     (schema, diagnostics)
 }
 

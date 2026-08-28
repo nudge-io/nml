@@ -1,0 +1,9 @@
+// NML2060: overlay assigns a field the base sealed.
+model flow:
+    entrypoint string #sealed
+
+flow base:
+    entrypoint = "search"
+
+flow hijacked uses base:
+    entrypoint = "adminPanel"

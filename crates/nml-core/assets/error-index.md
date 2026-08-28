@@ -1423,6 +1423,341 @@ unit``.
 (duration bounds are duration literals: `min = 5s`); string/collection
 length constraints are deliberately not spelled with these keys.
 
+## NML2059
+
+**Unresolved layer reference.** A `uses` ref names no in-scope instance
+(RFC 0019). Layer refs are bare identifiers resolved through the file's
+scope — same-file declarations, plus import bindings once RFC 0020
+lands. The message offers a did-you-mean over in-scope instances of the
+same model keyword.
+
+```nml check expect-error='[NML2059]'
+model flow:
+    entrypoint string
+
+flow memberLookup:
+    entrypoint = "search"
+
+flow tenant uses memberLokup:
+    entrypoint = "search"
+```
+
+**Fix:** spell the ref as the base instance is declared (the hint names
+the closest candidate).
+
+## NML2060
+
+**Sealed field violation.** A `#sealed` field is write-once from the
+bottom of the layer stack (RFC 0019): the first layer to assign it fixes
+it, and any higher assignment is rejected — **even at the identical
+value**, because a restatement silently decouples the moment the base
+changes (that form carries a machine-applicable *delete this
+assignment* suggestion). The seal binds every field shape — scalars,
+lists, and object-typed fields alike (an object body is a write; only a
+zero-item entry on a *list*-shaped sealed field is not, per NML2079's
+contract). The third form is the **seal backstop**: a variant switch (a
+oneof arm change — RFC 0019 extends the same rule to union `as`
+switches and arm-set replacement, which arrive with the union-compose
+slice) that would discard a lower body containing an assigned sealed
+field, at any depth — nested objects and nested oneof arms included;
+the message states the count when more than one sealed field would be
+discarded.
+
+```nml check expect-error='[NML2060]'
+model flow:
+    entrypoint string #sealed
+
+flow base:
+    entrypoint = "search"
+
+flow hijacked uses base:
+    entrypoint = "adminPanel"
+```
+
+**Fix:** delete the overlay assignment — a sealed value is the lower
+layer's to change. If the field must vary per tier, the schema author
+removes `#sealed` or leaves the field unassigned at the base (a sealed
+field no layer assigns stays open for the next tier).
+
+## NML2061
+
+**Layer reference cycle.** A `uses` stack loops back on itself
+(RFC 0019). Composition is a DAG; the cycle renders as its full path in
+a canonical rotation (smallest member name first), so the same cycle
+discovered from every entry point is ONE finding, not one per member.
+
+```nml check expect-error='[NML2061]'
+model thing:
+    v string
+
+thing a uses b:
+    v = "a"
+
+thing b uses a:
+    v = "b"
+```
+
+**Fix:** break the cycle — one of the two instances is the base and
+must not `uses` the other.
+
+## NML2062
+
+**Layer keyword mismatch.** Every layer in a stack must declare the
+same model keyword as the composing block (RFC 0019) — layers compose
+only within one model. The code also covers a `uses` clause on a schema
+definition (`model` / `trait` / `enum`), which cannot compose layers.
+
+```nml check expect-error='[NML2062]'
+model thing:
+    v string
+
+model other:
+    w string
+
+other base:
+    w = "b"
+
+thing t uses base:
+    v = "t"
+```
+
+**Fix:** reference an instance of the same keyword, or move the shared
+content into one.
+
+## NML2063
+
+**Illegal identity redefinition.** Three shapes, one rule — list items
+merge by identity, and an identity may only be redefined where the
+schema grants it (RFC 0019): an item redefining an existing identity
+under `#append` **without** `#identity` (the schema grants adding, not
+overriding); a **cross-kind** match at an equal token (a named
+`- search:` against a scalar `- "search"`, or any item at a bodiless
+reference/role item's token — match the base's spelling); or a
+**duplicate identity within one layer's own list** (the merge key must
+be unique before it can be merged on).
+
+```nml check expect-error='[NML2063]'
+model step:
+    name string+
+    action string
+
+model flow:
+    steps []step #append
+
+flow base:
+    steps:
+        - audit:
+            action = "log"
+
+flow t uses base:
+    steps:
+        - audit:
+            action = "noop"
+```
+
+**Fix:** for the `#append` shape, ask the schema owner for `#identity`
+if overriding is legitimate; for a cross-kind match, restate the item in
+the base's spelling; for a within-layer duplicate, delete it.
+
+## NML2064
+
+**Composition not permitted.** The file's governing context denies
+composition outright (RFC 0019). Three shapes, each naming its owner:
+the governing binding carries no `layers:` grant (names the binding and
+its manifest — an operator change, not fixable from a content file);
+the file is **ambiguously claimed** by two or more manifests (names
+both; remove or narrow one claim); or no binding governs the file in a
+closed universe (names the manifest root). All three end by pointing at
+`nml binding <file>`. In the open developer context (no manifest
+anywhere) composition is permitted and this code never fires.
+
+*Slice status:* grant enforcement activates with the shared
+binding-resolution core; until that lands, `nml check` runs every file
+in the open developer context and this code is reachable only through
+embedder-supplied grant providers.
+
+**Fix:** an operator adds a `layers:` grant to the governing binding —
+content authors cannot grant themselves composition.
+
+## NML2065
+
+**Layer reference denied by grant.** A referenced layer falls outside
+the governing `layers:` grant (RFC 0019). Two forms: a **deny-veto**
+names the vetoing rule by index (`denyRefs[2]` — grant rules are
+unnamed, so the index is the stable referent, and `nml binding` prints
+the same indices) and may name the path (the allowlist already admits
+it); an **allow-miss** states that no `allowRefs` entry admits the
+layer, never naming the path (a deny must not become an enumeration
+channel). Stack-level denials — a transitively pulled layer the root
+grant does not admit — name the entering ref (the root clause's own
+listed token, whose span anchors the diagnostic in the checked file);
+the stack-level allow-miss form also withholds the denied layer's
+*instance name* (author-chosen, so it too must not leak through a
+denial the author never spelled).
+
+**Fix:** an operator widens `allowRefs` (or removes the deny rule) on
+the governing binding; the message names which.
+
+*Slice status:* as with NML2064 — `nml check` currently runs in the
+open developer context; grant evaluation is exercised by embedder
+providers and the engine's test battery until the resolver core lands.
+
+## NML2066
+
+**Layer bound exceeded.** A composition bound was hit (RFC 0019), and
+the message names **which**: the grant's `maxStackDepth` (an operator
+change), the language stack cap (16 distinct instances in one
+linearized stack, the declaring instance included — enforced during
+discovery *and* before the linearization merge, so an over-wide clause
+is rejected in linear time), or the import-closure cap (256 files;
+that cap arrives with RFC 0020 imports). The language caps bound merge
+work — they are defensive, not product rules.
+
+**Fix:** restructure the stack (fewer tiers), or — for the grant cap —
+ask the operator to raise `maxStackDepth`.
+
+## NML2067
+
+**Unmatched overlay item.** In an `#identity` list without `#append`,
+an upper-layer item matched no base identity (RFC 0019). Nothing is
+implicit: an unmatched item is never a silent addition — a typo'd
+identity gets a did-you-mean instead of becoming a stray executable
+step. The hint discloses **named** identities only; scalar-keyed tokens
+are values and are never echoed.
+
+```nml check expect-error='[NML2067]'
+model step:
+    name string+
+    locator string
+
+model flow:
+    steps []step #identity
+
+flow base:
+    steps:
+        - submitSearch:
+            locator = "#submit"
+
+flow t uses base:
+    steps:
+        - submitSaerch:
+            locator = "#x"
+```
+
+**Fix:** match an existing base identity (the hint names the closest),
+or ask the schema owner for `#append` if adding items is legitimate.
+
+## NML2068
+
+**Invalid merge-policy declaration.** The schema's merge-policy
+directives are incoherent (RFC 0019, schema load): `#sealed` composes
+with no other policy (write-once contradicts every other grant — seal
+the *item fields*, not the list, when that is the intent);
+`#identity`/`#append` are list and set policies and are rejected on
+scalar and object fields; `#identity` needs items with something to key
+and something to merge, so plain scalar lists and `set<T>` are rejected
+(`#append` and overlay are the policies that mean something there); and
+`#overlay` is the explicit spelling of the default and combines with
+nothing. Exactly one policy per field — with one sanctioned pair,
+`#identity #append`.
+
+```nml check expect-error='[NML2068]'
+model m:
+    xs []string #identity
+
+m instanceOfM:
+    xs = ["a"]
+```
+
+**Fix:** the message names the incoherence; pick the one policy (or the
+sanctioned pair) that states the intended grant.
+
+## NML2076
+
+**Unreachable seal** *(warning, schema load)*. A `#sealed` declaration
+that cannot engage — a promise of protection the composition rules do
+not deliver (RFC 0019). Three shapes: item-model seals under a
+**bare-overlay list** (wholesale replacement drops base items; grant
+the list `#identity` to make item seals reachable); a **oneof** — as a
+field type or an instance root — whose arm models declare sealed fields
+while the discriminator is unsealed (an arm switch discards the sealed
+body; the seal backstop still rejects a switch that would drop an
+*assigned* seal, but sealing the discriminator forbids switching
+outright); and `#sealed` on a field **with a schema default** (a
+default is not an assignment — the field stays open until some layer
+writes it).
+
+**Fix:** the message names the shape and its remedy; the common one is
+granting the list `#identity`, sealing the discriminator, or dropping
+the default and assigning explicitly at the base. Sealing the
+discriminator is spelled on each arm model as an **optional** field
+(`kind string? #sealed`) — an instance's property of that name is
+always claimed as the discriminator, so a required spelling could never
+be satisfied; the sealed form is exempt from the NML2054 shadowing
+advisory.
+
+## NML2077
+
+**No consistent linearization.** The `uses` DAG's declared orders
+contradict, and the C3 merge refuses rather than guessing (RFC 0019) —
+stack order decides which assignment holds a seal, so it is never
+resolved by heuristic. Two shapes: a listed layer is a transitive base
+of an earlier-listed layer (the clause asks for it both above and below
+its dependent), or two listed layers' own stacks order a shared pair
+oppositely. The diagnostic names the contradicting pair and its cause;
+the transitive-base shape carries a machine-applicable remove-the-ref
+fix (`nml fix` applies it, separator included), and the sibling shape
+offers both reorderings as hints. Note redundancy and contradiction
+are orthogonal: the same ref
+listed in the dependency-consistent position is redundant but legal,
+and deliberately silent.
+
+```nml check expect-error='[NML2077]'
+model thing:
+    v string
+
+thing base:
+    v = "b"
+
+thing mid uses base:
+    v = "m"
+
+thing top uses mid, base:
+    v = "t"
+```
+
+**Fix:** reorder or drop the contradicting ref (here: `uses base, mid`
+— or just `uses mid`, which already contains `base`).
+
+## NML2079
+
+**Zero-item layer entry** *(warning)*. A composing layer's list entry
+normalizes to zero items — a `.shared:`-only block, an empty array
+literal (`xs = []`), or an empty nested block (RFC 0019). It does not
+count as supplying the list, so it neither replaces nor empties
+anything — and because the author may have *meant* "clear the base
+list" (an operation with no merge spelling), it is always diagnosed,
+never silently ignored.
+
+**Fix:** delete the entry, or supply the items the layer should
+contribute. Emptying a base list is not expressible; where entries must
+be removable, the schema owner models it as data (an `enabled` flag).
+
+## NML2084
+
+**Dead delta** *(warning)*. An overlay assignment restates the
+effective lower value unchanged (`semantic_eq`) — the
+copy-the-whole-body anti-pattern layer composition exists to eliminate
+(RFC 0019). The restatement is not wrong today, but it silently
+decouples the moment the base changes. Scalar and object fields under
+overlay policy; on a `#sealed` field the equal-value NML2060 form takes
+precedence — one span, one diagnostic. Never fires on
+`#append`/`#identity` lists, whose per-item semantics differ (a
+duplicate scalar append is legal).
+
+**Fix:** delete the restatement — an overlay states deltas, and an
+absent field inherits the base value automatically.
+
 ## NML3000
 
 **Invalid money literal.** The amount or its fractional part is not a

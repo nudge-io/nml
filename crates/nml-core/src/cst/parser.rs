@@ -344,15 +344,95 @@ impl<'a> Parser<'a> {
         let m = self.start();
         self.bump(); // keyword
         self.name();
-        self.reject_decl_annotation();
-        self.extends_clause();
-        // `host H is Base as modelB:` — the annotation can trail the `is`
-        // clause too; both header exits are guarded.
-        self.reject_decl_annotation();
+        self.header_clauses();
         if self.eat(SyntaxKind::Colon) {
             self.body();
         }
         m.complete(self, SyntaxKind::BlockDecl);
+    }
+
+    /// The declaration header's clause loop — ONE place that knows the
+    /// clause vocabulary (`is`, `uses`), the canonical order (`is` before
+    /// `uses`), and the fail-loud recovery for every stray header token
+    /// (`as` annotations, repeated clauses, misordered clauses). A fixed
+    /// clause pipeline diagnoses only the mistakes it anticipated and lets
+    /// everything else fall through the missing-colon leniency into a
+    /// silent declaration split; a loop makes silent splitting structurally
+    /// impossible for every current and future clause.
+    /// The header-clause vocabulary — ONE list, consumed by the block
+    /// clause loop and the array-decl rejection alike, so a future clause
+    /// cannot be added to one and silently split declarations in the other.
+    const HEADER_CLAUSE_KEYWORDS: [&'static str; 2] = ["is", "uses"];
+
+    fn at_header_clause(&self) -> bool {
+        Self::HEADER_CLAUSE_KEYWORDS.iter().any(|k| self.at_kw(k))
+    }
+
+    /// Fail-loud recovery for a stray header clause: error with `desc`,
+    /// consume the clause keyword and its refs, so the colon and body still
+    /// attach to the REAL declaration. One recovery contract for every
+    /// stray-clause site.
+    fn stray_clause(&mut self, desc: &'static str, ctx: &'static str) {
+        self.expected(
+            vec![
+                crate::error::ExpectedItem::Kind(SyntaxKind::Colon),
+                crate::error::ExpectedItem::Desc(desc),
+            ],
+            Some(ctx),
+        );
+        self.bump(); // the clause keyword
+        self.consume_clause_refs();
+    }
+
+    fn header_clauses(&mut self) {
+        let mut seen_is = false;
+        let mut seen_uses = false;
+        loop {
+            self.reject_decl_annotation();
+            if self.at_kw("is") {
+                if seen_is || seen_uses {
+                    self.stray_clause(
+                        if seen_is {
+                            "a body — one `is` clause per declaration \
+                             (list every parent in it, comma-separated)"
+                        } else {
+                            "a body — the `is` clause precedes `uses` \
+                             (canonical order: `keyword name is … uses …:`)"
+                        },
+                        "in a declaration header",
+                    );
+                    continue;
+                }
+                seen_is = true;
+                self.extends_clause();
+                continue;
+            }
+            if self.at_kw("uses") {
+                if seen_uses {
+                    self.stray_clause(
+                        "a body — one `uses` clause per declaration \
+                         (list every layer ref in it, comma-separated)",
+                        "in a declaration header",
+                    );
+                    continue;
+                }
+                seen_uses = true;
+                self.uses_clause();
+                continue;
+            }
+            break;
+        }
+    }
+
+    /// Consume a stray clause's `Ident (, Ident)*` refs on the same line —
+    /// shared recovery for every header-clause error path.
+    fn consume_clause_refs(&mut self) {
+        while self.at(SyntaxKind::Ident) && !self.newline_before() {
+            self.bump();
+            if !self.eat(SyntaxKind::Comma) {
+                break;
+            }
+        }
     }
 
     /// `[] item_keyword name : body?`
@@ -363,6 +443,16 @@ impl<'a> Parser<'a> {
         self.expect_desc(SyntaxKind::Ident, "an item keyword");
         self.name();
         self.reject_decl_annotation();
+        // Array declarations take no header clauses: a stray clause must
+        // fail loudly here or the missing-colon leniency silently splits
+        // the declaration (same hazard class the block clause loop closes;
+        // same vocabulary list, so a new clause covers both shapes).
+        while self.at_header_clause() {
+            self.stray_clause(
+                "a body — array declarations take no header clauses",
+                "after an array declaration name",
+            );
+        }
         if self.eat(SyntaxKind::Colon) {
             self.body();
         }
@@ -445,10 +535,8 @@ impl<'a> Parser<'a> {
     }
 
     /// `is Parent (, Parent)*`
+    /// Caller (the clause loop) has already established `at_kw("is")`.
     fn extends_clause(&mut self) {
-        if !self.at_kw("is") {
-            return;
-        }
         let m = self.start();
         self.bump(); // is
         self.expect_parent_name();
@@ -458,20 +546,47 @@ impl<'a> Parser<'a> {
         m.complete(self, SyntaxKind::Extends);
     }
 
+    /// RFC 0019: `uses Ref (, Ref)*` — layer-composition refs on an instance
+    /// declaration, a sibling of the `is` clause (canonical order: `is` first,
+    /// `uses` second; both optional).
+    /// Caller (the clause loop) has already established `at_kw("uses")`.
+    fn uses_clause(&mut self) {
+        let m = self.start();
+        self.bump(); // uses
+        self.expect_layer_ref();
+        while self.eat(SyntaxKind::Comma) {
+            self.expect_layer_ref();
+        }
+        m.complete(self, SyntaxKind::Uses);
+    }
+
+    /// A layer ref in a `uses` clause — see [`Self::expect_clause_ref`] for
+    /// the shared `as`-guard contract.
+    fn expect_layer_ref(&mut self) {
+        self.expect_clause_ref("a layer reference", "in a `uses` clause");
+    }
+
+    /// A name inside a header clause (`is` parents, `uses` refs) — but NEVER
+    /// the contextual keyword `as`: `host H is as modelB:` must leave `as`
+    /// for [`Self::reject_decl_annotation`] (which follows every clause) so
+    /// the error names the real problem and the body stays on the real
+    /// declaration. ONE guard, shared by every clause parser — the contract
+    /// cannot drift per clause.
+    fn expect_clause_ref(&mut self, desc: &'static str, ctx: &'static str) {
+        if self.at_kw("as") {
+            self.expected(vec![crate::error::ExpectedItem::Desc(desc)], Some(ctx));
+            return; // leave `as` for the annotation rejection
+        }
+        self.expect_desc(SyntaxKind::Ident, desc);
+    }
+
     /// A parent name in an `is` clause — but NEVER the contextual keyword `as`:
     /// `host H is as modelB:` must leave `as` for [`Self::reject_decl_annotation`]
     /// (which follows the clause) so the error names the real problem and the
     /// body stays on the real declaration, instead of `as` being swallowed as a
     /// bogus parent and the diagnostic pointing at the wrong thing.
     fn expect_parent_name(&mut self) {
-        if self.at_kw("as") {
-            self.expected(
-                vec![crate::error::ExpectedItem::Desc("a parent name")],
-                Some("in an `is` clause"),
-            );
-            return; // leave `as` for the annotation rejection
-        }
-        self.expect_desc(SyntaxKind::Ident, "a parent name");
+        self.expect_clause_ref("a parent name", "in an `is` clause");
     }
 
     /// The declaration/property name, wrapped for typed access.

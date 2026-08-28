@@ -248,12 +248,35 @@ fn analyze(path: &Path, source: &str, schema_dir: Option<&PathBuf>) -> Analysis 
             .into_iter()
             .filter(|d| d.source.as_deref().is_none_or(|s| s == own_name)),
     );
-    if !schema.is_empty() {
-        diags.extend(
-            SchemaValidator::from(schema)
-                .composition_checked_at_load()
-                .validate(&file),
-        );
+    // Compose before validating (RFC 0019): the fixer must see the same
+    // baseline `check` sees — validating a raw overlay body derives fixes
+    // from a phantom (uncomposed) instance, and the compose diagnostics
+    // themselves carry machine-applicable fixes (NML2060's deletion,
+    // NML2077's remove-the-ref) that are unreachable without composing.
+    let validator =
+        (!schema.is_empty()).then(|| SchemaValidator::from(schema).composition_checked_at_load());
+    let empty_index = nml_core::schema_index::SchemaIndex::build(vec![], vec![], vec![]);
+    let index = validator.as_ref().map_or(&empty_index, |v| v.index());
+    let composed =
+        nml_core::layers::compose_file(index, own_name, &file, &nml_core::layers::OpenContext);
+    // Foreign-source compose findings are context, not fix candidates —
+    // same rule as schema_diags above.
+    diags.extend(
+        composed
+            .diagnostics
+            .into_iter()
+            .filter(|d| d.source.as_deref().is_none_or(|s| s == own_name)),
+    );
+    if let Some(validator) = &validator {
+        // One home per finding across the compose and validate passes —
+        // a duplicated diagnostic would apply the same edit twice.
+        let mut seen: std::collections::HashSet<nml_core::layers::FindingKey> =
+            diags.iter().map(nml_core::layers::finding_key).collect();
+        for diag in validator.validate(composed.validation_file.as_ref().unwrap_or(&file)) {
+            if seen.insert(nml_core::layers::finding_key(&diag)) {
+                diags.push(diag);
+            }
+        }
     }
     Analysis {
         parse_clean: true,

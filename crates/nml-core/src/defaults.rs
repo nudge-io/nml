@@ -95,7 +95,7 @@ pub fn from_document_defaulted<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
-    let body = match doc.block(keyword, name).body() {
+    let block = match doc.block_decl(keyword, name) {
         Some(b) => b,
         None => {
             return Err(serde::de::Error::custom(format!(
@@ -103,13 +103,40 @@ where
             )));
         }
     };
-    let inlined = inline_array_references(doc, body, 0);
+    uses_guard(block)?;
+    let inlined = inline_array_references(doc, &block.body, 0);
     from_body_defaulted(index, keyword, &inlined, resolver)
+}
+
+/// Fail closed on layered instances (RFC 0019): every deserialization
+/// entry that can SEE the block header must refuse a `uses`-bearing block
+/// — its raw body is not its effective config, and reading it would
+/// silently substitute schema defaults for layer-provided values (the
+/// runtime booting with the wrong config and no error). One guard, every
+/// header-aware entry; body-only entries (`from_body_defaulted`) cannot
+/// see the clause and rely on their callers coming through here.
+fn uses_guard(block: &BlockDecl) -> Result<(), de::Error> {
+    if block.uses.is_empty() {
+        return Ok(());
+    }
+    Err(de::Error::De(format!(
+        "instance '{}' declares `uses` layers; its raw body is not its \
+         effective config — compose the stack (RFC 0019) and deserialize \
+         the resolved body instead",
+        block.name.name
+    )))
 }
 
 /// Rewrite `x = SomeArrayName` properties into the inline nested-list form
 /// when `SomeArrayName` is a top-level array declaration, recursively (a
 /// materialized array's own properties may reference further arrays).
+/// RFC 0019: per-layer array-reference inlining against the layer's OWN
+/// document (array declarations are file-local). The compose engine's step-3
+/// entry point; wraps the depth-guarded walker `from_document_defaulted` uses.
+pub fn inline_layer_array_references(doc: &crate::query::Document<'_>, body: &Body) -> Body {
+    inline_array_references(doc, body, 0)
+}
+
 fn inline_array_references(doc: &crate::query::Document<'_>, body: &Body, depth: u32) -> Body {
     if depth >= MAX_REFERENCE_DEPTH {
         return body.clone();
@@ -218,6 +245,7 @@ pub fn from_block_defaulted<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
+    uses_guard(block)?;
     from_body_defaulted(index, &block.keyword.name, &block.body, resolver)
 }
 
@@ -1238,6 +1266,40 @@ mod tests {
         let resolver = ValueResolver::new(|_| None);
         let p: Prompt = from_block_defaulted(&idx, block, &resolver).unwrap();
         assert_eq!(p.output_format, "text");
+    }
+
+    #[test]
+    fn from_block_defaulted_refuses_uses_bearing_blocks() {
+        // Fail closed (RFC 0019): this entry sees only the raw body, so a
+        // layered instance would silently read schema defaults in place
+        // of layer-provided values — it must error, not mis-read.
+        #[derive(Debug, serde::Deserialize)]
+        struct Prompt {}
+        let idx = index_from("model prompt:\n    outputFormat string = \"text\"\n");
+        let file = crate::cst::parse_to_ast(
+            "prompt base:\n    outputFormat = \"json\"\n\nprompt P uses base:\n    other = \"z\"\n",
+        )
+        .unwrap();
+        let block = match &file.declarations[1].kind {
+            DeclarationKind::Block(b) => b,
+            _ => panic!(),
+        };
+        let resolver = ValueResolver::new(|_| None);
+        let err = from_block_defaulted::<Prompt>(&idx, block, &resolver).unwrap_err();
+        assert!(
+            err.to_string().contains("uses"),
+            "names the cause and the fix: {err}"
+        );
+        // The document-level entry sees the same header and refuses the
+        // same way — fetching the body through `Document::block()` used
+        // to drop the clause and slip past the guard.
+        let doc = crate::query::Document::new(&file);
+        let err =
+            from_document_defaulted::<Prompt>(&idx, &doc, "prompt", "P", &resolver).unwrap_err();
+        assert!(
+            err.to_string().contains("uses"),
+            "document-level entry is guarded too: {err}"
+        );
     }
 
     #[test]

@@ -257,6 +257,9 @@ pub struct BlockDecl {
     pub keyword: Identifier,
     pub name: Identifier,
     pub extends: Vec<Identifier>,
+    /// RFC 0019: the `uses` clause's layer refs, in authored order (empty
+    /// when the declaration has no clause).
+    pub uses: Vec<Identifier>,
     pub body: Body,
 }
 
