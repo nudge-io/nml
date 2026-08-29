@@ -10,8 +10,12 @@
   reversed orientation — an inconsistent order is NML2077, never a
   heuristic) and composes bottom-up under schema-declared merge
   policies: `#sealed` (write-once from the bottom, equal-value
-  restatement included, with the oneof arm-switch seal backstop —
-  union `as` and arm-set forms arrive with the union-compose slice),
+  restatement included, with the seal backstop binding all three
+  variant forms equally: oneof arm switches, union `as` switches
+  (RFC 0015 — lowest supplying layer establishes the variant, authored
+  or shape-inferred with a synthesized annotation on the resolved body;
+  un-annotated upper bodies never switch), and arm-set wholesale
+  replacement, judged through the one decision-trace fold),
   `#identity` (merge list items by the four-kind identity pair),
   `#append` (additions only), and the sanctioned `#identity #append`
   pair. `nml check` composes same-file stacks before validation
@@ -63,7 +67,66 @@
   other spelling; type-annotation modifiers survive composition; the
   block-form empty modifier draws NML2079 like its sibling spellings;
   clause findings dedup across dependent composes; and every
-  `resolve_layers` failure carries a diagnostic.
+  `resolve_layers` failure carries a diagnostic. The seal backstop's
+  "at any depth" contract is total: the scan descends union-typed
+  interiors (every variant the group could establish, fail-closed),
+  arm-set inline arm bodies, and oneof-TARGETED arm sets (each
+  displaced arm judged under its own discriminator's arm model), and
+  union list elements route identity-matched item groups through the
+  union authority (seal enforcement, establishment, annotation
+  synthesis) instead of merging model-less. Structural (scalar/list)
+  union variants are first-class in compose: the lowest supplying
+  layer establishes them too, an authored `as` switches away from
+  them, and a contribution that can neither merge into the established
+  variant nor switch it — a whole-value spelling over a named
+  establishment, or an un-annotated body over a structural one — is
+  discarded LOUDLY as the new NML2085 rather than silently dropped. A
+  bogus `as` on a dependent layer is reported (NML2051) by the merge
+  itself, since composition replaces the annotation before the
+  validator can see the authored one. All three NML2060 backstop faces
+  share one wording owner (position, switch target, count suffix,
+  action tail, "sealed here" note), and the bare-overlay
+  seals-cannot-engage lint (NML2076) sees union elements too. The
+  structural bucket is per-shape: a scalar value and a list value are
+  distinct establishments, a scalar↔list cross is a loud NML2085 (one
+  bucket let the winner flip with the base's spelling), every
+  union-typed group routes through the union authority regardless of
+  spelling, and a switch away from a LIST-variant establishment is
+  seal-judged over the displaced item bodies under the list variants'
+  element models ("a structural group has no seals" is true only for
+  scalars). Ambiguity is fail-closed end to end: a keyed body the D2
+  oracle refuses composes model-less and un-annotated — composition
+  never guesses a variant by source order nor synthesizes an annotation
+  that would silence NML2052. The seal scan reaches union-typed LIST
+  elements of displaced variants (item paths as `slot[w].field`);
+  `nml check` seeds its validator dedup with the composed diagnostics
+  (the merge-emitted NML2051 printed twice with a non-`uses` base);
+  NML2076 covers a union's list variant with honest advice
+  (`#identity` is not grantable there), and NML2068 gets a
+  union-element wording. NML2085 leads with the position and its
+  establishment and carries an "established here" related note; its
+  switch hint never names a first-wins guess. A switch away from a
+  list-variant establishment is judged over the displaced LIST — list-
+  level `.shared` writes distributed, each item's identity token
+  materialized (a positional `+` field is a write), oneof elements under
+  the item's own arm, modifier-spelled item blocks included — and the
+  judgment is memoized per unchanged group (N rejected switches over M
+  sealed items were N full scans, a super-linear DoS axis). Every
+  spelling of a union field reaches the union authority (the
+  all-modifier short-circuit no longer bypasses it); zero-item entries
+  (`= []`, an empty block) at union positions draw NML2079 and never
+  establish; an authored `as` above an oracle-ambiguous group PINS it
+  rather than switching (nothing was chosen to switch from); ambiguous
+  interiors are seal-scanned under every oracle candidate, never the
+  resolver's first-wins pick; normalization no longer guesses a
+  variant for ambiguous bodies; NML2085 faces are keyed on the
+  (establishment, supply) pair the fold recorded, so a discard before a
+  later switch reports once; the NML2060 tail is one clause; NML2076
+  leads name the shape; NML2051 names a list variant's element honestly
+  (no did-you-mean) through one builder the validator and the merge
+  share; `nml explain` never rewrites inline code as a link; and the new
+  NML2086 names a violated internal composition invariant instead of
+  composing silently wrong.
 
 ### Changed
 

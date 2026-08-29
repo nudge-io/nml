@@ -367,6 +367,43 @@ impl SchemaIndex {
         (candidates.len() >= 2).then_some(candidates)
     }
 
+    /// The one NML2051 builder — an `as` annotation naming no nameable
+    /// variant — shared by the validator (raw bodies) and the compose
+    /// engine (a dependent layer's annotation the composed view replaces
+    /// before validation): identical message + span, so a non-`uses`
+    /// base declaration's finding and the merge's collapse to one home.
+    /// A name that is a LIST variant's element gets the honest form
+    /// (list variants are selected by shape, never named) and no
+    /// did-you-mean; anything else gets the closest nameable variant.
+    pub fn unknown_union_variant(
+        &self,
+        variants: &[FieldType],
+        ann: &crate::ast::Identifier,
+    ) -> crate::diagnostic::Diagnostic {
+        use crate::diagnostic::{Diagnostic, codes};
+        let list_element = variants.iter().any(|v| {
+            matches!(v, FieldType::List(inner) | FieldType::Set(inner)
+                if matches!(inner.as_ref(), FieldType::ModelRef(n) if *n == ann.name))
+        });
+        if list_element {
+            return Diagnostic::error(format!(
+                "`{}` names a list variant's element, not a nameable variant — \
+                 list variants are selected by shape; drop the `as`",
+                ann.name
+            ))
+            .with_code(codes::UNKNOWN_UNION_VARIANT)
+            .with_span(ann.span);
+        }
+        let nameable = self.nameable_variant_names(variants);
+        let mut diag = Diagnostic::error(format!("`{}` is not a variant of this union", ann.name))
+            .with_code(codes::UNKNOWN_UNION_VARIANT)
+            .with_span(ann.span);
+        if let Some(s) = crate::suggest::suggest(&ann.name, nameable.iter().copied()) {
+            diag = diag.with_suggestion(s.to_string(), ann.span);
+        }
+        diag
+    }
+
     /// The declared type names of a union's **nameable** variants (model/`oneof`
     /// refs) — the one candidate set powering `as`-position completion and the
     /// did-you-mean on an unknown annotation. Source order, so completion and

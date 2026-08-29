@@ -845,6 +845,48 @@ mod tests {
         );
     }
 
+    /// Editor parity for the union compose family: a discarded
+    /// contribution (NML2085) and its "established here" related note
+    /// reach the buffer through the composed path, in-buffer.
+    #[test]
+    fn editor_surfaces_union_discards_like_check() {
+        let schema = nml_core::cst::extract_schema(
+            "model ua:\n    x string\n\nmodel h:\n    slot (ua | string)\n",
+        )
+        .0;
+        let uri = tower_lsp::lsp_types::Url::parse("file:///h.nml").unwrap();
+        let diags = compute(
+            "h base:\n    slot as ua:\n        x = \"1\"\n\nh t uses base:\n    slot = \"v\"\n",
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            Some(&uri),
+        );
+        let discard = diags
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "NML2085".to_string(),
+                    ))
+            })
+            .unwrap_or_else(|| panic!("the discard reaches the buffer: {diags:?}"));
+        assert_eq!(discard.range.start.line, 5, "on the discarded entry");
+        let related = discard
+            .related_information
+            .as_ref()
+            .expect("related note present when a uri is known");
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].message, "established here");
+        assert_eq!(
+            related[0].location.range.start.line, 1,
+            "the establishing entry"
+        );
+    }
+
     /// Editor parity with `check`'s structural compose: a buffer with NO
     /// schema anywhere still composes structurally, so a typo'd `uses`
     /// ref squiggles instead of going dark.

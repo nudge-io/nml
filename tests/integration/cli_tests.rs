@@ -781,6 +781,27 @@ fn layers_sealed_violation_is_nml2060_with_related_note() {
 }
 
 #[test]
+fn layers_union_switch_seal_is_nml2060_end_to_end() {
+    // The union face of the seal backstop, through the real CLI: names
+    // the switch, the buried seal's full path, the teaching tail, and
+    // the "sealed here" note.
+    let out = check_fixture("tests/fixtures/layers/union-switch-seal.nml");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("NML2060"), "{stderr}");
+    assert!(
+        stderr.contains("variant switch to `as cash` on 'payment'"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("payment.pan"), "{stderr}");
+    assert!(
+        stderr.contains("unseal the field in the schema"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("sealed here"), "{stderr}");
+}
+
+#[test]
 fn layers_linearization_contradiction_is_nml2077() {
     let out = check_fixture("tests/fixtures/layers/linearization-contradiction.nml");
     assert!(!out.status.success());
@@ -997,6 +1018,229 @@ fn wide_model_compose_is_not_quadratic() {
         elapsed < std::time::Duration::from_secs(10),
         "compose is near-linear in width, took {elapsed:?}"
     );
+}
+
+#[test]
+fn wide_union_bodies_compose_fast() {
+    // Security: every union position folds variant decisions and (on a
+    // switch) normalizes the displaced group for the seal scan — a wide
+    // stack of union fields with per-layer switches must stay
+    // near-linear, or hostile sub-megabyte input buys seconds of CPU.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("wide-union.nml");
+    let width = 250;
+    let mut src =
+        String::from("model ua:\n    x string\n\nmodel ub:\n    y string\n\nmodel wideu:\n");
+    for i in 0..width {
+        src.push_str(&format!("    u{i} (ua | ub)\n"));
+    }
+    src.push_str("\nwideu base:\n");
+    for i in 0..width {
+        src.push_str(&format!("    u{i} as ua:\n        x = \"b\"\n"));
+    }
+    let mut prev = "base".to_string();
+    for l in 0..15 {
+        let (variant, field, value) = if l % 2 == 0 {
+            ("ub", "y", "v")
+        } else {
+            ("ua", "x", "w")
+        };
+        src.push_str(&format!("\nwideu l{l} uses {prev}:\n"));
+        for i in 0..width {
+            src.push_str(&format!(
+                "    u{i} as {variant}:\n        {field} = \"{value}{l}\"\n"
+            ));
+        }
+        prev = format!("l{l}");
+    }
+    std::fs::write(&f, src).unwrap();
+    let start = std::time::Instant::now();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let elapsed = start.elapsed();
+    assert!(
+        out.status.success(),
+        "alternating unsealed switches compose clean: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "union compose is near-linear in width, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn wide_union_rejected_switches_compose_fast() {
+    // The seal-scan axis the unsealed wide-union pin cannot guard: every
+    // switch normalizes the displaced group for judgment — with seals
+    // ASSIGNED, so the scan actually runs, width × layers times.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("wide-union-sealed.nml");
+    let width = 250;
+    let mut src = String::from(
+        "model ua:\n    x string\n    s string #sealed\n\nmodel ub:\n    y string\n\nmodel widesu:\n",
+    );
+    for i in 0..width {
+        src.push_str(&format!("    u{i} (ua | ub)\n"));
+    }
+    src.push_str("\nwidesu base:\n");
+    for i in 0..width {
+        src.push_str(&format!("    u{i} as ua:\n        s = \"locked\"\n"));
+    }
+    let mut prev = "base".to_string();
+    for l in 0..15 {
+        src.push_str(&format!("\nwidesu l{l} uses {prev}:\n"));
+        for i in 0..width {
+            src.push_str(&format!("    u{i} as ub:\n        y = \"v{l}\"\n"));
+        }
+        prev = format!("l{l}");
+    }
+    std::fs::write(&f, src).unwrap();
+    let start = std::time::Instant::now();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let elapsed = start.elapsed();
+    assert!(
+        !out.status.success(),
+        "every switch is seal-rejected — the check must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("error[NML2060]").count(),
+        width * 15,
+        "every switch is rejected by the BACKSTOP (not some other error)"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "seal-judged switches stay near-linear in width, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn wide_list_variant_rejected_switches_scale_linearly_in_items() {
+    // The Items-establishment axis: N sealed list items displaced by M
+    // rejected switches was N×M full scans with an O(hits²) dedup —
+    // super-linear (~3× per doubling) from a sub-megabyte file. The
+    // judgment is memoized per unchanged group and dedups by hash now.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("wide-list-variant-sealed.nml");
+    let items = 2000;
+    let mut src = String::from(
+        "model ua:\n    x string\n\nmodel ub:\n    kind string\n    secret string #sealed\n\n\
+         model holder:\n    slot (ua | []ub)\n\nholder base:\n    slot:\n",
+    );
+    for i in 0..items {
+        src.push_str(&format!("        - w{i}:\n            secret = \"s\"\n"));
+    }
+    let mut prev = "base".to_string();
+    for l in 0..15 {
+        src.push_str(&format!(
+            "\nholder l{l} uses {prev}:\n    slot as ua:\n        x = \"v{l}\"\n"
+        ));
+        prev = format!("l{l}");
+    }
+    std::fs::write(&f, src).unwrap();
+    let start = std::time::Instant::now();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let elapsed = start.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("error[NML2060]").count(),
+        15,
+        "every switch off the sealed list is rejected:\n{}",
+        stderr.lines().take(3).collect::<Vec<_>>().join("\n")
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "list-variant judgment is near-linear in items, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn ambiguous_stack_reports_nml2052_once() {
+    // An ambiguous base composed by dependents is ONE finding through
+    // `check`: compose never guesses (the composed body stays
+    // un-annotated) and the composed entry carries the establishing
+    // span, so the raw and composed findings collapse to one home.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("ambiguous-stack.nml");
+    std::fs::write(
+        &f,
+        "model stepA:\n    note string\n\nmodel stepB:\n    note string\n\n\
+         model holder:\n    slot (stepA | stepB)\n\n\
+         holder base:\n    slot:\n        note = \"1\"\n\n\
+         holder t uses base:\n    slot:\n        note = \"2\"\n\n\
+         holder t2 uses t:\n    slot:\n        note = \"3\"\n",
+    )
+    .unwrap();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches("error[NML2052]").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("add an explicit type with `as <variant>`"),
+        "D2's teaching survives composition: {stderr}"
+    );
+}
+
+#[test]
+fn base_bogus_as_is_reported_exactly_once_with_dependents() {
+    // The merge reports a swallowed NML2051 itself; a non-`uses` base's
+    // raw validation re-derives the same finding — `check` must seed its
+    // dedup with the composed diagnostics (LSP and `fix` already did),
+    // or the pair prints twice.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("bogus-as-base.nml");
+    std::fs::write(
+        &f,
+        "model card:\n    last4 string\n\nmodel cash:\n    amount string\n\n\
+         model account:\n    payment (card | cash)\n\n\
+         account base:\n    payment as cardd:\n        last4 = \"4242\"\n\n\
+         account t uses base:\n    payment:\n        last4 = \"9999\"\n",
+    )
+    .unwrap();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let n = stderr.matches("error[NML2051]").count();
+    assert_eq!(n, 1, "one defect, one finding:\n{stderr}");
+}
+
+#[test]
+fn explain_serves_the_union_codes() {
+    for (code, needle) in [
+        ("NML2085", "Discarded union contribution"),
+        ("NML2086", "Internal composition invariant"),
+        // Inline code in the index is content, never a link to strip:
+        // the type spelling must render verbatim.
+        ("NML2076", "such as `(a | []b)`"),
+    ] {
+        let out = nml_bin()
+            .args(["explain", code])
+            .output()
+            .expect("failed to run nml");
+        assert!(out.status.success(), "{code}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(needle), "{code}: {stdout}");
+    }
 }
 
 #[test]

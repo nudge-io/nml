@@ -1232,7 +1232,13 @@ with explicit arms.
 
 **Unknown union variant.** An `as <Variant>` annotation (RFC 0015) must name
 one of the union's variants. This one names a type the union does not include;
-a did-you-mean points at the closest match.
+a did-you-mean points at the closest match; a name that is a list
+variant's element gets the honest form instead (list variants are
+selected by shape, never named). Under layer composition
+(RFC 0019) a bogus name never switches the established variant — the
+compose engine treats it as un-annotated (fail-safe) and reports this
+error itself, because the composed body carries the *established*
+annotation and the validator would otherwise never see the authored one.
 
 ```nml check expect-error='[NML2051]'
 model alpha:
@@ -1255,7 +1261,11 @@ host H:
 **Ambiguous union instance.** A same-class union instance carries no
 `as <Variant>` annotation and its body shape cannot choose between two or more
 model variants. NML is fail-closed here: rather than silently guessing the
-first variant, it asks you to state the type (RFC 0015 D2).
+first variant, it asks you to state the type (RFC 0015 D2). Layer
+composition (RFC 0019) honors the same discipline: an ambiguous body is
+composed model-less and left un-annotated — never guessed, never
+stamped with a synthesized annotation — so this error fires on the
+composed view exactly as it would on the raw one.
 
 ```nml check expect-error='[NML2052]'
 model alpha:
@@ -1455,13 +1465,21 @@ changes (that form carries a machine-applicable *delete this
 assignment* suggestion). The seal binds every field shape — scalars,
 lists, and object-typed fields alike (an object body is a write; only a
 zero-item entry on a *list*-shaped sealed field is not, per NML2079's
-contract). The third form is the **seal backstop**: a variant switch (a
-oneof arm change — RFC 0019 extends the same rule to union `as`
-switches and arm-set replacement, which arrive with the union-compose
-slice) that would discard a lower body containing an assigned sealed
-field, at any depth — nested objects and nested oneof arms included;
+contract). The third form is the **seal backstop**, and it binds all
+three variant forms equally: a oneof arm change, a union `as` switch
+(RFC 0015 — the lowest supplying layer establishes the variant, an
+un-annotated upper body never switches, and the resolved body carries
+the variant as an explicit annotation), and arm-set wholesale
+replacement (RFC 0007) — any of them discarding a lower body containing
+an assigned sealed field, at any depth (nested objects and nested oneof
+arms included — and interiors reached through union-typed fields,
+union-typed LIST elements and a union's own list variant (item paths
+render as `slot[w].field`), arm-set inline arm bodies, and
+oneof-targeted arm sets), is this error;
 the message states the count when more than one sealed field would be
-discarded.
+discarded, names the switch it refused (the discriminator value, the
+`as` target, or the replacement), and closes with the action: compose
+into the lower value, or unseal the field in the schema.
 
 ```nml check expect-error='[NML2060]'
 model flow:
@@ -1681,7 +1699,11 @@ sanctioned pair) that states the intended grant.
 that cannot engage — a promise of protection the composition rules do
 not deliver (RFC 0019). Three shapes: item-model seals under a
 **bare-overlay list** (wholesale replacement drops base items; grant
-the list `#identity` to make item seals reachable); a **oneof** — as a
+the list `#identity` to make item seals reachable — for a list whose
+element is a union, or a union's own list variant such as `(a | []b)`,
+where `#identity` is not grantable, the advice is honest instead: seal
+outside the list element; the variant-switch backstop still guards
+switches); a **oneof** — as a
 field type or an instance root — whose arm models declare sealed fields
 while the discriminator is unsealed (an arm switch discards the sealed
 body; the seal backstop still rejects a switch that would drop an
@@ -1762,6 +1784,62 @@ duplicate scalar append is legal).
 
 **Fix:** delete the restatement — an overlay states deltas, and an
 absent field inherits the base value automatically.
+
+## NML2085
+
+**Discarded union contribution.** A union-typed position received a
+contribution that can neither merge into the established variant nor
+switch it (RFC 0015 + RFC 0019). The lowest supplying layer establishes
+the variant — named (its `as` annotation, else its unambiguous body
+shape), or structural *per shape* (a scalar value or a list value are
+distinct establishments) — and only an authored `as` on a nested body
+ever switches. That leaves three irreconcilable pairings, all reported
+by this error rather than silently dropped: a whole-value spelling over
+an established *named* variant (`as` has no scalar spelling, so it
+cannot switch); an un-annotated body over an established *structural*
+value (an un-annotated body never switches, and a body cannot merge
+into a scalar); and a scalar↔list cross inside the structural bucket (a
+list cannot merge into a scalar or vice versa, and structural variants
+have no `as` spelling to switch between — scalar variants of different
+scalar types, e.g. `(string | number)`, overlay like any scalar). The
+message leads with the position and its establishment, and a related
+note marks the establishing entry. Zero-item entries (`= []`, an empty
+block) never supply and never establish — they are NML2079's warned
+no-ops here too. Composition never *guesses* a variant: a keyed body
+the D2 oracle calls ambiguous composes model-less and un-annotated, so
+NML2052 fires on the composed view exactly as it would on the raw one;
+an authored `as` above an ambiguous group *pins* it (it resolves the
+ambiguity rather than switching away from a variant never chosen).
+
+```nml check expect-error='[NML2085]'
+model card:
+    last4 string
+
+model account:
+    payment (card | string)
+
+account base:
+    payment as card:
+        last4 = "4242"
+
+account t uses base:
+    payment = "cash"
+```
+
+**Fix:** compose into the established variant (match its shape), or
+switch deliberately — an authored `as <Variant>` on a nested body — or
+restate the structural value where one is established.
+
+## NML2086
+
+**Internal composition invariant violated.** The compose engine reached
+a decision it holds to be unreachable (for example a union-only verdict
+at a oneof position). The engine fails safe and loud: the affected
+layer's contribution is not composed, and this error names the position
+rather than composing something silently wrong. It should never appear
+on valid or invalid input alike.
+
+**Fix:** none on your side — please report the input that produced it.
 
 ## NML3000
 

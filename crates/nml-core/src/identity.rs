@@ -26,7 +26,6 @@ use crate::model::{FieldType, ModelDef, OneOfDef};
 use crate::schema_index::{FieldTarget, SchemaIndex};
 use crate::span::Span;
 use crate::types::{SpannedValue, Value};
-use std::collections::HashMap;
 
 /// The conventional field a *named* declaration's identity fills.
 const NAME_FIELD: &str = "name";
@@ -328,7 +327,7 @@ fn error(
 /// property: materializing first makes the field present, and the lenient shared-merge
 /// then yields to it.
 pub fn apply_positional(index: &SchemaIndex, root: &str, body: &Body) -> Body {
-    let no_plan = HashMap::new();
+    let no_plan = crate::layers::ArmPlan::default();
     match index.model(root) {
         Some(model) => Positionalizer {
             index,
@@ -347,11 +346,11 @@ pub fn apply_positional(index: &SchemaIndex, root: &str, body: &Body) -> Body {
 /// discriminator materializes against the arm the stack actually
 /// composes. A oneof root (unreachable through plain
 /// [`apply_positional`]) materializes here against its planned arm.
-pub fn apply_positional_planned(
+pub(crate) fn apply_positional_planned(
     index: &SchemaIndex,
     root: &str,
     body: &Body,
-    plan: &HashMap<String, String>,
+    plan: &crate::layers::ArmPlan<'_>,
 ) -> Body {
     let pos = Positionalizer { index, plan };
     match index.model(root) {
@@ -365,11 +364,11 @@ pub fn apply_positional_planned(
 
 struct Positionalizer<'a> {
     index: &'a SchemaIndex,
-    /// Oneof positions' stack-effective arms (dotted path → discriminator
-    /// value). Empty outside layer composition. `path: None` in the
-    /// walkers below means "out of plan scope" (inside list items, arm
-    /// sets, and unions — their positions are never planned).
-    plan: &'a HashMap<String, String>,
+    /// The stack's planned vocabularies (oneof arms AND union variants,
+    /// dotted path-keyed). Empty outside layer composition. `path: None`
+    /// in the walkers below means "out of plan scope" (inside list items
+    /// and arm sets — their positions are never planned).
+    plan: &'a crate::layers::ArmPlan<'a>,
 }
 
 impl Positionalizer<'_> {
@@ -420,6 +419,29 @@ impl Positionalizer<'_> {
         // validator and defaulter. `union_variants` unwraps a modifier wrapper,
         // so `|slot (a | b)` materializes like a plain union.
         if let Some(variants) = field.field_type.union_variants() {
+            // The PLAN's variant overrides the layer's own consult (a
+            // layer that omits its `as` under an established non-default
+            // variant must materialize against the stack's variant, not
+            // its shape's guess) — same rule as planned oneof arms.
+            if let Some(v) = child.and_then(|p| self.plan.planned_union_variant(p)) {
+                if let Some(m) = self.index.model(v) {
+                    return self.model_body(m, body, depth + 1, child);
+                }
+                if let Some(o) = self.index.oneof(v) {
+                    return self.oneof_body(o, body, depth + 1, child);
+                }
+            }
+            // Unplanned and oracle-ambiguous: materialize NOTHING — the
+            // resolver's first-wins guess would inject that variant's
+            // positional machinery into a body compose refuses to assign
+            // a variant (the validator's NML2052 owns it).
+            if self
+                .index
+                .ambiguous_union_variants(variants, body)
+                .is_some()
+            {
+                return body.clone();
+            }
             return match self.index.resolve_type_in_body(&field.field_type, body) {
                 FieldTarget::Model(m) => self.model_body(m, body, depth + 1, None),
                 FieldTarget::OneOf(o) => self.oneof_body(o, body, depth + 1, None),
@@ -464,7 +486,7 @@ impl Positionalizer<'_> {
     /// `oneof_body` (the discriminator itself is injected later, by
     /// `apply_defaults`). An unresolvable discriminator leaves the body unchanged.
     fn oneof_body(&self, oneof: &OneOfDef, body: &Body, depth: u32, path: Option<&str>) -> Body {
-        let planned = path.and_then(|p| self.plan.get(p)).map(|s| s.as_str());
+        let planned = path.and_then(|p| self.plan.planned_arm(p));
         let authored = body.entries.iter().find_map(|e| match &e.kind {
             BodyEntryKind::Property(p) if p.name.name == oneof.discriminator => {
                 p.value.value.as_str()

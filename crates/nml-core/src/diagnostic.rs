@@ -448,6 +448,18 @@ pub mod codes {
         /// lower value unchanged (`semantic_eq`) — a dead delta. Overlay- or
         /// sealed-policy scalar/object fields only.
         DEAD_DELTA = 2084;
+        /// RFC 0015+0019: a union-typed position discarded a layer's
+        /// contribution that can neither merge into the established
+        /// variant nor switch it — a whole-value (structural) spelling
+        /// over an established named variant, or an un-annotated body
+        /// over an established structural value (only an authored `as`
+        /// switches). Loud by design: silence here is data loss.
+        DISCARDED_UNION_CONTRIBUTION = 2085;
+        /// An internal composition invariant was violated (a decision the
+        /// engine believes unreachable was reached). The layer's
+        /// contribution is NOT composed — fail safe and loud, never
+        /// silently wrong. Please report the input.
+        INTERNAL_COMPOSE_INVARIANT = 2086;
 
         /// A money literal is malformed (unparseable amount or fraction).
         INVALID_MONEY = 3000;
@@ -591,6 +603,25 @@ pub fn explain_index() -> Vec<(&'static str, String)> {
 /// own review-guarded content — simple links only, and an unmatched shape
 /// passes through verbatim rather than being mangled.
 fn strip_relative_links(text: &str) -> String {
+    // Inline code spans are content, not markup: `[](a | b)` inside
+    // backticks is a type spelling, not a link. Rewrite only the prose
+    // segments (even-indexed after splitting on backticks); fences are
+    // handled by the caller.
+    let mut out = String::with_capacity(text.len());
+    for (i, segment) in text.split('`').enumerate() {
+        if i > 0 {
+            out.push('`');
+        }
+        if i % 2 == 0 {
+            out.push_str(&strip_relative_links_in_prose(segment));
+        } else {
+            out.push_str(segment);
+        }
+    }
+    out
+}
+
+fn strip_relative_links_in_prose(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find('[') {
@@ -964,6 +995,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("{code} has no summary"));
             assert!(!s.is_empty());
         }
+    }
+
+    #[test]
+    fn strip_relative_links_never_rewrites_inline_code() {
+        let text = "a `[](a | b)` element and a [doc](spec/x.md) link";
+        assert_eq!(
+            strip_relative_links(text),
+            "a `[](a | b)` element and a doc link"
+        );
     }
 
     #[test]

@@ -1319,15 +1319,7 @@ impl SchemaValidator {
                 .select_variant_by_type_name(variants, &ann.name)
                 .is_none()
             {
-                let nameable = self.index.nameable_variant_names(variants);
-                let mut diag =
-                    Diagnostic::error(format!("`{}` is not a variant of this union", ann.name))
-                        .with_code(codes::UNKNOWN_UNION_VARIANT)
-                        .with_span(ann.span);
-                if let Some(s) = nml_core::suggest::suggest(&ann.name, nameable.iter().copied()) {
-                    diag = diag.with_suggestion(s.to_string(), ann.span);
-                }
-                diags.push(diag);
+                diags.push(self.index.unknown_union_variant(variants, ann));
                 return false;
             }
             return true;

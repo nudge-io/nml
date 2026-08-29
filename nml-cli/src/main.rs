@@ -427,9 +427,18 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
             // resolved overlay body carries clones of base entries at their
             // authored spans, so a base defect would otherwise report once
             // as authored and once per overlay. Identical (code, span,
-            // message) triples collapse to one.
-            let mut seen: std::collections::HashSet<nml_core::layers::FindingKey> =
-                std::collections::HashSet::new();
+            // message) triples collapse to one. SEEDED with the composed
+            // diagnostics already reported above: the merge emits some
+            // validator-shaped findings itself (a bogus `as` the composed
+            // view would otherwise swallow, NML2051), and a non-`uses`
+            // base declaration's raw validation re-derives the same
+            // finding at the same span — the LSP and `nml fix` seed this
+            // way too, and an unseeded set printed the pair twice here.
+            let mut seen: std::collections::HashSet<nml_core::layers::FindingKey> = composed
+                .diagnostics
+                .iter()
+                .map(nml_core::layers::finding_key)
+                .collect();
             for diag in validator.validate(validation_file.as_ref().unwrap_or(&file)) {
                 if !seen.insert(nml_core::layers::finding_key(&diag)) {
                     continue;
