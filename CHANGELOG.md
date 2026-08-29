@@ -126,7 +126,24 @@
   (no did-you-mean) through one builder the validator and the merge
   share; `nml explain` never rewrites inline code as a link; and the new
   NML2086 names a violated internal composition invariant instead of
-  composing silently wrong.
+  composing silently wrong. The plan and the merge fold ONE supply set
+  (every spelling, through one constructor), so a planned union trace
+  always aligns and the local refold never judges bodies already
+  normalized under the final variant (a fabricated refusal); a
+  type-annotation modifier at a union position is a declaration that
+  yields to the values (it never routes a group around the authority,
+  never seals); a switch away from a list establishment is judged over
+  the bare-list WINNER only; `.shared`-only blocks are zero-item entries
+  raw and normalized alike, and an all-zero-item union position
+  survives as `= []`; arrays keep their spelling at union positions (an
+  empty block reads as an empty object downstream); a pin carries the
+  pinning layer's own identifier; every believed-unreachable arm in the
+  union faces fails LOUD (NML2086) rather than dropping or last-wins;
+  NML2085 names an earlier entry in the same layer when that is the
+  establishment, and advises resolving an ambiguous lower body; the
+  NML2060 count reads `'field' (and N more)`; NML2079 speaks in union
+  terms at union positions; and hover summaries of the long index
+  entries are their first sentence.
 
 ### Changed
 

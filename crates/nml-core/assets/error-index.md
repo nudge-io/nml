@@ -1459,7 +1459,9 @@ the closest candidate).
 
 **Sealed field violation.** A `#sealed` field is write-once from the
 bottom of the layer stack (RFC 0019): the first layer to assign it fixes
-it, and any higher assignment is rejected — **even at the identical
+it, and any higher assignment is rejected.
+
+Rejection holds **even at the identical
 value**, because a restatement silently decouples the moment the base
 changes (that form carries a machine-applicable *delete this
 assignment* suggestion). The seal binds every field shape — scalars,
@@ -1476,10 +1478,13 @@ arms included — and interiors reached through union-typed fields,
 union-typed LIST elements and a union's own list variant (item paths
 render as `slot[w].field`), arm-set inline arm bodies, and
 oneof-targeted arm sets), is this error;
-the message states the count when more than one sealed field would be
-discarded, names the switch it refused (the discriminator value, the
-`as` target, or the replacement), and closes with the action: compose
-into the lower value, or unseal the field in the schema.
+the message names the first discarded seal and how many more follow
+(`'slot[w].secret' (and 3 more)`), names the switch it refused (the
+discriminator value, the `as` target, or the replacement), and closes
+with the action: compose into the lower value, or unseal the field in
+the schema. A type-annotation modifier (`|slot (a | b)`) inside an
+instance body is a declaration, never a write: it neither seals nor
+violates a seal.
 
 ```nml check expect-error='[NML2060]'
 model flow:
@@ -1697,7 +1702,9 @@ sanctioned pair) that states the intended grant.
 
 **Unreachable seal** *(warning, schema load)*. A `#sealed` declaration
 that cannot engage — a promise of protection the composition rules do
-not deliver (RFC 0019). Three shapes: item-model seals under a
+not deliver (RFC 0019).
+
+Three shapes: item-model seals under a
 **bare-overlay list** (wholesale replacement drops base items; grant
 the list `#identity` to make item seals reachable — for a list whose
 element is a union, or a union's own list variant such as `(a | []b)`,
@@ -1789,7 +1796,9 @@ absent field inherits the base value automatically.
 
 **Discarded union contribution.** A union-typed position received a
 contribution that can neither merge into the established variant nor
-switch it (RFC 0015 + RFC 0019). The lowest supplying layer establishes
+switch it (RFC 0015 + RFC 0019).
+
+The lowest supplying layer establishes
 the variant — named (its `as` annotation, else its unambiguous body
 shape), or structural *per shape* (a scalar value or a list value are
 distinct establishments) — and only an authored `as` on a nested body
@@ -1802,14 +1811,19 @@ into a scalar); and a scalar↔list cross inside the structural bucket (a
 list cannot merge into a scalar or vice versa, and structural variants
 have no `as` spelling to switch between — scalar variants of different
 scalar types, e.g. `(string | number)`, overlay like any scalar). The
-message leads with the position and its establishment, and a related
-note marks the establishing entry. Zero-item entries (`= []`, an empty
-block) never supply and never establish — they are NML2079's warned
-no-ops here too. Composition never *guesses* a variant: a keyed body
+message leads with the position and its establishment (by a lower
+layer, or by an earlier entry in the same layer), and a related note
+marks the establishing entry. Zero-item entries (`= []`, an empty
+block, a `.shared`-only block) never supply and never establish — they
+are NML2079's warned no-ops here too, and a position only they supply
+survives as `= []`. Composition never *guesses* a variant: a keyed body
 the D2 oracle calls ambiguous composes model-less and un-annotated, so
 NML2052 fires on the composed view exactly as it would on the raw one;
 an authored `as` above an ambiguous group *pins* it (it resolves the
-ambiguity rather than switching away from a variant never chosen).
+ambiguity rather than switching away from a variant never chosen, and
+its own identifier becomes the composed annotation). A switch away from
+a list-value establishment is judged over the list the displaced compose
+would carry — the highest layer's list, under the union's list variant.
 
 ```nml check expect-error='[NML2085]'
 model card:

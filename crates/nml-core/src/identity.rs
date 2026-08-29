@@ -531,6 +531,21 @@ impl Positionalizer<'_> {
         // (scalar-on-union is out of scope, flagged by the validator — §10).
         let empty = Body::fresh(Vec::new());
         let probe = item_body(item).unwrap_or(&empty);
+        // A union ELEMENT whose item body the D2 oracle calls ambiguous
+        // gets NO materialization — the resolver's first-wins guess
+        // would inject that variant's positional token into a body
+        // compose refuses to assign a variant (identity pairing is
+        // token-based and unaffected; the validator's NML2052 owns the
+        // ambiguity).
+        if let Some(variants) = inner.union_variants() {
+            if self
+                .index
+                .ambiguous_union_variants(variants, probe)
+                .is_some()
+            {
+                return item.clone();
+            }
+        }
         // A oneof ELEMENT resolves through its arm: the item's own stated
         // discriminator, else the schema default — same consult as
         // `oneof_body`. Bailing instead left oneof items' `+` tokens

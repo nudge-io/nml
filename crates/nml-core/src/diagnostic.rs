@@ -1007,6 +1007,15 @@ mod tests {
     }
 
     #[test]
+    fn strip_relative_links_unmatched_backtick_leaves_the_tail_verbatim() {
+        // An unmatched backtick flips parity for the rest of the text:
+        // everything after it is treated as code and passes through
+        // verbatim — never mangled, never crashed.
+        assert_eq!(strip_relative_links("a ` b [x](y)"), "a ` b [x](y)");
+        assert_eq!(strip_relative_links("[x](y) ` tail"), "x ` tail");
+    }
+
+    #[test]
     fn strip_relative_links_keeps_absolute_ones() {
         assert_eq!(
             strip_relative_links("see [the policy](../stability.md) and [site](https://nml.dev)"),

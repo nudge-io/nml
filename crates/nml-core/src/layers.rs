@@ -15,6 +15,7 @@
 //! pipeline) lives with the provider (nml-validate), keeping the dependency
 //! direction clean; this module owns the *decisions*.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
@@ -1135,7 +1136,14 @@ fn items_of(kind: &BodyEntryKind) -> Option<Vec<ListItem>> {
 /// every entry is a write. One predicate shared by `merge_sealed` and the
 /// backstop scan so "assigned" can never mean two different things.
 fn seal_write(f: &FieldDef, kind: &BodyEntryKind) -> bool {
-    if !is_list_like(effective_type(&f.field_type)) {
+    // A type-annotation modifier is a declaration, never a value: it can
+    // neither seal a field nor violate a seal.
+    if matches!(kind, BodyEntryKind::Modifier(m)
+        if matches!(m.value, ModifierValue::TypeAnnotation { .. }))
+    {
+        return false;
+    }
+    if !admits_items(effective_type(&f.field_type)) {
         return true;
     }
     match kind {
@@ -1485,23 +1493,20 @@ fn candidate_variants(
         }
     };
     for (_, b) in bodies {
-        if let Some(n) = stated_variant(index, union_ty, b) {
-            push(n);
-            continue;
-        }
-        // An oracle-ambiguous body could have made EVERY candidate
-        // effective — all of them are candidates (the resolver's
-        // first-wins pick would make the scan variant-order dependent).
-        if let Some(vs) = union_ty.union_variants() {
-            if let Some(cands) = index.ambiguous_union_variants(vs, b) {
-                for c in cands {
-                    push(c.name().to_string());
-                }
-                continue;
+        // ONE classification: an oracle-ambiguous body could have made
+        // EVERY candidate effective — all of them are candidates (the
+        // resolver's first-wins pick would make the scan variant-order
+        // dependent).
+        match UnionSupply::classify(index, union_ty, Cow::Borrowed(b)) {
+            UnionSupply::Authored { variant, .. } | UnionSupply::Inferred { variant, .. } => {
+                push(variant)
             }
-        }
-        if let Some(n) = inferred_variant(index, union_ty, b) {
-            push(n);
+            UnionSupply::Ambiguous { candidates, .. } => {
+                for c in candidates {
+                    push(c);
+                }
+            }
+            UnionSupply::Items { .. } | UnionSupply::Empty | UnionSupply::Value => {}
         }
     }
     out
@@ -1664,8 +1669,12 @@ enum ArmDecision<'a> {
     /// lost to and what it was), never re-deriving a verdict.
     Discarded {
         over: Establishment,
-        supply: DiscardedSupply,
+        supply: Establishment,
     },
+    /// An authored `as` resolved an ambiguous group (RFC 0015 D2 meets
+    /// RFC 0019): the layer joins, and its identifier becomes the
+    /// group's annotation — never a switch, nothing was displaced.
+    Pinned,
 }
 
 /// Normalize one authored (inlined) body under a CANDIDATE arm model for
@@ -1721,7 +1730,7 @@ fn surviving_entries<'a, 'b>(
     let mut group: Vec<usize> = Vec::new();
     for (i, (_, d)) in trace.iter().enumerate() {
         match d {
-            ArmDecision::Join => group.push(i),
+            ArmDecision::Join | ArmDecision::Pinned => group.push(i),
             ArmDecision::Switch => {
                 group.clear();
                 group.push(i);
@@ -1754,17 +1763,30 @@ fn arm_plan_walk<'a>(
         // here — the one authority — and recurse into the established
         // variant's vocabulary over the surviving group.
         if ety.union_variants().is_some() {
-            let subs = sub_bodies_at(bodies, &f.name);
-            if subs.is_empty() {
+            // The SAME supply set the merge composes — every spelling —
+            // so the planned trace aligns and replays (a trace folded
+            // over nested bodies only never aligned once a whole-value
+            // sibling existed, and the local refold then judged bodies
+            // already normalized under the final variant).
+            let entries = sub_entries_at(bodies, &f.name);
+            if entries.is_empty() {
                 continue;
             }
             let fpath = join_path(path, &f.name);
-            let supplies: Vec<(InstanceId<'a>, UnionSupply<'_>)> = subs
-                .iter()
-                .map(|(l, b)| (*l, UnionSupply::classify(index, ety, b)))
-                .collect();
+            let supplies = union_supplies(index, ety, &entries);
             let (established, trace) = fold_variant_checked(index, ety, &supplies);
-            let survivors = surviving_entries(&trace, &subs);
+            // Nested positions plan over the surviving BODIES.
+            let mut survivors: Vec<(InstanceId<'a>, &Body)> = Vec::new();
+            for (i, (id, d)) in trace.iter().enumerate() {
+                match d {
+                    ArmDecision::Switch => survivors.clear(),
+                    ArmDecision::Rejected { .. } | ArmDecision::Discarded { .. } => continue,
+                    ArmDecision::Join | ArmDecision::Pinned => {}
+                }
+                if let Some(b) = supplies[i].1.body() {
+                    survivors.push((*id, b));
+                }
+            }
             // Ambiguous and structural establishments are deliberately
             // unplanned: the merge's local refold is the same authority,
             // and a plan keyed by variant name has nothing to record.
@@ -1915,11 +1937,14 @@ fn union_variant_vocab<'i>(
 /// Ambiguity is fail-closed end to end: where the D2 oracle refuses to
 /// pick a variant, compose refuses too — it never guesses one and never
 /// synthesizes an annotation that would blind the validator's NML2052.
-#[derive(Clone)]
+/// Doubles as "what a supply WOULD have established" — the second half
+/// of a recorded discard.
+#[derive(Clone, Debug, PartialEq)]
 enum Establishment {
     /// A nameable (model/oneof) variant; `synthesized` marks
-    /// shape-inferred (or ambiguity-pinned) establishment — the output
-    /// annotation is synthesized rather than cloned from the author.
+    /// shape-inferred establishment — the output annotation is
+    /// synthesized rather than cloned from the author (a pin is
+    /// authored: the pinning layer's identifier is carried).
     Named { variant: String, synthesized: bool },
     /// An un-annotated keyed/bare body the D2 oracle calls ambiguous
     /// (`candidates` = the oracle's set, source order): the group
@@ -1931,41 +1956,44 @@ enum Establishment {
     Ambiguous { candidates: Vec<String> },
     /// The scalar structural variant (a whole-value spelling).
     Value,
-    /// The list structural variant (items, in any spelling). Its bodies
-    /// ARE scannable — items carry sealed assignments at any depth,
+    /// The list structural variant (items, in any spelling). Its body
+    /// IS scannable — items carry sealed assignments at any depth,
     /// through positional tokens and list-level `.shared` writes too —
     /// so a switch away from this establishment is judged like every
-    /// other displacement, over the displaced LIST bodies.
+    /// other displacement, over the displaced LIST body (the bare-list
+    /// winner: the list the displaced compose would actually carry).
     Items,
 }
 
 impl Establishment {
-    /// The predicate diagnostics complete: "'{path}' is established …".
+    /// The predicate diagnostics complete: "'{path}' is established
+    /// {clause} {relation}".
     fn clause(&self) -> String {
         match self {
-            Establishment::Named { variant, .. } => format!("`as {variant}` by a lower layer"),
+            Establishment::Named { variant, .. } => format!("`as {variant}`"),
             Establishment::Ambiguous { candidates } => format!(
-                "by a lower layer's un-annotated body (ambiguous between {})",
+                "by an un-annotated body (ambiguous between {})",
                 candidates.join(" | ")
             ),
-            Establishment::Value => "as a scalar value by a lower layer".to_string(),
-            Establishment::Items => "as a list value by a lower layer".to_string(),
+            Establishment::Value => "as a scalar value".to_string(),
+            Establishment::Items => "as a list value".to_string(),
         }
     }
 
     /// The seal judgment a switch away from this establishment must
     /// pass — "what would the displaced compose carry?" under the
-    /// DISPLACED vocabulary: a named group under its variant, an
-    /// ambiguous group under EVERY oracle candidate (fail-closed, never
-    /// the resolver's first-wins guess), a list group over its list
-    /// bodies under the list variants' element types, a scalar
-    /// trivially (nothing to scan).
+    /// DISPLACED vocabulary: a named group under its variant, a list
+    /// group over its list body under the list variant's element type,
+    /// a scalar trivially (nothing to scan). An ambiguous group is never
+    /// switched away from (an authored `as` pins it — see
+    /// [`union_verdict`]); the arm is kept fail-closed over every oracle
+    /// candidate should that ever change.
     fn displaced_seals<'a>(
         &self,
         index: &SchemaIndex,
         union_ty: &FieldType,
         group: &[(InstanceId<'a>, &Body)],
-    ) -> Vec<(String, Span, InstanceId<'a>)> {
+    ) -> SealHits<'a> {
         match self {
             Establishment::Named { variant, .. } => {
                 let vocab = union_variant_vocab(index, variant, group);
@@ -1992,22 +2020,25 @@ impl Establishment {
 /// (items in any spelling — the body is the LIST body, synthesized for
 /// non-block spellings so it is scannable), a zero-item entry (never
 /// supplies, never establishes: NML2079's contract), or a scalar whole
-/// value.
+/// value. ONE constructor ([`union_supplies`]) serves the plan and the
+/// merge, so the two fold over the same supply set and the plan's trace
+/// always aligns — a trace folded over one set and replayed over another
+/// is how a switch silently sticks or a refusal gets fabricated.
 enum UnionSupply<'b> {
     Authored {
         variant: String,
-        body: &'b Body,
+        body: Cow<'b, Body>,
     },
     Inferred {
         variant: String,
-        body: &'b Body,
+        body: Cow<'b, Body>,
     },
     Ambiguous {
         candidates: Vec<String>,
-        body: &'b Body,
+        body: Cow<'b, Body>,
     },
     Items {
-        body: &'b Body,
+        body: Cow<'b, Body>,
     },
     Empty,
     Value,
@@ -2016,50 +2047,83 @@ enum UnionSupply<'b> {
 impl<'b> UnionSupply<'b> {
     /// Classify a nested (or synthesized list) body: authored `as`
     /// (valid names only — a bogus name never switches; the merge
-    /// reports it as NML2051); the block-form zero-item entry; an
-    /// oracle-ambiguous body (compose refuses to guess exactly where D2
-    /// does); a shape-selected nameable variant via the ONE resolver;
-    /// else the structural shape it spells.
-    fn classify(index: &SchemaIndex, union_ty: &FieldType, body: &'b Body) -> Self {
-        if let Some(variant) = stated_variant(index, union_ty, body) {
+    /// reports it as NML2051); the zero-item entry (no entries of its
+    /// OWN — `.shared` lines are distributed, not owned — under a union
+    /// that admits items: a warned no-op, not an empty object, and the
+    /// same verdict raw or normalized); an oracle-ambiguous body
+    /// (compose refuses to guess exactly where D2 does); a
+    /// shape-selected nameable variant via the ONE resolver; else the
+    /// structural shape it spells.
+    fn classify(index: &SchemaIndex, union_ty: &FieldType, body: Cow<'b, Body>) -> Self {
+        if let Some(variant) = stated_variant(index, union_ty, &body) {
             return UnionSupply::Authored { variant, body };
         }
-        // An entry-less, un-annotated body under a union that admits
-        // items is the block-form zero-item entry (a warned no-op), not
-        // an empty object.
-        if body.entries.is_empty() && admits_items(union_ty) {
+        let owns_entries = body
+            .entries
+            .iter()
+            .any(|e| !matches!(e.kind, BodyEntryKind::SharedProperty(_)));
+        if !owns_entries && admits_items(union_ty) {
             return UnionSupply::Empty;
         }
         if let Some(vs) = union_ty.union_variants() {
-            if let Some(cands) = index.ambiguous_union_variants(vs, body) {
+            if let Some(cands) = index.ambiguous_union_variants(vs, &body) {
                 return UnionSupply::Ambiguous {
                     candidates: cands.iter().map(|c| c.name().to_string()).collect(),
                     body,
                 };
             }
         }
-        if let Some(variant) = inferred_variant(index, union_ty, body) {
+        if let Some(variant) = inferred_variant(index, union_ty, &body) {
             return UnionSupply::Inferred { variant, body };
         }
-        if BodyShape::of(body).has_list_items {
+        if BodyShape::of(&body).has_list_items {
             UnionSupply::Items { body }
         } else {
             UnionSupply::Value
         }
     }
 
-    fn body(&self) -> Option<&'b Body> {
+    /// Classify one ENTRY of any spelling: a nested block by its body; an
+    /// item-bearing spelling (inline array, modifier block or array) by a
+    /// synthesized list body — only where the union admits items (else
+    /// an array is just an invalid whole value, never a phantom empty
+    /// object); anything else a scalar whole value.
+    fn classify_entry(index: &SchemaIndex, union_ty: &FieldType, kind: &'b BodyEntryKind) -> Self {
+        match kind {
+            BodyEntryKind::NestedBlock(nb) => {
+                UnionSupply::classify(index, union_ty, Cow::Borrowed(&nb.body))
+            }
+            kind => match items_of(kind) {
+                Some(items) if admits_items(union_ty) => {
+                    let list = Body::fresh(
+                        items
+                            .into_iter()
+                            .map(|item| BodyEntry {
+                                span: item.span,
+                                kind: BodyEntryKind::ListItem(item),
+                            })
+                            .collect(),
+                    );
+                    UnionSupply::classify(index, union_ty, Cow::Owned(list))
+                }
+                _ => UnionSupply::Value,
+            },
+        }
+    }
+
+    fn body(&self) -> Option<&Body> {
         match self {
             UnionSupply::Authored { body, .. }
             | UnionSupply::Inferred { body, .. }
             | UnionSupply::Ambiguous { body, .. }
-            | UnionSupply::Items { body } => Some(body),
+            | UnionSupply::Items { body } => Some(body.as_ref()),
             UnionSupply::Empty | UnionSupply::Value => None,
         }
     }
 
     /// The establishment this supply makes when it is the lowest one
-    /// (a zero-item entry makes none).
+    /// (a zero-item entry makes none) — and, recorded on a discard,
+    /// what the losing supply WOULD have established.
     fn establishes(&self) -> Option<Establishment> {
         match self {
             UnionSupply::Authored { variant, .. } => Some(Establishment::Named {
@@ -2079,24 +2143,62 @@ impl<'b> UnionSupply<'b> {
         }
     }
 
-    /// How a discard names this supply.
-    fn discarded(&self) -> DiscardedSupply {
+    /// The variant this supply names or unambiguously selects — the one
+    /// reading every normalization consumer takes (`None` for ambiguous
+    /// and structural supplies: nothing to normalize under, no guess).
+    fn nameable_variant(&self) -> Option<&str> {
         match self {
             UnionSupply::Authored { variant, .. } | UnionSupply::Inferred { variant, .. } => {
-                DiscardedSupply::Body(BodyHint::Variant(variant.clone()))
+                Some(variant)
             }
-            UnionSupply::Ambiguous { candidates, .. } => {
-                DiscardedSupply::Body(BodyHint::Candidates(candidates.clone()))
-            }
-            UnionSupply::Items { .. } | UnionSupply::Empty => DiscardedSupply::Items,
-            UnionSupply::Value => DiscardedSupply::Value,
+            _ => None,
         }
     }
+}
+
+/// The one supply constructor: every entry a group of sibling bodies
+/// holds under `name`, in group order — the exact set the merge composes
+/// and the plan folds.
+fn union_supplies<'a, 'b>(
+    index: &SchemaIndex,
+    union_ty: &FieldType,
+    entries: &[(InstanceId<'a>, &'b BodyEntry)],
+) -> Vec<(InstanceId<'a>, UnionSupply<'b>)> {
+    entries
+        .iter()
+        .map(|(l, e)| (*l, UnionSupply::classify_entry(index, union_ty, &e.kind)))
+        .collect()
+}
+
+/// The entries named `name` across a group of sibling bodies, in group
+/// order, across EVERY spelling (property, nested block, modifier) —
+/// the supply set of a union position at plan time, identical to the
+/// merge's gather.
+fn sub_entries_at<'b, 'a>(
+    siblings: &[(InstanceId<'a>, &'b Body)],
+    name: &str,
+) -> Vec<(InstanceId<'a>, &'b BodyEntry)> {
+    let mut out = Vec::new();
+    for (id, b) in siblings {
+        for e in &b.entries {
+            let entry_name = match &e.kind {
+                BodyEntryKind::Property(p) => Some(p.name.name.as_str()),
+                BodyEntryKind::NestedBlock(nb) => Some(nb.name.name.as_str()),
+                BodyEntryKind::Modifier(m) => Some(m.name.name.as_str()),
+                _ => None,
+            };
+            if entry_name == Some(name) {
+                out.push((*id, e));
+            }
+        }
+    }
+    out
 }
 
 /// The fold's policy verdict for one supply over the establishment in
 /// force — RFC 0019's rules as a table, separated from the group/trace
 /// bookkeeping that carries them out.
+#[derive(Debug, PartialEq)]
 enum Verdict {
     /// The lowest supplying layer establishes.
     Establish,
@@ -2153,33 +2255,21 @@ fn union_verdict(est: Option<&Establishment>, supply: &UnionSupply<'_>) -> Verdi
     }
 }
 
-/// How a discarded supply is named in NML2085.
-enum DiscardedSupply {
-    Body(BodyHint),
-    Value,
-    Items,
-}
-
-/// The switch hint a discarded body gets: its uniquely inferred
-/// variant, or the oracle's candidate list — never a first-wins guess.
-enum BodyHint {
-    Variant(String),
-    Candidates(Vec<String>),
-}
-
 /// One discarded contribution's coordinates for NML2085: where it sits,
-/// which layer authored it, and where the establishment it lost to was
-/// made.
+/// which layer authored it, and where (and in which layer) the
+/// establishment it lost to was made.
 struct DiscardSite<'a> {
     est_at: Span,
+    est_layer: InstanceId<'a>,
     at: Span,
     layer: InstanceId<'a>,
 }
 
 /// The composed union body's output annotation, shared by both faces:
-/// the establishing author's own identifier when one was authored, else
-/// a synthesized one — authored by no one, deliberately, so the merged
-/// shape can never re-infer a different variant.
+/// the authoring identifier when one was authored (the establishing
+/// layer's `as`, or the pinning layer's), else a synthesized one —
+/// authored by no one, deliberately, so the merged shape can never
+/// re-infer a different variant.
 fn union_output_annotation(
     authored: Option<Identifier>,
     synthesized: bool,
@@ -2196,9 +2286,9 @@ fn union_output_annotation(
 }
 
 /// Whether a type admits item-bearing spellings — a list/set, or a
-/// union with a list/set variant — the one gate for zero-item warnings
-/// and array→block normalization, so a union position is treated like
-/// the list it can be.
+/// union with a list/set variant — the one gate for "is a zero-item
+/// entry a no-op here" (NML2079, the union classifier, the seal-write
+/// predicate) so a union position is treated like the list it can be.
 fn admits_items(ty: &FieldType) -> bool {
     is_list_like(ty)
         || ty
@@ -2217,60 +2307,104 @@ fn body_anchor(body: &Body) -> Span {
         .unwrap_or_else(|| Span::empty(0))
 }
 
+/// The scan vocabulary of one list ELEMENT over an item group — a model
+/// element directly, a oneof element under every arm the group could
+/// have made effective (fail-closed, the schema default plus each
+/// stated discriminator), a union element under every variant the
+/// group could have established. One owner for the displaced-list
+/// judgment and the general list scan.
+fn list_element_vocab<'i>(
+    index: &'i SchemaIndex,
+    element: &FieldType,
+    group: &[(InstanceId<'_>, &Body)],
+) -> Vec<&'i ModelDef> {
+    let mut vocab: Vec<&'i ModelDef> = Vec::new();
+    match element {
+        FieldType::ModelRef(n) => {
+            if let Some(m) = index.model(n) {
+                push_model(&mut vocab, m);
+            } else if let Some(oneof) = index.oneof(n) {
+                for arm in candidate_arms(oneof, group) {
+                    if let Some(am) = variant_model_of(index, oneof, &arm) {
+                        push_model(&mut vocab, am);
+                    }
+                }
+            }
+        }
+        ty if ty.union_variants().is_some() => {
+            for name in candidate_variants(index, ty, group) {
+                for m in union_variant_vocab(index, &name, group) {
+                    push_model(&mut vocab, m);
+                }
+            }
+        }
+        _ => {}
+    }
+    vocab
+}
+
 /// Seal judgment over a displaced LIST group (an [`Establishment::Items`]
-/// switch): each displaced list body is judged AS A LIST under every
-/// list variant's element type — list-level `.shared` writes
+/// switch): the displaced list body is judged AS A LIST under the list
+/// variant the resolver selects for a list shape (the FIRST list
+/// variant — the one the displaced compose would carry; later list
+/// variants are unreachable by shape) — list-level `.shared` writes
 /// distributed, each item's identity token materialized into its body
-/// (a positional `+` field is a write), the body then normalized and
-/// scanned under the element vocabulary (a oneof element under the arm
-/// the item's own discriminator selects), seal paths prefixed with the
-/// item's non-disclosing token. Scanning item bodies in isolation
-/// missed positional tokens, `.shared` writes, and bodiless items alike
-/// — "a structural group has no seals" is true only for scalars.
+/// (a positional `+` field is a write) under the arm its own body
+/// selects, the body then normalized and scanned under the element
+/// vocabulary, seal paths prefixed with the item's non-disclosing
+/// segment. Scanning item bodies in isolation missed positional tokens,
+/// `.shared` writes, and bodiless items alike — "a structural group has
+/// no seals" is true only for scalars.
 fn displaced_list_seals<'a>(
     index: &SchemaIndex,
     union_ty: &FieldType,
     group: &[(InstanceId<'a>, &Body)],
-) -> Vec<(String, Span, InstanceId<'a>)> {
-    let mut out: Vec<(String, Span, InstanceId<'a>)> = Vec::new();
+) -> SealHits<'a> {
+    let mut out: SealHits<'a> = Vec::new();
     let mut seen: HashSet<(String, usize, usize)> = HashSet::new();
-    let Some(variants) = union_ty.union_variants() else {
+    let Some(element) = union_ty
+        .union_variants()
+        .and_then(|vs| vs.iter().find(|v| matches!(v, FieldType::List(_))))
+        .and_then(list_inner)
+    else {
         return out;
     };
-    let elements: Vec<&FieldType> = variants.iter().filter_map(list_inner).collect();
-    if elements.is_empty() {
-        return out;
-    }
     for (gid, gb) in group {
         let shared = crate::resolve::apply_shared_properties(gb);
         for entry in &shared.entries {
             let BodyEntryKind::ListItem(item) = &entry.kind else {
                 continue;
             };
-            let (token, probe): (String, Body) = match &item.kind {
-                ListItemKind::Named { name, body } => (name.name.clone(), body.clone()),
-                ListItemKind::Shorthand { value, body } => (
-                    value.value.type_name().to_string(),
-                    body.clone().unwrap_or_else(|| Body::fresh(Vec::new())),
-                ),
+            let probe: Cow<'_, Body> = match &item.kind {
+                ListItemKind::Named { body, .. } => Cow::Borrowed(body),
+                ListItemKind::Shorthand { body: Some(b), .. } => Cow::Borrowed(b),
+                ListItemKind::Shorthand { body: None, .. } => Cow::Owned(Body::fresh(Vec::new())),
                 _ => continue,
             };
-            for element in &elements {
-                let FieldType::ModelRef(n) = element else {
-                    continue;
-                };
-                let vocab = arm_body_vocab(index, index.model(n), index.oneof(n), &probe);
-                if vocab.is_empty() {
-                    continue;
+            let own = [(*gid, probe.as_ref())];
+            let vocab = list_element_vocab(index, element, &own);
+            // Materialize and normalize under the arm the item's OWN
+            // body selects (stated-else-default); scan under the
+            // fail-closed vocabulary.
+            let norm_model = match element {
+                FieldType::ModelRef(n) => {
+                    arm_body_vocab(index, index.model(n), index.oneof(n), &probe)
+                        .first()
+                        .copied()
                 }
-                let materialized = crate::identity::materialize_item(item, vocab[0]).body;
-                let normd = normalize_for_scan(index, vocab[0], &materialized);
-                let refs: Vec<(InstanceId<'a>, &Body)> = vec![(*gid, &normd)];
-                for (p, sp, l) in assigned_seals_over(index, "", &vocab, &refs) {
-                    let prefixed = format!("[{token}].{p}");
-                    if seen.insert((prefixed.clone(), sp.start, sp.end)) {
-                        out.push((prefixed, sp, l));
-                    }
+                _ => vocab.first().copied(),
+            };
+            let Some(norm_model) = norm_model else {
+                continue;
+            };
+            let materialized = crate::identity::materialize_item(item, norm_model).body;
+            let normd = normalize_for_scan(index, norm_model, &materialized);
+            let refs: Vec<(InstanceId<'a>, &Body)> = vec![(*gid, &normd)];
+            let segment = ItemKey::of(&item.kind).segment();
+            for (p, sp, l) in assigned_seals_over(index, "", &vocab, &refs) {
+                let prefixed = format!("[{segment}].{p}");
+                if seen.insert((prefixed.clone(), sp.start, sp.end)) {
+                    out.push((prefixed, sp, l));
                 }
             }
         }
@@ -2283,7 +2417,7 @@ fn displaced_list_seals<'a>(
 /// discriminator (else the schema default) selects — exactly what that
 /// body's displaced compose would carry. Shared by the merge-time
 /// arm-set backstop, the seal scan's arms interior walk, and the
-/// list-variant scan's element resolution.
+/// list-variant scan's normalization model.
 fn arm_body_vocab<'i>(
     index: &'i SchemaIndex,
     target_model: Option<&'i ModelDef>,
@@ -2304,11 +2438,14 @@ fn arm_body_vocab<'i>(
 }
 
 /// The replayed outcome at a union position (indexes into the supply
-/// list): which supplies survive, split by where they land, and the
-/// establishing entry — see [`Merger::replay_union`].
+/// list): which supplies survive, split by where they land, the
+/// establishing entry (whose name and span the output carries), and the
+/// pinning entry when an authored `as` resolved an ambiguous group (its
+/// identifier is the output annotation) — see [`Merger::replay_union`].
 #[derive(Default)]
 struct UnionReplay {
     establishing: Option<usize>,
+    pinned_by: Option<usize>,
     est_at: Option<Span>,
     group: Vec<usize>,
     structural: Vec<usize>,
@@ -2417,17 +2554,16 @@ fn seal_backstop_rejection(
     } else {
         join_path(path, &seal_path)
     };
-    let mut msg = format!(
-        "{lead} would discard the assigned `#sealed` field '{seal_field}' — \
-         replacement cannot launder a seal"
+    let more = if seals.len() > 1 {
+        format!(" (and {} more)", seals.len() - 1)
+    } else {
+        String::new()
+    };
+    let msg = format!(
+        "{lead} would discard the assigned `#sealed` field '{seal_field}'{more} — \
+         replacement cannot launder a seal; compose into the lower value, or \
+         unseal the field in the schema"
     );
-    if seals.len() > 1 {
-        msg.push_str(&format!(
-            " ({} sealed fields would be discarded)",
-            seals.len()
-        ));
-    }
-    msg.push_str("; compose into the lower value, or unseal the field in the schema");
     Diagnostic::error(msg)
         .with_code(codes::SEALED_FIELD_VIOLATION)
         .with_span(at)
@@ -2451,9 +2587,9 @@ fn seal_backstop_rejection(
 /// [`union_verdict`]; this loop only carries verdicts out — group and
 /// trace bookkeeping, plus the seal judgment a switch must pass
 /// ([`Establishment::displaced_seals`], judged over the displaced group
-/// normalized under the DISPLACED vocabulary). Supplies are classified
-/// by [`UnionSupply::classify`]; returns the establishment and the
-/// per-layer trace the merge replays.
+/// normalized under the DISPLACED vocabulary). Supplies come from the
+/// one constructor ([`union_supplies`]); returns the establishment and
+/// the per-layer trace the merge replays.
 fn fold_variant_checked<'a, 'b>(
     index: &SchemaIndex,
     union_ty: &FieldType,
@@ -2461,9 +2597,12 @@ fn fold_variant_checked<'a, 'b>(
 ) -> (Option<Establishment>, DecisionTrace<'a>) {
     let mut established: Option<Establishment> = None;
     // The effective group's SCANNABLE bodies, for the displaced-seal
-    // judgment (named, ambiguous, and list supplies carry bodies; only
-    // scalar whole values have nothing to scan).
-    let mut group: Vec<(InstanceId<'a>, &'b Body)> = Vec::new();
+    // judgment: named and ambiguous groups accumulate (they
+    // deep-merge); a list group holds ONLY the bare-list winner (a
+    // replaced list's seals never engaged — judging them would refuse a
+    // switch over items the engine itself discarded); scalar whole
+    // values have nothing to scan.
+    let mut group: Vec<(InstanceId<'a>, &Body)> = Vec::new();
     // A rejected switch leaves the group untouched, so consecutive
     // judgments over one group are identical — memoized by group
     // version (N rejected switches over M sealed items were N full
@@ -2482,28 +2621,32 @@ fn fold_variant_checked<'a, 'b>(
                 trace.push((*id, ArmDecision::Join));
             }
             Verdict::Join => {
-                let scannable = matches!(
-                    established,
-                    Some(
-                        Establishment::Named { .. }
-                            | Establishment::Ambiguous { .. }
-                            | Establishment::Items
-                    )
-                );
-                if let (true, Some(b)) = (scannable, supply.body()) {
-                    group.push((*id, b));
-                    group_version += 1;
+                match (&established, supply.body()) {
+                    (
+                        Some(Establishment::Named { .. } | Establishment::Ambiguous { .. }),
+                        Some(b),
+                    ) => {
+                        group.push((*id, b));
+                        group_version += 1;
+                    }
+                    (Some(Establishment::Items), Some(b)) => {
+                        group.clear();
+                        group.push((*id, b));
+                        group_version += 1;
+                    }
+                    _ => {}
                 }
                 trace.push((*id, ArmDecision::Join));
             }
             Verdict::Pin(variant) => {
+                // Authored by the pinning layer: not synthesized.
                 established = Some(Establishment::Named {
                     variant,
-                    synthesized: true,
+                    synthesized: false,
                 });
                 group.push((*id, supply.body().expect("an authored supply is a body")));
                 group_version += 1;
-                trace.push((*id, ArmDecision::Join));
+                trace.push((*id, ArmDecision::Pinned));
             }
             Verdict::JudgeSwitch(variant) => {
                 let est = established
@@ -2537,7 +2680,9 @@ fn fold_variant_checked<'a, 'b>(
                         over: established
                             .clone()
                             .expect("a discard is judged against an establishment"),
-                        supply: supply.discarded(),
+                        supply: supply
+                            .establishes()
+                            .expect("a zero-item entry always joins"),
                     },
                 ));
             }
@@ -2696,14 +2841,32 @@ fn normalize_spellings(
                 BodyEntryKind::Property(p) => {
                     let field = field_map.get(p.name.name.as_str()).copied();
                     match (&p.value.value, field) {
+                        // A zero-item array at a UNION position: warned
+                        // like every zero-item spelling, but kept in the
+                        // array spelling (an empty block reads as an empty
+                        // OBJECT of the first model variant downstream).
                         (Value::Array(values), Some(f))
-                            if admits_items(effective_type(&f.field_type)) =>
+                            if values.is_empty()
+                                && !is_list_like(effective_type(&f.field_type))
+                                && admits_items(effective_type(&f.field_type)) =>
+                        {
+                            diags.push(zero_item_warning(
+                                &p.name.name,
+                                entry.span,
+                                source_path,
+                                true,
+                            ));
+                            entry.kind.clone()
+                        }
+                        (Value::Array(values), Some(f))
+                            if is_list_like(effective_type(&f.field_type)) =>
                         {
                             if values.is_empty() {
                                 diags.push(zero_item_warning(
                                     &p.name.name,
                                     entry.span,
                                     source_path,
+                                    union_position(field_map.get(p.name.name.as_str()).copied()),
                                 ));
                             }
                             BodyEntryKind::NestedBlock(NestedBlock {
@@ -2730,20 +2893,33 @@ fn normalize_spellings(
                             // business, not a zero-item list entry. An
                             // undeclared name stays warned (fail-closed:
                             // modifiers are list-carriers by convention).
-                            let list_like = field_map
-                                .get(m.name.name.as_str())
+                            let declared = field_map.get(m.name.name.as_str()).copied();
+                            let list_like = declared
                                 .is_none_or(|f| admits_items(effective_type(&f.field_type)));
                             if values.is_empty() && list_like {
                                 diags.push(zero_item_warning(
                                     &m.name.name,
                                     entry.span,
                                     source_path,
+                                    union_position(declared),
                                 ));
                             }
-                            BodyEntryKind::Modifier(Modifier {
-                                name: m.name.clone(),
-                                value: ModifierValue::Block(items_from_array(values)),
-                            })
+                            // Block-form is the canonical spelling of a LIST
+                            // modifier; at a union position the inline
+                            // array keeps its spelling (a block modifier
+                            // under a union type is not a valid instance
+                            // spelling downstream — `items_of` reads the
+                            // array either way).
+                            if declared
+                                .is_some_and(|f| !is_list_like(effective_type(&f.field_type)))
+                            {
+                                entry.kind.clone()
+                            } else {
+                                BodyEntryKind::Modifier(Modifier {
+                                    name: m.name.clone(),
+                                    value: ModifierValue::Block(items_from_array(values)),
+                                })
+                            }
                         }
                         _ => entry.kind.clone(),
                     },
@@ -2756,7 +2932,12 @@ fn normalize_spellings(
                             .get(m.name.name.as_str())
                             .is_none_or(|f| admits_items(effective_type(&f.field_type)));
                         if list_like {
-                            diags.push(zero_item_warning(&m.name.name, entry.span, source_path));
+                            diags.push(zero_item_warning(
+                                &m.name.name,
+                                entry.span,
+                                source_path,
+                                union_position(field_map.get(m.name.name.as_str()).copied()),
+                            ));
                         }
                         entry.kind.clone()
                     }
@@ -2793,13 +2974,10 @@ fn normalize_spellings(
                             let variant = plan
                                 .planned_union_variant(&child_path)
                                 .map(str::to_string)
-                                .or_else(|| stated_variant(index, ty, &nb.body))
                                 .or_else(|| {
-                                    let vs = ty.union_variants()?;
-                                    if index.ambiguous_union_variants(vs, &nb.body).is_some() {
-                                        return None;
-                                    }
-                                    inferred_variant(index, ty, &nb.body)
+                                    UnionSupply::classify(index, ty, Cow::Borrowed(&nb.body))
+                                        .nameable_variant()
+                                        .map(str::to_string)
                                 });
                             variant.and_then(|v| {
                                 index
@@ -2825,7 +3003,12 @@ fn normalize_spellings(
                         _ => false,
                     };
                     if zero_item_block {
-                        diags.push(zero_item_warning(&nb.name.name, entry.span, source_path));
+                        diags.push(zero_item_warning(
+                            &nb.name.name,
+                            entry.span,
+                            source_path,
+                            union_position(nb_field),
+                        ));
                     }
                     BodyEntryKind::NestedBlock(NestedBlock {
                         name: nb.name.clone(),
@@ -2892,15 +3075,30 @@ fn normalize_spellings(
     body.with_entries(entries)
 }
 
-fn zero_item_warning(field: &str, span: Span, source_path: &str) -> Diagnostic {
-    Diagnostic::warning(format!(
-        "'{field}' normalizes to zero items in a composing layer — it does \
-         not supply the list, and \"empty the base list\" has no merge \
-         spelling"
-    ))
-    .with_code(codes::ZERO_ITEM_LAYER_ENTRY)
-    .with_span(span)
-    .with_source(source_path.to_string())
+/// Whether a field is a union position (for the zero-item warning's
+/// wording: nothing there is "the list").
+fn union_position(field: Option<&FieldDef>) -> bool {
+    field.is_some_and(|f| effective_type(&f.field_type).union_variants().is_some())
+}
+
+fn zero_item_warning(field: &str, span: Span, source_path: &str, at_union: bool) -> Diagnostic {
+    let msg = if at_union {
+        format!(
+            "'{field}' normalizes to zero items in a composing layer — it \
+             supplies nothing (an empty block or `[]` never establishes a \
+             variant), and \"empty the base value\" has no merge spelling"
+        )
+    } else {
+        format!(
+            "'{field}' normalizes to zero items in a composing layer — it does \
+             not supply the list, and \"empty the base list\" has no merge \
+             spelling"
+        )
+    };
+    Diagnostic::warning(msg)
+        .with_code(codes::ZERO_ITEM_LAYER_ENTRY)
+        .with_span(span)
+        .with_source(source_path.to_string())
 }
 
 // ───────────────────────────────────────────────────────────── resolve ──
@@ -3285,6 +3483,7 @@ pub fn compose_file(
 // ───────────────────────────────────────────────────────────── merging ──
 
 /// One layer's contribution to one field: the entry plus where it came from.
+#[derive(Clone)]
 struct Contribution<'a> {
     layer: InstanceId<'a>,
     entry: BodyEntry,
@@ -3453,13 +3652,29 @@ impl<'a, 'd> Merger<'a, 'd> {
         let union_ty = field
             .map(|f| effective_type(&f.field_type))
             .filter(|t| t.union_variants().is_some());
-        let type_annotated = contributions.iter().any(|c| {
-            matches!(&c.entry.kind, BodyEntryKind::Modifier(m)
-                if matches!(m.value, ModifierValue::TypeAnnotation { .. }))
-        });
         if let Some(union_ty) = union_ty {
-            if !type_annotated && policy != MergePolicy::Sealed {
-                return self.merge_union(&field_path, union_ty, contributions);
+            if policy != MergePolicy::Sealed {
+                // Type-annotation modifiers are declarations, not values
+                // (inert in a bound instance, like FieldDefinition
+                // entries): an all-annotation group passes through on the
+                // modifier path; otherwise the VALUES compose through the
+                // authority and the declaration yields to them (one entry
+                // per field). Excluding the whole group sent it around
+                // the authority — a debug panic and, in release, a
+                // last-wins that laundered seals.
+                let values: Vec<Contribution<'a>> = contributions
+                    .iter()
+                    .filter(|c| {
+                        !matches!(&c.entry.kind, BodyEntryKind::Modifier(m)
+                            if matches!(m.value, ModifierValue::TypeAnnotation { .. }))
+                    })
+                    .cloned()
+                    .collect();
+                return if values.is_empty() {
+                    self.merge_modifier(&field_path, policy, field, contributions)
+                } else {
+                    self.merge_union(&field_path, union_ty, &values)
+                };
             }
         }
         // All-modifier groups route by KIND first (modifier output shape,
@@ -3722,52 +3937,23 @@ impl<'a, 'd> Merger<'a, 'd> {
     }
 
     /// Union compose (RFC 0015 nominal unions) at FIELD scope: every
-    /// contribution is a supply — a nested body, or a whole-value
-    /// spelling (items in any spelling become a LIST body, synthesized
-    /// for non-block spellings so the Items group is scannable). The
-    /// fold (planned, else local) decides; [`Self::replay_union`]
-    /// carries the decisions out; the establishment picks the output —
-    /// a named-variant merge with an explicit annotation, a model-less
-    /// un-annotated merge for an ambiguous group (NML2052 stays the
-    /// validator's), or the structural overlay of the surviving whole
-    /// values.
+    /// contribution is a supply through the ONE constructor
+    /// ([`union_supplies`] — the plan folds the same set, so its trace
+    /// aligns and replays), the fold (planned, else local) decides,
+    /// [`Self::replay_union`] carries the decisions out, and the
+    /// establishment picks the output — a named-variant merge with an
+    /// explicit annotation, a model-less un-annotated merge for an
+    /// ambiguous group (NML2052 stays the validator's), or the
+    /// structural overlay of the surviving whole values.
     fn merge_union(
         &mut self,
         path: &str,
         union_ty: &FieldType,
         contributions: &[Contribution<'a>],
     ) -> Option<BodyEntry> {
-        let synthesized: Vec<Option<Body>> = contributions
-            .iter()
-            .map(|c| match &c.entry.kind {
-                BodyEntryKind::NestedBlock(_) => None,
-                kind => items_of(kind).map(|items| {
-                    Body::fresh(
-                        items
-                            .into_iter()
-                            .map(|item| BodyEntry {
-                                span: item.span,
-                                kind: BodyEntryKind::ListItem(item),
-                            })
-                            .collect(),
-                    )
-                }),
-            })
-            .collect();
-        let supplies: Vec<(InstanceId<'a>, UnionSupply<'_>)> = contributions
-            .iter()
-            .zip(&synthesized)
-            .map(|(c, synth)| {
-                let supply = match (&c.entry.kind, synth) {
-                    (BodyEntryKind::NestedBlock(nb), _) => {
-                        UnionSupply::classify(self.index, union_ty, &nb.body)
-                    }
-                    (_, Some(list)) => UnionSupply::classify(self.index, union_ty, list),
-                    (_, None) => UnionSupply::Value,
-                };
-                (c.layer, supply)
-            })
-            .collect();
+        let entries: Vec<(InstanceId<'a>, &BodyEntry)> =
+            contributions.iter().map(|c| (c.layer, &c.entry)).collect();
+        let supplies = union_supplies(self.index, union_ty, &entries);
         self.report_unknown_union_annotations(
             union_ty,
             supplies
@@ -3794,10 +3980,22 @@ impl<'a, 'd> Merger<'a, 'd> {
         let Some(established) = established else {
             // Zero-item entries only: nothing supplies the position — it
             // survives authored-empty rather than dropping (the bare-list
-            // rule's own verdict for a never-supplied list).
+            // rule's own verdict), in the `= []` spelling every consumer
+            // reads as the empty list (an entry-less block reads as an
+            // empty OBJECT of the first model variant downstream).
             let last = contributions.last()?;
             self.record(path, last.layer, last.entry.span);
-            return Some(last.entry.clone());
+            let (name, span) = match &last.entry.kind {
+                BodyEntryKind::NestedBlock(nb) => (nb.name.clone(), nb.name.span),
+                _ => return Some(last.entry.clone()),
+            };
+            return Some(BodyEntry {
+                span: last.entry.span,
+                kind: BodyEntryKind::Property(crate::ast::Property {
+                    name,
+                    value: SpannedValue::new(Value::Array(Vec::new()), span),
+                }),
+            });
         };
         let replay = self.replay_union(path, &established, trace, &supplies, |i| {
             contributions[i].entry.span
@@ -3805,27 +4003,41 @@ impl<'a, 'd> Merger<'a, 'd> {
         let group: Vec<(InstanceId<'a>, Body)> = replay
             .group
             .iter()
-            .map(|&i| {
-                (
-                    contributions[i].layer,
-                    supplies[i]
-                        .1
-                        .body()
-                        .expect("group members are bodies")
-                        .clone(),
-                )
+            .filter_map(|&i| {
+                supplies[i]
+                    .1
+                    .body()
+                    .map(|b| (contributions[i].layer, b.clone()))
             })
             .collect();
         match established {
             Establishment::Named { .. } | Establishment::Ambiguous { .. } => {
-                let est = replay.establishing?;
-                let BodyEntryKind::NestedBlock(est_nb) = &contributions[est].entry.kind else {
-                    // A body establishment is a nested block by
-                    // construction (synthesized list bodies classify
-                    // only as Items/Empty); fail safe, not silent-wrong.
+                let Some(est) = replay.establishing else {
+                    // Unreachable by construction (a body establishment
+                    // has a body-bearing establishing supply) — fail
+                    // safe and LOUD, never silently drop the field.
                     let last = contributions.last()?;
-                    self.record(path, last.layer, last.entry.span);
+                    self.internal_invariant(
+                        path,
+                        last.entry.span,
+                        last.layer,
+                        "a body establishment with no establishing supply",
+                    );
                     return Some(last.entry.clone());
+                };
+                let BodyEntryKind::NestedBlock(est_nb) = &contributions[est].entry.kind else {
+                    // Same: a body establishment is a nested block by
+                    // construction (synthesized list bodies classify
+                    // only as Items/Empty).
+                    let c = &contributions[est];
+                    self.internal_invariant(
+                        path,
+                        c.entry.span,
+                        c.layer,
+                        "a body establishment on a non-block entry",
+                    );
+                    self.record(path, c.layer, c.entry.span);
+                    return Some(c.entry.clone());
                 };
                 let est_span = contributions[est].entry.span;
                 let out_body = match &established {
@@ -3834,8 +4046,16 @@ impl<'a, 'd> Merger<'a, 'd> {
                         synthesized,
                     } => {
                         let mut merged = self.merge_variant_group(path, variant, &group);
+                        // The authored identifier: the pinning layer's
+                        // `as` when one resolved an ambiguous group,
+                        // else the establishing layer's own.
+                        let authored = replay
+                            .pinned_by
+                            .and_then(|i| supplies[i].1.body())
+                            .or(Some(&est_nb.body))
+                            .and_then(|b| b.type_annotation.clone());
                         merged.type_annotation = Some(union_output_annotation(
-                            est_nb.body.type_annotation.clone(),
+                            authored,
                             *synthesized,
                             variant.clone(),
                             est_span,
@@ -3873,9 +4093,10 @@ impl<'a, 'd> Merger<'a, 'd> {
     /// faces (field scope and item scope), index-based so each face maps
     /// survivors back to its own representation: rejections and
     /// discards are reported (with the context the fold recorded — the
-    /// merge never re-derives a verdict), a switch restarts the group,
-    /// a join lands in the body group or the structural slice by the
-    /// establishment in force, and a zero-item entry joins as a no-op.
+    /// merge never re-derives a verdict), a switch restarts the group, a
+    /// pin joins and takes the annotation, a join lands in the body
+    /// group or the structural slice by the establishment in force, and
+    /// a zero-item entry joins as a no-op.
     fn replay_union(
         &mut self,
         path: &str,
@@ -3889,6 +4110,7 @@ impl<'a, 'd> Merger<'a, 'd> {
             established,
             Establishment::Named { .. } | Establishment::Ambiguous { .. }
         );
+        let mut est_layer: Option<InstanceId<'a>> = None;
         for (idx, (layer, supply)) in supplies.iter().enumerate() {
             // Positional: the trace was folded over these exact supplies
             // in this exact order (plan alignment was checked by the
@@ -3901,8 +4123,25 @@ impl<'a, 'd> Merger<'a, 'd> {
                     self.report_variant_switch_rejection(path, seals, body, anchor(idx), *layer);
                 }
                 ArmDecision::Discarded { over, supply: what } => {
+                    // A discard is judged against an establishment in
+                    // force, so the establishing site is recorded by now;
+                    // fail safe (anchor on the discard itself) and loud
+                    // should that invariant ever break.
+                    let (est_at, est_layer) = match (replay.est_at, est_layer) {
+                        (Some(at), Some(l)) => (at, l),
+                        _ => {
+                            self.internal_invariant(
+                                path,
+                                anchor(idx),
+                                *layer,
+                                "a discard before any establishment",
+                            );
+                            (anchor(idx), *layer)
+                        }
+                    };
                     let site = DiscardSite {
-                        est_at: replay.est_at.unwrap_or_else(|| anchor(idx)),
+                        est_at,
+                        est_layer,
                         at: anchor(idx),
                         layer: *layer,
                     };
@@ -3913,7 +4152,15 @@ impl<'a, 'd> Merger<'a, 'd> {
                     replay.structural.clear();
                     replay.group.push(idx);
                     replay.establishing = Some(idx);
+                    replay.pinned_by = None;
                     replay.est_at = Some(anchor(idx));
+                    est_layer = Some(*layer);
+                }
+                ArmDecision::Pinned => {
+                    replay.group.push(idx);
+                    replay.pinned_by = Some(idx);
+                    replay.est_at = Some(anchor(idx));
+                    est_layer = Some(*layer);
                 }
                 ArmDecision::Join => match supply {
                     UnionSupply::Empty => {}
@@ -3922,11 +4169,13 @@ impl<'a, 'd> Merger<'a, 'd> {
                         if replay.establishing.is_none() {
                             replay.establishing = Some(idx);
                             replay.est_at = Some(anchor(idx));
+                            est_layer = Some(*layer);
                         }
                     }
                     _ => {
                         if replay.est_at.is_none() {
                             replay.est_at = Some(anchor(idx));
+                            est_layer = Some(*layer);
                         }
                         replay.structural.push(idx);
                     }
@@ -3934,6 +4183,32 @@ impl<'a, 'd> Merger<'a, 'd> {
             }
         }
         replay
+    }
+
+    /// NML2086 — an internal composition invariant the engine holds to
+    /// be unreachable was reached: fail safe and LOUD (the position
+    /// elided at an instance root), never silently wrong. The module's
+    /// precedent for believed-unreachable arms.
+    fn internal_invariant(&mut self, path: &str, at: Span, layer: InstanceId<'a>, what: &str) {
+        debug_assert!(
+            false,
+            "internal composition invariant violated: {what} at '{path}'"
+        );
+        let position = if path.is_empty() {
+            String::new()
+        } else {
+            format!(" at '{path}'")
+        };
+        self.diags.push(
+            Diagnostic::error(format!(
+                "internal composition invariant violated{position} ({what}) — \
+                 this layer's contribution was not composed; please report \
+                 the input"
+            ))
+            .with_code(codes::INTERNAL_COMPOSE_INVARIANT)
+            .with_span(at)
+            .with_source(layer.source_path.to_string()),
+        );
     }
 
     /// The one NML2060 emission for a rejected union `as` switch, shared
@@ -3986,73 +4261,98 @@ impl<'a, 'd> Merger<'a, 'd> {
     /// NML2085 — RFC 0019's loud-not-silent floor for the union shape
     /// conflict the fold cannot compose: a contribution that can neither
     /// merge into the establishment in force nor switch it. The face is
-    /// keyed on the (establishment, supply) pair the FOLD recorded — the
-    /// merge never re-derives it — leads with the position and the
-    /// establishment, names the losing spelling and what WOULD switch,
-    /// and points a related note at the establishing entry.
+    /// keyed on the (establishment it lost to, establishment it would
+    /// have made) pair the FOLD recorded — the merge never re-derives it
+    /// — leads with the position and the establishment (naming the
+    /// relation: a lower layer, or an earlier entry in this same layer),
+    /// names the losing spelling and what WOULD switch, and points a
+    /// related note at the establishing entry.
     fn discarded_union_contribution(
         &mut self,
         path: &str,
         over: &Establishment,
-        what: &DiscardedSupply,
+        what: &Establishment,
         site: DiscardSite<'a>,
     ) {
-        let clause = over.clause();
+        let relation = if site.est_layer == site.layer {
+            "by an earlier entry in this same layer"
+        } else {
+            "by a lower layer"
+        };
+        let clause = format!("{} {relation}", over.clause());
         let msg = match (over, what) {
             (
                 Establishment::Named { .. } | Establishment::Ambiguous { .. },
-                DiscardedSupply::Value | DiscardedSupply::Items,
+                Establishment::Value | Establishment::Items,
             ) => {
                 let noun = match what {
-                    DiscardedSupply::Items => "list",
+                    Establishment::Items => "list",
                     _ => "value",
+                };
+                let fix = match over {
+                    Establishment::Ambiguous { candidates } => format!(
+                        "resolve the lower body with `as <{}>`, or switch with an \
+                         authored `as` on a nested body",
+                        candidates.join(" | ")
+                    ),
+                    _ => "compose into the established variant, or switch with an \
+                          authored `as` on a nested body"
+                        .to_string(),
                 };
                 format!(
                     "'{path}' is established {clause} — a whole-value \
                      spelling never switches an established variant; this \
-                     {noun} is discarded (compose into the established \
-                     variant, or switch with an authored `as` on a nested \
-                     body)"
+                     {noun} is discarded ({fix})"
                 )
             }
-            (Establishment::Value | Establishment::Items, DiscardedSupply::Body(hint)) => {
-                let hint = match hint {
-                    BodyHint::Variant(v) => format!("author `as {v}` to switch"),
-                    BodyHint::Candidates(c) => {
-                        format!("author `as <{}>` to switch", c.join(" | "))
+            (
+                Establishment::Value | Establishment::Items,
+                Establishment::Named { .. } | Establishment::Ambiguous { .. },
+            ) => {
+                let hint = match what {
+                    Establishment::Named { variant, .. } => {
+                        format!("author `as {variant}` to switch")
                     }
+                    Establishment::Ambiguous { candidates } => {
+                        format!("author `as <{}>` to switch", candidates.join(" | "))
+                    }
+                    _ => unreachable!("matched a body establishment"),
+                };
+                let instead = match over {
+                    Establishment::Items => "supply a list instead",
+                    _ => "supply a scalar value instead",
                 };
                 format!(
                     "'{path}' is established {clause} — an un-annotated \
                      body never switches the variant; this body is \
-                     discarded ({hint}, or restate the established value)"
+                     discarded ({hint}, or {instead})"
                 )
             }
-            (Establishment::Value, DiscardedSupply::Items)
-            | (Establishment::Items, DiscardedSupply::Value) => {
-                let noun = match what {
-                    DiscardedSupply::Items => "list",
-                    _ => "scalar",
+            (Establishment::Value, Establishment::Items)
+            | (Establishment::Items, Establishment::Value) => {
+                let (noun, instead) = match what {
+                    Establishment::Items => ("list", "supply a scalar value instead"),
+                    _ => ("scalar", "supply a list instead"),
                 };
                 format!(
                     "'{path}' is established {clause} — a {noun} value \
                      cannot merge into it, and structural variants have no \
                      `as` spelling to switch between; this value is \
-                     discarded (restate the established shape)"
+                     discarded ({instead})"
                 )
             }
-            // Not producible by the rule table (a body over a body
+            // Same-class pairs never discard (a body over a body
             // establishment joins; same-shape structural supplies join)
-            // — named rather than panicked on, fail-safe.
+            // — pinned by the rule-table test; loud if ever reached.
             (
                 Establishment::Named { .. } | Establishment::Ambiguous { .. },
-                DiscardedSupply::Body(_),
+                Establishment::Named { .. } | Establishment::Ambiguous { .. },
             )
-            | (Establishment::Value, DiscardedSupply::Value)
-            | (Establishment::Items, DiscardedSupply::Items) => format!(
-                "'{path}' is established {clause} — this contribution \
-                 cannot compose into it and is discarded"
-            ),
+            | (Establishment::Value, Establishment::Value)
+            | (Establishment::Items, Establishment::Items) => {
+                self.internal_invariant(path, site.at, site.layer, "a same-class discard");
+                return;
+            }
         };
         self.diags.push(
             Diagnostic::error(msg)
@@ -4110,7 +4410,12 @@ impl<'a, 'd> Merger<'a, 'd> {
         self.report_unknown_union_annotations(union_ty, layers.iter().map(|(l, b)| (*l, b)));
         let supplies: Vec<(InstanceId<'a>, UnionSupply<'_>)> = layers
             .iter()
-            .map(|(l, b)| (*l, UnionSupply::classify(self.index, union_ty, b)))
+            .map(|(l, b)| {
+                (
+                    *l,
+                    UnionSupply::classify(self.index, union_ty, Cow::Borrowed(b)),
+                )
+            })
             .collect();
         let (established, trace) = fold_variant_checked(self.index, union_ty, &supplies);
         let Some(established) = established else {
@@ -4129,12 +4434,25 @@ impl<'a, 'd> Merger<'a, 'd> {
                 synthesized,
             } => {
                 let Some(est) = replay.establishing else {
+                    let (l, b) = &layers[0];
+                    self.internal_invariant(
+                        path,
+                        body_anchor(b),
+                        *l,
+                        "an item body establishment with no establishing supply",
+                    );
                     return self.merge_model_bodies(path, None, &group);
                 };
                 let est_body = &layers[est].1;
+                let authored = replay
+                    .pinned_by
+                    .map(|i| &layers[i].1)
+                    .unwrap_or(est_body)
+                    .type_annotation
+                    .clone();
                 let mut merged = self.merge_variant_group(path, &variant, &group);
                 merged.type_annotation = Some(union_output_annotation(
-                    est_body.type_annotation.clone(),
+                    authored,
                     synthesized,
                     variant,
                     body_anchor(est_body),
@@ -4672,6 +4990,29 @@ impl<'a, 'd> Merger<'a, 'd> {
                                         let shorthand_field = item_model
                                             .and_then(|m| m.fields.iter().find(|f| f.shorthand))
                                             .or_else(|| {
+                                                // A union element's `+`
+                                                // field lives on the
+                                                // variant the item
+                                                // unambiguously selects
+                                                // (an ambiguous item was
+                                                // never materialized).
+                                                let ItemTarget::Union(ty) = target else {
+                                                    return None;
+                                                };
+                                                [&lo_body, &hi_body].into_iter().find_map(|b| {
+                                                    UnionSupply::classify(
+                                                        self.index,
+                                                        ty,
+                                                        Cow::Borrowed(b),
+                                                    )
+                                                    .nameable_variant()
+                                                    .and_then(|v| self.index.model(v))
+                                                    .and_then(|m| {
+                                                        m.fields.iter().find(|f| f.shorthand)
+                                                    })
+                                                })
+                                            })
+                                            .or_else(|| {
                                                 // A oneof element's `+`
                                                 // field lives on its
                                                 // effective arm — the
@@ -4874,22 +5215,14 @@ impl<'a, 'd> Merger<'a, 'd> {
                 // (a silent no-compose is the failure class NML2085
                 // exists to make visible), matching the module's
                 // fail-safe precedent for believed-unreachable arms.
-                ArmDecision::Discarded { .. } => {
-                    debug_assert!(false, "oneof folds never produce Discarded");
-                    self.diags.push(
-                        Diagnostic::error(format!(
-                            "internal decision-trace conflict at '{path}' — \
-                             this layer's contribution was not composed; \
-                             please report this"
-                        ))
-                        .with_code(codes::INTERNAL_COMPOSE_INVARIANT)
-                        .with_span(stated_entry.map(|e| e.span).unwrap_or_else(|| {
-                            body.entries
-                                .first()
-                                .map(|e| e.span)
-                                .unwrap_or_else(|| Span::empty(0))
-                        }))
-                        .with_source(layer.source_path.to_string()),
+                ArmDecision::Discarded { .. } | ArmDecision::Pinned => {
+                    self.internal_invariant(
+                        path,
+                        stated_entry
+                            .map(|e| e.span)
+                            .unwrap_or_else(|| body_anchor(body)),
+                        *layer,
+                        "a union-only verdict at a oneof position",
                     );
                 }
                 ArmDecision::Switch => {
@@ -5299,29 +5632,7 @@ fn scan_list_items<'a, 'b>(
             group.push((layer, b));
         }
         for ety in &element_types {
-            let mut item_vocab: Vec<&ModelDef> = Vec::new();
-            match ety {
-                FieldType::ModelRef(n) => {
-                    if let Some(m) = index.model(n) {
-                        push_model(&mut item_vocab, m);
-                    } else if let Some(oneof) = index.oneof(n) {
-                        for arm in candidate_arms(oneof, &group) {
-                            if let Some(am) = variant_model_of(index, oneof, &arm) {
-                                push_model(&mut item_vocab, am);
-                            }
-                        }
-                    }
-                }
-                // Union element: every variant the item group could
-                // have made effective, fail-closed.
-                ty => {
-                    for name in candidate_variants(index, ty, &group) {
-                        for m in union_variant_vocab(index, &name, &group) {
-                            push_model(&mut item_vocab, m);
-                        }
-                    }
-                }
-            }
+            let item_vocab = list_element_vocab(index, ety, &group);
             if !item_vocab.is_empty() {
                 let ipath = format!("{fpath}[{seg}]");
                 seal_scan_body(index, &ipath, &item_vocab, b, &group, layer, out);
@@ -5341,6 +5652,16 @@ enum ItemKey {
 }
 
 impl ItemKey {
+    /// The non-disclosing path segment of an item (`xs[w]`): a named
+    /// item's name; a scalar-keyed item's TYPE (tokens are data, never
+    /// echoed); a reference's or role's name.
+    fn segment(&self) -> String {
+        match self {
+            ItemKey::Named(n) | ItemKey::Reference(n) | ItemKey::Role(n) => n.clone(),
+            ItemKey::Scalar(v) => v.type_name().to_string(),
+        }
+    }
+
     fn of(kind: &ListItemKind) -> Self {
         match kind {
             ListItemKind::Named { name, .. } => ItemKey::Named(name.name.clone()),
@@ -6971,7 +7292,7 @@ relay t uses base:
             .find(|d| d.code == Some(codes::SEALED_FIELD_VIOLATION))
             .expect("backstop fires");
         assert!(
-            seal.message.contains("2 sealed fields would be discarded"),
+            seal.message.contains("(and 1 more)"),
             "states the count: {}",
             seal.message
         );
@@ -7563,7 +7884,7 @@ relay t uses base:
             .find(|d| d.code == Some(codes::SEALED_FIELD_VIOLATION))
             .expect("backstop fires");
         assert!(
-            seal.message.contains("2 sealed fields would be discarded"),
+            seal.message.contains("(and 1 more)"),
             "two items' seals are two findings, not one masked path: {}",
             seal.message
         );
@@ -7947,7 +8268,7 @@ svc t uses base:
         // (path, span) dedup collapses them) — count reflects authored
         // assignments, not distribution fan-out.
         assert!(
-            !seal.message.contains("sealed fields would be discarded"),
+            !seal.message.contains("(and "),
             "one authored write reports once: {}",
             seal.message
         );
@@ -9518,11 +9839,12 @@ holder13 t uses base:
         x = \"2\"
 ";
         let (_, diags) = compose(LIST_VARIANT_SHARED_SCHEMA, shared, "holder13", "t");
-        let d = diags
-            .iter()
-            .find(|d| d.code == Some(codes::SEALED_FIELD_VIOLATION))
-            .expect("the `.shared` sealed write is judged");
-        assert!(d.message.contains("slot[w].secret"), "{}", d.message);
+        assert_eq!(codes_of(&diags), [codes::SEALED_FIELD_VIOLATION]);
+        assert!(
+            diags[0].message.contains("slot[w].secret"),
+            "{}",
+            diags[0].message
+        );
 
         let positional = "\
 holder13 base:
@@ -9534,11 +9856,12 @@ holder13 t uses base:
         x = \"2\"
 ";
         let (_, diags) = compose(LIST_VARIANT_SHARED_SCHEMA, positional, "holder13", "t");
-        let d = diags
-            .iter()
-            .find(|d| d.code == Some(codes::SEALED_FIELD_VIOLATION))
-            .expect("the positional token is a sealed write");
-        assert!(d.message.contains("slot[string].name"), "{}", d.message);
+        assert_eq!(codes_of(&diags), [codes::SEALED_FIELD_VIOLATION]);
+        assert!(
+            diags[0].message.contains("slot[string].name"),
+            "{}",
+            diags[0].message
+        );
     }
 
     #[test]
@@ -9577,11 +9900,12 @@ holder14 t uses base:
         x = \"1\"
 ";
         let (_, diags) = compose(S, src, "holder14", "t");
-        let d = diags
-            .iter()
-            .find(|d| d.code == Some(codes::SEALED_FIELD_VIOLATION))
-            .expect("oneof element items are judged under their arm");
-        assert!(d.message.contains("slot[w].secret"), "{}", d.message);
+        assert_eq!(codes_of(&diags), [codes::SEALED_FIELD_VIOLATION]);
+        assert!(
+            diags[0].message.contains("slot[w].secret"),
+            "{}",
+            diags[0].message
+        );
     }
 
     #[test]
@@ -9600,11 +9924,10 @@ holder13 t uses base:
         x = \"1\"
 ";
         let (_, diags) = compose(LIST_VARIANT_SHARED_SCHEMA, launder, "holder13", "t");
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.code == Some(codes::SEALED_FIELD_VIOLATION)),
-            "modifier-spelled items are judged: {diags:?}"
+        assert_eq!(
+            codes_of(&diags),
+            [codes::SEALED_FIELD_VIOLATION],
+            "modifier-spelled items are judged, and nothing else fires"
         );
 
         const S: &str = "\
@@ -9768,14 +10091,16 @@ holder13 t uses base:
         x = \"2\"
 ";
         let (_, diags) = compose(LIST_VARIANT_SHARED_SCHEMA, src, "holder13", "t");
-        let d = diags
-            .iter()
-            .find(|d| d.code == Some(codes::UNKNOWN_UNION_VARIANT))
-            .expect("reported");
+        assert_eq!(
+            codes_of(&diags),
+            [codes::UNKNOWN_UNION_VARIANT],
+            "one defect, one finding (no NML2085 riding along): {diags:?}"
+        );
         assert!(
-            d.message.contains("names a list variant's element") && d.suggestions.is_empty(),
+            diags[0].message.contains("names a list variant's element")
+                && diags[0].suggestions.is_empty(),
             "honest form, no did-you-mean: {}",
-            d.message
+            diags[0].message
         );
     }
 
@@ -9880,6 +10205,31 @@ holder4 t uses base:
                 .any(|r| r.message == "established here"),
             "the named face carries the note too"
         );
+        for src in [
+            // ambiguous establishment, scalar supply
+            "holder base:\n    slot:\n        x = \"1\"\n\nholder t uses base:\n    slot = \"v\"\n",
+            // list establishment, scalar supply
+            "holder13 base:\n    slot:\n        - w:\n            note = \"n\"\n\nholder13 t uses base:\n    slot = \"v\"\n",
+        ] {
+            let (schema, kw, name) = if src.starts_with("holder13") {
+                (LIST_VARIANT_SHARED_SCHEMA, "holder13", "t")
+            } else {
+                (UNION_SCHEMA, "holder", "t")
+            };
+            let (_, diags) = compose(schema, src, kw, name);
+            assert_eq!(
+                codes_of(&diags),
+                [codes::DISCARDED_UNION_CONTRIBUTION],
+                "{src}"
+            );
+            assert!(
+                diags[0]
+                    .related
+                    .iter()
+                    .any(|r| r.message == "established here"),
+                "every face carries the note: {src}"
+            );
+        }
     }
 
     #[test]
@@ -9892,7 +10242,7 @@ model leafA:
     s string #sealed
 
 model outer:
-    inner (leafA | string)
+    inner (leafA | []string)
 
 model holder17:
     slot (outer | string)
@@ -9905,7 +10255,8 @@ holder17 base:
 
 holder17 t uses base:
     slot:
-        inner = \"v\"
+        inner:
+            - \"v\"
 ";
         let (resolved, planned_diags) = compose(S, planned, "holder17", "t");
         assert_eq!(
@@ -9925,7 +10276,8 @@ holder17 base:
 
 holder17 mid uses base:
     slot:
-        inner = \"v\"
+        inner:
+            - \"v\"
 
 holder17 t uses mid:
     slot:
@@ -9942,6 +10294,516 @@ holder17 t uses mid:
         assert_eq!(
             planned_diags[0].message, refold_diags[0].message,
             "planned and refolded routes agree"
+        );
+    }
+
+    // ── union compose: round-15 battery (the rule table itself, every
+    //    spelling through the authority, list judgment as the bare-list
+    //    winner, plan/merge supply parity, loud fail-safes) ──────────────
+
+    #[test]
+    fn union_verdict_table_enumerates_every_cell() {
+        // The rule table, cell by cell — RFC 0019's rules (and the
+        // documented errata) as one readable matrix. A regression in
+        // any cell shows up as a named (row, column).
+        fn body() -> Cow<'static, Body> {
+            Cow::Owned(Body::fresh(Vec::new()))
+        }
+        let named = || Establishment::Named {
+            variant: "ua".into(),
+            synthesized: false,
+        };
+        let ambiguous = || Establishment::Ambiguous {
+            candidates: vec!["ua".into(), "ub".into()],
+        };
+        let rows: [(&str, Option<Establishment>); 5] = [
+            ("none", None),
+            ("named ua", Some(named())),
+            ("ambiguous", Some(ambiguous())),
+            ("value", Some(Establishment::Value)),
+            ("items", Some(Establishment::Items)),
+        ];
+        type Make = fn() -> UnionSupply<'static>;
+        let supplies: [(&str, Make); 7] = [
+            ("authored ua", || UnionSupply::Authored {
+                variant: "ua".into(),
+                body: body(),
+            }),
+            ("authored ub", || UnionSupply::Authored {
+                variant: "ub".into(),
+                body: body(),
+            }),
+            ("inferred", || UnionSupply::Inferred {
+                variant: "ua".into(),
+                body: body(),
+            }),
+            ("ambiguous", || UnionSupply::Ambiguous {
+                candidates: vec!["ua".into(), "ub".into()],
+                body: body(),
+            }),
+            ("items", || UnionSupply::Items { body: body() }),
+            ("empty", || UnionSupply::Empty),
+            ("value", || UnionSupply::Value),
+        ];
+        // Columns: authored-same, authored-other, inferred, ambiguous,
+        // items, empty, value. E=Establish J=Join P=Pin S=JudgeSwitch
+        // D=Discard.
+        let expected: [(&str, [&str; 7]); 5] = [
+            // RFC 0019: the lowest supplying layer establishes; a
+            // zero-item entry never supplies (NML2079's contract).
+            ("none", ["E", "E", "E", "E", "E", "J", "E"]),
+            // restatement joins; a different `as` switches (judged); an
+            // un-annotated body never switches; whole values cannot
+            // merge into a named variant.
+            ("named ua", ["J", "S:ub", "J", "J", "D", "J", "D"]),
+            // an `as` above an ambiguous group pins it (nothing was
+            // chosen to switch from); bodies join; whole values cannot
+            // merge into a body.
+            ("ambiguous", ["P:ua", "P:ub", "J", "J", "D", "J", "D"]),
+            // structural establishments: an authored `as` switches (a
+            // displaced scalar has no seals); bodies cannot merge; the
+            // same shape joins its overlay; a cross shape is discarded.
+            ("value", ["S:ua", "S:ub", "D", "D", "D", "J", "J"]),
+            ("items", ["S:ua", "S:ub", "D", "D", "J", "J", "D"]),
+        ];
+        for ((row, est), (_, want)) in rows.iter().zip(expected.iter()) {
+            for ((col, make), w) in supplies.iter().zip(want.iter()) {
+                let tag = match union_verdict(est.as_ref(), &make()) {
+                    Verdict::Establish => "E".to_string(),
+                    Verdict::Join => "J".to_string(),
+                    Verdict::Pin(v) => format!("P:{v}"),
+                    Verdict::JudgeSwitch(v) => format!("S:{v}"),
+                    Verdict::Discard => "D".to_string(),
+                };
+                assert_eq!(&tag, w, "cell ({row}, {col})");
+            }
+        }
+    }
+
+    #[test]
+    fn type_annotation_modifiers_never_bypass_the_union_authority() {
+        // A `|slot (ua | ub)` declaration inside an instance body is a
+        // declaration, not a value: it must neither route the group
+        // around the authority (a debug panic; in release a last-wins
+        // that laundered seals or deleted the value) nor count as a
+        // sealing write.
+        const S: &str = "\
+model ua:
+    x string #sealed
+
+model ub:
+    y string
+
+model holder18:
+    slot (ua | ub)
+";
+        let launder = "\
+holder18 base:
+    slot as ua:
+        x = \"1\"
+
+holder18 top uses base:
+    |slot (ua | ub)
+    slot as ub:
+        y = \"2\"
+";
+        let (resolved, diags) = compose(S, launder, "holder18", "top");
+        assert_eq!(codes_of(&diags), [codes::SEALED_FIELD_VIOLATION]);
+        assert_eq!(
+            slot_annotation(&resolved.unwrap().body).as_deref(),
+            Some("ua"),
+            "the sealed base survives the annotated switch"
+        );
+
+        let alone = "\
+holder18 base:
+    slot as ua:
+        x = \"1\"
+
+holder18 top uses base:
+    |slot (ua | ub)
+";
+        let (resolved, diags) = compose(S, alone, "holder18", "top");
+        assert!(diags.is_empty(), "{diags:?}");
+        let body = resolved.unwrap().body;
+        assert_eq!(
+            nested_scalar(&body, "slot", "x"),
+            Some(&Value::String("1".into())),
+            "an annotation-only upper never deletes the established value"
+        );
+
+        const SEALED: &str = "\
+model ua:
+    x string
+
+model ub:
+    y string
+
+model holder19:
+    slot (ua | ub) #sealed
+";
+        let sealed = "\
+holder19 base:
+    |slot (ua | ub)
+    slot as ua:
+        x = \"1\"
+
+holder19 top uses base:
+    slot as ub:
+        y = \"2\"
+";
+        let (resolved, diags) = compose(SEALED, sealed, "holder19", "top");
+        assert_eq!(
+            codes_of(&diags),
+            [codes::SEALED_FIELD_VIOLATION],
+            "the real assignment seals; the declaration never does"
+        );
+        assert_eq!(
+            slot_annotation(&resolved.unwrap().body).as_deref(),
+            Some("ua")
+        );
+    }
+
+    #[test]
+    fn plan_and_merge_fold_the_same_supply_set() {
+        // A whole-value sibling used to break plan alignment, and the
+        // local refold then judged bodies already normalized under the
+        // FINAL planned variant — a fabricated refusal (itb's `key`
+        // token injected into the base, then scanned as ua's sealed
+        // `key`). Same supply set on both sides: the trace aligns.
+        const S: &str = "\
+model ita:
+    name string+
+    key string? #sealed
+
+model itb:
+    key string+ #sealed
+
+model ua:
+    items []ita
+
+model ub:
+    items []itb
+
+model holder20:
+    slot (ua | ub | string)
+";
+        let src = "\
+holder20 base:
+    slot as ua:
+        items:
+            - \"w\"
+
+holder20 mid uses base:
+    slot = \"x\"
+
+holder20 top uses mid:
+    slot as ub:
+        items:
+            - \"k\"
+";
+        let (resolved, diags) = compose(S, src, "holder20", "top");
+        assert_eq!(
+            codes_of(&diags),
+            [codes::DISCARDED_UNION_CONTRIBUTION],
+            "mid's scalar is discarded; the switch is clean (no seal was assigned): {diags:?}"
+        );
+        assert_eq!(
+            slot_annotation(&resolved.unwrap().body).as_deref(),
+            Some("ub")
+        );
+    }
+
+    #[test]
+    fn shared_only_union_blocks_survive_authored_empty() {
+        // A `.shared`-only block owns no entries: a zero-item entry raw
+        // AND normalized (the plan and the merge agree), and an
+        // all-zero-item position survives in the `= []` spelling rather
+        // than dropping (a phantom "missing required field 'slot'").
+        let src = "\
+holder13 base:
+    slot:
+        .note = \"n\"
+
+holder13 t uses base:
+    slot:
+        .note = \"m\"
+";
+        let (resolved, diags) = compose(LIST_VARIANT_SHARED_SCHEMA, src, "holder13", "t");
+        assert_eq!(
+            codes_of(&diags),
+            [codes::ZERO_ITEM_LAYER_ENTRY, codes::ZERO_ITEM_LAYER_ENTRY]
+        );
+        let body = resolved.unwrap().body;
+        let respelled = body.entries.iter().any(|e| {
+            matches!(&e.kind, BodyEntryKind::Property(p)
+                if p.name.name == "slot" && matches!(&p.value.value, Value::Array(v) if v.is_empty()))
+        });
+        assert!(respelled, "survives as `slot = []`: {body:?}");
+    }
+
+    #[test]
+    fn replaced_lists_are_not_judged_on_a_later_switch() {
+        // The displaced compose of a list establishment is the bare-list
+        // WINNER; a lower list the engine itself replaced wholesale
+        // (its seals never engaged, as NML2076 warns) must not refuse a
+        // later switch.
+        let src = "\
+holder7 base:
+    slot:
+        - w:
+            kind = \"k\"
+            secret = \"locked\"
+
+holder7 mid uses base:
+    slot:
+        - v:
+            kind = \"k\"
+
+holder7 top uses mid:
+    slot as ua:
+        x = \"1\"
+";
+        let (resolved, diags) = compose(LIST_VARIANT_SCHEMA, src, "holder7", "top");
+        assert!(diags.is_empty(), "no phantom refusal: {diags:?}");
+        assert_eq!(
+            slot_annotation(&resolved.unwrap().body).as_deref(),
+            Some("ua")
+        );
+    }
+
+    #[test]
+    fn zero_item_entry_never_seals_a_sealed_union_position() {
+        const S: &str = "\
+model ua:
+    x string
+
+model ub:
+    kind string
+
+model holder21:
+    slot (ua | []ub) #sealed
+";
+        let src = "\
+holder21 base:
+    slot = []
+
+holder21 t uses base:
+    slot as ua:
+        x = \"1\"
+";
+        let (resolved, diags) = compose(S, src, "holder21", "t");
+        assert_eq!(codes_of(&diags), [codes::ZERO_ITEM_LAYER_ENTRY]);
+        assert_eq!(
+            slot_annotation(&resolved.unwrap().body).as_deref(),
+            Some("ua"),
+            "the first REAL assignment seals"
+        );
+    }
+
+    #[test]
+    fn empty_array_under_a_listless_union_is_a_loud_whole_value() {
+        // `= []` under a union with no list variant is an (invalid)
+        // whole value — never a phantom empty object that classifies as
+        // a body and swallows silently.
+        const S: &str = "\
+model ua:
+    x string #sealed
+
+model uc:
+    z string
+
+model holder22:
+    slot (ua | uc)
+";
+        let src = "\
+holder22 base:
+    slot as ua:
+        x = \"s\"
+
+holder22 t uses base:
+    slot = []
+";
+        let (resolved, diags) = compose(S, src, "holder22", "t");
+        assert_eq!(codes_of(&diags), [codes::DISCARDED_UNION_CONTRIBUTION]);
+        assert_eq!(
+            nested_scalar(&resolved.unwrap().body, "slot", "x"),
+            Some(&Value::String("s".into()))
+        );
+    }
+
+    #[test]
+    fn pin_carries_the_authored_identifier() {
+        // The pinning layer's `as` is authored: the composed annotation
+        // is that identifier (span inside the pinning layer), not one
+        // synthesized at the ambiguous base.
+        let src = "\
+holder base:
+    slot:
+        x = \"1\"
+
+holder t uses base:
+    slot as ua:
+        x = \"2\"
+";
+        let (resolved, diags) = compose(UNION_SCHEMA, src, "holder", "t");
+        assert!(diags.is_empty(), "{diags:?}");
+        let body = resolved.unwrap().body;
+        let ann = sub_block(&body, "slot")
+            .and_then(|b| b.type_annotation.clone())
+            .expect("annotated");
+        assert_eq!(ann.name, "ua");
+        let pin_at = src.find("holder t uses base").unwrap();
+        assert!(
+            ann.span.start > pin_at,
+            "the annotation is the pinning layer's own token, not the base's span"
+        );
+    }
+
+    #[test]
+    fn pin_then_switch_is_judged_under_the_pinned_vocabulary() {
+        // Once pinned, the group IS the pinned variant: a later
+        // different `as` is judged over it under that vocabulary only
+        // (a write meaningful in an un-pinned candidate is not a seal
+        // there). Both orders pinned.
+        const S: &str = "\
+model ua:
+    x string
+    s string
+
+model uc:
+    x string
+    s string #sealed
+
+model holder23:
+    slot (ua | uc)
+";
+        let pin_ua = "\
+holder23 base:
+    slot:
+        s = \"locked\"
+
+holder23 mid uses base:
+    slot as ua:
+        x = \"1\"
+
+holder23 top uses mid:
+    slot as uc:
+        x = \"2\"
+";
+        let (resolved, diags) = compose(S, pin_ua, "holder23", "top");
+        assert!(diags.is_empty(), "under ua, `s` is unsealed: {diags:?}");
+        assert_eq!(
+            slot_annotation(&resolved.unwrap().body).as_deref(),
+            Some("uc")
+        );
+
+        let pin_uc = "\
+holder23 base:
+    slot:
+        s = \"locked\"
+
+holder23 mid uses base:
+    slot as uc:
+        x = \"1\"
+
+holder23 top uses mid:
+    slot as ua:
+        x = \"2\"
+";
+        let (resolved, diags) = compose(S, pin_uc, "holder23", "top");
+        assert_eq!(codes_of(&diags), [codes::SEALED_FIELD_VIOLATION]);
+        assert_eq!(
+            slot_annotation(&resolved.unwrap().body).as_deref(),
+            Some("uc")
+        );
+    }
+
+    #[test]
+    fn memo_is_invalidated_when_a_join_changes_the_list() {
+        // Two rejected switches reuse one judgment; a layer that
+        // supplies a NEW list (the bare-list winner changes) is judged
+        // fresh — the count suffix follows the new list.
+        let src = "\
+holder7 base:
+    slot:
+        - w:
+            kind = \"k\"
+            secret = \"a\"
+
+holder7 l1 uses base:
+    slot as ua:
+        x = \"1\"
+
+holder7 l2 uses l1:
+    slot as ua:
+        x = \"2\"
+
+holder7 l3 uses l2:
+    slot:
+        - v:
+            kind = \"k\"
+            secret = \"b\"
+        - u:
+            kind = \"k\"
+            secret = \"c\"
+
+holder7 l4 uses l3:
+    slot as ua:
+        x = \"4\"
+";
+        let (_, diags) = compose(LIST_VARIANT_SCHEMA, src, "holder7", "l4");
+        let seals: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| d.code == Some(codes::SEALED_FIELD_VIOLATION))
+            .collect();
+        assert_eq!(seals.len(), 3, "{diags:?}");
+        assert!(!seals[0].message.contains("(and "), "{}", seals[0].message);
+        assert!(!seals[1].message.contains("(and "), "{}", seals[1].message);
+        assert!(
+            seals[2].message.contains("(and 1 more)"),
+            "judged fresh over l3's list: {}",
+            seals[2].message
+        );
+    }
+
+    #[test]
+    fn same_layer_discard_names_the_earlier_entry() {
+        let src = "\
+holder4 base:
+    slot as ua:
+        x = \"1\"
+    slot = \"cash\"
+";
+        let (_, diags) = compose(SCALAR_UNION_SCHEMA, src, "holder4", "base");
+        assert_eq!(codes_of(&diags), [codes::DISCARDED_UNION_CONTRIBUTION]);
+        assert!(
+            diags[0]
+                .message
+                .contains("by an earlier entry in this same layer"),
+            "{}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn ambiguous_establishment_discard_advises_resolving_the_lower_body() {
+        let src = "\
+holder base:
+    slot:
+        x = \"1\"
+
+holder t uses base:
+    slot = \"cash\"
+";
+        let (_, diags) = compose(UNION_SCHEMA, src, "holder", "t");
+        assert_eq!(codes_of(&diags), [codes::DISCARDED_UNION_CONTRIBUTION]);
+        assert!(
+            diags[0]
+                .message
+                .contains("resolve the lower body with `as <ua | ub>`"),
+            "{}",
+            diags[0].message
         );
     }
 

@@ -5113,6 +5113,28 @@ workflow W:
     }
 
     #[test]
+    fn unknown_variant_naming_a_list_element_gets_the_honest_form() {
+        // `as ub` where `ub` is only a list variant's ELEMENT: not a
+        // nameable variant, and "did you mean ua" would mislead — the
+        // shared builder says so, with no suggestion (one message, one
+        // home, byte-identical with the compose engine's).
+        let diags = diags_for(
+            "model ua:\n    x string\n\nmodel ub:\n    k string\n\n\
+             model host:\n    slot (ua | []ub)\n",
+            "host H:\n    slot as ub:\n        x = \"1\"\n",
+        );
+        let d = diags
+            .iter()
+            .find(|d| d.code == Some(codes::UNKNOWN_UNION_VARIANT))
+            .expect("unknown-variant error");
+        assert!(
+            d.message.contains("names a list variant's element") && d.suggestions.is_empty(),
+            "honest form, no did-you-mean: {d:?}"
+        );
+        assert_eq!(diags.len(), 1, "no guessed-variant noise: {diags:?}");
+    }
+
+    #[test]
     fn unknown_variant_annotation_errors_with_did_you_mean() {
         let diags = diags_for(
             SAME_CLASS_SCHEMA,

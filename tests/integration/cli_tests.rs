@@ -1167,6 +1167,84 @@ fn wide_list_variant_rejected_switches_scale_linearly_in_items() {
 }
 
 #[test]
+fn inherited_empty_array_at_a_union_position_composes_clean() {
+    // A valid inherited `slot = []` at `(ua | []ub)` must stay a valid
+    // empty list on every dependent — never an empty OBJECT of the
+    // first model variant (a phantom "missing required field").
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("inherited-empty-union-list.nml");
+    std::fs::write(
+        &f,
+        "model ua:\n    x string\n\nmodel ub:\n    kind string\n\n\
+         model holder:\n    slot (ua | []ub)\n    label string\n\n\
+         holder base:\n    slot = []\n    label = \"b\"\n\n\
+         holder t uses base:\n    label = \"l\"\n",
+    )
+    .unwrap();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("NML2007"), "{stderr}");
+}
+
+#[test]
+fn zero_item_entries_at_union_positions_warn_exactly_once_per_spelling() {
+    // `= []`, an empty block, `|slot = []`, `|slot:` — each zero-item
+    // spelling at a union position warns exactly once through `check`
+    // (no normalization+merge double, no re-report from dependents).
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("zero-item-union-spellings.nml");
+    std::fs::write(
+        &f,
+        "model ua:\n    x string\n\nmodel ub:\n    kind string\n\n\
+         model holder:\n    slot (ua | []ub)\n\n\
+         holder base:\n    slot:\n        - w:\n            kind = \"k\"\n\n\
+         holder t1 uses base:\n    slot = []\n\n\
+         holder t2 uses t1:\n    slot:\n\n\
+         holder t3 uses t2:\n    |slot = []\n\n\
+         holder t4 uses t3:\n    |slot:\n",
+    )
+    .unwrap();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches("warning[NML2079]").count(), 4, "{stderr}");
+    assert!(out.status.success(), "{stderr}");
+}
+
+#[test]
+fn type_annotation_modifier_at_a_union_position_never_panics_or_launders() {
+    // The end-to-end face of the routing fix: a debug-build `check`
+    // must not panic, and the sealed base must survive the annotated
+    // switch (NML2060), never be laundered by a last-wins fallthrough.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("typeann-union.nml");
+    std::fs::write(
+        &f,
+        "model ua:\n    x string #sealed\n\nmodel ub:\n    y string\n\n\
+         model holder:\n    slot (ua | ub)\n\n\
+         holder base:\n    slot as ua:\n        x = \"1\"\n\n\
+         holder top uses base:\n    |slot (ua | ub)\n    slot as ub:\n        y = \"2\"\n",
+    )
+    .unwrap();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(stderr.matches("error[NML2060]").count(), 1, "{stderr}");
+}
+
+#[test]
 fn ambiguous_stack_reports_nml2052_once() {
     // An ambiguous base composed by dependents is ONE finding through
     // `check`: compose never guesses (the composed body stays
