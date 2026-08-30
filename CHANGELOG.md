@@ -143,9 +143,145 @@
   establishment, and advises resolving an ambiguous lower body; the
   NML2060 count reads `'field' (and N more)`; NML2079 speaks in union
   terms at union positions; and hover summaries of the long index
-  entries are their first sentence.
+  entries are their first sentence. A keyed or annotated body at a `#sealed`
+  union position that admits items is a WRITE (one zero-item predicate
+  — `= []`, an empty modifier, an entry-less un-annotated block — owns
+  NML2079, the seal exemption, the modifier overlay's no-op skip and the
+  classifier's `Empty`); declarations (type-annotation modifiers) pass
+  through beside the composed value on EVERY route and never desync the
+  plan (one value predicate shared by the plan's gather and the merge's
+  partition); the plan is the authority for union positions (every
+  establishment recorded with the supplies' kinds; a misaligned planned
+  position is NML2086, never a silent refold); a sealed union position
+  still reports a dependent's bogus `as`; the seal scan dedups by hash
+  (a wide judgment was O(hits²)); item-scope discards anchor on the
+  item; a list establishment's "established here" follows the effective
+  list; set and later list variants are unreachable by shape — neither
+  judged nor promised by NML2076; a `[]` on a declared scalar modifier
+  reaches the composed view (a type error, not a no-op); the validator
+  no longer counts a type-annotation modifier as satisfying a required
+  field (errata E12); NML2085 says "as an un-annotated body" and
+  "resolve the establishing body"; the RFC 0019 code table gained
+  NML2085/NML2086 rows; and hover summaries of NML2051/2052/2077/2086
+  are their first sentence too. Nothing under a `#sealed` position is
+  planned (its surviving body normalizes under its own variant, never a
+  rejected upper layer's — errata E13); the plan strips a oneof's
+  discriminator entries exactly as the merge does (a union field named
+  like the discriminator no longer desynchronizes them); the zero-item
+  predicate is total (`= []` included, one owner, typed or untyped);
+  set variants count as list-admitting again (reachable by array
+  literal); one seal-hit sink owns every dedup (`assigned_seals_into`);
+  declarations are gathered as passthrough entries beside the composed
+  value (`merge_field` is single-entry again, its dispatch one
+  exhaustive match); the composed annotation's source is one replay
+  field; a merged identity item keeps the BASE item's span (a
+  three-layer chain's notes point at the base); NML2086 says whether
+  the contribution was dropped or composed by a local fold; a
+  structural establishment's note reads "in force here"; NML2079 names
+  the zero-item entry generically; the editor's compose pass is
+  guarded (an internal error degrades to raw-text findings plus
+  NML2086, never a dark buffer); and a `.shared` line inside a modifier
+  block is a parse error instead of a silent drop. The displaced-list
+  seal judgment binds to the union's first `List` variant — the one
+  block-shaped items resolve to — never to a `set<T>` variant that
+  precedes it (a switch could discard sealed items silently); block-
+  shaped items at a union position normalize under that variant's
+  element model like a plain list's items (their nested zero-item
+  entries are warned, their array-spelled lists re-spelled), under a
+  bracketed item path the plan never writes; the plan, normalization
+  and the merge resolve a name in ONE order (a model before a oneof of
+  the same name — a colliding name was planned under one reading and
+  merged under the other); the plan hides a oneof's discriminator from
+  its supply gather instead of cloning stripped bodies; the ownership
+  order of a field group is a table (`route_of`); declarations precede
+  their value in the composed view (declare, then assign); the survivor
+  rule, the discriminator-entry predicate and the establishing supply
+  each have one owner; the seal sink dedups by (path, file, span); the
+  invariant debug assertion sits at the compose boundary (the diagnostic
+  and the fail-safe composition are observable in every build); the
+  editor's guard anchors its NML2086 at the buffer start (a span-less
+  finding was dropped before the editor saw it) and guards its fallback
+  too; a non-item line in a modifier block names its own kind ("found a
+  shared property") at its own position; the validator checks EVERY
+  discriminator-named entry (a dependent's `kind = 5` was laundered
+  behind the re-added string discriminator); and the provenance of an
+  identity-merged item is its base position (its fields keep their own
+  writers' rows); and an `nml fix` deletion takes its whole line, never leaving an
+  indentation-only husk behind (later superseded by RFC 0023's
+  structural resolver, below)
+  — `nml explain NML2079` now covers union positions, and its hover
+  summary is its first sentence. Then: the ONE resolution order holds
+  at the ROOT too (`SchemaIndex::nameable`, model before oneof, total
+  matches at every site — the plan and the merge HAD read a colliding
+  root oneof-first while normalization, the positionalizer and the
+  validator read the model; no longer); list items resolve their normalization
+  vocabulary PER ITEM from the element type (`Vocab::Items`), so oneof-
+  and union-element items are peers of model-element items (their
+  zero-item entries are warned, their arrays re-spelled) and a block
+  modifier's items normalize like a nested block's; machine deletions are STRUCTURAL
+  (RFC 0023): one resolver in nml-core computes every fix's bytes for
+  `nml fix` AND the editor's quick-fix by token walks over the lossless
+  tree — entry rows, `uses` clauses, clause references, the colon rule
+  on an emptied clause-carrying header — with every refusal
+  per-suggestion and printed (`fix refused: …`), the
+  structural-injection guard owned in the same place (the editor's
+  quick-fix path had none), editor staleness settled by cache
+  membership, and `nml fix`'s round gate a multiset decrement over the
+  applied diagnostics (a repair that reveals the next finding lands;
+  a failed round retries its first applied candidate alone, and the
+  round budget scales with the finding count); a deletion targeting a
+  row INSIDE a `.shared` block is refused outright — the row is
+  distributed into every named item, and the block-form NML2060 fix
+  silently stripped a shared default from every sibling; the injection
+  guard's refusal set equals the render-escape set (controls, the
+  Trojan-Source bidi controls, U+2028/U+2029), one predicate for the
+  guard, the message renderer and the CLI's note lines; a
+  composed entry carries the span, name and provenance of the HEAD of
+  its surviving group (RFC 0019 E15 — the switching layer after an
+  accepted switch, the base otherwise), so two switching dependents'
+  findings keep two homes instead of collapsing onto the base's under
+  the one-home dedup key, and NML2085's item-scope note lands on the
+  establishing item; discriminator stripping is by NAME with non-string
+  entries passed through beside the canonical one (E16 — each drawing
+  NML2042 at its author's span; `kind = 6` no longer overlays
+  `kind = 5`, and the NML2054 shape draws NML2042, not NML2085); the
+  NML2060 backstop counts DISTINCT SEALED FIELDS with the assignment
+  count when it exceeds the fields (E17 — `(and 1 more field)`,
+  `(2 assignments)`), over a hashed structural identity whose scalar
+  item keys are never printed or `Debug`-leaked, with one `sealed here`
+  note per assignment carrying its own file (`Related.source` lands;
+  both renderers locate a note in its own file, falling back loudly); a backstop
+  rejection carries one `sealed here` note per discarded assignment
+  (the first four); the validator materializes a named item's name into
+  a oneof element's arm (`- a: kind = "a"` under `[]oo` with `name
+  string+` read as a missing required field on every raw block);
+  `FieldRoute` no longer defines identity-equality; plan keys are
+  debug-asserted dotted (never an item scope); a test-only tamper seam
+  proves the compose boundary's invariant assertion is live; and the
+  NML0016 fix for a bare CR INSIDE a string literal is the `\r`
+  escape, and a CR in token position has NO machine fix (`nml fix`
+  deleted both — a silent value change inside a string, and glued
+  lines on a CR-terminated old-Mac file).
 
 ### Changed
+
+- **Source-character policy closed over its classes (NML0017/NML0018)**
+  — a breaking tightening, landed pre-release. NML0017 now rejects
+  every Unicode control character raw (general category Cc: C0, DEL,
+  and the previously unpoliced C1 range — including the one-byte CSI
+  terminal-escape introducer and NEL); NML0018 adds the U+2028/U+2029
+  line/paragraph separators, so every Unicode line-boundary character
+  outside LF/CRLF is now diagnosed. The banned set is deliberately a
+  strict superset of rustc's (rustc reads LS/PS as whitespace and
+  allows raw C1 in literals): NML values are echoed into terminals,
+  logs, and generated configs. The implicit bidi marks (LRM/RLM/ALM)
+  stay legal — ordinary RTL content. Raw NEL/LS/PS previously parsed
+  clean inside strings and comments; the escapes (`\u{85}`,
+  `\u{2028}`, `\u{2029}`) and `\n` are the spellings, and the error's
+  hint teaches both. `nml fmt` previously re-rendered those escapes as
+  RAW bytes (so a formatted file could newly fail) — it now emits the
+  escapes, restoring "formatted output never carries a character the
+  parser rejects" as a tested invariant.
 
 - **Quoted-literal migration teaching extended (NML0001)** — quoted
   numbers (`port = "3000"`) and quoted bools (`admin = "true"`) against
@@ -273,7 +409,8 @@
   spellings of a list field (`f = [v]` and `f:` + `- v`) now validate
   identically, by construction and by CI-enforced test. — one contract,
   *raw is transport, escaped is content*, enforced end to end:
-  - New diagnostics: bare CR (NML0016, machine-fixable deletion), raw
+  - New diagnostics: bare CR (NML0016; inside a string the machine
+    fix is the `\r` escape), raw
     C0/DEL control characters (NML0017), bidirectional controls and
     interior U+FEFF — the Trojan Source defense, rustc's banned set
     (NML0018). A leading U+FEFF is accepted as a BOM.

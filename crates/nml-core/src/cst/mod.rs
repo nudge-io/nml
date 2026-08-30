@@ -160,6 +160,38 @@ fn parse_lowered(source: &str) -> (Parse, crate::ast::File, Vec<NmlError>, usize
     // bounded, so past its cap the generic error survives (per-site
     // coverage is never silently narrowed).
     let (policy_errors, policy_suppressed) = crate::source_policy::check(source);
+    // A bare CR INSIDE a string literal is content, not transport: its
+    // machine fix is the `\r` escape, never a deletion (which would
+    // change the value). The policy scan is context-free; the lexed
+    // string tokens supply the context.
+    let string_ranges: Vec<(usize, usize)> = parsed
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == syntax::SyntaxKind::String)
+        .map(|t| {
+            let r = t.text_range();
+            (usize::from(r.start()), usize::from(r.end()))
+        })
+        .collect();
+    let policy_errors: Vec<NmlError> = policy_errors
+        .into_iter()
+        .map(|e| match e {
+            NmlError::Syntax {
+                kind: crate::error::ParseErrorKind::BareCarriageReturn { .. },
+                span,
+            } if string_ranges
+                .iter()
+                .any(|&(s, e)| s < span.start && span.end <= e) =>
+            {
+                NmlError::Syntax {
+                    kind: crate::error::ParseErrorKind::BareCarriageReturn { in_string: true },
+                    span,
+                }
+            }
+            other => other,
+        })
+        .collect();
     let policy_spans: std::collections::HashSet<(usize, usize)> = policy_errors
         .iter()
         .map(|e| (e.span().start, e.span().end))
@@ -2340,8 +2372,9 @@ service App is Base:
         );
 
         // In token position: the policy error replaces the generic
-        // unexpected-character error — exactly one diagnostic, the one
-        // that teaches the fix.
+        // unexpected-character error — exactly one char diagnostic, the
+        // one that teaches the fix. (The parser's recovery NML0002s are
+        // a separate accompaniment, hence the filter idiom.)
         let (_, diags) = parse_to_ast_all("service App:\n    x = \u{1}1\n");
         let about_char: Vec<String> = diags
             .iter()
@@ -2351,7 +2384,45 @@ service App is Base:
         assert_eq!(about_char.len(), 1, "{about_char:?}");
         assert!(about_char[0].contains("NML0017"), "{about_char:?}");
 
-        // The bare-CR diagnostic carries the machine-applicable deletion.
+        // The closed classes' new members ride the same supersede: NEL
+        // (C1 → NML0017) and LS (steering invisible → NML0018), at
+        // token position and inside strings.
+        for (src, policy) in [
+            ("service App:\n    x\u{85} = 1\n", "NML0017"),
+            ("service App:\n    x\u{2028} = 1\n", "NML0018"),
+        ] {
+            let (_, diags) = parse_to_ast_all(src);
+            let about_char: Vec<String> = diags
+                .iter()
+                .map(|d| d.to_string())
+                .filter(|m| m.contains(policy) || m.contains("NML0004"))
+                .collect();
+            assert_eq!(about_char.len(), 1, "{src:?}: {about_char:?}");
+            assert!(about_char[0].contains(policy), "{about_char:?}");
+        }
+        let (_, diags) = parse_to_ast_all("service App:\n    x = \"a\u{85}b\"\n");
+        let rendered: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+        assert_eq!(
+            rendered.len(),
+            1,
+            "in-string NEL is the policy's alone: {rendered:?}"
+        );
+        assert!(
+            rendered[0].contains("NML0017") && rendered[0].contains("Unicode line break"),
+            "the line-break hint teaches both intents: {rendered:?}"
+        );
+
+        // The bare-CR diagnostic carries the `\r` escape INSIDE a
+        // string, where the CR is content — and NO machine fix in token
+        // position, where a deletion glues lines on a CR-terminated file.
+        let (_, diags) = parse_to_ast_all("service App:\n    tag = \"a\rb\"\n");
+        let cr: Vec<String> = diags
+            .iter()
+            .map(|d| d.to_string())
+            .filter(|m| m.contains("NML0016"))
+            .collect();
+        assert_eq!(cr.len(), 1, "{cr:?}");
+        assert!(cr[0].contains("(fix: `\\r`)"), "{cr:?}");
         let (_, diags) = parse_to_ast_all("service App:\r    port = 1\n");
         let cr: Vec<String> = diags
             .iter()
@@ -2359,7 +2430,10 @@ service App is Base:
             .filter(|m| m.contains("NML0016"))
             .collect();
         assert_eq!(cr.len(), 1, "{cr:?}");
-        assert!(cr[0].contains("(fix: remove)"), "{cr:?}");
+        assert!(
+            !cr[0].contains("(fix:"),
+            "no machine fix in token position: {cr:?}"
+        );
     }
 
     /// A leading U+FEFF is a byte-order mark: accepted, filed as trivia

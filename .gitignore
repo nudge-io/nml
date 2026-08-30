@@ -18,9 +18,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# RFC drafts (local working docs)
-docs/rfcs/
-
 # Node (pnpm workspace)
 node_modules/
 

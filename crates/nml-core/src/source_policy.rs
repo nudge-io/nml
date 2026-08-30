@@ -6,13 +6,28 @@
 //!   corruption or content smuggling; it is diagnosed, never silently
 //!   normalized. (CRLF→LF *value* normalization is the value layer's job —
 //!   `cst::value` — because the lossless CST must preserve transport bytes.)
-//! * **Raw source is printable.** C0 controls (other than tab and line
-//!   endings) and DEL are content, and content belongs in `\u{…}` escapes,
-//!   where review can see it: a raw ESC in a value is a terminal-injection
-//!   primitive, a raw NUL truncates C strings downstream.
-//! * **Nothing invisible may steer the reader.** Bidirectional controls
-//!   (Trojan Source, CVE-2021-42574) and interior U+FEFF can make source
-//!   display differently than it parses. The banned set matches rustc's.
+//! * **Raw source is printable.** Every Unicode CONTROL character
+//!   (general category Cc — C0, DEL, and the C1 range U+0080–U+009F)
+//!   other than tab and NML's line endings is content, and content
+//!   belongs in `\u{…}` escapes, where review can see it: a raw ESC in
+//!   a value is a terminal-injection primitive, C1's CSI (U+009B) is
+//!   the same primitive in one byte, and a raw NUL truncates C strings
+//!   downstream. (Raw C1 inside valid UTF-8 usually marks Windows-1252
+//!   double-decoding — the error catches real corruption too.)
+//! * **Nothing invisible may steer the reader.** The class is
+//!   structure-steering invisibles: the explicit bidirectional controls
+//!   (Trojan Source, CVE-2021-42574), interior U+FEFF, and the two
+//!   non-control mandatory line breaks U+2028/U+2029 (UAX #14) — so
+//!   every Unicode line-boundary character outside LF/CRLF is diagnosed
+//!   (NEL/VT/FF as controls, LS/PS here, bare CR by its own rule). The
+//!   bidi set matches rustc's Trojan-Source lints; the whole set is a
+//!   strict superset of rustc's (rustc reads LS/PS as ordinary
+//!   whitespace and allows raw C1 in literals) — NML values are echoed
+//!   into terminals, logs, and generated configs, so the display-vs-
+//!   parse guidance of UTS #55 (Unicode Source Code Handling) is
+//!   applied at the language level. The implicit bidi marks
+//!   (LRM/RLM/ALM) stay legal: ordinary RTL content that reorders only
+//!   neighboring weak characters, never tokens — rustc's line too.
 //!
 //! A *leading* U+FEFF is accepted as a byte-order mark (Windows-editor
 //! interop; the lexer files it as trivia) — everywhere else it is an error.
@@ -31,7 +46,7 @@ pub(crate) fn check(source: &str) -> (Vec<NmlError>, usize) {
     for (i, ch) in source.char_indices() {
         let kind = match ch {
             '\r' if source.as_bytes().get(i + 1) == Some(&b'\n') => continue,
-            '\r' => ParseErrorKind::BareCarriageReturn,
+            '\r' => ParseErrorKind::BareCarriageReturn { in_string: false },
             '\u{FEFF}' if i == 0 => continue, // the byte-order mark
             _ if is_banned_control(ch) => ParseErrorKind::ForbiddenControlCharacter { ch },
             _ if is_invisible(ch) => ParseErrorKind::InvisibleCharacter { ch },
@@ -55,16 +70,29 @@ pub fn must_escape(ch: char) -> bool {
     ch == '\r' || is_banned_control(ch) || is_invisible(ch)
 }
 
-/// C0 (minus tab and the line-ending characters) and DEL. CR is *not* here:
-/// it has its own contextual rule — CRLF is a line ending, bare CR errors.
+/// Every Unicode control (general category Cc — exactly
+/// `char::is_control`: C0, DEL, and C1) minus tab and the line-ending
+/// characters. Derived from the category, not a hand list, so the class
+/// is closed by construction. CR is excluded here because it has its
+/// own contextual rule — CRLF is a line ending, bare CR errors — and
+/// NEL (U+0085), a Unicode mandatory line break, lands here as the C1
+/// control it is.
 fn is_banned_control(ch: char) -> bool {
-    (ch < '\u{20}' && !matches!(ch, '\t' | '\n' | '\r')) || ch == '\u{7F}'
+    ch.is_control() && !matches!(ch, '\t' | '\n' | '\r')
 }
 
-/// rustc's Trojan-Source set (the explicit bidi embeddings, overrides, and
-/// isolates) plus U+FEFF, which is a BOM only at offset zero.
+/// The structure-steering invisibles: the EXPLICIT bidi controls
+/// (rustc's Trojan-Source lint set — embeddings, overrides, isolates),
+/// U+FEFF (a BOM only at offset zero), and the two non-control
+/// mandatory line breaks LS/PS (UAX #14) — characters that change how
+/// source STRUCTURE reads. The implicit bidi marks (LRM/RLM/ALM) are
+/// deliberately NOT here: ordinary RTL string content, reordering only
+/// neighboring weak characters (rustc excludes them too).
 fn is_invisible(ch: char) -> bool {
-    matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+    matches!(
+        ch,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}' | '\u{2028}' | '\u{2029}'
+    )
 }
 
 #[cfg(test)]
@@ -77,7 +105,7 @@ mod tests {
             .iter()
             .map(|e| match e {
                 NmlError::Syntax { kind, .. } => match kind {
-                    ParseErrorKind::BareCarriageReturn => 16,
+                    ParseErrorKind::BareCarriageReturn { .. } => 16,
                     ParseErrorKind::ForbiddenControlCharacter { .. } => 17,
                     ParseErrorKind::InvisibleCharacter { .. } => 18,
                     other => panic!("unexpected policy kind: {other:?}"),
@@ -119,6 +147,11 @@ mod tests {
         assert_eq!(codes_of("a = \u{1B}1"), vec![17]);
         assert_eq!(codes_of("a = \"\u{0}\""), vec![17]);
         assert_eq!(codes_of("// \u{7F}"), vec![17]);
+        // The C1 range is Cc too: NEL (a Unicode mandatory line break)
+        // and CSI (the one-byte ESC-[) are banned raw everywhere.
+        assert_eq!(codes_of("a = \"x\u{85}y\""), vec![17]);
+        assert_eq!(codes_of("// \u{9B}"), vec![17]);
+        assert_eq!(codes_of("a = \u{85}1"), vec![17]);
     }
 
     #[test]
@@ -128,6 +161,16 @@ mod tests {
         assert_eq!(codes_of("a = \"x\u{FEFF}\""), vec![18]);
         // Offset zero is the byte-order mark: accepted.
         assert_eq!(codes_of("\u{FEFF}a = 1\n"), Vec::<u16>::new());
+    }
+
+    #[test]
+    fn line_and_paragraph_separators_are_invisible_steering() {
+        // U+2028/U+2029 — the only mandatory line breaks (UAX #14) that
+        // are not control characters: banned raw in strings, comments,
+        // and token position alike; no BOM-style offset-0 carve-out.
+        assert_eq!(codes_of("a = \"x\u{2028}y\""), vec![18]);
+        assert_eq!(codes_of("// c\u{2029}x = 1"), vec![18]);
+        assert_eq!(codes_of("\u{2028}a = 1\n"), vec![18]);
     }
 
     #[test]
@@ -146,10 +189,22 @@ mod tests {
         assert!(must_escape('\u{7F}'));
         assert!(must_escape('\u{202E}'));
         assert!(must_escape('\u{FEFF}'));
+        assert!(must_escape('\u{85}'), "NEL is a C1 control");
+        assert!(must_escape('\u{9B}'), "CSI is a C1 control");
+        assert!(must_escape('\u{2028}'));
+        assert!(must_escape('\u{2029}'));
+        // The closed class: every C1 code point, no hand-list drift.
+        assert!(('\u{80}'..='\u{9F}').all(must_escape));
         // Legal raw content stays literal.
         assert!(!must_escape('\t'));
         assert!(!must_escape('\n'));
         assert!(!must_escape('é'));
+        // The implicit bidi marks are ORDINARY RTL content — outside
+        // the steering class by decision, not oversight (they reorder
+        // only neighboring weak characters; rustc excludes them too).
+        assert!(!must_escape('\u{200E}'), "LRM stays legal");
+        assert!(!must_escape('\u{200F}'), "RLM stays legal");
+        assert!(!must_escape('\u{061C}'), "ALM stays legal");
         // Zero-width joiners are legitimate content (emoji, Persian text).
         assert!(!must_escape('\u{200D}'));
     }

@@ -75,6 +75,12 @@ impl Lower {
                 .uses()
                 .map(|u| u.refs().map(ident).collect())
                 .unwrap_or_default(),
+            // The ref filter keeps the invariant with `uses` above: a
+            // clause that parses with zero refs records no span.
+            uses_span: b
+                .uses()
+                .filter(|u| u.refs().next().is_some())
+                .map(|u| content_span(u.syntax())),
             body: self.body_of(b.body()),
         }
     }
@@ -223,14 +229,35 @@ impl Lower {
         let value = if let Some(v) = m.value() {
             ModifierValue::Inline(self.decode(&v))
         } else if let Some(body) = m.body() {
-            ModifierValue::Block(
-                body.entries()
-                    .filter_map(|e| match e {
-                        ast::Entry::ListItem(l) => Some(self.list_item(&l)),
-                        _ => None,
-                    })
-                    .collect(),
-            )
+            // A modifier block holds list items only. Anything else (a
+            // `.shared` line, a property, a nested block) has no place in
+            // the lowered value and would vanish silently — an error,
+            // never a silent drop (silent loss is data loss downstream).
+            let mut items = Vec::new();
+            for e in body.entries() {
+                match e {
+                    ast::Entry::ListItem(l) => items.push(self.list_item(&l)),
+                    other => {
+                        // Name the offending entry by its kind ("found a
+                        // shared property") and anchor on its content:
+                        // `found: None` renders as "end of file" (false
+                        // mid-file) and the node span starts at the indent.
+                        let node = other.syntax();
+                        self.push_error(NmlError::syntax(
+                            crate::error::ParseErrorKind::Expected {
+                                expected: vec![crate::error::ExpectedItem::Desc("a list item")],
+                                found: Some(crate::error::FoundToken {
+                                    kind: node.kind(),
+                                    text: String::new(),
+                                }),
+                                context: Some("in a modifier block"),
+                            },
+                            content_span(node),
+                        ));
+                    }
+                }
+            }
+            ModifierValue::Block(items)
         } else if let Some(te) = m.type_expr() {
             ModifierValue::TypeAnnotation {
                 field_type: type_expr(&te, &mut self.errors),
@@ -792,6 +819,54 @@ mod tests {
 
     fn cst_ast(src: &str) -> File {
         to_ast(&ast::Root::cast(parse(src).syntax()).unwrap())
+    }
+
+    /// A modifier block holds list items only: any other entry is a loud
+    /// NML0002 naming the entry's own kind, anchored on the entry (never
+    /// the indent, never "found end of file" mid-file) — a silent drop was
+    /// data loss downstream. The items around it still lower.
+    #[test]
+    fn non_items_in_a_modifier_block_are_nml0002_at_their_own_span() {
+        for (line, found) in [
+            (".note = \"x\"", "a shared property"),
+            ("note = \"x\"", "a property"),
+            ("note:\n            deeper = 1", "a nested block"),
+            ("|inner = 1", "a modifier"),
+            ("|inner:\n            - \"z\"", "a modifier"),
+            ("\"k\" -> target", "a routing arm"),
+            ("foo string", "a field definition"),
+        ] {
+            let src = format!(
+                "policy p:\n    |deny:\n        - \"a\"\n        {line}\n        - \"b\"\n"
+            );
+            // Lowering errors ride the all-errors form (`parse().errors()`
+            // carries lexer and parser errors only).
+            let (file, errors) = crate::cst::parse_to_ast_all(&src);
+            assert_eq!(errors.len(), 1, "{src}: {errors:?}");
+            assert!(
+                errors[0].message.contains(&format!(
+                    "expected a list item in a modifier block, found {found}"
+                )),
+                "{}",
+                errors[0].message
+            );
+            let first_line = line.split('\n').next().unwrap();
+            assert_eq!(
+                errors[0].span.map(|s| s.start),
+                src.find(first_line),
+                "anchored on the entry itself: {src}"
+            );
+            let DeclarationKind::Block(b) = &file.declarations[0].kind else {
+                panic!("block: {src}");
+            };
+            let BodyEntryKind::Modifier(m) = &b.body.entries[0].kind else {
+                panic!("modifier: {:?}", b.body.entries);
+            };
+            let ModifierValue::Block(items) = &m.value else {
+                panic!("block value: {:?}", m.value);
+            };
+            assert_eq!(items.len(), 2, "the items around it survive: {src}");
+        }
     }
 
     /// RFC 0030: `- Name:` (trailing colon, no entries) lowers as a Named item

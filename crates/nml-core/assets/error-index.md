@@ -66,10 +66,14 @@ shorthand annotation was removed in favor of `+` (RFC 0005).
 ## NML0002
 
 **Unexpected token.** The parser met something that fits none of the
-alternatives valid at this position. The message lists what was expected
-— concrete tokens and grammar classes — plus what was actually found;
-when recovery tries several alternatives at one position, they merge into
-a single "expected X or Y" report.
+alternatives valid at this position.
+
+The message lists what was expected — concrete tokens and grammar
+classes — plus what was actually found; when recovery tries several
+alternatives at one position, they merge into a single "expected X or
+Y" report. A modifier block (`|deny:`) holds list items only: any other
+line inside it (a `.shared` property, a property, a nested block) is
+reported here, naming the line's kind, never silently dropped.
 
 ```nml check expect-error='[NML0002]'
 service Api:
@@ -296,8 +300,11 @@ service Api:
 are LF or CRLF (the source-character policy: *raw is transport, escaped
 is content*); a bare CR is invisible in most editors and diff viewers,
 so it is either file corruption or content smuggling — never intent.
-The file still parses (the CR is treated as whitespace), and the fix is
-machine-applicable: remove it.
+
+A CR in token position is reported without a machine fix: on a
+CR-terminated ("old Mac") file every CR is a line ending, and deleting
+it would glue the lines together. Inside a string literal the CR is
+content, and the machine fix is the `\r` escape (value-preserving).
 
 The fence below is stored with LF endings and converted to lone-CR
 ("old Mac") endings by the docs harness before it runs, so this
@@ -308,19 +315,27 @@ service Api:
     port = 8080
 ```
 
-**Fix:** remove the stray CR (apply the suggestion), or re-save the
-file with LF or CRLF line endings. For a literal CR *inside a string
-value*, write `\r`.
+**Fix:** re-save the file with LF or CRLF line endings, or delete a
+truly stray mid-line CR by hand. For a literal CR *inside a string
+value*, write `\r` (the suggested fix).
 
 ## NML0017
 
-**Raw control character.** A C0 control (other than tab and line
-endings) or DEL appears raw in source — in a value, a comment, or
-between tokens. Control characters are content, and content belongs in
-escapes, where review can see it: a raw ESC in a value is a
-terminal-injection primitive when that value is later printed, and a
-raw NUL truncates C strings downstream. Tab is legal raw in string
-content; only indentation restricts it ([NML0005](#nml0005)).
+**Raw control character.** Any Unicode control character (general
+category Cc — C0, DEL, and the C1 range U+0080–U+009F), other than tab
+and line endings, appears raw in source — in a value, a comment, or
+between tokens; write it as its `\u{…}` escape.
+
+Control characters are content, and content belongs in escapes, where
+review can see it: a raw ESC in a value is a terminal-injection
+primitive when that value is later printed, C1's CSI (U+009B) is the
+same primitive in a single byte, and a raw NUL truncates C strings
+downstream. NEL (U+0085) is a Unicode mandatory line break some
+renderers honor — the error's hint offers `\n` beside the escape,
+since a pasted NEL usually meant a line break. (Raw C1 inside valid
+UTF-8 most often marks Windows-1252 double-decoding, so this error
+catches real corruption too.) Tab is legal raw in string content; only
+indentation restricts it ([NML0005](#nml0005)).
 
 The escaped spelling is always available and is the fix:
 
@@ -333,16 +348,27 @@ service Api:
 
 ## NML0018
 
-**Invisible directionality character.** A bidirectional control
-(U+202A–U+202E, U+2066–U+2069) or an interior U+FEFF can make source
-*display* differently than it *parses* — the Trojan Source attack
-(CVE-2021-42574). NML matches rustc's banned set. A leading U+FEFF is
-accepted as a byte-order mark; everywhere else U+FEFF is this error.
+**Invisible steering character.** A character that can make source
+*display* differently than it *parses*: an explicit bidirectional
+control (U+202A–U+202E, U+2066–U+2069 — the Trojan Source attack,
+CVE-2021-42574), an interior U+FEFF, or a U+2028/U+2029 line/paragraph
+separator; write it as its `\u{…}` escape.
+
+The separators are the only mandatory line breaks (UAX #14) that are
+not control characters — an editor honoring them displays one authored
+line as two. The bidi set matches rustc's Trojan-Source lints; with the
+separators the whole set is a strict superset of rustc's, per the
+display-vs-parse guidance of UTS #55 (Unicode Source Code Handling). A
+leading U+FEFF is accepted as a byte-order mark; everywhere else U+FEFF
+is this error.
 
 Right-to-left *text* is unaffected: Hebrew and Arabic string values
-need no bidi controls to render correctly. Only the explicit override
-and isolate controls — the ones that can reorder what a reviewer sees —
-are banned, and only in their raw form:
+need no bidi controls to render correctly, and the implicit bidi marks
+(LRM, RLM, ALM) stay legal — they are ordinary RTL content that
+reorders only neighboring weak characters, never tokens. Only the
+explicit override and isolate controls — the ones that can reorder what
+a reviewer sees — and the separators are banned, and only in their raw
+form:
 
 ```nml check
 service Api:
@@ -350,8 +376,9 @@ service Api:
 ```
 
 **Fix:** if the character is intentional content, write its `\u{…}`
-escape so it is visible in review; otherwise delete it (it usually
-arrives via copy-paste from rendered text).
+escape so it is visible in review; for U+2028/U+2029 a `\n` line break
+is usually what was meant; otherwise delete it (it usually arrives via
+copy-paste from rendered text).
 
 ## NML0019
 
@@ -1103,6 +1130,15 @@ entry E:
 **Invalid discriminator.** The discriminator's value must be a string
 naming an arm.
 
+Under layer composition (RFC 0019 E16), a non-string discriminator
+entry in ANY layer is reported on the composed view at its author's
+span: stripping is by name, so such entries never compose over each
+other — they pass through beside the canonical entry, and the layer's
+other fields still compose. At the NML2054 shape (an arm field named
+like the discriminator) this error replaces the NML2085 discard: the
+union field never sees the entry, and the truthful finding is that the
+field can never be set.
+
 ```nml check expect-error='[NML2042]'
 model a:
     x string?
@@ -1231,8 +1267,10 @@ with explicit arms.
 ## NML2051
 
 **Unknown union variant.** An `as <Variant>` annotation (RFC 0015) must name
-one of the union's variants. This one names a type the union does not include;
-a did-you-mean points at the closest match; a name that is a list
+one of the union's variants, and this one names a type the union does not
+include.
+
+A did-you-mean points at the closest match; a name that is a list
 variant's element gets the honest form instead (list variants are
 selected by shape, never named). Under layer composition
 (RFC 0019) a bogus name never switches the established variant — the
@@ -1260,7 +1298,9 @@ host H:
 
 **Ambiguous union instance.** A same-class union instance carries no
 `as <Variant>` annotation and its body shape cannot choose between two or more
-model variants. NML is fail-closed here: rather than silently guessing the
+model variants.
+
+NML is fail-closed here: rather than silently guessing the
 first variant, it asks you to state the type (RFC 0015 D2). Layer
 composition (RFC 0019) honors the same discipline: an ambiguous body is
 composed model-less and left un-annotated — never guessed, never
@@ -1478,11 +1518,14 @@ arms included — and interiors reached through union-typed fields,
 union-typed LIST elements and a union's own list variant (item paths
 render as `slot[w].field`), arm-set inline arm bodies, and
 oneof-targeted arm sets), is this error;
-the message names the first discarded seal and how many more follow
-(`'slot[w].secret' (and 3 more)`), names the switch it refused (the
-discriminator value, the `as` target, or the replacement), and closes
-with the action: compose into the lower value, or unseal the field in
-the schema. A type-annotation modifier (`|slot (a | b)`) inside an
+the message names the first discarded seal and counts the DISTINCT
+sealed fields that follow (`'slot[w].secret' (and 3 more fields)`),
+adding the assignment count when it exceeds the fields (two layers
+assigning one sealed field are `(2 assignments)`); one `sealed here`
+note points at each of the first four assignments, each locating its
+own file, and it names the switch it refused (the discriminator value,
+the `as` target, or the replacement), and closes with the action:
+compose into the lower value, or unseal the field in the schema. A type-annotation modifier (`|slot (a | b)`) inside an
 instance body is a declaration, never a write: it neither seals nor
 violates a seal.
 
@@ -1545,7 +1588,9 @@ thing t uses base:
 ```
 
 **Fix:** reference an instance of the same keyword, or move the shared
-content into one.
+content into one. On a schema definition, delete the `uses` clause —
+the suggested fix is structural (`nml fix` and the editor remove the
+clause, its separators, and the colon rule on a bodyless header).
 
 ## NML2063
 
@@ -1731,8 +1776,9 @@ advisory.
 ## NML2077
 
 **No consistent linearization.** The `uses` DAG's declared orders
-contradict, and the C3 merge refuses rather than guessing (RFC 0019) —
-stack order decides which assignment holds a seal, so it is never
+contradict, and the C3 merge refuses rather than guessing (RFC 0019).
+
+Stack order decides which assignment holds a seal, so it is never
 resolved by heuristic. Three shapes: a listed layer is a transitive
 base of an earlier-listed layer (the clause asks for it both above and
 below its dependent); two listed layers' own stacks order a shared pair
@@ -1740,8 +1786,9 @@ oppositely; or the orders ROTATE across three or more clauses — the
 diagnostic names the cycle's pairwise steps and which clause forces
 each. The diagnostic names the contradicting pair and its cause;
 the transitive-base shape carries a machine-applicable remove-the-ref
-fix (`nml fix` applies it, separator included), and the sibling shape
-offers both reorderings as hints. Note redundancy and contradiction
+fix — structural: `nml fix` and the editor delete the reference with
+its separator — and the sibling shape offers both reorderings as
+hints. Note redundancy and contradiction
 are orthogonal: the same ref
 listed in the dependency-consistent position is redundant but legal,
 and deliberately silent.
@@ -1765,13 +1812,19 @@ thing top uses mid, base:
 
 ## NML2079
 
-**Zero-item layer entry** *(warning)*. A composing layer's list entry
-normalizes to zero items — a `.shared:`-only block, an empty array
-literal (`xs = []`), or an empty nested block (RFC 0019). It does not
-count as supplying the list, so it neither replaces nor empties
-anything — and because the author may have *meant* "clear the base
-list" (an operation with no merge spelling), it is always diagnosed,
-never silently ignored.
+**Zero-item layer entry** *(warning)*. A composing layer's entry at a
+list — or at a union position with a list or set variant — normalizes
+to zero items and supplies nothing.
+
+At a list field that is a `.shared:`-only block, an empty array literal
+(`xs = []`), or an empty nested block (RFC 0019); at a union position,
+`= []`, an empty modifier, or an entry-less un-annotated block (a keyed
+or annotated block is a model body and a write). It does not count as
+supplying the list, so it neither replaces nor empties anything — and
+at a union position it never establishes a variant either (the lowest
+layer that *supplies* establishes; RFC 0019 errata E7). Because the
+author may have *meant* "clear the base list" (an operation with no
+merge spelling), it is always diagnosed, never silently ignored.
 
 **Fix:** delete the entry, or supply the items the layer should
 contribute. Emptying a base list is not expressible; where entries must
@@ -1813,17 +1866,32 @@ have no `as` spelling to switch between — scalar variants of different
 scalar types, e.g. `(string | number)`, overlay like any scalar). The
 message leads with the position and its establishment (by a lower
 layer, or by an earlier entry in the same layer), and a related note
-marks the establishing entry. Zero-item entries (`= []`, an empty
-block, a `.shared`-only block) never supply and never establish — they
-are NML2079's warned no-ops here too, and a position only they supply
-survives as `= []`. Composition never *guesses* a variant: a keyed body
-the D2 oracle calls ambiguous composes model-less and un-annotated, so
-NML2052 fires on the composed view exactly as it would on the raw one;
-an authored `as` above an ambiguous group *pins* it (it resolves the
-ambiguity rather than switching away from a variant never chosen, and
-its own identifier becomes the composed annotation). A switch away from
-a list-value establishment is judged over the list the displaced compose
-would carry — the highest layer's list, under the union's list variant.
+marks the establishing entry — "established here" for a body
+establishment, "in force here" for the structural value currently in
+force (the latest scalar, or the highest list supplier).
+
+At a union position that admits items (one with a list or set variant —
+a set variant is reachable by array literal, never by block shape),
+zero-item entries (`= []`, an empty block, a `.shared`-only block)
+never supply and never establish — they are NML2079's warned no-ops
+here too, and a position only they supply survives as `= []`; a keyed
+or annotated block is a model body and a write, seal included. An
+un-annotated body is *inferred* only where the union has one nameable
+variant — with two or more, the D2 oracle calls it ambiguous.
+Composition never *guesses* a variant: a keyed body the D2 oracle calls
+ambiguous composes model-less and un-annotated, so NML2052 fires on the
+composed view exactly as it would on the raw one; an authored `as`
+above an ambiguous group *pins* it (it resolves the ambiguity rather
+than switching away from a variant never chosen, and its own identifier
+becomes the composed annotation) — except at a `#sealed` union
+position, where the pin is a second assignment and the seal rejects it
+(NML2060).
+
+A switch away from a list-value establishment is judged over the list
+the displaced compose would carry — the highest layer's list, under the
+union's first `List` variant (the one block-shaped items resolve to; a
+set variant is never selected by block shape, so it is never the
+judging vocabulary).
 
 ```nml check expect-error='[NML2085]'
 model card:
@@ -1847,11 +1915,17 @@ restate the structural value where one is established.
 ## NML2086
 
 **Internal composition invariant violated.** The compose engine reached
-a decision it holds to be unreachable (for example a union-only verdict
-at a oneof position). The engine fails safe and loud: the affected
-layer's contribution is not composed, and this error names the position
-rather than composing something silently wrong. It should never appear
-on valid or invalid input alike.
+a decision it holds to be unreachable.
+
+Examples: a union-only verdict at a oneof position; a planned union
+position whose supplies no longer match its plan. The engine fails safe
+and loud rather than composing something silently wrong — the message
+names the position and says what happened to the layer's contribution:
+it was not composed, or (for a plan that no longer matches) composition
+fell back to a local fold and the plan was ignored. It should never
+appear on valid or invalid input alike. The editor guards its compose
+pass the same way: an internal error degrades to raw-text findings plus
+this code at the top of the buffer, never a dark buffer.
 
 **Fix:** none on your side — please report the input that produced it.
 

@@ -61,9 +61,44 @@ impl fmt::Display for Severity {
 ///   picking one would resurrect exactly the guess the diagnostic exists to
 ///   forbid. A future `nml fix --apply` applies `Fix`es only when singular.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SuggestionKind {
     DidYouMean,
     Fix,
+    /// Structural deletion of the syntax node whose content span equals
+    /// `span`: a body entry (`BodyEntry.span`), a `uses` clause
+    /// (`BlockDecl.uses_span`), or a clause reference (`Identifier.span`).
+    /// `replacement` is always empty. Singular and machine-applicable
+    /// (DidYouMean's exclusivity, RFC 0017 §4.1); the bytes are computed
+    /// only by [`resolve_suggestions`](crate::cst::edit::resolve_suggestions)
+    /// — never by textual widening. Renders nothing in the message: the
+    /// producer's prose states the action.
+    Delete,
+}
+
+impl SuggestionKind {
+    /// The LSP `data.suggestions[].kind` string — exhaustive HERE, in the
+    /// defining crate, where a new variant cannot compile without naming
+    /// itself (`#[non_exhaustive]` would force a wildcard arm on an
+    /// external matcher and lose that forcing).
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            SuggestionKind::DidYouMean => "didYouMean",
+            SuggestionKind::Fix => "fix",
+            SuggestionKind::Delete => "delete",
+        }
+    }
+
+    /// The inverse of [`Self::wire_name`], for the editor's code action —
+    /// an unknown string is no action, never a guess.
+    pub fn from_wire_name(s: &str) -> Option<Self> {
+        match s {
+            "didYouMean" => Some(SuggestionKind::DidYouMean),
+            "fix" => Some(SuggestionKind::Fix),
+            "delete" => Some(SuggestionKind::Delete),
+            _ => None,
+        }
+    }
 }
 
 /// A machine-applicable edit carried alongside a diagnostic (RFC 0030): the
@@ -202,12 +237,13 @@ pub mod codes {
         /// A carriage return with no following line feed (spec: Source
         /// text — line endings are LF or CRLF).
         BARE_CARRIAGE_RETURN = 16;
-        /// A raw control character (C0 minus tab/line endings, or DEL)
-        /// in source; the `\u{…}` escape is the sanctioned spelling.
+        /// A raw control character (any Unicode Cc — C0, DEL, or C1 —
+        /// minus tab/line endings) in source; the `\u{…}` escape is the
+        /// sanctioned spelling.
         FORBIDDEN_CONTROL = 17;
-        /// An invisible character that can make source display
-        /// differently than it parses (bidirectional controls, interior
-        /// U+FEFF) — the Trojan Source defense.
+        /// An invisible steering character (bidirectional controls,
+        /// interior U+FEFF, the U+2028/U+2029 line separators) — the
+        /// Trojan Source defense.
         INVISIBLE_CHARACTER = 18;
         /// Content on a multi-line string's opening line (content must
         /// begin on a new line — the Swift/Java text-block rule).
@@ -680,6 +716,13 @@ pub struct Diagnostic {
 pub struct Related {
     pub span: Span,
     pub message: String,
+    /// The file `span` indexes into, when it differs from the
+    /// diagnostic's own (`Diagnostic.source` vocabulary — a path);
+    /// `None` inherits the diagnostic's own
+    /// ([`Diagnostic::related_source`]). Renderers locate a note in ITS
+    /// OWN file — a cross-file span through the wrong line index prints
+    /// the right file with a wrong range.
+    pub source: Option<String>,
 }
 
 impl Diagnostic {
@@ -726,8 +769,32 @@ impl Diagnostic {
         self.related.push(Related {
             span,
             message: message.into(),
+            source: None,
         });
         self
+    }
+
+    /// [`Self::with_related`] with the note's own file (RFC 0019 plan
+    /// item 2) — for a note whose span indexes a different source than
+    /// the diagnostic's.
+    pub fn with_related_in(
+        mut self,
+        span: Span,
+        message: impl Into<String>,
+        source: Option<String>,
+    ) -> Self {
+        self.related.push(Related {
+            span,
+            message: message.into(),
+            source,
+        });
+        self
+    }
+
+    /// The file `rel`'s span indexes into: the note's own, else the
+    /// diagnostic's — the ONE inheritance rule both renderers share.
+    pub fn related_source<'s>(&'s self, rel: &'s Related) -> Option<&'s str> {
+        rel.source.as_deref().or(self.source.as_deref())
     }
 
     /// Attach a singular near-miss correction ([`SuggestionKind::DidYouMean`]).
@@ -747,6 +814,17 @@ impl Diagnostic {
             replacement: replacement.into(),
             span,
             kind: SuggestionKind::Fix,
+        });
+        self
+    }
+
+    /// Attach a structural deletion ([`SuggestionKind::Delete`]) of the
+    /// node whose content span equals `span`.
+    pub fn with_deletion(mut self, span: Span) -> Self {
+        self.suggestions.push(Suggestion {
+            replacement: String::new(),
+            span,
+            kind: SuggestionKind::Delete,
         });
         self
     }
@@ -771,16 +849,31 @@ impl Diagnostic {
 /// See [`Diagnostic::rendered`].
 pub struct Rendered<'a>(&'a Diagnostic);
 
-/// Write `text` with control characters escaped (`\n` → `\u{a}`-style),
-/// still zero-alloc. Diagnostics echo *untrusted source text* (found
-/// tokens, bad literals, enum values); a malicious file must not be able
-/// to smuggle terminal escape sequences into CLI output or log lines.
-/// One choke point — every render path goes through [`Rendered`], so no
-/// producer has to remember.
+/// A character every rendering surface escapes and no machine-applied
+/// replacement may carry: every Unicode control (line breaks included —
+/// new *structure* must never ride a fix) and the source policy's
+/// banned raw set (`must_escape`: the controls again, plus CR, the
+/// Trojan-Source bidi controls, interior U+FEFF, and the U+2028/U+2029
+/// separators). The union is exactly `is_control ∪ must_escape` — the
+/// guard set, the render-escape set, and the language's own raw-source
+/// policy are ONE congruent fact, shared by the renderer's choke point,
+/// the CLI's note lines, and the structural resolver's injection guard,
+/// so no set can drift from the others.
+pub fn needs_escape(ch: char) -> bool {
+    ch.is_control() || crate::source_policy::must_escape(ch)
+}
+
+/// Write `text` with hostile characters escaped (`\n` → `\u{a}`-style,
+/// [`needs_escape`]), still zero-alloc. Diagnostics echo *untrusted
+/// source text* (found tokens, bad literals, enum values); a malicious
+/// file must not be able to smuggle terminal escape sequences — or
+/// invisible bidi steering — into CLI output or log lines. One choke
+/// point — every render path goes through [`Rendered`], so no producer
+/// has to remember.
 fn write_sanitized(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
     use fmt::Write as _;
     for ch in text.chars() {
-        if ch.is_control() {
+        if needs_escape(ch) {
             write!(f, "{}", ch.escape_default())?;
         } else {
             f.write_char(ch)?;
@@ -792,11 +885,11 @@ fn write_sanitized(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
 impl fmt::Display for Rendered<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_sanitized(f, &self.0.message)?;
-        // An empty replacement is a machine-applicable DELETION (e.g.
-        // NML2060's "delete this assignment"); rendering it as
-        // `(did you mean ""?)` reads as nonsense, and the deletion
-        // producers already state the action in `message` — so empty
-        // replacements stay structural (for `nml fix`) and render nothing.
+        // Structural deletions are their own kind (`Delete`) and render
+        // nothing — the producer's prose states the action; the filters
+        // below select by kind, so `Delete` matches neither. The empty-
+        // replacement guard on did-you-means is defense in depth (no
+        // producer emits one): `(did you mean ""?)` reads as nonsense.
         let dym: Vec<&Suggestion> = self
             .0
             .suggestions
@@ -943,19 +1036,34 @@ mod tests {
     }
 
     #[test]
-    fn empty_replacement_suggestion_renders_no_hint() {
-        // An empty replacement is a machine-applicable DELETION (NML2060's
-        // "delete this assignment"); `(did you mean ""?)` is nonsense to a
-        // human, so the hint is suppressed — the suggestion stays
-        // structural for `nml fix`, and the producer's message names the
-        // action.
+    fn a_deletion_renders_nothing_and_stays_structural() {
+        // `Delete` is structural (NML2060's "delete this assignment"):
+        // the producer's prose states the action, so the renderer adds no
+        // hint — and the suggestion survives for the resolver.
         let diag = Diagnostic::error("'x' is sealed — delete this assignment")
-            .with_suggestion("", Span::new(1, 5));
+            .with_deletion(Span::new(1, 5));
         assert_eq!(
             diag.rendered_message(),
             "'x' is sealed — delete this assignment"
         );
         assert_eq!(diag.suggestions.len(), 1, "the machine fix survives");
+        assert_eq!(diag.suggestions[0].kind, SuggestionKind::Delete);
+        // Defense in depth: an empty DID-YOU-MEAN (no producer emits one)
+        // still renders no `(did you mean ""?)` nonsense.
+        let legacy = Diagnostic::error("x").with_suggestion("", Span::new(1, 5));
+        assert_eq!(legacy.rendered_message(), "x");
+    }
+
+    #[test]
+    fn wire_names_round_trip_for_every_kind() {
+        for kind in [
+            SuggestionKind::DidYouMean,
+            SuggestionKind::Fix,
+            SuggestionKind::Delete,
+        ] {
+            assert_eq!(SuggestionKind::from_wire_name(kind.wire_name()), Some(kind));
+        }
+        assert_eq!(SuggestionKind::from_wire_name("nonsense"), None);
     }
 
     #[test]
@@ -1125,6 +1233,17 @@ mod tests {
         let out = d.rendered_message();
         assert!(!out.contains('\u{1b}') && !out.contains('\u{7}'), "{out:?}");
         assert!(out.contains("\\u{1b}"), "escaped visibly: {out:?}");
+
+        // The choke point speaks the FULL `needs_escape` set — the
+        // Trojan-Source bidi controls and the U+2028/U+2029 separators
+        // render escaped, exactly like the controls.
+        let steering = Diagnostic::error("found \u{202E}x\u{2028}y");
+        let out = steering.rendered_message();
+        assert!(
+            !out.contains('\u{202E}') && !out.contains('\u{2028}'),
+            "{out}"
+        );
+        assert!(out.contains("\\u{202e}"), "{out}");
     }
 
     #[test]

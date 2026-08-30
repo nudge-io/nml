@@ -14,9 +14,12 @@ the *same document*: line endings are transport, not content, so CRLF
 normalizes to LF inside multiline string values, and no value can observe
 which convention the file used (a fuzzed property test holds the parser to
 this). A carriage return with no following line feed is an error
-([NML0016](../crates/nml-core/assets/error-index.md#nml0016)) with a
-machine-applicable deletion fix. This fence is re-transcribed to CRLF by
-the docs harness before it runs, making the claim executable:
+([NML0016](../crates/nml-core/assets/error-index.md#nml0016)) — reported
+without a machine fix in token position (on a CR-terminated old-Mac file
+every CR is a line ending, and deleting it would glue lines together);
+inside a string the machine fix is the `\r` escape. This fence is
+re-transcribed to CRLF by the docs harness before it runs, making the
+claim executable:
 
 ```nml check eol=crlf
 service Api:
@@ -27,19 +30,26 @@ service Api:
         """
 ```
 
-**Raw source is printable.** C0 control characters (other than tab and
-line endings) and DEL are rejected wherever they appear — values,
-comments, or between tokens
+**Raw source is printable.** Every Unicode control character (general
+category Cc — C0, DEL, and the C1 range U+0080–U+009F), other than tab
+and line endings, is rejected wherever it appears — values, comments,
+or between tokens
 ([NML0017](../crates/nml-core/assets/error-index.md#nml0017)). Control
 characters are content, and content belongs in `\u{…}` escapes, where
-review can see it. Tab is legal raw in string content; indentation
-restricts it separately (NML0005).
+review can see it; C1's one-byte CSI (U+009B) is the same
+terminal-injection primitive as ESC. Tab is legal raw in string
+content; indentation restricts it separately (NML0005).
 
-**Nothing invisible may steer the reader.** The bidirectional control
-characters U+202A–U+202E and U+2066–U+2069 (the Trojan Source attack,
-CVE-2021-42574) and interior U+FEFF are rejected in raw form
-([NML0018](../crates/nml-core/assets/error-index.md#nml0018)); the banned
-set matches rustc's. Right-to-left text itself is unaffected — Hebrew and
+**Nothing invisible may steer the reader.** The explicit bidirectional
+controls U+202A–U+202E and U+2066–U+2069 (the Trojan Source attack,
+CVE-2021-42574), interior U+FEFF, and the U+2028/U+2029 line and
+paragraph separators are rejected in raw form
+([NML0018](../crates/nml-core/assets/error-index.md#nml0018)). The bidi
+set matches rustc's Trojan-Source lints; the whole set is a strict
+superset of rustc's, per the display-vs-parse guidance of UTS #55 —
+with the separators banned, every Unicode line-boundary character
+outside LF/CRLF is diagnosed (NEL, VT and FF as controls; a bare CR by
+its own rule, NML0016). Right-to-left text itself is unaffected — Hebrew and
 Arabic values need no bidi controls. A *leading* U+FEFF is accepted as a
 byte-order mark for Windows-editor interoperability.
 

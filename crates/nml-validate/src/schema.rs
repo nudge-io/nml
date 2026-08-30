@@ -1654,15 +1654,48 @@ impl SchemaValidator {
                 };
                 self.validate_materialized(result, m, ctx.depth, ctx.header_span, diags);
             }
-            FieldTarget::OneOf(_) => {
-                self.validate_target_instance(
-                    ctx.elem,
-                    ctx.body,
-                    ctx.depth,
-                    ctx.header_span,
-                    ctx.label,
-                    diags,
-                );
+            FieldTarget::OneOf(oneof) => {
+                // A NAMED item under a oneof element materializes its
+                // name into the arm's `+` field exactly like a model
+                // element's item (the arm the body states, else the
+                // schema default — the same consult composition makes),
+                // or the arm's required positional field reads as
+                // missing on every raw block.
+                let arm = ctx.name.and_then(|_| {
+                    let stated = ctx.body.entries.iter().find_map(|e| match &e.kind {
+                        BodyEntryKind::Property(p) if p.name.name == oneof.discriminator => {
+                            p.value.value.as_str().map(str::to_string)
+                        }
+                        _ => None,
+                    });
+                    let disc = stated.or_else(|| oneof.default_discriminator.clone())?;
+                    oneof
+                        .variants
+                        .iter()
+                        .find(|(v, _)| *v == disc)
+                        .and_then(|(_, m)| self.find_model(m))
+                });
+                let materialized = match (ctx.name, arm) {
+                    (Some(name), Some(arm)) => {
+                        nml_core::identity::materialize_arm_inline(name, ctx.body, arm)
+                    }
+                    _ => nml_core::identity::Materialized {
+                        body: ctx.body.clone(),
+                        diagnostics: Vec::new(),
+                        validatable: true,
+                    },
+                };
+                diags.extend(materialized.diagnostics);
+                if materialized.validatable {
+                    self.validate_target_instance(
+                        ctx.elem,
+                        &materialized.body,
+                        ctx.depth,
+                        ctx.header_span,
+                        ctx.label,
+                        diags,
+                    );
+                }
             }
             FieldTarget::Leaf(ty) | FieldTarget::Union(ty) => {
                 if !ctx.body.entries.is_empty() {
@@ -1943,7 +1976,12 @@ impl SchemaValidator {
                     }
                 }
                 BodyEntryKind::Modifier(m) => {
-                    seen_fields.push(&m.name.name);
+                    // A type-annotation modifier (`|slot (a | b)`) is a
+                    // declaration, never a value (RFC 0019 errata E12):
+                    // it satisfies no required field.
+                    if !matches!(m.value, ModifierValue::TypeAnnotation { .. }) {
+                        seen_fields.push(&m.name.name);
+                    }
 
                     if let Some(field_def) = model.fields.iter().find(|f| f.name == m.name.name) {
                         self.validate_modifier_value(m, field_def, diags);
@@ -2061,6 +2099,34 @@ impl SchemaValidator {
             BodyEntryKind::Property(prop) if prop.name.name == oneof.discriminator => Some(prop),
             _ => None,
         });
+        // EVERY later entry of that name must be a string too: composition
+        // re-adds the effective string discriminator ahead of a dependent's
+        // `kind = 5`, so a first-only check laundered the dependent's type
+        // error through the composed view (NML2042 raw, silence composed).
+        for prop in body
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                BodyEntryKind::Property(prop) if prop.name.name == oneof.discriminator => {
+                    Some(prop)
+                }
+                _ => None,
+            })
+            .skip(1)
+        {
+            if !matches!(prop.value.value, Value::String(_)) {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "discriminator '{}' for oneof '{}' must be a string (one of: {})",
+                        oneof.discriminator,
+                        oneof.name,
+                        valid_values(),
+                    ))
+                    .with_code(codes::INVALID_DISCRIMINATOR)
+                    .with_span(prop.value.span),
+                );
+            }
+        }
 
         let Some(discriminator) = discriminator else {
             // An omitted discriminator is valid when the union declares a default —
@@ -5113,6 +5179,99 @@ workflow W:
     }
 
     #[test]
+    fn a_type_annotation_modifier_satisfies_no_required_field() {
+        // RFC 0019 errata E12: `|deny []string` inside an instance body
+        // is a declaration, never a value — the required field stays
+        // missing until a real value is written.
+        let schema = "model m:\n    |deny []string\n    name string\n";
+        let decl_only = diags(schema, "m a:\n    |deny []string\n    name = \"n\"\n");
+        assert!(
+            decl_only
+                .iter()
+                .any(|d| d.code == Some(codes::MISSING_REQUIRED_FIELD)
+                    && d.message.contains("'deny'")),
+            "{decl_only:?}"
+        );
+        let with_value = diags(
+            schema,
+            "m b:\n    |deny []string\n    |deny = [\"a\"]\n    name = \"n\"\n",
+        );
+        assert!(
+            with_value.is_empty(),
+            "a real value satisfies it: {with_value:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_item_under_a_oneof_element_credits_the_arms_positional_field() {
+        // `- a: kind = "a"` under `steps []oo` where the arm declares
+        // `name string+`: the name is the `+` field, exactly as under a
+        // model element — no phantom NML2007 on the raw block.
+        let schema = "model arma:\n    name string+\n    kind string?\n\n\
+                      model armb:\n    name string+\n    kind string?\n    z string\n\n\
+                      oneof oo by kind = \"a\":\n    \"a\" -> arma\n    \"b\" -> armb\n\n\
+                      model flow:\n    steps []oo\n";
+        let d = diags(
+            schema,
+            "flow f:\n    steps:\n        - a:\n            kind = \"a\"\n        - b:\n            kind = \"b\"\n            z = \"1\"\n        - c:\n",
+        );
+        assert!(d.is_empty(), "{d:?}");
+        // The arm's other required field is still required.
+        let d = diags(
+            schema,
+            "flow g:\n    steps:\n        - b:\n            kind = \"b\"\n",
+        );
+        assert_eq!(
+            d.iter()
+                .filter(|d| d.code == Some(codes::MISSING_REQUIRED_FIELD))
+                .count(),
+            1,
+            "{d:?}"
+        );
+        assert!(d[0].message.contains("'z'"), "{}", d[0].message);
+    }
+
+    #[test]
+    fn every_discriminator_entry_must_be_a_string() {
+        // A first-only check laundered a dependent's `kind = 5` through the
+        // composed view (the effective string discriminator is re-added
+        // ahead of it): every entry of that name is checked.
+        let schema = "model arma:\n    kind string\n    a string\n\n\
+                      oneof oo by kind:\n    \"a\" -> arma\n\nmodel h:\n    cfg oo\n";
+        let d = diags(
+            schema,
+            "h x:\n    cfg:\n        kind = \"a\"\n        a = \"1\"\n        kind = 5\n",
+        );
+        assert_eq!(
+            d.iter()
+                .filter(|d| d.code == Some(codes::INVALID_DISCRIMINATOR))
+                .count(),
+            1,
+            "{d:?}"
+        );
+        // The count contract: every non-string entry, first or later,
+        // exactly once; a duplicate STRING is not this finding.
+        for (body, want) in [
+            ("kind = \"a\"\n        kind = 5\n        kind = true\n", 2),
+            ("kind = \"a\"\n        kind = \"a\"\n", 0),
+            ("kind = 5\n        kind = \"a\"\n", 1),
+            ("kind = 5\n        kind = 6\n", 2),
+        ] {
+            let d = diags(
+                schema,
+                &format!("h x:\n    cfg:\n        {body}        a = \"1\"\n"),
+            );
+            assert_eq!(
+                d.iter()
+                    .filter(|d| d.code == Some(codes::INVALID_DISCRIMINATOR))
+                    .count(),
+                want,
+                "{body:?}: {d:?}"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_variant_naming_a_list_element_gets_the_honest_form() {
         // `as ub` where `ub` is only a list variant's ELEMENT: not a
         // nameable variant, and "did you mean ua" would mislead — the
@@ -6669,6 +6828,7 @@ workflow W:
                     name: Identifier::new("Root", span),
                     extends: vec![],
                     uses: vec![],
+                    uses_span: None,
                     body,
                 }),
                 span,

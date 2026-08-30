@@ -39,14 +39,20 @@ pub enum ParseErrorKind {
     /// A carriage return not followed by a line feed. Line endings are LF or
     /// CRLF (spec: Source text); a bare CR is invisible in most tools and is
     /// either corruption or content smuggling, never intent.
-    BareCarriageReturn,
-    /// A raw control character (C0 other than tab and line endings, or DEL)
-    /// anywhere in source. Control characters are content, and content
-    /// belongs in escapes (`\u{1B}`), where review can see it.
+    BareCarriageReturn {
+        /// Inside a string literal (content, whose fix is the `\\r` escape)
+        /// or in token position (transport, whose fix is deletion).
+        in_string: bool,
+    },
+    /// A raw control character (any Unicode Cc — C0, DEL, or the C1
+    /// range — other than tab and line endings) anywhere in source.
+    /// Control characters are content, and content belongs in escapes
+    /// (`\u{1B}`), where review can see it.
     ForbiddenControlCharacter { ch: char },
     /// An invisible character that can make source display differently than
-    /// it parses: a bidirectional control (Trojan Source, CVE-2021-42574) or
-    /// an interior U+FEFF. The `\u{…}` escape is the sanctioned spelling.
+    /// it parses: a bidirectional control (Trojan Source, CVE-2021-42574),
+    /// an interior U+FEFF, or a U+2028/U+2029 line/paragraph separator.
+    /// The `\u{…}` escape is the sanctioned spelling.
     InvisibleCharacter { ch: char },
     /// Content on a multi-line string's opening line (the Swift/Java rule:
     /// content begins on a new line). Text there would participate in
@@ -212,6 +218,20 @@ impl ExpectedItem {
     }
 }
 
+/// The teaching tail for the Unicode line-break characters (NEL, LS,
+/// PS) — the ones renderers actually display as line breaks, where the
+/// author almost always meant `\n`: the generic escape advice alone
+/// would entrench the pasted artifact. (VT/FF are controls no renderer
+/// breaks on; they keep the generic message.)
+fn line_break_hint(ch: char) -> &'static str {
+    if matches!(ch, '\u{85}' | '\u{2028}' | '\u{2029}') {
+        " — this is a Unicode line break: write `\\n` for a line break, \
+         or the escape to keep the character"
+    } else {
+        ""
+    }
+}
+
 impl ParseErrorKind {
     /// The human-facing message, derived from the payload. Echoed source
     /// text is length-bounded here and control-escaped by the renderer.
@@ -256,19 +276,23 @@ impl ParseErrorKind {
                 format!("unexpected character `{}`", echo(&ch.to_string()))
             }
             TabInIndent => "tabs are not permitted in indentation; use spaces".to_string(),
-            BareCarriageReturn => "bare carriage return (a CR with no following LF); \
+            BareCarriageReturn { .. } => "bare carriage return (a CR with no following LF); \
                                    line endings are LF or CRLF — for a literal CR in a \
                                    string, write `\\r`"
                 .to_string(),
             ForbiddenControlCharacter { ch } => format!(
                 "raw control character U+{:04X} is not permitted in source; \
-                 write it as `\\u{{{:X}}}` inside a string",
-                *ch as u32, *ch as u32
+                 write it as `\\u{{{:X}}}` inside a string{}",
+                *ch as u32,
+                *ch as u32,
+                line_break_hint(*ch)
             ),
             InvisibleCharacter { ch } => format!(
                 "invisible character U+{:04X} can make source display differently \
-                 than it parses; write it as `\\u{{{:X}}}` inside a string",
-                *ch as u32, *ch as u32
+                 than it parses; write it as `\\u{{{:X}}}` inside a string{}",
+                *ch as u32,
+                *ch as u32,
+                line_break_hint(*ch)
             ),
             MultilineOpeningContent => "multi-line string content must begin on the \
                                         line after the opening `\"\"\"` (text on the \
@@ -377,7 +401,7 @@ impl ParseErrorKind {
             UnterminatedString { .. } => codes::UNTERMINATED_STRING,
             UnexpectedCharacter { .. } => codes::UNEXPECTED_CHARACTER,
             TabInIndent => codes::TAB_IN_INDENT,
-            BareCarriageReturn => codes::BARE_CARRIAGE_RETURN,
+            BareCarriageReturn { .. } => codes::BARE_CARRIAGE_RETURN,
             ForbiddenControlCharacter { .. } => codes::FORBIDDEN_CONTROL,
             InvisibleCharacter { .. } => codes::INVISIBLE_CHARACTER,
             MultilineOpeningContent => codes::MULTILINE_OPENING_CONTENT,
@@ -412,9 +436,15 @@ impl ParseErrorKind {
             )),
             // `&&` → `&`, over the span the emission anchored on both amps.
             DoubleAmp => Some(("&".to_string(), span)),
-            // Deleting the stray CR provably preserves intent: it is never
-            // content (that spelling is `\r`) and never a line ending.
-            BareCarriageReturn => Some((String::new(), span)),
+            // A bare CR in token position has NO machine fix: on a
+            // CR-terminated ("old Mac") file every CR IS a line ending,
+            // so deleting it glues lines together, and the one
+            // value-preserving repair (a line break) is exactly the
+            // control character the shared injection guard refuses.
+            // INSIDE a string literal the CR is content, and the
+            // value-preserving fix is its escape.
+            BareCarriageReturn { in_string: false } => None,
+            BareCarriageReturn { in_string: true } => Some(("\\r".to_string(), span)),
             // Rewriting the closing line's indent is provably
             // value-preserving: the line is edge-trimmed either way.
             MultilineClosingMisaligned { expected, .. } => Some((" ".repeat(*expected), span)),
@@ -562,12 +592,15 @@ impl NmlError {
                     None => diag,
                 };
                 let diag = match kind.suggestion(*span) {
-                    // Empty or whitespace-only replacements are mechanical
-                    // fixes (deletions, indent rewrites) — structurally a
-                    // fix, never a did-you-mean (there is no near-miss
-                    // *spelling* of nothing or of whitespace).
+                    // Whitespace-only replacements are mechanical fixes
+                    // (indent rewrites), as is the empty one — a VERBATIM
+                    // byte removal (the trailing dot), never a structural
+                    // `Delete` — and the in-string CR escape (`\r`, not
+                    // whitespace): never a did-you-mean (there is no
+                    // near-miss *spelling* of nothing or of whitespace).
                     Some((replacement, fix_span))
-                        if replacement.chars().all(char::is_whitespace) =>
+                        if replacement.chars().all(char::is_whitespace)
+                            || matches!(kind, ParseErrorKind::BareCarriageReturn { .. }) =>
                     {
                         diag.with_fix(replacement, fix_span)
                     }

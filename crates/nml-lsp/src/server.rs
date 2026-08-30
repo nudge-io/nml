@@ -665,6 +665,42 @@ impl Inner {
             (outcome, sources, own_name, owns_composition)
         });
         dc.load_pass_owns_composition = model_pass.as_ref().is_some_and(|(_, _, _, owns)| *owns);
+        // Locating a related note's OWN file (`Related.source`): an open
+        // buffer first (its unsaved text is the truth), else disk —
+        // memoized per compute (several notes can share a file) and
+        // capped (a note's line index is not worth an unbounded read;
+        // over the cap the renderer falls back loudly, as for any
+        // unlocatable file).
+        let located: std::cell::RefCell<std::collections::HashMap<String, Option<(Url, String)>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+        let locate = |src: &str| -> Option<(Url, String)> {
+            if let Some(hit) = located.borrow().get(src) {
+                return hit.clone();
+            }
+            const MAX_LOCATE_BYTES: u64 = 8 * 1024 * 1024;
+            let resolved = (|| {
+                let url = Url::from_file_path(std::path::Path::new(src)).ok()?;
+                let buffered = {
+                    let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+                    docs.get(&url).cloned()
+                };
+                let text = match buffered {
+                    Some(text) => text,
+                    None => {
+                        let len = std::fs::metadata(src).ok()?.len();
+                        if len > MAX_LOCATE_BYTES {
+                            return None;
+                        }
+                        std::fs::read_to_string(src).ok()?
+                    }
+                };
+                Some((url, text))
+            })();
+            located
+                .borrow_mut()
+                .insert(src.to_string(), resolved.clone());
+            resolved
+        };
         let mut diags = match resolved.as_ref().map(|r| &r.resolution) {
             Some(Resolution::Bound(b)) => {
                 let identity = b.identity();
@@ -676,6 +712,7 @@ impl Inner {
                     },
                     &dc,
                     Some(uri),
+                    &locate,
                 )
             }
             _ => {
@@ -689,6 +726,7 @@ impl Inner {
                     },
                     &dc,
                     Some(uri),
+                    &locate,
                 )
             }
         };
@@ -792,11 +830,15 @@ impl NmlLanguageServer {
     /// document pull or hover's explanation lookup). The entry is validated
     /// against the CURRENT buffer text, so an insert from a compute that
     /// raced an edit reads as a miss — never served as stale ranges. `None`
-    /// for an unknown document.
+    /// for an unknown document. Returns the exact TEXT the items were
+    /// computed against beside them, so a consumer that edits (the
+    /// code-action path) can resolve against that text instead of
+    /// re-reading the document map — coherent even if a `didChange`
+    /// interleaves between its own snapshot and this call.
     async fn cached_diagnostics(
         &self,
         uri: &Url,
-    ) -> Option<Arc<Vec<tower_lsp::lsp_types::Diagnostic>>> {
+    ) -> Option<(String, Arc<Vec<tower_lsp::lsp_types::Diagnostic>>)> {
         let text = self
             .documents
             .lock()
@@ -815,10 +857,11 @@ impl NmlLanguageServer {
             .get(uri)
         {
             if entry.text == text && entry.generation == generation {
-                return Some(Arc::clone(&entry.items));
+                return Some((text, Arc::clone(&entry.items)));
             }
         }
         let items = Arc::new(self.validate_document(uri, &text));
+        let validated = text.clone();
         // Store-health events queued during this resolution surface promptly
         // on whichever path computed (the drain's charter).
         self.drain_store_events().await;
@@ -833,7 +876,7 @@ impl NmlLanguageServer {
                     items: Arc::clone(&items),
                 },
             );
-        Some(items)
+        Some((validated, items))
     }
 
     /// The RFC 0010 tier-1 hover augmentation at a position: explanation
@@ -845,7 +888,7 @@ impl NmlLanguageServer {
         uri: &Url,
         pos: Position,
     ) -> Option<(String, Range)> {
-        let items = self.cached_diagnostics(uri).await?;
+        let (_, items) = self.cached_diagnostics(uri).await?;
         explanations_at_position(&items, pos)
     }
 
@@ -1111,13 +1154,30 @@ fn snapshot_universe(
     (out, own_name)
 }
 
+/// Canonicalize `path` and require the result inside one of the
+/// (already-canonical) `roots` — the ONE containment predicate for any
+/// surface that turns an untrusted path into a filesystem read. The
+/// order is load-bearing: canonicalize FIRST (resolving symlinks), then
+/// contain — check-then-canonicalize is the classic symlink escape.
+/// Pure containment: symlink *policy* stays with callers that have one
+/// (a symlink check must run BEFORE canonicalization, which erases the
+/// evidence). Fail-closed: a path that cannot canonicalize is `None`.
+fn canonical_within_roots(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    let canonical = dunce::canonicalize(path).ok()?;
+    roots
+        .iter()
+        .any(|root| canonical.starts_with(root))
+        .then_some(canonical)
+}
+
 /// Whether a watched-file event should be honored.
 ///
 /// Mirrors the safety rules of `index_workspace`/`find_nml_files`: the path
 /// must not be a symlink, and it must canonicalize to a location inside one
-/// of the (canonicalized) workspace roots. Clients can send arbitrary
-/// `file://` URIs in watched-file notifications, so this is the boundary
-/// check that keeps the server from reading files outside the workspace.
+/// of the (canonicalized) workspace roots ([`canonical_within_roots`]).
+/// Clients can send arbitrary `file://` URIs in watched-file
+/// notifications, so this is the boundary check that keeps the server
+/// from reading files outside the workspace.
 fn watched_file_is_eligible(path: &Path, roots: &[PathBuf]) -> bool {
     let is_symlink = fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
@@ -1125,10 +1185,7 @@ fn watched_file_is_eligible(path: &Path, roots: &[PathBuf]) -> bool {
     if is_symlink {
         return false;
     }
-    match dunce::canonicalize(path) {
-        Ok(canonical) => roots.iter().any(|root| canonical.starts_with(root)),
-        Err(_) => false,
-    }
+    canonical_within_roots(path, roots).is_some()
 }
 
 /// A watched-change path in the resolver's namespace. Roots are
@@ -1823,7 +1880,7 @@ fn build_body_symbols(body: &Body, line_index: &LineIndex) -> Vec<DocumentSymbol
 fn arm_selector_label(selector: &ArmSelector) -> String {
     match selector {
         ArmSelector::Role(r) => r.clone(),
-        ArmSelector::Literal(k) => quote_nml_string(k),
+        ArmSelector::Literal(k) => nml_fmt::formatter::quote_string(k),
         ArmSelector::Else => "else".into(),
     }
 }
@@ -2728,22 +2785,10 @@ fn ambiguous_candidates<'i>(
     None
 }
 
-/// Quote a string as an NML literal for outline labels — same escaping as fmt.
-fn quote_nml_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
+// String-literal quoting for labels, snippets and hover values lives in
+// `nml_fmt::formatter::quote_string` — THE one quoter, which re-escapes
+// the source policy's banned set (a local table here silently diverged
+// the day the policy grew, leaking raw steering bytes into editor UI).
 
 /// True when the cursor sits at or after the end of the last `->` token on
 /// the line — the arm **target** side (RFC 0007). Mid-selector typing must
@@ -2785,11 +2830,12 @@ fn arm_selector_completion_items(
     let mut items = Vec::new();
     if let Some(enum_def) = index.arm_key_enum_def(key) {
         for (i, variant) in enum_def.variants.iter().enumerate() {
+            let quoted = nml_fmt::formatter::quote_string(variant);
             items.push(CompletionItem {
-                label: format!("\"{variant}\""),
+                label: quoted.clone(),
                 kind: Some(CompletionItemKind::ENUM_MEMBER),
                 detail: Some("arm selector key".to_string()),
-                insert_text: Some(format!("\"{variant}\" -> ")),
+                insert_text: Some(format!("{quoted} -> ")),
                 sort_text: Some(format!("0_{i:03}")),
                 ..Default::default()
             });
@@ -3793,7 +3839,7 @@ fn simplify_number_action(source: &str, offset: usize) -> Option<SimplifyNumber>
 
 fn format_value(value: &Value) -> String {
     match value {
-        Value::String(s) => format!("\"{}\"", s),
+        Value::String(s) => nml_fmt::formatter::quote_string(s),
         Value::Number(n) => n.to_string(),
         Value::Money(m) => m.format_display(),
         Value::Duration(d) => d.to_string(),
@@ -3965,7 +4011,7 @@ fn quoted_value_item(
     edit_ranges: Option<(Range, Range)>,
     insert_replace: bool,
 ) -> CompletionItem {
-    let quoted = format!("\"{variant}\"");
+    let quoted = nml_fmt::formatter::quote_string(variant);
     let text_edit = edit_ranges.map(|(insert, replace)| {
         if insert_replace {
             CompletionTextEdit::InsertAndReplace(InsertReplaceEdit {
@@ -4524,7 +4570,11 @@ impl LanguageServer for NmlLanguageServer {
         // An unknown document (never opened, not indexed) has nothing to
         // report — an empty full report, never an error. A cache hit means
         // the *Unchanged* comparison below costs no re-validation (RFC 0010).
-        let items = self.cached_diagnostics(&uri).await.unwrap_or_default();
+        let items = self
+            .cached_diagnostics(&uri)
+            .await
+            .map(|(_, items)| items)
+            .unwrap_or_default();
         // The fill path drains; a cache hit skips it — but other handlers may
         // have queued store events since, so the pull stays the reliable
         // delivery path (cheap no-op when empty).
@@ -4994,7 +5044,7 @@ impl LanguageServer for NmlLanguageServer {
                                 if let Some(e) = index.enum_def(keyword) {
                                     for (i, variant) in e.variants.iter().enumerate() {
                                         items.push(CompletionItem {
-                                            label: format!("\"{variant}\""),
+                                            label: nml_fmt::formatter::quote_string(variant),
                                             kind: Some(CompletionItemKind::ENUM_MEMBER),
                                             detail: Some("enum variant".to_string()),
                                             sort_text: Some(format!("0_{i:03}")),
@@ -5311,35 +5361,109 @@ impl LanguageServer for NmlLanguageServer {
         let line_index = LineIndex::new(&source);
 
         // 1. Machine-applicable suggestions the validator derived — never
-        //    re-derived, never parsed out of message text.
+        //    re-derived, never parsed out of message text. STALENESS is
+        //    settled by MEMBERSHIP, not by a version: an action is offered
+        //    only for a client diagnostic whose `data` equals a member's
+        //    `data` in the current cache — `data` is the one field the LSP
+        //    spec preserves verbatim between a report and `codeAction`,
+        //    the cache is keyed by exact text AND registry generation, and
+        //    the action consumes only `data` plus the current text. A
+        //    buffer edit or a registry rebuild (which no document version
+        //    can see) therefore yields NO action, never an edit at a stale
+        //    offset. Equal `data` on the current text yields the identical
+        //    action, so which member matched is immaterial.
+        use nml_core::diagnostic::SuggestionKind;
+
+        // The cache (and its line index) is consulted only when some
+        // context diagnostic actually carries suggestion `data` — most
+        // code-action requests (selection menus over clean text) skip
+        // the clone, the compare and the index scan entirely.
+        let wants_suggestions = params.context.diagnostics.iter().any(|d| d.data.is_some());
+        let cached = if wants_suggestions {
+            self.cached_diagnostics(&uri).await
+        } else {
+            None
+        };
+        // Resolution and edit ranges use the exact text the cached
+        // diagnostics were computed against — never the snapshot above —
+        // so membership and the emitted edits stay coherent even if a
+        // `didChange` interleaves between the two reads.
+        let (cache_text, cache_index) = match &cached {
+            Some((text, _)) => (text.as_str(), LineIndex::new(text)),
+            None => ("", LineIndex::new("")),
+        };
         for diag in &params.context.diagnostics {
-            let Some(suggestions) = diag
-                .data
+            let Some(data) = diag.data.as_ref() else {
+                continue;
+            };
+            let current = cached
                 .as_ref()
-                .and_then(|d| d.get("suggestions"))
-                .and_then(|s| s.as_array())
-            else {
+                .is_some_and(|(_, items)| items.iter().any(|d| d.data.as_ref() == Some(data)));
+            if !current {
+                continue;
+            }
+            let Some(suggestions) = data.get("suggestions").and_then(|s| s.as_array()) else {
                 continue;
             };
             let parsed = parse_suggestion_entries(suggestions);
             let total = parsed.len();
             for (replacement, start, end, kind) in parsed {
-                let edit = TextEdit {
-                    range: line_index.range(nml_core::span::Span::new(start, end)),
-                    new_text: replacement.clone(),
+                // An unknown kind is no action, never a guess.
+                let Some(kind) = SuggestionKind::from_wire_name(&kind) else {
+                    continue;
                 };
+                // The ONE resolver both appliers share (RFC 0023): a
+                // singleton batch per suggestion — N did-you-mean
+                // alternatives share one span and are N actions
+                // (`Overlap` is a batch-applier verdict and never fires
+                // here); any refusal (the injection guard, a stale span,
+                // an unparsable source) is no action.
+                let suggestion = nml_core::diagnostic::Suggestion {
+                    replacement,
+                    span: nml_core::span::Span::new(start, end),
+                    kind,
+                };
+                let resolved = nml_core::cst::edit::resolve_suggestions(
+                    cache_text,
+                    std::slice::from_ref(&suggestion),
+                );
+                let Some(Ok(deleted)) = resolved.outcomes.first() else {
+                    continue;
+                };
+                let edits: Vec<TextEdit> = resolved
+                    .edits
+                    .iter()
+                    .map(|e| TextEdit {
+                        range: cache_index.range(e.span),
+                        new_text: e.replacement.clone(),
+                    })
+                    .collect();
+                if edits.is_empty() {
+                    continue;
+                }
                 let mut changes = std::collections::HashMap::new();
-                changes.insert(uri.clone(), vec![edit]);
-                // Titles derive from the suggestion KIND; `is_preferred` only
-                // for a SINGLETON did-you-mean — N mutually exclusive fixes
-                // must never let the editor auto-apply a guess (the exact
-                // ambiguity RFC 0015 D2 exists to forbid).
-                let title = if kind == "fix" {
-                    format!("Apply fix: `{replacement}`")
-                } else {
-                    format!("Replace with \"{replacement}\"")
+                changes.insert(uri.clone(), edits);
+                // Titles derive from the outcome: a structural deletion
+                // names what it deletes; an empty verbatim fix (the
+                // trailing-dot removal) is `Remove`; `is_preferred` only
+                // for a SINGLETON did-you-mean — N mutually exclusive
+                // fixes must never let the editor auto-apply a guess (the
+                // exact ambiguity RFC 0015 D2 exists to forbid), and a
+                // structural removal is not a spelling repair, so
+                // deletions are never preferred.
+                let title = match deleted {
+                    Some(d) => d.title().to_string(),
+                    None if suggestion.kind == SuggestionKind::Fix
+                        && suggestion.replacement.is_empty() =>
+                    {
+                        "Remove".to_string()
+                    }
+                    None if suggestion.kind == SuggestionKind::Fix => {
+                        format!("Apply fix: `{}`", suggestion.replacement)
+                    }
+                    None => format!("Replace with \"{}\"", suggestion.replacement),
                 };
-                let preferred = kind == "didYouMean" && total == 1;
+                let preferred = suggestion.kind == SuggestionKind::DidYouMean && total == 1;
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                     title,
                     kind: Some(CodeActionKind::QUICKFIX),
@@ -9135,6 +9259,62 @@ workflow VoiceAgent:
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn canonical_within_roots_contains_after_canonicalizing() {
+        // The order is the security property: canonicalize FIRST, then
+        // contain — so an in-root symlink whose target is outside FAILS
+        // (post-resolution containment), while an in-root alias of an
+        // in-root file passes as its canonical target. Zero roots, a
+        // missing path, and an outside path all fail closed.
+        let root = temp_workspace("cwr");
+        let inside = root.join("a.nml");
+        fs::write(&inside, "x").unwrap();
+        let canon_root = dunce::canonicalize(&root).unwrap();
+
+        let hit = canonical_within_roots(&inside, std::slice::from_ref(&canon_root))
+            .expect("inside resolves");
+        assert!(hit.starts_with(&canon_root));
+        assert!(
+            canonical_within_roots(&inside, &[]).is_none(),
+            "zero roots refuses everything"
+        );
+        assert!(
+            canonical_within_roots(&root.join("missing.nml"), std::slice::from_ref(&canon_root))
+                .is_none(),
+            "a path that cannot canonicalize fails closed"
+        );
+
+        let outside_dir = temp_workspace("cwr-outside");
+        let outside = outside_dir.join("b.nml");
+        fs::write(&outside, "y").unwrap();
+        assert!(
+            canonical_within_roots(&outside, std::slice::from_ref(&canon_root)).is_none(),
+            "containment is against the roots, not existence"
+        );
+
+        #[cfg(unix)]
+        {
+            // An in-root symlink pointing OUTSIDE the root: rejected —
+            // containment is judged on the canonical target.
+            let escape = root.join("escape.nml");
+            std::os::unix::fs::symlink(&outside, &escape).unwrap();
+            assert!(
+                canonical_within_roots(&escape, std::slice::from_ref(&canon_root)).is_none(),
+                "post-resolution containment closes the symlink escape"
+            );
+            // An in-root symlink to an in-root file: accepted, as the
+            // canonical target.
+            let alias = root.join("alias.nml");
+            std::os::unix::fs::symlink(&inside, &alias).unwrap();
+            let via = canonical_within_roots(&alias, std::slice::from_ref(&canon_root))
+                .expect("in-root alias resolves");
+            assert_eq!(via, dunce::canonicalize(&inside).unwrap());
+        }
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&outside_dir).ok();
     }
 
     #[test]

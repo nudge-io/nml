@@ -14,29 +14,63 @@
 //!   describes exclusivity (RFC 0015's axis), not applicability — and it
 //!   upholds RFC 0015's rule by construction: N mutually exclusive fixes
 //!   are N candidates, so they never auto-apply.
+//! * **One resolver for every applier**
+//!   ([`nml_core::cst::edit::resolve_suggestions`], RFC 0023): verbatim
+//!   substitution with the structural-injection refusal, structural
+//!   deletions by token walks, batch overlap — and **every refusal is
+//!   printed** (`fix refused: …`), never hidden behind
+//!   "0 edit(s) applied".
 //! * **Highest-offset-first splicing** ([`nml_core::cst::edit::splice`]),
 //!   so earlier edits cannot invalidate later spans.
 //! * **Re-check and revert.** Every round's result is re-analyzed before
-//!   it is accepted; a round that does not strictly improve the file is
-//!   discarded. The check runs on the in-memory candidate *before* any
-//!   write — strictly safer than write-then-revert, with the same
-//!   guarantee: a fixer that can worsen a file is worse than none. Writes
-//!   go through the same atomic writer `fmt` uses.
+//!   it is accepted: the parse layer must not regress, and for every
+//!   `(code, message)` key the round applied a fix for, the count must
+//!   drop by at least the number applied — a multiset decrement; a
+//!   revealed finding lands on a key the round did not apply and is
+//!   welcome. A failed round retries as its first applied candidate
+//!   alone before the fixpoint is declared; a retry that still fails is
+//!   a genuinely moved finding and reverts. The check runs on the
+//!   in-memory candidate *before* any write — strictly safer than
+//!   write-then-revert, with the same guarantee: a fixer that can worsen
+//!   a file is worse than none. Writes go through the same atomic writer
+//!   `fmt` uses.
 //! * **Rounds to a fixpoint** (bounded): parse-layer fixes (`=>` → `->`)
 //!   can unblock validation-layer fixes (`"30s"` → `30s`), which only
 //!   become visible once the file parses; each round re-derives
-//!   diagnostics from the current text.
+//!   diagnostics from the current text. A round that resolves to zero
+//!   edits ends the loop, its refusals printed.
 
 use std::path::{Path, PathBuf};
 
-use nml_core::cst::edit::{SpliceEdit, splice};
-use nml_core::diagnostic::Diagnostic;
+use std::collections::{HashMap, HashSet};
+
+use nml_core::cst::edit::{Resolved, resolve_suggestions, splice};
+use nml_core::diagnostic::{Diagnostic, Suggestion};
+use nml_core::layers::{FindingKey, finding_key};
 use nml_validate::schema::SchemaValidator;
 
-/// Bound on fix rounds per file. Two layers (parse, then validation) plus
-/// headroom for fixes that reveal fixes; a file needing more is beyond
-/// mechanical repair and keeps its remaining diagnostics reported.
-const MAX_ROUNDS: usize = 8;
+/// Floor on fix rounds per file: two layers (parse, then validation)
+/// plus headroom for fixes that reveal fixes. The real budget scales
+/// with the file ([`round_budget`]): plain same-message findings land
+/// TOGETHER (the multiset decrement is per key, not per instance), but
+/// a batch COLLIDES when another applied fix un-suppresses a
+/// same-message finding — an NML2077 repair revealing an NML2060 whose
+/// key the round also applied — and a colliding batch lands ONE
+/// candidate per round; a fixed budget of eight stalled a fully
+/// fixable mixed file.
+const MIN_ROUNDS: usize = 8;
+
+/// Ceiling on fix rounds per file — a bound on re-analysis work (each
+/// round is one full re-analysis), not a convergence aid. A very wide
+/// colliding file can reach it with edits still landing; the run says
+/// so and a second `nml fix` continues from the fixpoint reached.
+const MAX_ROUNDS: usize = 64;
+
+/// The per-file round budget: one round per initial finding, plus the
+/// reveal headroom, clamped to [`MIN_ROUNDS`]..=[`MAX_ROUNDS`].
+fn round_budget(initial_findings: usize) -> usize {
+    (initial_findings + MIN_ROUNDS).clamp(MIN_ROUNDS, MAX_ROUNDS)
+}
 
 pub fn cmd_fix(args: &[String]) -> Result<(), String> {
     let mut schema_dir: Option<PathBuf> = None;
@@ -75,19 +109,42 @@ pub fn cmd_fix(args: &[String]) -> Result<(), String> {
     let mut fixed_files = 0usize;
     let mut total_edits = 0usize;
     let mut remaining = 0usize;
+    let mut exhausted_files = 0usize;
     for path in &files {
         let outcome = fix_file(path, schema_dir.as_ref(), dry_run)?;
+        if outcome.budget_exhausted {
+            exhausted_files += 1;
+        }
         if outcome.applied > 0 {
             fixed_files += 1;
             total_edits += outcome.applied;
             let verb = if dry_run { "would fix" } else { "fixed" };
-            println!("{verb} {} ({} edit(s))", path.display(), outcome.applied);
+            // Walked filenames are repo content — sanitized like every
+            // other surface that prints them.
+            println!(
+                "{verb} {} ({} edit(s))",
+                crate::sanitized(&path.display().to_string()),
+                outcome.applied
+            );
         }
         remaining += outcome.remaining;
     }
     let noun = if dry_run { "appliable" } else { "applied" };
+    // An exhausted file's remainder is NOT "not auto-fixable" — the
+    // budget cut the run mid-landing; label it honestly.
+    // Dry runs get their own tail: nothing was written, so "again"
+    // would imply persisted progress that does not exist.
+    let budget_note = match (exhausted_files, dry_run) {
+        (0, _) => String::new(),
+        (n, false) => {
+            format!(" ({n} file(s) hit the round budget — run `nml fix` again to continue)")
+        }
+        (n, true) => {
+            format!(" ({n} file(s) hit the round budget — a real run will need more than one pass)")
+        }
+    };
     println!(
-        "{total_edits} edit(s) {noun} across {fixed_files} of {} file(s); {remaining} diagnostic(s) not auto-fixable",
+        "{total_edits} edit(s) {noun} across {fixed_files} of {} file(s); {remaining} diagnostic(s) not auto-fixable{budget_note}",
         files.len()
     );
     Ok(())
@@ -146,8 +203,13 @@ fn collect_nml_files(paths: &[&String]) -> Result<Vec<PathBuf>, String> {
 struct FixOutcome {
     /// Edits applied (or, dry-run, that would be).
     applied: usize,
-    /// Diagnostics left after the final round — not mechanically fixable.
+    /// Diagnostics left after the final round. WITHOUT budget
+    /// exhaustion these are not mechanically fixable; an exhausted file
+    /// still holds landable candidates, and the summary says so.
     remaining: usize,
+    /// The round budget ran out with sole candidates still standing —
+    /// the remainder is not "not auto-fixable", another run continues.
+    budget_exhausted: bool,
 }
 
 fn fix_file(
@@ -160,28 +222,46 @@ fn fix_file(
     let mut text = original.clone();
     let mut applied = 0usize;
     let mut analysis = analyze(path, &text, schema_dir);
+    // Each distinct refusal prints once per file — rounds re-derive
+    // their candidates, and a persisting refusal would repeat.
+    let mut printed: HashSet<String> = HashSet::new();
 
-    for _ in 0..MAX_ROUNDS {
-        let edits = sole_candidate_edits(&analysis.diags);
-        if edits.is_empty() {
+    let budget = round_budget(analysis.diags.len());
+    let mut exhausted = true;
+    for _ in 0..budget {
+        let sole = sole_candidates(&analysis.diags);
+        if sole.is_empty() {
+            exhausted = false;
             break;
         }
-        let candidate = match splice(&text, &edits) {
-            Ok(c) => c,
-            // Defense in depth: a batch the pre-filter let through but the
-            // primitive refuses is a bug upstream, not a reason to write a
-            // half-fixed file. Stop with what already passed re-check.
-            Err(_) => break,
+        let suggestions: Vec<Suggestion> = sole.iter().map(|(_, s)| s.clone()).collect();
+        let resolved = resolve_suggestions(&text, &suggestions);
+        print_refusals(path, &text, &resolved, &mut printed);
+        // A round that resolves to zero edits ends the loop.
+        if resolved.edits.is_empty() {
+            exhausted = false;
+            break;
+        }
+        let Some((next, count, next_analysis)) =
+            accept_round(path, schema_dir, &text, &analysis, &sole, &resolved)
+        else {
+            exhausted = false;
+            break;
         };
-        // Re-check before accepting: the round must strictly improve the
-        // file at its own layer (see `improved`).
-        let candidate_analysis = analyze(path, &candidate, schema_dir);
-        if !improved(&analysis, &candidate_analysis) {
-            break;
-        }
-        text = candidate;
-        applied += edits.len();
-        analysis = candidate_analysis;
+        text = next;
+        applied += count;
+        analysis = next_analysis;
+    }
+    let budget_exhausted = exhausted && !sole_candidates(&analysis.diags).is_empty();
+    if budget_exhausted {
+        // Not a fixpoint — the budget ran out with sole candidates still
+        // STANDING (never attempted; the next run derives and tries
+        // them). Say so instead of mislabeling them "not auto-fixable".
+        eprintln!(
+            "{}: note: fix round budget reached with fix candidates still standing — \
+             run `nml fix` again to continue",
+            crate::sanitized(&path.display().to_string())
+        );
     }
 
     if applied > 0 {
@@ -194,6 +274,7 @@ fn fix_file(
     Ok(FixOutcome {
         applied,
         remaining: analysis.diags.len(),
+        budget_exhausted,
     })
 }
 
@@ -284,79 +365,165 @@ fn analyze(path: &Path, source: &str, schema_dir: Option<&PathBuf>) -> Analysis 
     }
 }
 
-/// The re-check-and-revert rule, layer-aware. Crossing the parse →
-/// validation boundary legitimately REVEALS diagnostics (a file that
-/// finally parses gets validated for the first time), so a raw
-/// total-count comparison would falsely revert exactly the most valuable
-/// rounds:
-///
-/// * Parse layer dirty: the round must reduce the parse-error count;
-///   reaching a clean parse is an improvement regardless of what
-///   validation then finds.
-/// * Parse layer clean: the round must keep it clean AND strictly reduce
-///   the total count — a validation fix that breaks the parse or merely
-///   reshuffles findings is discarded.
-fn improved(before: &Analysis, after: &Analysis) -> bool {
-    if !before.parse_clean {
-        return after.parse_clean || after.diags.len() < before.diags.len();
+/// One round's acceptance: splice, re-analyze, gate ([`round_improved`]).
+/// On a failed gate, retry the round as the FIRST APPLIED sole candidate
+/// alone — the first in suggestion-span order whose outcome was `Ok`; a
+/// refused candidate contributed no edits and cannot have failed the
+/// gate — before the fixpoint is declared. A singleton that passes lands
+/// and the next round re-derives the rest; a singleton that still fails
+/// is a genuinely moved finding and reverts (visible as "not
+/// auto-fixable").
+fn accept_round(
+    path: &Path,
+    schema_dir: Option<&PathBuf>,
+    text: &str,
+    analysis: &Analysis,
+    sole: &[(FindingKey, Suggestion)],
+    resolved: &Resolved,
+) -> Option<(String, usize, Analysis)> {
+    let applied: Vec<&FindingKey> = resolved
+        .outcomes
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.is_ok())
+        .map(|(i, _)| &sole[i].0)
+        .collect();
+    if let Some(out) = try_edits(path, schema_dir, text, analysis, &applied, &resolved.edits) {
+        return Some(out);
     }
-    after.parse_clean && after.diags.len() < before.diags.len()
+    let first = resolved.outcomes.iter().position(|o| o.is_ok())?;
+    let single = [sole[first].1.clone()];
+    let retry = resolve_suggestions(text, &single);
+    if retry.edits.is_empty() || retry.outcomes.first().is_none_or(|o| o.is_err()) {
+        return None;
+    }
+    try_edits(
+        path,
+        schema_dir,
+        text,
+        analysis,
+        &[&sole[first].0],
+        &retry.edits,
+    )
 }
 
-/// The sole-candidate filter (module doc): one suggestion per diagnostic,
-/// agreement across diagnostics per span, and a greedy non-overlap pass
-/// (an overlapped candidate is simply deferred — the next round re-derives
-/// it against the updated text).
+/// Splice, re-analyze, gate — `None` reverts the attempt. A batch the
+/// resolver produced but the primitive refuses is a bug upstream, not a
+/// reason to write a half-fixed file (defense in depth).
+fn try_edits(
+    path: &Path,
+    schema_dir: Option<&PathBuf>,
+    text: &str,
+    analysis: &Analysis,
+    applied: &[&FindingKey],
+    edits: &[nml_core::cst::edit::SpliceEdit],
+) -> Option<(String, usize, Analysis)> {
+    let candidate = splice(text, edits).ok()?;
+    let after = analyze(path, &candidate, schema_dir);
+    round_improved(analysis, &after, applied).then_some((candidate, edits.len(), after))
+}
+
+/// The re-check gate. Two clauses:
 ///
-/// **Structural-injection guard:** a replacement containing a line break
-/// or any other control character is refused outright. Every suggestion
-/// is a same-line token rewrite by design, but some replacements embed
-/// *decoded user content* (the role-literal fix carries the string's
-/// value), and a crafted escape sequence (`"admin\n evil = 1"`) would
-/// otherwise let file content smuggle new lines — new *structure* —
-/// through an auto-applied fix. Editors present quick-fixes for a human
-/// to eyeball; a batch applier must refuse this class by construction.
-fn sole_candidate_edits(diags: &[Diagnostic]) -> Vec<SpliceEdit> {
-    let mut candidates: Vec<SpliceEdit> = diags
+/// * **The parse layer never regresses** (`after.parse_clean ||
+///   !before.parse_clean`): reaching a clean parse is an improvement
+///   regardless of what validation then finds — crossing the boundary
+///   legitimately REVEALS diagnostics — and a validation fix that breaks
+///   the parse is discarded.
+/// * **A multiset decrement over the keys the round applied**: for every
+///   `(code, message)` key with `applied(key) > 0`,
+///   `count_after(key) <= count_before(key) − applied(key)`. Keys the
+///   round did not apply are unconstrained — a revealed finding normally
+///   lands on one (a raw count comparison rejected a round that reveals
+///   as many findings as it fixes, sticking the file at a false
+///   fixpoint; a gate over EVERY key would reject the reveal it exists
+///   to accept; and a gate over keys present before would reject a
+///   repair that reveals more instances of an existing key).
+fn round_improved(before: &Analysis, after: &Analysis, applied: &[&FindingKey]) -> bool {
+    if !(after.parse_clean || !before.parse_clean) {
+        return false;
+    }
+    let mut applied_counts: HashMap<(Option<nml_core::diagnostic::Code>, &str), usize> =
+        HashMap::new();
+    for k in applied {
+        *applied_counts.entry((k.0, k.2.as_str())).or_default() += 1;
+    }
+    let count = |diags: &[Diagnostic], key: &(Option<nml_core::diagnostic::Code>, &str)| {
+        diags
+            .iter()
+            .filter(|d| d.code == key.0 && d.message == key.1)
+            .count()
+    };
+    applied_counts
+        .iter()
+        .all(|(key, n)| count(&after.diags, key) + n <= count(&before.diags, key))
+}
+
+/// The sole-candidate filter (module doc): one suggestion per
+/// diagnostic, byte-identical `(span, replacement, kind)` candidates
+/// collapsed to one application, same-span disagreement dropping both,
+/// sorted by suggestion span — the order the resolver's greedy batch
+/// rules assume. Overlap, injection, and every structural concern belong
+/// to the RESOLVER, where each refusal is per-suggestion and printed: a
+/// silent pre-filter here would be an exemption from "every applier
+/// refuses it, by construction, in one place". The paired
+/// [`FindingKey`] is what the round gate decrements.
+fn sole_candidates(diags: &[Diagnostic]) -> Vec<(FindingKey, Suggestion)> {
+    let mut candidates: Vec<(FindingKey, Suggestion)> = diags
         .iter()
         .filter_map(|d| match d.suggestions.as_slice() {
-            [one] if !one.replacement.chars().any(char::is_control) => Some(SpliceEdit {
-                span: one.span,
-                replacement: one.replacement.clone(),
-            }),
+            [one] => Some((finding_key(d), one.clone())),
             _ => None,
         })
         .collect();
     candidates.sort_by(|a, b| {
-        (a.span.start, a.span.end, &a.replacement).cmp(&(b.span.start, b.span.end, &b.replacement))
+        (a.1.span.start, a.1.span.end, &a.1.replacement).cmp(&(
+            b.1.span.start,
+            b.1.span.end,
+            &b.1.replacement,
+        ))
     });
-    candidates.dedup();
+    // Two diagnostics carrying the same suggestion are ONE application.
+    candidates.dedup_by(|a, b| a.1 == b.1);
 
     // Two diagnostics proposing DIFFERENT texts for one span: neither is
     // the sole candidate — drop both rather than pick.
-    let mut edits: Vec<SpliceEdit> = Vec::new();
+    let mut out: Vec<(FindingKey, Suggestion)> = Vec::new();
     let mut i = 0;
     while i < candidates.len() {
         let same_span_end = candidates[i + 1..]
             .iter()
-            .take_while(|c| c.span == candidates[i].span)
+            .take_while(|c| c.1.span == candidates[i].1.span)
             .count()
             + i
             + 1;
         if same_span_end == i + 1 {
-            edits.push(candidates[i].clone());
+            out.push(candidates[i].clone());
         }
         i = same_span_end;
     }
+    out
+}
 
-    // Greedy non-overlap, in offset order.
-    let mut kept: Vec<SpliceEdit> = Vec::new();
-    for e in edits {
-        if kept.last().is_none_or(|prev| prev.span.end <= e.span.start) {
-            kept.push(e);
+/// `<file>:<line>:<col>: fix refused: <reason>` — a refusal is a
+/// legitimate outcome, not an upstream bug; hiding it behind
+/// "0 edit(s) applied" left the user staring at an unexplained
+/// fixpoint. Each distinct line prints once per file.
+fn print_refusals(path: &Path, text: &str, resolved: &Resolved, printed: &mut HashSet<String>) {
+    let map = nml_core::span::SourceMap::new(text);
+    for outcome in &resolved.outcomes {
+        let Err(e) = outcome else { continue };
+        let loc = map.location(e.span().start);
+        let msg = format!(
+            "{}:{}:{}: fix refused: {e}",
+            crate::sanitized(&path.display().to_string()),
+            loc.line,
+            loc.column
+        );
+        if printed.insert(msg.clone()) {
+            eprintln!("{msg}");
         }
     }
-    kept
 }
 
 /// A minimal unified diff (3 lines of context) for `--dry-run`. Line-based
@@ -367,7 +534,10 @@ fn unified_diff(old: &str, new: &str, path: &Path) -> String {
     let old_lines: Vec<&str> = old.split_inclusive('\n').collect();
     let new_lines: Vec<&str> = new.split_inclusive('\n').collect();
 
-    let mut out = format!("--- a/{0}\n+++ b/{0}\n", path.display());
+    let mut out = format!(
+        "--- a/{0}\n+++ b/{0}\n",
+        crate::sanitized(&path.display().to_string())
+    );
     const CONTEXT: usize = 3;
 
     let ops = diff_ops(&old_lines, &new_lines);
@@ -487,4 +657,84 @@ fn diff_ops(old: &[&str], new: &[&str]) -> Vec<(usize, usize, OpKind)> {
         j += 1;
     }
     ops
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nml_core::diagnostic::codes;
+    use nml_core::span::Span;
+
+    fn d(msg: &str) -> Diagnostic {
+        Diagnostic::error(msg)
+            .with_code(codes::SEALED_FIELD_VIOLATION)
+            .with_span(Span::new(0, 1))
+    }
+
+    fn a(parse_clean: bool, msgs: &[&str]) -> Analysis {
+        Analysis {
+            parse_clean,
+            diags: msgs.iter().map(|m| d(m)).collect(),
+        }
+    }
+
+    fn key(msg: &str) -> FindingKey {
+        (
+            Some(codes::SEALED_FIELD_VIOLATION),
+            Some((0, 1)),
+            msg.to_string(),
+        )
+    }
+
+    #[test]
+    fn gate_accepts_an_exact_decrement() {
+        let (before, after) = (a(true, &["k"]), a(true, &[]));
+        assert!(round_improved(&before, &after, &[&key("k")]));
+    }
+
+    #[test]
+    fn gate_accepts_a_reveal_on_an_unapplied_key() {
+        // The false-fixpoint class: a round that reveals as many findings
+        // as it fixes (the NML2077 → NML2060 probe) must land.
+        let (before, after) = (a(true, &["fixed"]), a(true, &["revealed"]));
+        assert!(round_improved(&before, &after, &[&key("fixed")]));
+    }
+
+    #[test]
+    fn gate_accepts_a_reveal_of_more_instances_of_an_existing_key() {
+        // A key present before but NOT applied this round is
+        // unconstrained — a repaired ref can reveal more of it.
+        let (before, after) = (a(true, &["fixed", "other"]), a(true, &["other", "other"]));
+        assert!(round_improved(&before, &after, &[&key("fixed")]));
+    }
+
+    #[test]
+    fn gate_rejects_a_surviving_applied_key() {
+        // The compound-reveal class: an applied fix whose (code, message)
+        // count did not drop — another applied fix un-suppressed an
+        // identical-message finding — fails, and the caller retries the
+        // first applied candidate alone.
+        let (before, after) = (a(true, &["k"]), a(true, &["k"]));
+        assert!(!round_improved(&before, &after, &[&key("k")]));
+    }
+
+    #[test]
+    fn gate_accepts_one_of_two_message_identical_findings_applied() {
+        let (before, after) = (a(true, &["k", "k"]), a(true, &["k"]));
+        assert!(round_improved(&before, &after, &[&key("k")]));
+    }
+
+    #[test]
+    fn gate_rejects_a_parse_regression_and_accepts_reaching_a_clean_parse() {
+        let (before, after) = (a(true, &["k"]), a(false, &[]));
+        assert!(
+            !round_improved(&before, &after, &[&key("k")]),
+            "a fix that breaks the parse is discarded"
+        );
+        let (before, after) = (a(false, &["k"]), a(true, &["x", "y", "z"]));
+        assert!(
+            round_improved(&before, &after, &[&key("k")]),
+            "crossing into a clean parse legitimately reveals findings"
+        );
+    }
 }

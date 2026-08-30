@@ -522,17 +522,25 @@ impl<'a> Formatter<'a> {
 }
 
 /// Render a string as a single-line, double-quoted NML literal with the same
-/// escaping rules the lexer accepts. Used for `oneof` discriminator values.
-fn quote_string(s: &str) -> String {
+/// escaping rules the lexer accepts — THE one quoter for every consumer
+/// that writes or displays an NML string literal (the formatter's
+/// `oneof` discriminator values and literal arm selectors/targets, the
+/// LSP's outline labels, hover values and completion snippets). Every
+/// character funnels through [`push_value_char`] — the ONE emitter that
+/// re-escapes the source policy's banned set — so no string surface can
+/// launder an escaped banned character into a raw byte the parser then
+/// rejects, or a steering byte into an editor UI (a second hand-rolled
+/// escape table did exactly that for every banned character it did not
+/// know about).
+pub fn quote_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {
         match ch {
             '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
             '\t' => out.push_str("\\t"),
             '\n' => out.push_str("\\n"),
-            c => out.push(c),
+            c => push_value_char(&mut out, c),
         }
     }
     out.push('"');
@@ -710,6 +718,23 @@ fn push_value_char(out: &mut String, ch: char) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A non-item line inside a modifier block cannot be lowered losslessly:
+    /// `format_source` refuses (the CLI leaves the file untouched) rather
+    /// than dropping the line.
+    #[test]
+    fn format_source_refuses_non_items_in_a_modifier_block() {
+        let err = format_source(
+            "policy p:\n    |deny:\n        - \"a\"\n        .note = \"x\"\n        - \"b\"\n",
+        )
+        .expect_err("refused");
+        assert!(
+            err.to_string()
+                .contains("expected a list item in a modifier block, found a shared property"),
+            "{err}"
+        );
+    }
+
     use nml_core::parse;
 
     /// A resolved env value formats as the REFERENCE that produced it —
@@ -951,13 +976,63 @@ mod tests {
     /// NML0016–NML0018.
     #[test]
     fn banned_value_characters_render_as_escapes() {
-        let source = "service App:\n    ansi = \"\\u{1B}[0m\"\n    bidi = \"\\u{202E}\"\n    cr = \"a\\rb\"\n";
+        // The roundtrip IS the enforcement: `roundtrip` reparses with
+        // the source policy live, so a formatter that laundered an
+        // escape into a raw banned byte (the pre-closed-class defect for
+        // NEL/CSI/LS/PS) fails here, not in a user's tree.
+        let source = "service App:\n    ansi = \"\\u{1B}[0m\"\n    bidi = \"\\u{202E}\"\n    cr = \"a\\rb\"\n    nel = \"\\u{85}\"\n    csi = \"\\u{9B}\"\n    ls = \"\\u{2028}\"\n    ps = \"\\u{2029}\"\n";
         roundtrip(source);
         idempotent(source);
         let formatted = format_source(source).unwrap();
         assert!(formatted.contains("\\u{1B}[0m"), "{formatted}");
         assert!(formatted.contains("\\u{202E}"), "{formatted}");
         assert!(formatted.contains("a\\rb"), "{formatted}");
+        assert!(formatted.contains("\\u{85}"), "{formatted}");
+        assert!(formatted.contains("\\u{9B}"), "{formatted}");
+        assert!(formatted.contains("\\u{2028}"), "{formatted}");
+        assert!(formatted.contains("\\u{2029}"), "{formatted}");
+        for raw in ['\u{85}', '\u{9B}', '\u{2028}', '\u{2029}'] {
+            assert!(
+                !formatted.contains(raw),
+                "a raw banned byte in formatter output: {formatted:?}"
+            );
+        }
+    }
+
+    /// `quote_string`'s surfaces — oneof arm values and literal arm
+    /// selectors/targets — must re-escape the banned set exactly like
+    /// every other string surface: a second escape table laundered
+    /// every banned character it did not know about (ESC, bidi, CR,
+    /// then the closed-class additions) into raw bytes the parser
+    /// rejects, so `nml fmt` corrupted a working file.
+    #[test]
+    fn quoted_arm_surfaces_render_banned_characters_as_escapes() {
+        let source = concat!(
+            "model emailLog:\n    kind string?\n\n",
+            "oneof email by provider:\n    \"a\\u{85}b\" -> emailLog\n    \"c\\u{202E}d\" -> emailLog\n"
+        );
+        roundtrip(source);
+        idempotent(source);
+        let formatted = format_source(source).unwrap();
+        assert!(formatted.contains("a\\u{85}b"), "{formatted}");
+        assert!(formatted.contains("c\\u{202E}d"), "{formatted}");
+        for raw in ['\u{85}', '\u{202E}'] {
+            assert!(
+                !formatted.contains(raw),
+                "a raw banned byte in formatter output: {formatted:?}"
+            );
+        }
+
+        let arms = concat!(
+            "model landing:\n    label number\n\n",
+            "model svc:\n    routing (string -> landing)?\n\n",
+            "svc Api:\n    routing:\n        \"p\\u{2028}q\" -> \"up\\rsell\"\n"
+        );
+        roundtrip(arms);
+        idempotent(arms);
+        let formatted = format_source(arms).unwrap();
+        assert!(formatted.contains("p\\u{2028}q"), "{formatted}");
+        assert!(formatted.contains("up\\rsell"), "{formatted}");
     }
 
     /// Edge spaces in multiline values (writable via `\u{20}`, which

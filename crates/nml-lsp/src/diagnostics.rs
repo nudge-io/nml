@@ -66,21 +66,67 @@ fn composed_validate(
     file: &nml_core::ast::File,
     source_name: &str,
 ) -> Vec<nml_core::diagnostic::Diagnostic> {
-    let composed = nml_core::layers::compose_file(
-        validator.index(),
-        source_name,
-        file,
-        &nml_core::layers::OpenContext,
-    );
-    let mut out = composed.diagnostics;
-    let mut seen: std::collections::HashSet<nml_core::layers::FindingKey> =
-        out.iter().map(nml_core::layers::finding_key).collect();
-    for diag in validator.validate(composed.validation_file.as_ref().unwrap_or(file)) {
-        if seen.insert(nml_core::layers::finding_key(&diag)) {
-            out.push(diag);
+    never_dark(
+        || {
+            let composed = nml_core::layers::compose_file(
+                validator.index(),
+                source_name,
+                file,
+                &nml_core::layers::OpenContext,
+            );
+            let mut out = composed.diagnostics;
+            let mut seen: std::collections::HashSet<nml_core::layers::FindingKey> =
+                out.iter().map(nml_core::layers::finding_key).collect();
+            for diag in validator.validate(composed.validation_file.as_ref().unwrap_or(file)) {
+                if seen.insert(nml_core::layers::finding_key(&diag)) {
+                    out.push(diag);
+                }
+            }
+            out
+        },
+        || validator.validate(file),
+    )
+}
+
+/// The editor must never go dark: a panic inside compose+validate (an
+/// engine invariant, an `expect`) would otherwise unwind through
+/// tower-lsp's inline handler future and take the whole server down into
+/// a crash-restart loop. Degrade instead: `raw` (guarded too — a second
+/// panic would be the same loop) plus one NML2086 anchored at the buffer
+/// start, so the degradation is visible, never silent. The debug
+/// assertion at the compose boundary stays loud in nml-core's tests. (On
+/// `wasm32-wasip1` panics abort — the guard is inert there by
+/// construction; the CLI's own process posture applies.)
+fn never_dark(
+    attempt: impl FnOnce() -> Vec<nml_core::diagnostic::Diagnostic>,
+    raw: impl FnOnce() -> Vec<nml_core::diagnostic::Diagnostic>,
+) -> Vec<nml_core::diagnostic::Diagnostic> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt)) {
+        Ok(out) => out,
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown panic".to_string());
+            let mut out =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(raw)).unwrap_or_default();
+            out.push(compose_guard_diag(&what));
+            out
         }
     }
-    out
+}
+
+/// The guard's own finding — anchored at the buffer start: a span-less
+/// diagnostic never reaches the editor (`push_diagnostic` drops it), and
+/// a silent degradation would defeat the guard's purpose.
+fn compose_guard_diag(what: &str) -> nml_core::diagnostic::Diagnostic {
+    nml_core::diagnostic::Diagnostic::error(format!(
+        "internal error while composing this file — showing findings for the raw \
+         text only; please report the input ({what})"
+    ))
+    .with_code(nml_core::diagnostic::codes::INTERNAL_COMPOSE_INVARIANT)
+    .with_span(nml_core::span::Span::empty(0))
 }
 
 pub fn compute(
@@ -88,10 +134,18 @@ pub fn compute(
     mode: &SchemaMode<'_>,
     config: &DiagnosticConfig,
     uri: Option<&tower_lsp::lsp_types::Url>,
+    locate: &dyn Fn(&str) -> Option<(tower_lsp::lsp_types::Url, String)>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let line_index = LineIndex::new(source);
     let source_name = uri.map(|u| u.path().to_string()).unwrap_or_default();
+    let push_diagnostic = |diag: nml_core::diagnostic::Diagnostic,
+                           identity: Option<&str>,
+                           uri: Option<&tower_lsp::lsp_types::Url>,
+                           line_index: &LineIndex,
+                           out: &mut Vec<Diagnostic>| {
+        push_diagnostic_located(diag, identity, uri, line_index, &source_name, locate, out);
+    };
 
     // Resilient parse: always yields a best-effort AST plus the full set of
     // syntactic + semantic errors (position-sorted, bounded). Reporting every
@@ -222,13 +276,20 @@ pub fn compute(
                 // so the editor must too or a schema-less buffer goes
                 // dark on a typo'd `uses` ref the CLI catches.
                 let empty = nml_core::schema_index::SchemaIndex::build(vec![], vec![], vec![]);
-                let composed = nml_core::layers::compose_file(
-                    &empty,
-                    &source_name,
-                    &file,
-                    &nml_core::layers::OpenContext,
+                // Same never-go-dark guard as the schema-bearing path.
+                let composed = never_dark(
+                    || {
+                        nml_core::layers::compose_file(
+                            &empty,
+                            &source_name,
+                            &file,
+                            &nml_core::layers::OpenContext,
+                        )
+                        .diagnostics
+                    },
+                    Vec::new,
                 );
-                for diag in composed.diagnostics {
+                for diag in composed {
                     push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
                 }
             } else {
@@ -335,11 +396,29 @@ fn cap_diagnostics(diagnostics: &mut Vec<Diagnostic>) {
 /// onto package-mode errors, and rides the structured suggestion in
 /// `Diagnostic.data` so the code-action handler offers a one-keystroke fix
 /// without re-deriving (or worse, message-parsing) it.
+/// [`push_diagnostic_located`] for the passes with no compose notes to
+/// locate (templates, model-source checks): same-file notes behave
+/// identically, and a foreign-source note falls back to the
+/// diagnostic's own location with the file named — never a foreign span
+/// through this document's index.
 fn push_diagnostic(
     diag: nml_core::diagnostic::Diagnostic,
     identity: Option<&str>,
     uri: Option<&tower_lsp::lsp_types::Url>,
     line_index: &LineIndex,
+    out: &mut Vec<Diagnostic>,
+) {
+    let own = uri.map(|u| u.path().to_string()).unwrap_or_default();
+    push_diagnostic_located(diag, identity, uri, line_index, &own, &|_| None, out);
+}
+
+fn push_diagnostic_located(
+    diag: nml_core::diagnostic::Diagnostic,
+    identity: Option<&str>,
+    uri: Option<&tower_lsp::lsp_types::Url>,
+    line_index: &LineIndex,
+    own_source: &str,
+    locate: &dyn Fn(&str) -> Option<(tower_lsp::lsp_types::Url, String)>,
     out: &mut Vec<Diagnostic>,
 ) {
     let Some(span) = diag.span else {
@@ -366,10 +445,9 @@ fn push_diagnostic(
                         "replacement": s.replacement,
                         "start": s.span.start,
                         "end": s.span.end,
-                        "kind": match s.kind {
-                            nml_core::diagnostic::SuggestionKind::DidYouMean => "didYouMean",
-                            nml_core::diagnostic::SuggestionKind::Fix => "fix",
-                        },
+                        // The names live with the kind (`wire_name`),
+                        // where a new variant cannot compile unnamed.
+                        "kind": s.kind.wire_name(),
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -391,17 +469,45 @@ fn push_diagnostic(
         message,
         source: Some("nml".to_string()),
         data,
-        // Secondary locations (RFC 0009), spec-native. Same-document by
-        // construction; the uri is required by the LSP `Location` shape.
+        // Secondary locations (RFC 0009), spec-native — each located in
+        // ITS OWN file (`Related.source`, RFC 0019 plan item 2): the
+        // current document's index for a same-file note, a located
+        // foreign file's own index otherwise, and the diagnostic's own
+        // location with the file named in the message when the file
+        // cannot be located — never the right file with a wrong range.
         related_information: uri.map(|uri| {
             diag.related
                 .iter()
-                .map(|rel| tower_lsp::lsp_types::DiagnosticRelatedInformation {
-                    location: tower_lsp::lsp_types::Location {
-                        uri: uri.clone(),
-                        range: line_index.range(rel.span),
-                    },
-                    message: rel.message.clone(),
+                .map(|rel| {
+                    let foreign = diag
+                        .related_source(rel)
+                        .filter(|s| *s != own_source)
+                        .map(|s| (s, locate(s)));
+                    match foreign {
+                        None => tower_lsp::lsp_types::DiagnosticRelatedInformation {
+                            location: tower_lsp::lsp_types::Location {
+                                uri: uri.clone(),
+                                range: line_index.range(rel.span),
+                            },
+                            message: rel.message.clone(),
+                        },
+                        Some((_, Some((furl, text)))) => {
+                            tower_lsp::lsp_types::DiagnosticRelatedInformation {
+                                location: tower_lsp::lsp_types::Location {
+                                    uri: furl,
+                                    range: LineIndex::new(&text).range(rel.span),
+                                },
+                                message: rel.message.clone(),
+                            }
+                        }
+                        Some((s, None)) => tower_lsp::lsp_types::DiagnosticRelatedInformation {
+                            location: tower_lsp::lsp_types::Location {
+                                uri: uri.clone(),
+                                range: diag.span.map(|sp| line_index.range(sp)).unwrap_or_default(),
+                            },
+                            message: format!("{} (in {s})", rel.message),
+                        },
+                    }
                 })
                 .collect()
         }),
@@ -448,6 +554,18 @@ pub fn schema_load_pass(
         .map(|(n, t)| (n.as_str(), t.as_str()))
         .collect();
     let (_schema, findings) = nml_validate::loader::load_schema(&refs);
+    // The note locator speaks the UNIVERSE's name vocabulary — the same
+    // names the loader stamps — and serves from the in-hand sources
+    // (read buffer-first), so a same-file note never degrades on a
+    // canonicalized-vs-`uri.path()` spelling mismatch and a sibling's
+    // note locates in the sibling's own text with zero I/O. A
+    // non-path universe name (an untitled buffer) yields no Url and
+    // falls back loudly, named in the message.
+    let locate = |src: &str| -> Option<(tower_lsp::lsp_types::Url, String)> {
+        let (name, text) = sources.iter().find(|(n, _)| n == src)?;
+        let url = tower_lsp::lsp_types::Url::from_file_path(std::path::Path::new(name)).ok()?;
+        Some((url, text.clone()))
+    };
     let mut out = Vec::new();
     for diag in findings
         .into_iter()
@@ -461,7 +579,7 @@ pub fn schema_load_pass(
         {
             continue;
         }
-        push_diagnostic(diag, None, uri, &line_index, &mut out);
+        push_diagnostic_located(diag, None, uri, &line_index, own_name, &locate, &mut out);
     }
     out
 }
@@ -800,6 +918,56 @@ mod tests {
         DiagnosticConfig::default()
     }
 
+    /// `Related.source` at the LSP wire (RFC 0019 plan item 2), pinned
+    /// with a synthetic diagnostic because both consumers compose
+    /// single-file today: a located foreign note gets ITS OWN file's
+    /// uri and line index; an un-locatable one falls back to the
+    /// diagnostic's own location with the file named in the message —
+    /// never a foreign span through this document's index.
+    #[test]
+    fn related_notes_locate_in_their_own_files() {
+        use nml_core::span::Span;
+        let own_url = tower_lsp::lsp_types::Url::parse("file:///ws/main.nml").unwrap();
+        let foreign_url = tower_lsp::lsp_types::Url::parse("file:///ws/b.nml").unwrap();
+        let foreign_text = "x = 1\ny = 2\n";
+        let locate = |src: &str| -> Option<(tower_lsp::lsp_types::Url, String)> {
+            (src == "/ws/b.nml").then(|| (foreign_url.clone(), foreign_text.to_string()))
+        };
+        let diag = nml_core::diagnostic::Diagnostic::error("sealed")
+            .with_code(nml_core::diagnostic::codes::SEALED_FIELD_VIOLATION)
+            .with_span(Span::new(0, 1))
+            .with_related_in(Span::new(0, 1), "sealed here", None)
+            .with_related_in(Span::new(6, 7), "sealed here", Some("/ws/b.nml".into()))
+            .with_related_in(Span::new(3, 4), "sealed here", Some("/ws/gone.nml".into()));
+        let mut out = Vec::new();
+        let line_index = LineIndex::new("a = 1\n");
+        push_diagnostic_located(
+            diag,
+            None,
+            Some(&own_url),
+            &line_index,
+            "/ws/main.nml",
+            &locate,
+            &mut out,
+        );
+        let related = out[0].related_information.as_ref().expect("notes");
+        assert_eq!(related.len(), 3);
+        assert_eq!(related[0].location.uri, own_url, "same-file note");
+        assert_eq!(related[1].location.uri, foreign_url, "its own file");
+        assert_eq!(
+            related[1].location.range.start.line, 1,
+            "byte 6 is LINE 2 of b.nml, through b.nml's OWN index"
+        );
+        assert_eq!(
+            related[2].location.uri, own_url,
+            "un-locatable: the diagnostic's own location"
+        );
+        assert!(
+            related[2].message.contains("(in /ws/gone.nml)"),
+            "{related:?}"
+        );
+    }
+
     /// RFC 0019: the editor composes same-file `uses` stacks exactly as
     /// `nml check` does — an overlay whose base supplies a required field
     /// gets no phantom missing-required error, and compose findings
@@ -820,6 +988,7 @@ mod tests {
             },
             &default_config(),
             None,
+            &|_| None,
         );
         assert!(
             clean.is_empty(),
@@ -835,6 +1004,7 @@ mod tests {
             },
             &default_config(),
             None,
+            &|_| None,
         );
         assert!(
             sealed.iter().any(|d| d.code
@@ -864,6 +1034,7 @@ mod tests {
             },
             &default_config(),
             Some(&uri),
+            &|_| None,
         );
         let discard = diags
             .iter()
@@ -887,6 +1058,131 @@ mod tests {
         );
     }
 
+    /// Why the guard's finding carries a span: `push_diagnostic` drops a
+    /// span-less finding (a validator defect the parity suite polices),
+    /// so an un-anchored guard diagnostic would degrade SILENTLY.
+    #[test]
+    fn push_diagnostic_drops_a_spanless_finding_and_keeps_the_anchored_guard() {
+        let line_index = LineIndex::new("flow t uses base:\n");
+        let mut out = Vec::new();
+        push_diagnostic(
+            nml_core::diagnostic::Diagnostic::error("no span"),
+            None,
+            None,
+            &line_index,
+            &mut out,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        push_diagnostic(
+            compose_guard_diag("boom"),
+            None,
+            None,
+            &line_index,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            (out[0].range.start.line, out[0].range.start.character),
+            (0, 0)
+        );
+        assert!(out[0].message.contains("boom"));
+    }
+
+    /// A non-item line in a modifier block reaches the editor at its own
+    /// range (the entry, not the indent).
+    #[test]
+    fn the_editor_surfaces_a_modifier_block_non_item_at_its_range() {
+        let schema = nml_core::cst::extract_schema("model policy:\n    |deny []string\n").0;
+        let diags = compute(
+            "policy p:\n    |deny:\n        - \"a\"\n        .note = \"x\"\n",
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            None,
+            &|_| None,
+        );
+        let d = diags
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "NML0002".to_string(),
+                    ))
+            })
+            .unwrap_or_else(|| panic!("{diags:?}"));
+        assert!(
+            d.message.contains("found a shared property"),
+            "{}",
+            d.message
+        );
+        assert_eq!((d.range.start.line, d.range.start.character), (3, 8));
+        assert_eq!((d.range.end.line, d.range.end.character), (3, 19));
+    }
+
+    /// The never-go-dark guard: a panicking compose pass degrades to the
+    /// raw findings plus one NML2086 that names the panic and carries a
+    /// span (a span-less finding is dropped before the editor sees it);
+    /// a panicking fallback is guarded too.
+    #[test]
+    fn a_compose_panic_degrades_to_raw_findings_plus_nml2086() {
+        let raw = || {
+            vec![
+                nml_core::diagnostic::Diagnostic::warning("raw")
+                    .with_span(nml_core::span::Span::empty(3)),
+            ]
+        };
+        let out = never_dark(|| panic!("boom"), raw);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].message, "raw");
+        assert_eq!(
+            out[1].code,
+            Some(nml_core::diagnostic::codes::INTERNAL_COMPOSE_INVARIANT)
+        );
+        assert!(out[1].message.contains("boom"), "{}", out[1].message);
+        assert!(out[1].span.is_some(), "anchored, so it reaches the editor");
+        let out = never_dark(|| panic!("boom"), || panic!("again"));
+        assert_eq!(out.len(), 1, "{out:?}");
+    }
+
+    /// The zero-item warning at a union position reaches the editor in
+    /// its union wording (a scalar/list variant is not "the list").
+    #[test]
+    fn editor_surfaces_union_zero_item_warnings() {
+        let schema = nml_core::cst::extract_schema(
+            "model ua:\n    x string\n\nmodel ub:\n    kind string\n\nmodel h:\n    slot (ua | []ub)\n",
+        )
+        .0;
+        let diags = compute(
+            "h base:\n    slot:\n        - w:\n            kind = \"k\"\n\nh t uses base:\n    slot = []\n",
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            None,
+            &|_| None,
+        );
+        let warn = diags
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "NML2079".to_string(),
+                    ))
+            })
+            .unwrap_or_else(|| panic!("the zero-item warning reaches the buffer: {diags:?}"));
+        assert_eq!(warn.range.start.line, 6);
+        assert!(
+            warn.message.contains("never establishes a variant"),
+            "{}",
+            warn.message
+        );
+    }
+
     /// Editor parity with `check`'s structural compose: a buffer with NO
     /// schema anywhere still composes structurally, so a typo'd `uses`
     /// ref squiggles instead of going dark.
@@ -901,6 +1197,7 @@ mod tests {
             },
             &default_config(),
             None,
+            &|_| None,
         );
         assert!(
             diags.iter().any(|d| d.code
@@ -927,6 +1224,7 @@ mod tests {
             },
             &default_config(),
             None,
+            &|_| None,
         );
         assert!(
             diags.iter().any(|d| d.code
@@ -990,6 +1288,7 @@ mod tests {
             },
             &default_config(),
             None,
+            &|_| None,
         );
         assert!(
             diags.len() <= 501,
@@ -1041,6 +1340,7 @@ package demo:
             },
             &default_config(),
             None,
+            &|_| None,
         );
         let dym = diags
             .iter()
@@ -1235,6 +1535,7 @@ package demo:
             },
             config,
             None,
+            &|_| None,
         )
     }
 
@@ -1298,6 +1599,41 @@ package demo:
             .map(|(n, t)| (n.to_string(), t.to_string()))
             .collect();
         schema_load_pass(own, &owned, None, true)
+    }
+
+    /// The certification probe, pinned: the load pass locates notes in
+    /// the UNIVERSE'S name vocabulary — the names the loader stamps —
+    /// never `uri.path()`, so a canonicalized `own_name` (macOS
+    /// `/private/tmp`) beside a `/tmp` uri still renders a same-file
+    /// note at its OWN span with a clean message, in the buffer's uri.
+    #[test]
+    fn load_pass_notes_survive_a_uri_spelling_mismatch() {
+        let own_name = "/private/tmp/probe-ws/m.model.nml";
+        let uri = tower_lsp::lsp_types::Url::parse("file:///tmp/probe-ws/m.model.nml").unwrap();
+        // An unterminated string: the finding carries a same-file
+        // "string opened here" note at the opening quote.
+        let text = "model m:\n    name string = \"oops\n";
+        let sources = vec![(own_name.to_string(), text.to_string())];
+        let out = schema_load_pass(own_name, &sources, Some(&uri), true);
+        let with_note = out
+            .iter()
+            .find(|d| {
+                d.related_information
+                    .as_ref()
+                    .is_some_and(|r| !r.is_empty())
+            })
+            .unwrap_or_else(|| panic!("no noted finding: {out:?}"));
+        let note = &with_note.related_information.as_ref().unwrap()[0];
+        assert_eq!(
+            note.message, "string opened here",
+            "clean message — no `(in …)` fallback: {note:?}"
+        );
+        assert_eq!(note.location.uri, uri, "the buffer's own uri");
+        let quote_line = 1u32; // the opening quote sits on line 2 (0-based 1)
+        assert_eq!(
+            note.location.range.start.line, quote_line,
+            "the note's OWN span, not the diagnostic's: {note:?}"
+        );
     }
 
     /// Another file's findings must NOT paint onto this buffer. The
@@ -1764,6 +2100,7 @@ package demo:
             },
             &DiagnosticConfig::default(),
             Some(&uri),
+            &|_| None,
         );
         let unterminated = diags
             .iter()
@@ -1792,6 +2129,7 @@ package demo:
             },
             &DiagnosticConfig::default(),
             None,
+            &|_| None,
         );
         assert!(
             diags
@@ -1816,6 +2154,7 @@ package demo:
             },
             &DiagnosticConfig::default(),
             None,
+            &|_| None,
         );
         assert!(
             diags.iter().any(|d| d.code
@@ -1846,6 +2185,7 @@ package demo:
             },
             &config,
             None,
+            &|_| None,
         );
         assert!(
             diags.iter().all(|d| d.code

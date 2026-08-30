@@ -49,9 +49,10 @@ Beyond fenced blocks, more passes run:
 - Banned legacy tokens: syntax the language has removed must not reappear in
   teaching material. Enforced inside nml blocks and example files only (raw
   prose and Rust snippets legitimately contain e.g. `=>`), skipping
-  `expect-error` blocks (deliberate demonstrations) and historical records
-  (`docs/rfcs/`, the plan document), which are supposed to describe the old
-  world.
+  `expect-error` blocks (deliberate demonstrations) and the ban-exempt
+  design records (`docs/rfcs/`, the plan document — tracked, and supposed
+  to describe the old world). The reserved-name scan below has NO
+  exemption: it runs over every doc and every example file.
 
 The `nml` binary is taken from $NML_BIN, else target/debug/nml (build with
 `cargo build -p nml-cli` first — the `just docs-test` recipe does).
@@ -140,6 +141,22 @@ BANNED_PATTERNS: list[tuple[str, "re.Pattern[str]"]] = [
 
 # Historical records may (and should) describe removed syntax.
 BAN_EXEMPT_PATHS = ("docs/rfcs/", "docs/DOCUMENTATION-PLAN.md")
+
+# The reserved-name rule (RFC 0023 Part F): first-party names — the
+# directories of this workspace — are allowed in documentation; anything
+# else is replaced by the documentation's fictional vocabulary. These two
+# external identifiers appeared in early RFC examples, and this regex is
+# THE ONLY place in the repository that may spell them: no document, the
+# RFCs included, may quote them. Scanned WITHOUT the ban exemption, over
+# every doc's full text and every example/tutorial `.nml` file. The
+# leading word boundary has no trailing twin, so compound identifiers
+# cannot smuggle a name back in.
+RESERVED_NAMES = re.compile(r"\b(corelation|keystone)", re.IGNORECASE)
+
+
+def reserved_names_in(text: str) -> list[str]:
+    """Every reserved-name hit in `text`, deduplicated and lowercased."""
+    return sorted({m.group(1).lower() for m in RESERVED_NAMES.finditer(text)})
 
 
 def nml_bin() -> Path:
@@ -439,8 +456,12 @@ def check_example_files() -> tuple[int, int, list[tuple[str, str]]]:
     for path in sorted(example_dir.glob("*.nml")):
         checked += 1
         where = path.relative_to(REPO).as_posix()
-        if bad := banned_tokens_in(path.read_text(encoding="utf-8")):
+        text = path.read_text(encoding="utf-8")
+        if bad := banned_tokens_in(text):
             failures.append((where, f"banned legacy token(s): {', '.join(bad)}"))
+            continue
+        if bad := reserved_names_in(text):
+            failures.append((where, f"reserved name(s): {', '.join(bad)}"))
             continue
         if path.name.endswith(".model.nml"):
             cmd = [str(nml_bin()), "validate", str(path)]
@@ -492,8 +513,12 @@ def check_tutorial_files() -> tuple[int, int, list[tuple[str, str]]]:
         for path in files:
             checked += 1
             where = path.relative_to(REPO).as_posix()
-            if bad := banned_tokens_in(path.read_text(encoding="utf-8")):
+            text = path.read_text(encoding="utf-8")
+            if bad := banned_tokens_in(text):
                 failures.append((where, f"banned legacy token(s): {', '.join(bad)}"))
+                continue
+            if bad := reserved_names_in(text):
+                failures.append((where, f"reserved name(s): {', '.join(bad)}"))
                 continue
             if path.name.endswith(".model.nml"):
                 cmd = [str(nml_bin()), "validate", str(path)]
@@ -956,6 +981,8 @@ def check_guide_links() -> list[tuple[str, str]]:
         # The front door and the release record: their links break loudest.
         REPO / "README.md",
         REPO / "CHANGELOG.md",
+        # Links the RFC index (tracked since RFC 0023 Part F).
+        REPO / "CONTRIBUTING.md",
     ]
     for page in pages:
         failures.extend(check_relative_links(page))
@@ -969,9 +996,17 @@ def main() -> int:
         print("build it first: cargo build -p nml-cli", file=sys.stderr)
         return 2
 
+    # Self-test: the gate walks fixed repo globs, so a temp file is never
+    # discovered — a seeded string proves the scan itself is alive.
+    seeded = reserved_names_in("a CORELATIONx flow and a keystoneVariant")
+    if seeded != ["corelation", "keystone"]:
+        print(f"docs-test: reserved-name self-test failed: {seeded}", file=sys.stderr)
+        return 2
+
     checked = passed = 0
     unverified = 0
     rust_synced = 0
+    reserved_docs = reserved_files = 0
     failures: list[tuple[str, str]] = []
 
     for path in doc_files():
@@ -984,6 +1019,11 @@ def main() -> int:
         exempt = any(
             rel == p or (p.endswith("/") and rel.startswith(p)) for p in BAN_EXEMPT_PATHS
         )
+        # The reserved-name scan has NO exemption: the design records are
+        # exactly where the names crept in.
+        reserved_docs += 1
+        if bad := reserved_names_in(path.read_text(encoding="utf-8")):
+            failures.append((rel, f"reserved name(s): {', '.join(bad)}"))
         if not exempt:
             prose_bad = [
                 tok
@@ -1014,8 +1054,10 @@ def main() -> int:
                 failures.append((block.where(), detail))
 
     files_checked, files_passed, file_failures = check_example_files()
+    reserved_files += files_checked
     failures.extend(file_failures)
     tut_checked, tut_passed, tut_failures = check_tutorial_files()
+    reserved_files += tut_checked
     failures.extend(tut_failures)
     apps_checked, apps_passed, app_failures = run_tutorial_apps()
     failures.extend(app_failures)
@@ -1036,7 +1078,9 @@ def main() -> int:
         f" {apps_passed}/{apps_checked} tutorial programs passed,"
         f" {cb_passed}/{cb_checked} cookbook recipes passed,"
         f" {rust_synced} rust listings source-synced,"
-        f" {unverified} untagged/fragment blocks not verified"
+        f" {unverified} untagged/fragment blocks not verified;"
+        f" {reserved_docs} docs + {reserved_files} example files scanned"
+        f" for reserved names"
     )
     return 1 if failures else 0
 

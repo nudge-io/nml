@@ -21,7 +21,14 @@ fn parse_or_report_all(path: &Path, source: &str) -> Result<nml_core::ast::File,
         first_code = first_code.or(report(path, &source_map, e));
     }
     explain_hint(first_code);
-    Err(format!("{} parse error(s)", errors.len()))
+    // The suppressed-count row is an info diagnostic riding the same
+    // vec — counting it printed "129 parse error(s)" for a 128-error
+    // flood.
+    let error_count = errors
+        .iter()
+        .filter(|e| matches!(e.severity, Severity::Error))
+        .count();
+    Err(format!("{error_count} parse error(s)"))
 }
 
 /// The one diagnostic printer: `path:line:col: <Display>` — `Display` renders
@@ -46,28 +53,100 @@ fn report(path: &Path, source_map: &nml_core::span::SourceMap, diag: &Diagnostic
     // `line:col` already locates the finding — the raw byte-span suffix that
     // `Display` adds for span-less contexts would be noise here.
     let code = diag.code.map(|c| format!("[{c}]")).unwrap_or_default();
+    // `path` can be a WALKED schema file (`--schema <dir>` attribution),
+    // not only an argv path — a hostile filename must not smuggle
+    // terminal escapes (the message itself renders through the
+    // sanitizing `Rendered`).
     eprintln!(
         "{}:{}:{}: {}{}: {}",
-        path.display(),
+        sanitized(&path.display().to_string()),
         line,
         column,
         diag.severity,
         code,
         diag.rendered()
     );
-    // Secondary locations (RFC 0009) — rustc's `note:` shape, from the one
-    // shared model, so every consumer prints the same explanation.
+    // Secondary locations (RFC 0009) — rustc's `note:` shape, each
+    // located in ITS OWN file (`Related.source`, RFC 0019 plan item 2):
+    // the checked file's map for same-file notes; a foreign path is read
+    // and mapped on first use, cached across this diagnostic's notes.
+    let own = path.display().to_string();
+    let mut foreign: std::collections::HashMap<&str, Option<nml_core::span::SourceMap>> =
+        std::collections::HashMap::new();
     for rel in &diag.related {
-        let loc = source_map.location(rel.span.start);
         eprintln!(
-            "{}:{}:{}: note: {}",
-            path.display(),
-            loc.line,
-            loc.column,
-            rel.message
+            "{}",
+            note_line(path, source_map, &own, &mut foreign, diag, rel)
         );
     }
     diag.code
+}
+
+/// Escape hostile characters for terminal output — the CLI twin of the
+/// diagnostic renderer's choke point (`nml_core::diagnostic::needs_escape`):
+/// note messages and note FILE PATHS print outside `Rendered`, and a
+/// hostile path (a repo filename carrying an ESC byte or a bidi
+/// override) must not smuggle terminal escapes.
+pub(crate) fn sanitized(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if nml_core::diagnostic::needs_escape(ch) {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// One note's rendered line — `<file>:<line>:<col>: note: <message>`,
+/// located in the note's own file; `<file>: note: <message> (bytes
+/// <start>..<end>)` when that file cannot be read — never the right
+/// file with a wrong range (a foreign span through the checked file's
+/// map would be exactly that). Message and path both sanitized.
+fn note_line<'d>(
+    path: &Path,
+    source_map: &nml_core::span::SourceMap,
+    own: &str,
+    foreign: &mut std::collections::HashMap<&'d str, Option<nml_core::span::SourceMap>>,
+    diag: &'d Diagnostic,
+    rel: &'d nml_core::diagnostic::Related,
+) -> String {
+    let foreign_src = diag.related_source(rel).filter(|s| *s != own);
+    let Some(src) = foreign_src else {
+        let loc = source_map.location(rel.span.start);
+        return format!(
+            "{}:{}:{}: note: {}",
+            sanitized(&path.display().to_string()),
+            loc.line,
+            loc.column,
+            sanitized(&rel.message)
+        );
+    };
+    let map = foreign.entry(src).or_insert_with(|| {
+        std::fs::read_to_string(src)
+            .ok()
+            .map(|t| nml_core::span::SourceMap::new(&t))
+    });
+    match map {
+        Some(map) => {
+            let loc = map.location(rel.span.start);
+            format!(
+                "{}:{}:{}: note: {}",
+                sanitized(src),
+                loc.line,
+                loc.column,
+                sanitized(&rel.message)
+            )
+        }
+        None => format!(
+            "{}: note: {} (bytes {}..{})",
+            sanitized(src),
+            sanitized(&rel.message),
+            rel.span.start,
+            rel.span.end
+        ),
+    }
 }
 
 fn main() {
@@ -101,7 +180,10 @@ fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        // Err strings embed walked filesystem names (an unreadable
+        // subdirectory, a failing schema file) — repo content, sanitized
+        // like every other surface that prints it.
+        eprintln!("error: {}", sanitized(&e));
         process::exit(1);
     }
 }
@@ -507,4 +589,73 @@ pub(crate) fn write_file_atomically(path: &PathBuf, contents: &str) -> Result<()
         )
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nml_core::span::Span;
+
+    /// `Related.source` rendering (RFC 0019 plan item 2), pinned at the
+    /// renderer because both consumers compose single-file today: a
+    /// same-file note through the checked map; a foreign note through
+    /// ITS OWN file's map; an unreadable path without a range — never
+    /// the right file with a wrong range.
+    #[test]
+    fn notes_locate_in_their_own_files() {
+        let checked_text = "a = 1\n";
+        let map = nml_core::span::SourceMap::new(checked_text);
+        let path = Path::new("main.nml");
+        let own = path.display().to_string();
+        let mut foreign = std::collections::HashMap::new();
+
+        let dir = std::env::temp_dir().join(format!("nml-note-line-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = dir.join("b.nml");
+        std::fs::write(&b, "x = 1\ny = 2\n    z = 3\n").unwrap();
+        let b_name = b.display().to_string();
+
+        let diag = Diagnostic::error("sealed")
+            .with_span(Span::new(0, 1))
+            .with_related_in(Span::new(0, 1), "sealed here", None)
+            .with_related_in(Span::new(10, 11), "sealed here", Some(b_name.clone()))
+            .with_related_in(
+                Span::new(3, 4),
+                "sealed here",
+                Some("no/such/file.nml".into()),
+            );
+
+        let lines: Vec<String> = diag
+            .related
+            .iter()
+            .map(|rel| note_line(path, &map, &own, &mut foreign, &diag, rel))
+            .collect();
+        assert_eq!(lines[0], "main.nml:1:1: note: sealed here");
+        assert_eq!(
+            lines[1],
+            format!("{b_name}:2:5: note: sealed here"),
+            "byte 10 is line 2 col 5 of b.nml, not of the checked file"
+        );
+        assert_eq!(
+            lines[2], "no/such/file.nml: note: sealed here (bytes 3..4)",
+            "an unreadable path renders without a wrong range"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sanitized_escapes_hostile_paths_and_is_idempotent() {
+        // A walked repo filename can carry terminal-escape bytes or bidi
+        // overrides; the sanitizer must neutralize both — and escaping
+        // twice must not double-escape (escape_default output is
+        // escape-free ASCII).
+        let hostile = "ev\u{1b}]0;pwned\u{7}il\u{202e}.nml";
+        let once = sanitized(hostile);
+        assert!(
+            !once.contains('\u{1b}') && !once.contains('\u{202e}'),
+            "{once}"
+        );
+        assert!(once.contains("\\u{1b}"), "escaped visibly: {once}");
+        assert_eq!(sanitized(&once), once, "idempotent");
+    }
 }

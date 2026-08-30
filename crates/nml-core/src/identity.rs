@@ -23,7 +23,7 @@ use crate::ast::{
     ListItemKind, NestedBlock, Property,
 };
 use crate::model::{FieldType, ModelDef, OneOfDef};
-use crate::schema_index::{FieldTarget, SchemaIndex};
+use crate::schema_index::{FieldTarget, NameableVariant, SchemaIndex};
 use crate::span::Span;
 use crate::types::{SpannedValue, Value};
 
@@ -353,12 +353,12 @@ pub(crate) fn apply_positional_planned(
     plan: &crate::layers::ArmPlan<'_>,
 ) -> Body {
     let pos = Positionalizer { index, plan };
-    match index.model(root) {
-        Some(model) => pos.model_body(model, body, 0, Some("")),
-        None => match index.oneof(root) {
-            Some(oneof) => pos.oneof_body(oneof, body, 0, Some("")),
-            None => body.clone(),
-        },
+    // The root resolves in the ONE order every pass shares (`nameable`:
+    // a model before a oneof of the same name).
+    match index.nameable(root) {
+        Some(NameableVariant::Model(model)) => pos.model_body(model, body, 0, Some("")),
+        Some(NameableVariant::OneOf(oneof)) => pos.oneof_body(oneof, body, 0, Some("")),
+        None => body.clone(),
     }
 }
 
@@ -424,11 +424,14 @@ impl Positionalizer<'_> {
             // variant must materialize against the stack's variant, not
             // its shape's guess) — same rule as planned oneof arms.
             if let Some(v) = child.and_then(|p| self.plan.planned_union_variant(p)) {
-                if let Some(m) = self.index.model(v) {
-                    return self.model_body(m, body, depth + 1, child);
-                }
-                if let Some(o) = self.index.oneof(v) {
-                    return self.oneof_body(o, body, depth + 1, child);
+                match self.index.nameable(v) {
+                    Some(NameableVariant::Model(m)) => {
+                        return self.model_body(m, body, depth + 1, child);
+                    }
+                    Some(NameableVariant::OneOf(o)) => {
+                        return self.oneof_body(o, body, depth + 1, child);
+                    }
+                    None => {}
                 }
             }
             // Unplanned and oracle-ambiguous: materialize NOTHING — the

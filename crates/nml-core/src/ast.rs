@@ -225,7 +225,7 @@ impl ArmTarget {
 
 /// An [`Arm`] selector: a role reference, a string literal key, or the `else`
 /// catch-all.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 pub enum ArmSelector {
     /// A selector token, e.g. `@plan/Pro` — stored verbatim (with the leading
     /// `@`), matching [`ListItemKind::Role`]; the consumer parses its shape.
@@ -260,6 +260,10 @@ pub struct BlockDecl {
     /// RFC 0019: the `uses` clause's layer refs, in authored order (empty
     /// when the declaration has no clause).
     pub uses: Vec<Identifier>,
+    /// The clause's own content span (the `uses` keyword through the last
+    /// ref) — the structural deletion target for NML2062's fix.
+    /// Invariant: `uses_span.is_some() == !uses.is_empty()`.
+    pub uses_span: Option<Span>,
     pub body: Body,
 }
 

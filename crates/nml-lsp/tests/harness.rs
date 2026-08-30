@@ -23,8 +23,11 @@ use tower_lsp::lsp_types::Url;
 use tower_lsp::{ClientSocket, LspService};
 
 use nml_lsp::server::NmlLanguageServer;
+use nml_validate::package::SchemaPackage;
 use nml_validate::store::Store;
-use nml_validate::test_support::{DEMO_MANIFEST_WITH_DIRECTIVES, demo_package, publish_demo};
+use nml_validate::test_support::{
+    DEMO_MANIFEST, DEMO_MANIFEST_WITH_DIRECTIVES, demo_package, publish_demo,
+};
 
 /// Generous slack for a server→client notification. Store-health
 /// `window/logMessage`s are emitted during the diagnostic-pull handler
@@ -2174,4 +2177,333 @@ async fn universe_provenance_matrix() {
             "an unsaved sibling edit must reach the buffer's verdict: {diags:?}"
         );
     }
+}
+
+/// One `textDocument/codeAction` round-trip for one diagnostic.
+async fn one_code_action(harness: &mut Harness, path: &Path, diag: Value) -> Value {
+    harness
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": file_uri(path) },
+                "range": diag["range"],
+                "context": { "diagnostics": [diag] },
+            }),
+        )
+        .await
+}
+
+/// RFC 0023 A.3 — the editor's quick-fix path. Staleness is settled by
+/// MEMBERSHIP (`data` equality against the current cache), each
+/// suggestion resolves through the ONE resolver as a singleton batch,
+/// titles derive from the outcome (`Deleted::title` for structural
+/// deletions; `Remove` for the empty verbatim fix), and a deletion is
+/// never a preferred action.
+#[tokio::test]
+async fn code_actions_gate_on_membership_and_resolve_deletions() {
+    let base = temp_dir("resolver-actions");
+    let ws = demo_workspace(&base);
+    let mut harness = Harness::new(Store::at(base.join("store")));
+    harness.initialize(&ws).await;
+
+    let app = ws.join("uses-on-def.nml");
+    let text = "model core uses ghost:\n    name string\n";
+    fs::write(&app, text).expect("write app");
+    let report = harness.open(&app, text).await;
+    let diags = report["diagnostics"].as_array().expect("diagnostics");
+    let d2062 = diags
+        .iter()
+        .find(|d| d["code"] == json!("NML2062"))
+        .unwrap_or_else(|| panic!("no NML2062 in {report}"))
+        .clone();
+    assert_eq!(
+        d2062["data"]["suggestions"][0]["kind"],
+        json!("delete"),
+        "the structural kind rides the wire: {d2062}"
+    );
+
+    let deletions = |result: &Value| -> Vec<Value> {
+        result
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a["title"] == json!("Delete the `uses` clause"))
+            .collect()
+    };
+
+    // A CURRENT diagnostic yields the resolver-backed action.
+    let result = one_code_action(&mut harness, &app, d2062.clone()).await;
+    let dels = deletions(&result);
+    assert_eq!(dels.len(), 1, "one action per suggestion: {result}");
+    let action = &dels[0];
+    assert_eq!(action["kind"], json!("quickfix"), "{action}");
+    assert!(
+        action["isPreferred"].is_null(),
+        "a structural removal is never auto-applied: {action}"
+    );
+    let edits = action["edit"]["changes"][file_uri(&app)]
+        .as_array()
+        .expect("workspace edit")
+        .clone();
+    assert_eq!(edits.len(), 1, "the clause is one splice: {edits:?}");
+    assert_eq!(edits[0]["newText"], json!(""), "{edits:?}");
+
+    // An unknown wire kind is no action, never a guess.
+    let mut forged = d2062.clone();
+    forged["data"]["suggestions"][0]["kind"] = json!("mystery");
+    let result = one_code_action(&mut harness, &app, forged).await;
+    assert!(
+        deletions(&result).is_empty(),
+        "an unknown kind must offer nothing: {result}"
+    );
+
+    // A STALE diagnostic (the buffer moved under it) is no action —
+    // membership, not a version: the cached diagnostics for the new text
+    // carry different data.
+    harness
+        .notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": file_uri(&app), "version": 2 },
+                "contentChanges": [{ "text": format!("// moved\n{text}") }],
+            }),
+        )
+        .await;
+    let result = one_code_action(&mut harness, &app, d2062.clone()).await;
+    assert!(
+        deletions(&result).is_empty(),
+        "a stale suggestion must fail closed: {result}"
+    );
+
+    // Restoring the text restores the action: membership is data
+    // equality on the CURRENT text, not a version counter.
+    harness
+        .notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": file_uri(&app), "version": 3 },
+                "contentChanges": [{ "text": text }],
+            }),
+        )
+        .await;
+    let result = one_code_action(&mut harness, &app, d2062).await;
+    assert_eq!(deletions(&result).len(), 1, "current again: {result}");
+}
+
+/// The empty VERBATIM fix (the trailing-dot removal) is titled `Remove` —
+/// a byte removal, not a structural deletion — and is not preferred.
+#[tokio::test]
+async fn an_empty_verbatim_fix_is_titled_remove() {
+    let base = temp_dir("remove-title");
+    let ws = demo_workspace(&base);
+    let mut harness = Harness::new(Store::at(base.join("store")));
+    harness.initialize(&ws).await;
+
+    let app = ws.join("trailing-dot.nml");
+    let text = "service Api:\n    x = 1299.\n";
+    fs::write(&app, text).expect("write app");
+    let report = harness.open(&app, text).await;
+    let diags = report["diagnostics"].as_array().expect("diagnostics");
+    let dot = diags
+        .iter()
+        .find(|d| {
+            d["data"]["suggestions"][0]["replacement"] == json!("")
+                && d["data"]["suggestions"][0]["kind"] == json!("fix")
+        })
+        .unwrap_or_else(|| panic!("no empty verbatim fix in {report}"))
+        .clone();
+    let result = harness
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                "range": dot["range"],
+                "context": { "diagnostics": [dot] },
+            }),
+        )
+        .await;
+    let actions: Vec<Value> = result.as_array().cloned().unwrap_or_default();
+    let remove = actions
+        .iter()
+        .find(|a| a["title"] == json!("Remove"))
+        .unwrap_or_else(|| panic!("no Remove action in {result}"));
+    assert!(remove["isPreferred"].is_null(), "{remove}");
+}
+
+/// A structural deletion whose resolution is TWO splices — the entry's
+/// row plus the colon drop on the emptied clause-carrying header —
+/// arrives as one action with one `WorkspaceEdit` holding both
+/// `TextEdit`s (RFC 0023 §A.3's two-edit row, at the editor surface).
+#[tokio::test]
+async fn a_two_splice_deletion_is_one_action_with_two_text_edits() {
+    let base = temp_dir("two-splice-action");
+    let ws = demo_workspace(&base);
+    let mut harness = Harness::new(Store::at(base.join("store")));
+    harness.initialize(&ws).await;
+
+    let app = ws.join("sealed-restatement.nml");
+    let text = concat!(
+        "model spec:\n    x string #sealed\n\n",
+        "spec base:\n    x = \"1\"\n\n",
+        "spec t uses base:\n    x = \"1\"\n",
+    );
+    fs::write(&app, text).expect("write app");
+    let report = harness.open(&app, text).await;
+    let diags = report["diagnostics"].as_array().expect("diagnostics");
+    let d2060 = diags
+        .iter()
+        .find(|d| d["code"] == json!("NML2060"))
+        .unwrap_or_else(|| panic!("no NML2060 in {report}"))
+        .clone();
+    let result = one_code_action(&mut harness, &app, d2060).await;
+    let actions: Vec<Value> = result.as_array().cloned().unwrap_or_default();
+    let action = actions
+        .iter()
+        .find(|a| a["title"] == json!("Delete this property"))
+        .unwrap_or_else(|| panic!("no deletion action in {result}"));
+    let edits = action["edit"]["changes"][file_uri(&app)]
+        .as_array()
+        .expect("workspace edit")
+        .clone();
+    assert_eq!(
+        edits.len(),
+        2,
+        "the row and the emptied header's colon: {edits:?}"
+    );
+    assert!(edits.iter().all(|e| e["newText"] == json!("")), "{edits:?}");
+}
+
+/// A SINGLETON did-you-mean is the one preferred action (`Replace with
+/// "…"`); N alternatives are N actions, none preferred (the RFC 0015
+/// rule — the editor must never auto-apply a guess).
+#[tokio::test]
+async fn a_singleton_did_you_mean_is_preferred() {
+    let base = temp_dir("dym-preferred");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let text = "model core:\n    name string+ #lvie\n    mode string?\n";
+    let (ws, model) = directive_workspace(&base, text);
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+    let report = harness.open(&model, text).await;
+    let diags = report["diagnostics"].as_array().expect("diagnostics");
+    let dym = diags
+        .iter()
+        .find(|d| {
+            d["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("unknown directive '#lvie'"))
+        })
+        .unwrap_or_else(|| panic!("no did-you-mean in {report}"))
+        .clone();
+    let result = one_code_action(&mut harness, &model, dym).await;
+    let actions: Vec<Value> = result.as_array().cloned().unwrap_or_default();
+    let replace = actions
+        .iter()
+        .find(|a| a["title"] == json!("Replace with \"#live\""))
+        .unwrap_or_else(|| panic!("no replace action in {result}"));
+    assert_eq!(
+        replace["isPreferred"],
+        json!(true),
+        "a singleton did-you-mean auto-applies: {replace}"
+    );
+}
+
+/// The REGISTRY-REBUILD leg of code-action staleness (RFC 0023 §A.3's
+/// stated reason membership beats a document version): a store
+/// re-publish — content-addressed, same version string, NO buffer edit —
+/// bumps the resolver generation, the diagnostics cache recomputes, and
+/// the old suggestion's `data` is no longer a member, so it yields no
+/// action; the fresh pull's diagnostic acts. One unchanging buffer with
+/// two typos keeps every leg distinguishable: `nme` is a near-miss of
+/// v1's `name` only, `lable` of v2's `label` only (the suggest cutoff
+/// is max(len)/3 — every cross pair is out of range). Facts the fixture
+/// depends on: the buffer MUST be named `demo.nml` (the validator
+/// globs; any other name silently unbinds), and the diagnostic counts
+/// are ASYMMETRIC (the block name satisfies v1's `name`, so only v2
+/// adds a missing-required finding) — so diagnostics are selected by
+/// typo token, never by count, field name, or full message (messages
+/// embed the flipping content hash).
+#[tokio::test]
+async fn a_store_republish_stales_old_suggestions_and_heals_forward() {
+    let base = temp_dir("store-republish-staleness");
+    let store_base = base.join("store");
+    fs::create_dir_all(&store_base).expect("create store dir");
+    let store = Store::at(&store_base);
+    let publish = |schema: &'static str| {
+        let package = SchemaPackage::from_parts(DEMO_MANIFEST, |_| Ok(schema.to_string()))
+            .expect("package loads");
+        store.publish(&package).expect("publish");
+    };
+    publish("model core:\n    name string+\n    mode string?\n");
+
+    let ws = demo_workspace(&base);
+    let mut harness = Harness::new(Store::at(&store_base));
+    harness.initialize(&ws).await;
+
+    let app = ws.join("demo.nml");
+    let text = "core Main:\n    nme = \"x\"\n    lable = \"y\"\n";
+    fs::write(&app, text).expect("write app");
+    let report = harness.open(&app, text).await;
+
+    let diag_for = |report: &Value, token: &str| -> Option<Value> {
+        report["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .find(|d| d["message"].as_str().is_some_and(|m| m.contains(token)))
+            .cloned()
+    };
+    let replace_offered = |result: &Value, replacement: &str| -> bool {
+        result
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .any(|a| a["title"] == json!(format!("Replace with \"{replacement}\"")))
+    };
+
+    // v1 positive control: `nme` acts (did-you-mean `name`); `lable`
+    // carries no suggestion at all.
+    let nme_v1 = diag_for(&report, "'nme'").expect("nme diagnostic");
+    assert!(
+        nme_v1["data"]["suggestions"][0]["replacement"] == json!("name"),
+        "{nme_v1}"
+    );
+    let lable_v1 = diag_for(&report, "'lable'").expect("lable diagnostic");
+    assert!(lable_v1["data"].is_null(), "no v1 suggestion: {lable_v1}");
+    let result = one_code_action(&mut harness, &app, nme_v1.clone()).await;
+    assert!(
+        replace_offered(&result, "name"),
+        "positive control: {result}"
+    );
+
+    // The registry rebuild: same version, different content — the
+    // pointer is content-addressed, so the stat-guard notices on the
+    // next resolve with no sleeps and NO buffer edit.
+    publish("model core:\n    label string+\n    mode string?\n");
+
+    // The OLD suggestion fails closed…
+    let result = one_code_action(&mut harness, &app, nme_v1).await;
+    assert!(
+        !replace_offered(&result, "name"),
+        "a registry rebuild must stale the old suggestion: {result}"
+    );
+
+    // …and the system heals forward: a fresh pull's `lable` diagnostic
+    // carries v2's suggestion and acts, while `nme` has gone dark.
+    let report = harness.diagnostics(&file_uri(&app)).await;
+    let lable_v2 = diag_for(&report, "'lable'").expect("lable diagnostic (v2)");
+    assert!(
+        lable_v2["data"]["suggestions"][0]["replacement"] == json!("label"),
+        "{lable_v2}"
+    );
+    let nme_v2 = diag_for(&report, "'nme'").expect("nme diagnostic (v2)");
+    assert!(
+        nme_v2["data"].is_null(),
+        "no v2 suggestion for nme: {nme_v2}"
+    );
+    let result = one_code_action(&mut harness, &app, lable_v2).await;
+    assert!(replace_offered(&result, "label"), "heals forward: {result}");
 }

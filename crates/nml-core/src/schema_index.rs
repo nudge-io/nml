@@ -425,16 +425,32 @@ impl SchemaIndex {
             .collect()
     }
 
-    /// Resolve a named type reference (`someModel`) to its **recursible**
-    /// definition — a model or a `oneof` — or `None` (an enum or unknown
-    /// name: a leaf, whose declared type lives at the reference site, not
-    /// here). The single definition of name→definition dispatch, shared by
-    /// schema validation, defaulting, and the LSP.
-    pub fn resolve_ref(&self, name: &str) -> Option<FieldTarget<'_>> {
+    /// The named type a reference resolves to — a model before a `oneof`
+    /// of the same name — the ONE resolution order every pass shares (the
+    /// validator, the plan, normalization, the merge, the seal scans): a
+    /// colliding name (NML1000/NML2016 at load, but composition still
+    /// runs over the loaded schema) reads the same way everywhere, so no
+    /// position is planned under one reading and merged under the other.
+    /// Two-variant by construction, so every consumer's match is total.
+    ///
+    /// Only **recursible** definitions are nameable — an enum or unknown
+    /// name is `None` (a leaf, whose declared type lives at the reference
+    /// site, not here). The single definition of name→definition
+    /// dispatch, shared by schema validation, defaulting, and the LSP.
+    pub fn nameable(&self, name: &str) -> Option<NameableVariant<'_>> {
         if let Some(m) = self.model(name) {
-            return Some(FieldTarget::Model(m));
+            return Some(NameableVariant::Model(m));
         }
-        self.oneof(name).map(FieldTarget::OneOf)
+        self.oneof(name).map(NameableVariant::OneOf)
+    }
+
+    /// [`Self::nameable`] as a [`FieldTarget`], for the type-resolution
+    /// walk.
+    pub fn resolve_ref(&self, name: &str) -> Option<FieldTarget<'_>> {
+        self.nameable(name).map(|named| match named {
+            NameableVariant::Model(m) => FieldTarget::Model(m),
+            NameableVariant::OneOf(o) => FieldTarget::OneOf(o),
+        })
     }
 
     fn resolve_type<'a>(&'a self, ty: &'a FieldType) -> FieldTarget<'a> {
