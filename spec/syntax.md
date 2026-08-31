@@ -42,8 +42,10 @@ content; indentation restricts it separately (NML0005).
 
 **Nothing invisible may steer the reader.** The explicit bidirectional
 controls U+202A–U+202E and U+2066–U+2069 (the Trojan Source attack,
-CVE-2021-42574), interior U+FEFF, and the U+2028/U+2029 line and
-paragraph separators are rejected in raw form
+CVE-2021-42574), interior U+FEFF, the U+2028/U+2029 line and
+paragraph separators, and the Unicode tag block U+E0000–U+E007F (an
+invisible ASCII mirror — raw, a hidden-text channel; emoji tag
+sequences are written with escapes) are rejected in raw form
 ([NML0018](../crates/nml-core/assets/error-index.md#nml0018)). The bidi
 set matches rustc's Trojan-Source lints; the whole set is a strict
 superset of rustc's, per the display-vs-parse guidance of UTS #55 —

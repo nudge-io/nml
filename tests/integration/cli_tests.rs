@@ -242,9 +242,11 @@ fn test_check_bad_money_precision() {
         "check should fail for bad money precision"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // The exact classified finding — an any-of-("…"|"error") assertion
+    // was vacuously true for every failing check.
     assert!(
-        stderr.contains("decimal") || stderr.contains("precision") || stderr.contains("error"),
-        "stderr should mention the precision error: {stderr}"
+        stderr.contains("NML3002") && stderr.contains("2 decimal places, but got 3"),
+        "the precision finding is classified and exact: {stderr}"
     );
 }
 
@@ -2258,6 +2260,94 @@ fn check_output_escapes_hostile_schema_filenames() {
 }
 
 #[test]
+fn fix_converges_a_capped_same_key_flood_in_one_run() {
+    // The Σ-deficit clause end-to-end (D-A): 129 in-string C0
+    // instances of ONE character exceed the 128-diagnostic cap, so the
+    // first round can only see (and apply) 128 — and the hidden 129th
+    // then SURFACES on the very key the round applied. The old exact
+    // decrement read that as a failed round and fell back to
+    // one-candidate-per-round, exhausting the budget; the deficit is
+    // now charged to the reported suppressed count and the file
+    // converges in ONE invocation.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("fix-capped-flood.nml");
+    let mut src = String::from("service App:\n");
+    for i in 0..129 {
+        src.push_str(&format!("    k{i} = \"a\u{1}b\"\n"));
+    }
+    std::fs::write(&f, &src).unwrap();
+    let out = nml_bin()
+        .args(["fix", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("129 edit(s) applied")
+            && stdout.contains("0 diagnostic(s) not auto-fixable"),
+        "one run lands every instance and reports honestly: {stdout}"
+    );
+    let fixed = std::fs::read_to_string(&f).unwrap();
+    assert_eq!(
+        fixed.matches("\"a\\u{1}b\"").count(),
+        129,
+        "every instance carries the escape"
+    );
+    assert!(!fixed.contains('\u{1}'), "no raw C0 survives");
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn fix_converges_a_mixed_capped_flood_in_one_run() {
+    // Σ-deficit with two keys sharing the cap: 129 of one character
+    // push 3 of another (plus their own 129th) past the truncation
+    // boundary. The surfacing instances land across BOTH keys over the
+    // following rounds; the summary stays honest and the file reaches
+    // a clean check in one invocation.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("fix-mixed-capped-flood.nml");
+    let mut src = String::from("service App:\n");
+    for i in 0..129 {
+        src.push_str(&format!("    k{i} = \"a\u{1}b\"\n"));
+    }
+    for i in 0..3 {
+        src.push_str(&format!("    m{i} = \"c\u{2}d\"\n"));
+    }
+    std::fs::write(&f, &src).unwrap();
+    let out = nml_bin()
+        .args(["fix", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("132 edit(s) applied")
+            && stdout.contains("0 diagnostic(s) not auto-fixable"),
+        "one run lands both keys' instances: {stdout}"
+    );
+    let fixed = std::fs::read_to_string(&f).unwrap();
+    assert_eq!(fixed.matches("\"a\\u{1}b\"").count(), 129, "{stdout}");
+    assert_eq!(fixed.matches("\"c\\u{2}d\"").count(), 3, "{stdout}");
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn fix_reports_budget_exhaustion_and_a_second_run_finishes() {
     // The 64-round clamp, exercised for real: 72 restating dependents
     // beside 12 suppressed (mid, top-uses-mid,base) pairs sit safely on
@@ -2406,6 +2496,303 @@ fn fix_never_deletes_a_shared_blocks_distributed_row() {
     assert!(
         stderr.contains("fix refused: the entry is distributed by its `.shared` block"),
         "the refusal is printed: {stderr}"
+    );
+    assert!(stdout.contains("0 edit(s) applied"), "{stdout}");
+}
+
+#[test]
+fn fix_never_glues_lines_behind_an_unterminated_string() {
+    // The stray-quote corruption vector: an unterminated string's token
+    // swallows to EOF, and trusting it as "in-string" context flipped
+    // every following TRANSPORT CR to content — whose `\r` escape fix
+    // then rewrote the old-Mac file's line endings into literal text
+    // inside a string value. The reclassifier now excludes tokens named
+    // by an unterminated-string error; the file stays byte-identical.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("fix-stray-quote-old-mac.nml");
+    let src = "service App:\r    a = \"stray x\r    b = 2\r";
+    std::fs::write(&f, src).unwrap();
+    let out = nml_bin()
+        .args(["fix", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        src.as_bytes(),
+        "an uncertain string reading must never grant the in-string fix: {stdout}"
+    );
+    assert!(stdout.contains("0 edit(s) applied"), "{stdout}");
+}
+
+#[test]
+fn fix_applies_the_singular_in_string_escape_and_never_picks_an_alternative() {
+    // The D1 taxonomy at the applier: an in-string C0 has ONE
+    // value-preserving reading (its escape) — `nml fix` applies it.
+    // An in-string NEL has THREE readings (line break | kept byte |
+    // mojibake ellipsis) — alternatives are structurally never a sole
+    // candidate, so the byte stays until a human chooses; the file's
+    // other repair still lands (progress is per-finding, not
+    // all-or-nothing).
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("fix-in-string-taxonomy.nml");
+    let src = "service App:\n    bell = \"a\u{1}b\"\n    note = \"x\u{85}y\"\n";
+    std::fs::write(&f, src).unwrap();
+    let out = nml_bin()
+        .args(["fix", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let fixed = std::fs::read_to_string(&f).unwrap();
+    assert!(
+        fixed.contains("bell = \"a\\u{1}b\""),
+        "the singular escape auto-applies: {fixed:?}\n{stdout}"
+    );
+    assert!(
+        fixed.contains("note = \"x\u{85}y\""),
+        "an ambiguous character is never auto-resolved: {fixed:?}\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1 diagnostic(s) not auto-fixable — run `nml check` to see them"),
+        "the run counts the standing NEL and points at the next action: {stdout}"
+    );
+}
+
+#[test]
+fn fix_collapses_an_unsound_remove_to_the_escape_and_applies_it() {
+    // D-C at the applier: a FEFF separating `""` from `"` inside a
+    // multiline body has NO sound removal (deletion would glue a
+    // closing `"""` and re-tokenize the rest of the file), so the
+    // alternatives COLLAPSE to the singular escape — which, singular,
+    // auto-applies. The fixed file parses clean and the value is
+    // byte-identical (the escape spells the same character).
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("fix-collapsed-remove.nml");
+    let src = "service App:\n    doc = \"\"\"\n        a\n        \"\"\u{FEFF}\"\n        \"\"\"\n    port = 1\n";
+    std::fs::write(&f, src).unwrap();
+    let out = nml_bin()
+        .args(["fix", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let fixed = std::fs::read_to_string(&f).unwrap();
+    assert!(
+        fixed.contains("\"\"\\u{FEFF}\""),
+        "exactly the escape lands — never the deletion: {fixed:?}\n{stdout}"
+    );
+    assert!(!fixed.contains('\u{FEFF}'), "{fixed:?}");
+    assert!(stdout.contains("1 edit(s)"), "{stdout}");
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    assert!(
+        out.status.success(),
+        "the fixed file must check clean: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn fix_never_pulls_a_multiline_blank_edge_line_into_the_value() {
+    // The r28 corruption vector: a bare CR in a multiline string's
+    // ALIGNED blank closing line sat inside the token, so it got the
+    // in-string `\r` fix — but `decode_multiline` DROPS blank edge
+    // lines from the value, and the applied escape turned the line
+    // non-blank and pulled it in: `"body"` became `"body\n\r"` with a
+    // clean post-state. Dropped edge lines now grant no repair.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("fix-multiline-blank-edge.nml");
+    let src = "service App:\n    doc = \"\"\"\n        body\n        \u{D}\"\"\"\n";
+    std::fs::write(&f, src).unwrap();
+    let out = nml_bin()
+        .args(["fix", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        src.as_bytes(),
+        "a dropped edge line must never gain value bytes: {stdout}"
+    );
+    assert!(stdout.contains("0 edit(s) applied"), "{stdout}");
+}
+
+#[test]
+fn fix_never_reindents_a_value_through_a_blank_middle_line() {
+    // The r29 corruption vector: a blank middle line BELOW min-indent
+    // is exempt from indent arithmetic; escaping its CR made it
+    // participate, dropped min for the whole body, and a second round
+    // auto-applied the revealed closing realignment — clean post-state,
+    // every value line re-indented. The decode-judged gate refuses the
+    // repair, so the file stays byte-identical.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("fix-blank-middle-reindent.nml");
+    let src =
+        "service App:\n    doc = \"\"\"\n        body\n \u{D} \n        more\n        \"\"\"\n";
+    std::fs::write(&f, src).unwrap();
+    let out = nml_bin()
+        .args(["fix", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        src.as_bytes(),
+        "a geometry-bearing blank line must never gain value bytes: {stdout}"
+    );
+    assert!(stdout.contains("0 edit(s) applied"), "{stdout}");
+}
+
+#[test]
+fn dry_run_diffs_never_echo_raw_control_bytes() {
+    // The diff's content lines are repo bytes headed for a terminal —
+    // and the very files `fix --dry-run` triages carry raw controls
+    // (that is why they have fixes). A raw ESC in the printed `-` line
+    // is an ANSI-injection channel (colors, cursor, OSC title); every
+    // body byte renders through the sanitizer, escaped and visible.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("dry-run-ansi.nml");
+    let src = "service App:\n    x = \"a\u{1B}[31mRED\"\n";
+    std::fs::write(&f, src).unwrap();
+    let out = nml_bin()
+        .args(["fix", "--dry-run", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("-    x = "),
+        "the dry run must show the diff: {stdout}"
+    );
+    assert!(
+        !stdout.contains('\u{1B}'),
+        "no raw ESC may reach the terminal: {stdout:?}"
+    );
+    // The `-` line pins the SANITIZER's own rendering (lowercase, from
+    // `escape_default`) — an implementation that stripped the hostile
+    // byte instead of escaping it would still show the `+` line's
+    // uppercase repair text, so the deleted line is the load-bearing
+    // assertion.
+    assert!(
+        stdout.contains("-    x = \"a\\u{1b}[31mRED\""),
+        "the hostile byte renders escaped in the deleted line: {stdout}"
+    );
+    assert!(
+        stdout.contains("\\u{1B}"),
+        "the applied repair renders in the added line: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        src.as_bytes(),
+        "a dry run writes nothing"
+    );
+}
+
+#[test]
+fn dry_run_diffs_keep_crlf_terminators_literal() {
+    // The r35 sanitizer splits the terminator BEFORE escaping: a CRLF
+    // file's dry-run diff keeps every `\r\n` literal (no per-line
+    // `\u{D}` noise), while a hostile byte in an UNTERMINATED final
+    // line still renders escaped beside the no-newline marker.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("dry-run-crlf.nml");
+    let src = "service App:\r\n    a = \"x\u{1}y\"\r\n    b = \"tail\u{1B}!\"";
+    std::fs::write(&f, src).unwrap();
+    let out = nml_bin()
+        .args(["fix", "--dry-run", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("-    a = \"x\\u{1}y\"\r\n"),
+        "CRLF terminators stay literal, bodies render escaped: {stdout:?}"
+    );
+    assert!(!stdout.contains("\\u{D}"), "no terminator noise: {stdout}");
+    assert!(
+        stdout.contains("\\ No newline at end of file"),
+        "the unterminated final line carries the marker: {stdout}"
+    );
+    assert!(!stdout.contains('\u{1B}'), "no raw ESC: {stdout:?}");
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        src.as_bytes(),
+        "a dry run writes nothing"
+    );
+}
+
+#[test]
+fn fix_summary_discloses_suppressed_findings_beside_the_count() {
+    // The count parenthetical (P1): 128 visible findings and 72 more
+    // past the diagnostic limit — the summary must disclose the hidden
+    // population beside the number it qualifies (suppressed findings
+    // are UNKNOWNS, never folded into the not-auto-fixable count), in
+    // the marker row's own vocabulary. The stray-quote swallow shape
+    // keeps every finding unfixable, so 0 edits apply.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("fix-suppressed-summary.nml");
+    let mut src = String::from("service App:\r    a = \"stray x\r");
+    for _ in 0..195 {
+        src.push_str("    k = 1\r");
+    }
+    std::fs::write(&f, &src).unwrap();
+    let out = nml_bin()
+        .args(["fix", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "128 diagnostic(s) not auto-fixable (72 more suppressed past \
+             the diagnostic limit) — run `nml check` to see them"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(std::fs::read(&f).unwrap(), src.as_bytes(), "{stdout}");
+    // The dry run keeps the parenthetical (it qualifies the count,
+    // which prints) and drops only the pointer tail.
+    let out = nml_bin()
+        .args(["fix", "--dry-run", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "0 edit(s) appliable across 0 of 1 file(s); 128 diagnostic(s) \
+             not auto-fixable (72 more suppressed past the diagnostic limit)"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("run `nml check`"), "{stdout}");
+}
+
+#[test]
+fn fix_never_rewrites_the_phantom_closing_of_an_unterminated_string() {
+    // The NML0020 gate (P2): with no closing delimiter the trailing
+    // blank line is a recovery artifact, not the closing quotes — the
+    // phantom align-fix used to APPLY, growing the file by 8 bytes of
+    // whitespace on a string that has no delimiter to align.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("fix-unterminated-phantom-close.nml");
+    let src = "service App:\n    doc = \"\"\"\n        body\n      \n";
+    std::fs::write(&f, src).unwrap();
+    let out = nml_bin()
+        .args(["fix", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        src.as_bytes(),
+        "no phantom-close rewrite: {stdout}"
     );
     assert!(stdout.contains("0 edit(s) applied"), "{stdout}");
 }

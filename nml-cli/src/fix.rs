@@ -109,6 +109,7 @@ pub fn cmd_fix(args: &[String]) -> Result<(), String> {
     let mut fixed_files = 0usize;
     let mut total_edits = 0usize;
     let mut remaining = 0usize;
+    let mut suppressed_total = 0usize;
     let mut exhausted_files = 0usize;
     for path in &files {
         let outcome = fix_file(path, schema_dir.as_ref(), dry_run)?;
@@ -128,8 +129,21 @@ pub fn cmd_fix(args: &[String]) -> Result<(), String> {
             );
         }
         remaining += outcome.remaining;
+        suppressed_total += outcome.suppressed;
     }
     let noun = if dry_run { "appliable" } else { "applied" };
+    // Suppressed findings are UNKNOWNS — never folded into the
+    // not-auto-fixable count, only disclosed beside it. The
+    // parenthetical binds to the NUMBER it qualifies (before the
+    // pointer tail), speaks the marker row's vocabulary ("suppressed",
+    // "limit" — never the numeric limit, which is per-file), and
+    // prints on dry runs too: it qualifies the count, which prints
+    // there; only the pointer below is dry-run-gated.
+    let suppressed_note = if suppressed_total > 0 {
+        format!(" ({suppressed_total} more suppressed past the diagnostic limit)")
+    } else {
+        String::new()
+    };
     // An exhausted file's remainder is NOT "not auto-fixable" — the
     // budget cut the run mid-landing; label it honestly.
     // Dry runs get their own tail: nothing was written, so "again"
@@ -143,8 +157,19 @@ pub fn cmd_fix(args: &[String]) -> Result<(), String> {
             format!(" ({n} file(s) hit the round budget — a real run will need more than one pass)")
         }
     };
+    // Standing diagnostics deserve a next action, not a dead end: some
+    // carry enumerated ALTERNATIVES a human must pick from (the editor
+    // offers each; `nml check` prints them), the rest carry no machine
+    // repair at all. Suppressed on a dry run: nothing was applied, so
+    // `nml check` would list the would-be-fixed findings too and "to
+    // see them" would point at the wrong set.
+    let standing_note = if remaining > 0 && !dry_run {
+        " — run `nml check` to see them"
+    } else {
+        ""
+    };
     println!(
-        "{total_edits} edit(s) {noun} across {fixed_files} of {} file(s); {remaining} diagnostic(s) not auto-fixable{budget_note}",
+        "{total_edits} edit(s) {noun} across {fixed_files} of {} file(s); {remaining} diagnostic(s) not auto-fixable{suppressed_note}{standing_note}{budget_note}",
         files.len()
     );
     Ok(())
@@ -207,6 +232,11 @@ struct FixOutcome {
     /// exhaustion these are not mechanically fixable; an exhausted file
     /// still holds landable candidates, and the summary says so.
     remaining: usize,
+    /// The exact count the final analysis reported as suppressed past
+    /// the diagnostic limit — findings never materialized, hence never
+    /// CLASSIFIED: they are unknowns, and are never folded into
+    /// `remaining` (which counts judged, standing findings only).
+    suppressed: usize,
     /// The round budget ran out with sole candidates still standing —
     /// the remainder is not "not auto-fixable", another run continues.
     budget_exhausted: bool,
@@ -273,7 +303,15 @@ fn fix_file(
     }
     Ok(FixOutcome {
         applied,
-        remaining: analysis.diags.len(),
+        // Info rows are advisories (the truncation marker among them),
+        // not standing findings; warnings ARE genuine findings, so the
+        // filter is not-Info, never Error-only.
+        remaining: analysis
+            .diags
+            .iter()
+            .filter(|d| d.severity != nml_core::diagnostic::Severity::Info)
+            .count(),
+        suppressed: analysis.suppressed,
         budget_exhausted,
     })
 }
@@ -286,6 +324,12 @@ fn fix_file(
 struct Analysis {
     parse_clean: bool,
     diags: Vec<Diagnostic>,
+    /// The exact count the parse reported as suppressed past the
+    /// diagnostic cap (`nml_core::cst::suppressed_count` on the parse
+    /// findings; 0 on a clean parse) — the Σ-deficit budget of
+    /// [`round_improved`]: findings the cap HID can legitimately
+    /// surface on an applied key without failing the round.
+    suppressed: usize,
 }
 
 fn analyze(path: &Path, source: &str, schema_dir: Option<&PathBuf>) -> Analysis {
@@ -293,6 +337,7 @@ fn analyze(path: &Path, source: &str, schema_dir: Option<&PathBuf>) -> Analysis 
     if !parse_diags.is_empty() {
         return Analysis {
             parse_clean: false,
+            suppressed: nml_core::cst::suppressed_count(&parse_diags),
             diags: parse_diags,
         };
     }
@@ -312,6 +357,7 @@ fn analyze(path: &Path, source: &str, schema_dir: Option<&PathBuf>) -> Analysis 
         return Analysis {
             parse_clean: true,
             diags,
+            suppressed: 0,
         };
     };
     let source_refs: Vec<(&str, &str)> = named_sources
@@ -362,6 +408,7 @@ fn analyze(path: &Path, source: &str, schema_dir: Option<&PathBuf>) -> Analysis 
     Analysis {
         parse_clean: true,
         diags,
+        suppressed: 0,
     }
 }
 
@@ -430,15 +477,24 @@ fn try_edits(
 ///   regardless of what validation then finds — crossing the boundary
 ///   legitimately REVEALS diagnostics — and a validation fix that breaks
 ///   the parse is discarded.
-/// * **A multiset decrement over the keys the round applied**: for every
-///   `(code, message)` key with `applied(key) > 0`,
-///   `count_after(key) <= count_before(key) − applied(key)`. Keys the
-///   round did not apply are unconstrained — a revealed finding normally
-///   lands on one (a raw count comparison rejected a round that reveals
-///   as many findings as it fixes, sticking the file at a false
-///   fixpoint; a gate over EVERY key would reject the reveal it exists
-///   to accept; and a gate over keys present before would reject a
-///   repair that reveals more instances of an existing key).
+/// * **A Σ-deficit multiset decrement over the keys the round applied**:
+///   for every `(code, message)` key with `applied(key) > 0`, the key's
+///   *deficit* is `(count_after(key) + applied(key)) −
+///   count_before(key)`, floored at zero, and the deficits SUM to at
+///   most `before.suppressed` — the exact count the diagnostic cap hid
+///   (D-A). A capped flood (129 same-message findings, 128 visible)
+///   legitimately re-surfaces its hidden instances on the very key the
+///   round applied; the budget admits exactly those, and nothing else:
+///   with nothing suppressed the sum must be zero, which is the
+///   original per-key decrement exactly. The per-key floor means an
+///   over-delivering key (count dropped by more than applied) earns no
+///   credit — a failing key can never borrow another's slack. Keys the
+///   round did not apply stay unconstrained — a revealed finding
+///   normally lands on one (a raw count comparison rejected a round
+///   that reveals as many findings as it fixes, sticking the file at a
+///   false fixpoint; a gate over EVERY key would reject the reveal it
+///   exists to accept; and a gate over keys present before would reject
+///   a repair that reveals more instances of an existing key).
 fn round_improved(before: &Analysis, after: &Analysis, applied: &[&FindingKey]) -> bool {
     if !(after.parse_clean || !before.parse_clean) {
         return false;
@@ -454,9 +510,11 @@ fn round_improved(before: &Analysis, after: &Analysis, applied: &[&FindingKey]) 
             .filter(|d| d.code == key.0 && d.message == key.1)
             .count()
     };
-    applied_counts
+    let deficit: usize = applied_counts
         .iter()
-        .all(|(key, n)| count(&after.diags, key) + n <= count(&before.diags, key))
+        .map(|(key, n)| (count(&after.diags, key) + n).saturating_sub(count(&before.diags, key)))
+        .sum();
+    deficit <= before.suppressed
 }
 
 /// The sole-candidate filter (module doc): one suggestion per
@@ -588,9 +646,25 @@ fn unified_diff(old: &str, new: &str, path: &Path) -> String {
                 OpKind::Insert => ('+', new_lines[*n]),
             };
             out.push(sigil);
-            out.push_str(line);
-            if !line.ends_with('\n') {
+            // Content lines are REPO BYTES headed for a terminal: the
+            // very files this tool triages carry raw controls (that is
+            // why they have fixes), so each line body is sanitized like
+            // every other surface that echoes source. The line
+            // TERMINATOR (LF or CRLF — legal transport) stays literal:
+            // sanitizing it would escape every line ending; a bare CR
+            // inside the body is content and renders escaped.
+            let (body, term) = if let Some(b) = line.strip_suffix("\r\n") {
+                (b, "\r\n")
+            } else if let Some(b) = line.strip_suffix('\n') {
+                (b, "\n")
+            } else {
+                (line, "")
+            };
+            out.push_str(&crate::sanitized(body));
+            if term.is_empty() {
                 out.push_str("\n\\ No newline at end of file\n");
+            } else {
+                out.push_str(term);
             }
         }
         idx = hunk_end;
@@ -672,9 +746,15 @@ mod tests {
     }
 
     fn a(parse_clean: bool, msgs: &[&str]) -> Analysis {
+        a_s(parse_clean, msgs, 0)
+    }
+
+    /// [`a`] with a reported suppressed count — the Σ-deficit budget.
+    fn a_s(parse_clean: bool, msgs: &[&str], suppressed: usize) -> Analysis {
         Analysis {
             parse_clean,
             diags: msgs.iter().map(|m| d(m)).collect(),
+            suppressed,
         }
     }
 
@@ -722,6 +802,42 @@ mod tests {
     fn gate_accepts_one_of_two_message_identical_findings_applied() {
         let (before, after) = (a(true, &["k", "k"]), a(true, &["k"]));
         assert!(round_improved(&before, &after, &[&key("k")]));
+    }
+
+    #[test]
+    fn gate_accepts_flood_slack_within_the_suppressed_budget() {
+        // The Σ-deficit clause (D-A): a capped flood's hidden instances
+        // may re-surface on the applied key, up to EXACTLY the reported
+        // suppressed count. Miniature of the 129-instance flood: 2
+        // visible + 1 suppressed; the round applies both visible; one
+        // hidden instance surfaces — deficit 1 ≤ budget 1, accepted.
+        let (before, after) = (a_s(false, &["k", "k"], 1), a_s(false, &["k"], 0));
+        assert!(round_improved(&before, &after, &[&key("k"), &key("k")]));
+    }
+
+    #[test]
+    fn gate_rejects_flood_slack_beyond_the_suppressed_budget() {
+        // Two survivors against a budget of one: the second survivor is
+        // NOT explicable by the cap — a genuinely moved finding — and
+        // the round reverts.
+        let (before, after) = (a_s(false, &["k", "k"], 1), a_s(false, &["k", "k"], 0));
+        assert!(!round_improved(&before, &after, &[&key("k"), &key("k")]));
+    }
+
+    #[test]
+    fn gate_never_lets_a_failing_key_borrow_anothers_slack() {
+        // Key m over-delivers (applied 1, count fell 2) while key k
+        // fails outright (applied 1, count unchanged). The per-key
+        // floor keeps m's surplus from crediting k: the deficit is
+        // still 1, and with nothing suppressed the round fails —
+        // an unfloored sum would have netted to zero and accepted a
+        // genuinely failed fix.
+        let (before, after) = (a(true, &["k", "m", "m"]), a(true, &["k"]));
+        assert!(!round_improved(&before, &after, &[&key("k"), &key("m")]));
+        // Even a real suppressed budget is for cap-hidden findings, not
+        // for outright failures beyond it: deficit 3 > budget 1.
+        let (before, after) = (a_s(false, &["k", "k"], 1), a_s(false, &["k", "k", "k"], 0));
+        assert!(!round_improved(&before, &after, &[&key("k"), &key("k")]));
     }
 
     #[test]

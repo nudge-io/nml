@@ -543,7 +543,9 @@ mod tests {
                 kind: kind @ crate::error::ParseErrorKind::NumberTrailingDot { .. },
                 span,
             } => {
-                let (replacement, fix_span) = kind.suggestion(*span).expect("fix exists");
+                let crate::error::Repairs::Fix(replacement, fix_span) = kind.repairs(*span) else {
+                    panic!("fix exists");
+                };
                 assert_eq!(replacement, "");
                 assert_eq!(
                     (fix_span.start, fix_span.end),

@@ -306,6 +306,18 @@ CR-terminated ("old Mac") file every CR is a line ending, and deleting
 it would glue the lines together. Inside a string literal the CR is
 content, and the machine fix is the `\r` escape (value-preserving).
 
+That in-string fix is offered only where the escape provably leaves
+the decoded value byte-identical — a CR in a multiline string's blank
+edge line, in a blank line whose blankness holds the min-indent up, in
+the opening line's dropped padding, or glued to a preceding backslash
+is not string *content*, and the diagnostic stands there without a fix
+(hand-writing the escape in those places would change the value; and
+mind a preceding backslash when removing the character by hand — the
+deletion changes what the backslash escapes, so re-check the value).
+Very large string tokens (past 64 KiB) refuse machine repair entirely
+— the judgment is never run, fail-closed — so the diagnostic stands
+and the escape is written by hand.
+
 The fence below is stored with LF endings and converted to lone-CR
 ("old Mac") endings by the docs harness before it runs, so this
 example is executable, not illustrative:
@@ -331,8 +343,9 @@ review can see it: a raw ESC in a value is a terminal-injection
 primitive when that value is later printed, C1's CSI (U+009B) is the
 same primitive in a single byte, and a raw NUL truncates C strings
 downstream. NEL (U+0085) is a Unicode mandatory line break some
-renderers honor — the error's hint offers `\n` beside the escape,
-since a pasted NEL usually meant a line break. (Raw C1 inside valid
+renderers honor — the error's hint offers `\n` and the mojibake `…`
+beside the escape, since a pasted NEL usually meant a line break.
+(Raw C1 inside valid
 UTF-8 most often marks Windows-1252 double-decoding, so this error
 catches real corruption too.) Tab is legal raw in string content; only
 indentation restricts it ([NML0005](#nml0005)).
@@ -345,14 +358,34 @@ service Api:
 ```
 
 **Fix:** replace the raw control character with its `\u{…}` escape.
+Inside a string literal the repair is machine-applicable: for most
+controls the escape is the one value-preserving reading, so `nml fix`
+applies it (and the editor offers it) — offered only where the escape
+provably leaves the decoded value byte-identical (a character in a
+multiline string's blank edge line, a geometry-bearing blank line, the
+opening line's dropped padding, or one glued to a preceding backslash
+is not value content; the diagnostic stands there without a repair).
+Very large string tokens (past 64 KiB) refuse machine repair entirely
+(fail-closed — the value-preservation judgment is never run); the
+diagnostic stands and the escape is written by hand.
+Where the byte is genuinely
+ambiguous the alternatives are enumerated instead and a human picks —
+never auto-applied: NEL offers `\n` (a line break was meant), `\u{85}`
+(keep the byte), or `…` (the Windows-1252 reading — 0x85 is the
+ellipsis, the classic double-decode artifact); the other C1 bytes with
+CP-1252 meanings offer their escape or their mojibake repair (`\u{93}`
+or `“`). In token position there is no machine repair — the character
+is structure there, and any rewrite would be a guess.
 
 ## NML0018
 
 **Invisible steering character.** A character that can make source
-*display* differently than it *parses*: an explicit bidirectional
-control (U+202A–U+202E, U+2066–U+2069 — the Trojan Source attack,
-CVE-2021-42574), an interior U+FEFF, or a U+2028/U+2029 line/paragraph
-separator; write it as its `\u{…}` escape.
+*display* differently than it *parses* — or carry text the reader
+cannot see: an explicit bidirectional control (U+202A–U+202E,
+U+2066–U+2069 — the Trojan Source attack, CVE-2021-42574), an interior
+U+FEFF, a U+2028/U+2029 line/paragraph separator, or a character from
+the Unicode tag block (U+E0000–U+E007F, 128 code points); write it as
+its `\u{…}` escape.
 
 The separators are the only mandatory line breaks (UAX #14) that are
 not control characters — an editor honoring them displays one authored
@@ -361,6 +394,14 @@ separators the whole set is a strict superset of rustc's, per the
 display-vs-parse guidance of UTS #55 (Unicode Source Code Handling). A
 leading U+FEFF is accepted as a byte-order mark; everywhere else U+FEFF
 is this error.
+
+The tag block is a deprecated invisible mirror of ASCII: a raw tag
+sequence hides a full ASCII payload inside what displays as ordinary
+text — a smuggling channel through human review and into any system
+that echoes the value onward. Its one modern legitimate use, emoji tag
+sequences (the Scotland flag is the black-flag base U+1F3F4 plus tag
+letters spelling `gbsct`), is content, and content takes escapes:
+`"\u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}"`.
 
 Right-to-left *text* is unaffected: Hebrew and Arabic string values
 need no bidi controls to render correctly, and the implicit bidi marks
@@ -378,7 +419,20 @@ service Api:
 **Fix:** if the character is intentional content, write its `\u{…}`
 escape so it is visible in review; for U+2028/U+2029 a `\n` line break
 is usually what was meant; otherwise delete it (it usually arrives via
-copy-paste from rendered text).
+copy-paste from rendered text). Inside a string literal these
+alternatives are machine-offered — U+2028/U+2029 as `\n` or the
+escape; a bidi control, interior U+FEFF, or tag character as *remove*
+or the escape — and a human picks: intent is genuinely open, so
+nothing auto-applies. The *remove* option is offered only where
+deletion provably removes just that character; where it would disturb
+the string's structure (a line flipping blank into the edge trim, the
+indentation computation moving, quote runs merging into a delimiter)
+the escape is offered alone — and, being the one sound reading there,
+it auto-applies. In token position there is no machine repair. As with
+[NML0017](#nml0017), repairs are fail-closed: a very large string token
+refuses machine repair entirely and the diagnostic stands, while a
+value that defeats the deletion judgment's sentinel machinery merely
+loses the *remove* arm — the escape stands alone and auto-applies.
 
 ## NML0019
 
@@ -421,6 +475,17 @@ service Api:
 **Fix:** apply the suggestion — indent the closing quotes to the
 content's column (here: 8). A closing delimiter on the last content
 line has no alignment to check and stays legal.
+
+With no closing delimiter there is nothing to align: an unterminated
+string reports only [NML0003](#nml0003) — the file's trailing blank
+line is never treated as the closing quotes.
+
+```nml check expect-error='[NML0003]'
+service Api:
+    motd = """
+        All systems operational.
+
+```
 
 ## NML0021
 

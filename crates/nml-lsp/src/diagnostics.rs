@@ -968,6 +968,43 @@ mod tests {
         );
     }
 
+    /// A tag character (U+E0067, 4 UTF-8 bytes / 2 UTF-16 units) maps
+    /// to editor coordinates through the astral math: the NML0018 range
+    /// must cover exactly the two surrogate units, and text AFTER the
+    /// character must not be shifted — a byte-counted range here would
+    /// select the wrong columns in every editor.
+    #[test]
+    fn a_tag_character_diagnostic_spans_two_utf16_units() {
+        let text = "x = \"a\u{E0067}b\"\n";
+        let url = tower_lsp::lsp_types::Url::parse("file:///ws/tag.nml").unwrap();
+        let out = compute(
+            text,
+            &SchemaMode::Registry {
+                models: &[],
+                enums: &[],
+                oneofs: &[],
+            },
+            &default_config(),
+            Some(&url),
+            &|_| None,
+        );
+        let tag = out
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "NML0018".into(),
+                    ))
+            })
+            .expect("the policy fires on the raw tag character");
+        assert_eq!(tag.range.start.line, 0);
+        assert_eq!(tag.range.start.character, 6, "after `x = \"a`");
+        assert_eq!(
+            tag.range.end.character, 8,
+            "one astral scalar = two UTF-16 units"
+        );
+    }
+
     /// RFC 0019: the editor composes same-file `uses` stacks exactly as
     /// `nml check` does — an overlay whose base supplies a required field
     /// gets no phantom missing-required error, and compose findings

@@ -25,7 +25,13 @@
 //!   whitespace and allows raw C1 in literals) — NML values are echoed
 //!   into terminals, logs, and generated configs, so the display-vs-
 //!   parse guidance of UTS #55 (Unicode Source Code Handling) is
-//!   applied at the language level. The implicit bidi marks
+//!   applied at the language level. The Unicode tag block
+//!   U+E0000–U+E007F (128 scalars, a deprecated invisible mirror of
+//!   ASCII) is in the class too: a raw tag sequence is a hidden-text
+//!   channel — invisible instructions or payloads riding inside what
+//!   displays as ordinary text — with no raw-source use (its one
+//!   modern purpose, emoji tag sequences, is content and belongs in
+//!   escapes). The implicit bidi marks
 //!   (LRM/RLM/ALM) stay legal: ordinary RTL content that reorders only
 //!   neighboring weak characters, never tokens — rustc's line too.
 //!
@@ -48,8 +54,18 @@ pub(crate) fn check(source: &str) -> (Vec<NmlError>, usize) {
             '\r' if source.as_bytes().get(i + 1) == Some(&b'\n') => continue,
             '\r' => ParseErrorKind::BareCarriageReturn { in_string: false },
             '\u{FEFF}' if i == 0 => continue, // the byte-order mark
-            _ if is_banned_control(ch) => ParseErrorKind::ForbiddenControlCharacter { ch },
-            _ if is_invisible(ch) => ParseErrorKind::InvisibleCharacter { ch },
+            _ if is_banned_control(ch) => ParseErrorKind::ForbiddenControlCharacter {
+                ch,
+                in_string: false,
+            },
+            _ if is_invisible(ch) => ParseErrorKind::InvisibleCharacter {
+                ch,
+                in_string: false,
+                // Token position: no repair is sound, removal included.
+                // The reclassifier upgrades both fields together where
+                // the judgments pass.
+                remove_sound: false,
+            },
             _ => continue,
         };
         if errors.len() < crate::cst::MAX_ERRORS {
@@ -70,6 +86,55 @@ pub fn must_escape(ch: char) -> bool {
     ch == '\r' || is_banned_control(ch) || is_invisible(ch)
 }
 
+/// The canonical `\u{…}` escape spelling of a character — uppercase
+/// hex, no zero padding — shared by diagnostic messages, machine-fix
+/// replacement text, and the formatter's value emitter, so the spelling
+/// a diagnostic *advises* and the spelling tooling *writes* can never
+/// drift apart.
+pub fn unicode_escape(ch: char) -> String {
+    format!("\\u{{{:X}}}", ch as u32)
+}
+
+/// The Windows-1252 reading of a C1 code point (U+0080–U+009F): the
+/// character a CP-1252 byte displays as, which a double-decode (bytes
+/// read as Latin-1, then re-encoded as UTF-8) turns into the raw C1
+/// control NML0017 catches. `Some` is the mojibake *repair* — what the
+/// author's editor actually showed (the ftfy class of fix); `None` for
+/// the five bytes 0x81/0x8D/0x8F/0x90/0x9D that CP-1252 leaves
+/// undefined, where no repair reading exists.
+pub(crate) fn windows_1252_repair(ch: char) -> Option<char> {
+    Some(match ch {
+        '\u{80}' => '€',
+        '\u{82}' => '‚',
+        '\u{83}' => 'ƒ',
+        '\u{84}' => '„',
+        '\u{85}' => '…',
+        '\u{86}' => '†',
+        '\u{87}' => '‡',
+        '\u{88}' => 'ˆ',
+        '\u{89}' => '‰',
+        '\u{8A}' => 'Š',
+        '\u{8B}' => '‹',
+        '\u{8C}' => 'Œ',
+        '\u{8E}' => 'Ž',
+        '\u{91}' => '\u{2018}',
+        '\u{92}' => '\u{2019}',
+        '\u{93}' => '\u{201C}',
+        '\u{94}' => '\u{201D}',
+        '\u{95}' => '•',
+        '\u{96}' => '–',
+        '\u{97}' => '—',
+        '\u{98}' => '˜',
+        '\u{99}' => '™',
+        '\u{9A}' => 'š',
+        '\u{9B}' => '›',
+        '\u{9C}' => 'œ',
+        '\u{9E}' => 'ž',
+        '\u{9F}' => 'Ÿ',
+        _ => return None,
+    })
+}
+
 /// Every Unicode control (general category Cc — exactly
 /// `char::is_control`: C0, DEL, and C1) minus tab and the line-ending
 /// characters. Derived from the category, not a hand list, so the class
@@ -83,15 +148,23 @@ fn is_banned_control(ch: char) -> bool {
 
 /// The structure-steering invisibles: the EXPLICIT bidi controls
 /// (rustc's Trojan-Source lint set — embeddings, overrides, isolates),
-/// U+FEFF (a BOM only at offset zero), and the two non-control
-/// mandatory line breaks LS/PS (UAX #14) — characters that change how
-/// source STRUCTURE reads. The implicit bidi marks (LRM/RLM/ALM) are
+/// U+FEFF (a BOM only at offset zero), the two non-control mandatory
+/// line breaks LS/PS (UAX #14), and the Unicode tag block
+/// U+E0000–U+E007F (an invisible ASCII mirror — raw, it is a hidden
+/// payload channel; emoji tag sequences are content and take escapes)
+/// — characters that change how source STRUCTURE reads or carry text
+/// the reader cannot see. The implicit bidi marks (LRM/RLM/ALM) are
 /// deliberately NOT here: ordinary RTL string content, reordering only
 /// neighboring weak characters (rustc excludes them too).
 fn is_invisible(ch: char) -> bool {
     matches!(
         ch,
-        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}' | '\u{2028}' | '\u{2029}'
+        '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{E0000}'..='\u{E007F}'
     )
 }
 
@@ -207,5 +280,53 @@ mod tests {
         assert!(!must_escape('\u{061C}'), "ALM stays legal");
         // Zero-width joiners are legitimate content (emoji, Persian text).
         assert!(!must_escape('\u{200D}'));
+        // The tag block is closed end-to-end: 128 scalars, neighbors out.
+        // (membership continues below)
+        assert!(('\u{E0000}'..='\u{E007F}').all(must_escape));
+        assert!(must_escape('\u{E0067}'), "TAG LATIN SMALL LETTER G");
+        assert!(!must_escape('\u{E0080}'), "past the tag block");
+        assert!(!must_escape('\u{DFFFF}'), "before the tag block");
+    }
+
+    #[test]
+    fn the_escape_spelling_is_uppercase_hex_unpadded() {
+        assert_eq!(unicode_escape('\u{1}'), "\\u{1}");
+        assert_eq!(unicode_escape('\u{9B}'), "\\u{9B}");
+        assert_eq!(unicode_escape('\u{202E}'), "\\u{202E}");
+        assert_eq!(unicode_escape('\u{E0067}'), "\\u{E0067}");
+    }
+
+    #[test]
+    fn the_1252_table_covers_exactly_the_27_mapped_c1_bytes() {
+        let mapped = ('\u{80}'..='\u{9F}')
+            .filter(|&c| windows_1252_repair(c).is_some())
+            .count();
+        assert_eq!(mapped, 27);
+        for hole in ['\u{81}', '\u{8D}', '\u{8F}', '\u{90}', '\u{9D}'] {
+            assert_eq!(
+                windows_1252_repair(hole),
+                None,
+                "{hole:?} is undefined in CP-1252"
+            );
+        }
+        // Spot the classic mojibake trio: NEL=ellipsis, smart quotes.
+        assert_eq!(windows_1252_repair('\u{85}'), Some('…'));
+        assert_eq!(windows_1252_repair('\u{93}'), Some('\u{201C}'));
+        assert_eq!(windows_1252_repair('\u{92}'), Some('\u{2019}'));
+        // Every repair passes the RESOLVER'S OWN injection guard
+        // (`needs_escape` — a strict superset of `must_escape`): a fix
+        // the guard would refuse is an action that silently does
+        // nothing, and a character the policy re-diagnoses is worse.
+        for c in '\u{80}'..='\u{9F}' {
+            if let Some(r) = windows_1252_repair(c) {
+                assert!(
+                    !crate::diagnostic::needs_escape(r),
+                    "repair {r:?} must pass the injection guard"
+                );
+            }
+        }
+        // And outside C1 there is no table at all.
+        assert_eq!(windows_1252_repair('a'), None);
+        assert_eq!(windows_1252_repair('\u{2028}'), None);
     }
 }

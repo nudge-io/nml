@@ -119,6 +119,35 @@ pub fn parse_to_ast_all(source: &str) -> (crate::ast::File, Vec<crate::diagnosti
     (file, finalize_diagnostics(errors, suppressed))
 }
 
+/// The truncation marker's row shape, shared by the composer
+/// ([`finalize_diagnostics`]) and the recognizer ([`suppressed_count`])
+/// so the rendered row and the read-back can never drift: the exact
+/// suppressed count, then this tail, then the cap and a closing paren.
+const SUPPRESSED_ROW_TAIL: &str = " additional error(s) suppressed (limit ";
+
+/// The one truncation-marker row [`finalize_diagnostics`] appends.
+fn suppressed_row(suppressed: usize) -> String {
+    format!("{suppressed}{SUPPRESSED_ROW_TAIL}{MAX_ERRORS})")
+}
+
+/// The exact count a diagnostics list reports as suppressed (RFC 0009's
+/// truncation honesty, read back): recognizes the marker row
+/// [`finalize_diagnostics`] appends — `Severity::Info`, no code, the
+/// shared row shape anchored at BOTH ends (the suffix stripped, the
+/// whole remaining prefix parsed as the count) — and returns its N;
+/// `0` with no marker present. Consumers that budget for findings
+/// hidden past the cap (the `nml fix` convergence gate) read the count
+/// through this, never by re-deriving the format.
+pub fn suppressed_count(diags: &[crate::diagnostic::Diagnostic]) -> usize {
+    let tail = format!("{SUPPRESSED_ROW_TAIL}{MAX_ERRORS})");
+    diags
+        .iter()
+        .filter(|d| d.severity == crate::diagnostic::Severity::Info && d.code.is_none())
+        .filter_map(|d| d.message.strip_suffix(&tail[..]))
+        .filter_map(|prefix| prefix.parse::<usize>().ok())
+        .sum()
+}
+
 /// The ONE findings boundary (RFC 0009): bounded output (RFC 0004 §9) with
 /// exact-count honesty — when anything was clipped, the last entry says how
 /// much. Shared by every `Vec<Diagnostic>`-returning surface, so the CLI
@@ -136,8 +165,8 @@ fn finalize_diagnostics(
     let mut out: Vec<crate::diagnostic::Diagnostic> =
         errors.iter().map(NmlError::to_diagnostic).collect();
     if suppressed > 0 {
-        out.push(crate::diagnostic::Diagnostic::info(format!(
-            "{suppressed} additional error(s) suppressed (limit {MAX_ERRORS})"
+        out.push(crate::diagnostic::Diagnostic::info(suppressed_row(
+            suppressed,
         )));
     }
     out
@@ -163,33 +192,111 @@ fn parse_lowered(source: &str) -> (Parse, crate::ast::File, Vec<NmlError>, usize
     // A bare CR INSIDE a string literal is content, not transport: its
     // machine fix is the `\r` escape, never a deletion (which would
     // change the value). The policy scan is context-free; the lexed
-    // string tokens supply the context.
-    let string_ranges: Vec<(usize, usize)> = parsed
+    // string tokens supply the context — but only where the string
+    // reading is CERTAIN: an UNTERMINATED string's token swallows to
+    // EOF, and trusting it flipped every following transport CR to
+    // "content", whose machine fix then rewrote line endings into
+    // literal `\r` text — gluing an old-Mac file's line structure into
+    // a string value (probed). Tokens named by an unterminated-string
+    // error are excluded.
+    // Cap note: this reads the CAPPED parse-error list, so a ≥128-error
+    // flood before a stray quote can suppress the UnterminatedString
+    // entry — the glue vector stays closed anyway because
+    // finalize_diagnostics truncates the position-sorted merge at the
+    // SAME constant, and lexer errors never occur inside a string
+    // token's range, so the evictors always sort first and any
+    // guard-blind in-string fix is truncated before it can render
+    // (pinned by `a_flooded_stray_quote_still_grants_no_in_string_fix`).
+    let unterminated: Vec<usize> = errors
+        .iter()
+        .filter_map(|e| match e {
+            NmlError::Syntax {
+                kind: crate::error::ParseErrorKind::UnterminatedString { open, .. },
+                ..
+            } => Some(open.start),
+            _ => None,
+        })
+        .collect();
+    let strings: Vec<(usize, usize, syntax::SyntaxToken)> = parsed
         .syntax()
         .descendants_with_tokens()
         .filter_map(|e| e.into_token())
         .filter(|t| t.kind() == syntax::SyntaxKind::String)
+        .filter(|t| !unterminated.contains(&usize::from(t.text_range().start())))
         .map(|t| {
             let r = t.text_range();
-            (usize::from(r.start()), usize::from(r.end()))
+            (usize::from(r.start()), usize::from(r.end()), t)
         })
         .collect();
+    let mut judges: std::collections::HashMap<usize, value::RepairJudge> =
+        std::collections::HashMap::new();
     let policy_errors: Vec<NmlError> = policy_errors
         .into_iter()
-        .map(|e| match e {
-            NmlError::Syntax {
-                kind: crate::error::ParseErrorKind::BareCarriageReturn { .. },
-                span,
-            } if string_ranges
-                .iter()
-                .any(|&(s, e)| s < span.start && span.end <= e) =>
-            {
-                NmlError::Syntax {
-                    kind: crate::error::ParseErrorKind::BareCarriageReturn { in_string: true },
-                    span,
+        .map(|e| {
+            use crate::error::ParseErrorKind::*;
+            match e {
+                NmlError::Syntax { kind, span } => {
+                    // The in-string reading is granted per REPAIR
+                    // SOUNDNESS, not per position: the character must sit
+                    // inside a CERTAIN string token (the A2 guard above
+                    // excluded unterminated ones) AND splicing the kind's
+                    // own escape (`ParseErrorKind::in_string_escape` —
+                    // the SAME string the repair inserts) must leave the
+                    // decoded value byte-identical (`value::RepairJudge`
+                    // — decode itself judges, so blank edge lines,
+                    // min-indent-bearing blank lines, dropped opening
+                    // padding, and backslash gluing all refuse without
+                    // being named here). Refused characters keep the
+                    // token-position reading: the diagnostic stands,
+                    // with no repair.
+                    // The containing-token find is hoisted so BOTH
+                    // judgments — the escape keep-judgment and, for
+                    // invisibles only, the remove judgment (D-C) —
+                    // share one `judges` lookup.
+                    let escape = kind.in_string_escape();
+                    let judge = match &escape {
+                        Some(_) => strings
+                            .iter()
+                            .find(|&&(s, e, _)| s < span.start && span.end <= e)
+                            .map(|(s, _, tok)| {
+                                &*judges
+                                    .entry(*s)
+                                    .or_insert_with(|| value::RepairJudge::new(tok.text(), *s))
+                            }),
+                        None => None,
+                    };
+                    let sound = match (&escape, &judge) {
+                        (Some(escape), Some(judge)) => judge.escape_preserves_value(span, escape),
+                        _ => false,
+                    };
+                    let kind = match kind {
+                        BareCarriageReturn { .. } if sound => {
+                            BareCarriageReturn { in_string: true }
+                        }
+                        ForbiddenControlCharacter { ch, .. } if sound => {
+                            ForbiddenControlCharacter {
+                                ch,
+                                in_string: true,
+                            }
+                        }
+                        InvisibleCharacter { ch, .. } if sound => InvisibleCharacter {
+                            ch,
+                            in_string: true,
+                            // Judged ONLY where the keep-judgment
+                            // passed: an unsound escape already keeps
+                            // the whole token-position reading, and the
+                            // remove grant is meaningless without a
+                            // sound keep arm beside it.
+                            remove_sound: judge
+                                .expect("a sound judgment implies a judge")
+                                .remove_preserves_value(span),
+                        },
+                        other => other,
+                    };
+                    NmlError::Syntax { kind, span }
                 }
+                other => other,
             }
-            other => other,
         })
         .collect();
     let policy_spans: std::collections::HashSet<(usize, usize)> = policy_errors
@@ -848,6 +955,34 @@ mod tests {
         );
     }
 
+    /// The suppression row round-trips through its recognizer (D-A):
+    /// what `finalize_diagnostics` composes, `suppressed_count` reads
+    /// back exactly — the shared-const coupling, pinned. Near-miss
+    /// shapes (wrong severity, a code, a prefixed message) read 0.
+    #[test]
+    fn suppressed_count_roundtrips_the_marker_row() {
+        for n in [1usize, 2, 128, 272, 10_000] {
+            let row = crate::diagnostic::Diagnostic::info(suppressed_row(n));
+            assert_eq!(suppressed_count(&[row]), n, "{n}");
+        }
+        assert_eq!(suppressed_count(&[]), 0);
+        // Anchoring: an ordinary Info row, an Error carrying the text,
+        // and a marker with leading junk are all NOT the marker.
+        let not_markers = [
+            crate::diagnostic::Diagnostic::info("nothing suppressed here"),
+            crate::diagnostic::Diagnostic::error(suppressed_row(7)),
+            crate::diagnostic::Diagnostic::info(format!("note: {}", suppressed_row(7))),
+        ];
+        assert_eq!(suppressed_count(&not_markers), 0);
+        // And the real pipeline's row is recognized end-to-end.
+        let mut src = String::from("service App:\n");
+        for i in 0..400 {
+            src.push_str(&format!("    k{i} = 9.999 USD\n"));
+        }
+        let (_ast, diags) = parse_to_ast_all(&src);
+        assert_eq!(suppressed_count(&diags), 400 - MAX_ERRORS);
+    }
+
     #[test]
     fn parse_to_ast_all_reports_every_error_position_sorted() {
         // Two semantic (money, secret namespace) + one syntactic (`@@@`) — all
@@ -1301,7 +1436,9 @@ service App is Base:
                         matches!(kind, crate::error::ParseErrorKind::NumberTrailingDot { .. }),
                         "{src:?}: expected NumberTrailingDot, got {kind:?}"
                     );
-                    let (replacement, fix) = kind.suggestion(span).expect("fix exists");
+                    let crate::error::Repairs::Fix(replacement, fix) = kind.repairs(span) else {
+                        panic!("{src:?}: fix exists");
+                    };
                     assert_eq!(replacement, "", "{src:?}");
                     assert_eq!(
                         (fix.start, fix.end),
@@ -1572,6 +1709,40 @@ service App is Base:
         // Closing on the content line: no alignment exists to check.
         let (_, diags) = parse_to_ast_all("service App:\n    x = \"\"\"\n        content\"\"\"\n");
         assert!(diags.is_empty(), "{diags:?}");
+
+        // UNTERMINATED (P2 gate): with no closing delimiter the
+        // trailing blank line is a recovery artifact, not the closing
+        // quotes — NML0003 tells the real story and NML0020 must not
+        // fire (its phantom fix used to APPLY, rewriting whitespace at
+        // EOF on a string with nothing to align).
+        let (_, diags) = parse_to_ast_all("service App:\n    doc = \"\"\"\n        body\n      \n");
+        let m: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+        assert!(m.iter().any(|s| s.contains("NML0003")), "{m:?}");
+        assert!(
+            m.iter().all(|s| !s.contains("NML0020")),
+            "no alignment exists on an unterminated string: {m:?}"
+        );
+
+        // The escaped-close corner: `\"""` at EOF is lexer-UNTERMINATED
+        // (the backslash pairs one closing quote) even though the text
+        // ends in three quotes — the parity flag agrees with the lexer
+        // and no NML0020 collateral appears.
+        let (_, diags) = parse_to_ast_all("service App:\n    doc = \"\"\"x\\\"\"\"");
+        let codes: Vec<String> = diags
+            .iter()
+            .filter_map(|d| d.code.map(|c| c.to_string()))
+            .collect();
+        assert!(codes.contains(&"NML0003".to_string()), "{codes:?}");
+        assert!(!codes.contains(&"NML0020".to_string()), "{codes:?}");
+
+        // Even-run control: an interior line ending `a\\` (escaped
+        // backslash, even run) with a TERMINATED misaligned close —
+        // the gate must keep this real NML0020 (guards the parity
+        // direction).
+        let (_, diags) =
+            parse_to_ast_all("service App:\n    x = \"\"\"\n        a\\\\\n    \"\"\"\n");
+        let m: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+        assert!(m.iter().any(|s| s.contains("NML0020")), "{m:?}");
     }
 
     /// NML0005's principle extends into multiline bodies: a tab in a body
@@ -2390,6 +2561,7 @@ service App is Base:
         for (src, policy) in [
             ("service App:\n    x\u{85} = 1\n", "NML0017"),
             ("service App:\n    x\u{2028} = 1\n", "NML0018"),
+            ("service App:\n    x\u{E0067} = 1\n", "NML0018"),
         ] {
             let (_, diags) = parse_to_ast_all(src);
             let about_char: Vec<String> = diags
@@ -2399,6 +2571,15 @@ service App is Base:
                 .collect();
             assert_eq!(about_char.len(), 1, "{src:?}: {about_char:?}");
             assert!(about_char[0].contains(policy), "{about_char:?}");
+            // The mojibake clause is NEL's alone (0x85 is a CP-1252
+            // byte; LS/PS and tags have no such reading) — guards the
+            // hint-arm split against re-merging. The NEL row itself
+            // keeps it, in token position too.
+            assert_eq!(
+                about_char[0].contains("Windows-1252"),
+                policy == "NML0017",
+                "{src:?}: {about_char:?}"
+            );
         }
         let (_, diags) = parse_to_ast_all("service App:\n    x = \"a\u{85}b\"\n");
         let rendered: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
@@ -2407,10 +2588,67 @@ service App is Base:
             1,
             "in-string NEL is the policy's alone: {rendered:?}"
         );
+
         assert!(
             rendered[0].contains("NML0017") && rendered[0].contains("Unicode line break"),
-            "the line-break hint teaches both intents: {rendered:?}"
+            "the line-break hint teaches the line-break intent: {rendered:?}"
         );
+        assert!(
+            rendered[0].contains("Windows-1252"),
+            "NEL's hint teaches its third reading — the mojibake \
+             ellipsis — mirroring its three repair arms: {rendered:?}"
+        );
+
+        // The tag block (U+E0000–E007F) is an invisible ASCII mirror: in
+        // a string or a comment a raw tag character was ZERO diagnostics
+        // — a hidden payload channel through review. The policy scan is
+        // context-free, so membership alone closes every position.
+        for src in [
+            "service App:\n    x = \"a\u{E0067}b\"\n",
+            "service App:\n    // note\u{E0067}\n    x = 1\n",
+        ] {
+            let (_, diags) = parse_to_ast_all(src);
+            let tags: Vec<String> = diags
+                .iter()
+                .map(|d| d.to_string())
+                .filter(|m| m.contains("NML0018"))
+                .collect();
+            assert_eq!(tags.len(), 1, "{src:?}: {diags:?}");
+            assert_eq!(
+                diags.len(),
+                1,
+                "the surrounding syntax parses clean — the policy diagnostic \
+                 is the ONLY finding: {src:?}: {diags:?}"
+            );
+            assert!(
+                tags[0].contains("U+E0067") && tags[0].contains("tag characters"),
+                "the tag hint names the channel and the emoji use: {tags:?}"
+            );
+        }
+
+        // An UNTERMINATED string never grants in-string context: on an
+        // old-Mac file with a stray quote, the swallowed-to-EOF token
+        // must not flip the following TRANSPORT CRs to content (whose
+        // `\r` fix would glue the file's line structure into a string).
+        // Both open shapes pin the guard: the single- and triple-quote
+        // openers record different open spans, but each starts exactly
+        // at its String token's start.
+        for src in [
+            "service App:\r    a = \"stray x\r    b = 2\r",
+            "service App:\r    a = \"\"\"stray\r    b = 2\r",
+        ] {
+            let (_, diags) = parse_to_ast_all(src);
+            let cr: Vec<String> = diags
+                .iter()
+                .map(|d| d.to_string())
+                .filter(|m| m.contains("NML0016"))
+                .collect();
+            assert!(!cr.is_empty(), "{src:?}: {diags:?}");
+            assert!(
+                cr.iter().all(|m| !m.contains("(fix:")),
+                "no CR behind a stray quote may carry the in-string fix: {cr:?}"
+            );
+        }
 
         // The bare-CR diagnostic carries the `\r` escape INSIDE a
         // string, where the CR is content — and NO machine fix in token
@@ -2439,6 +2677,380 @@ service App is Base:
     /// A leading U+FEFF is a byte-order mark: accepted, filed as trivia
     /// (lossless), and invisible to the policy. Everywhere else it is
     /// NML0018.
+    /// The cap coincidence made structural (r30 F4): with ≥128 lexer
+    /// errors ahead of a stray quote, the UnterminatedString entry is
+    /// suppressed past MAX_ERRORS and the A2 guard goes blind — but the
+    /// rendered window truncates at the SAME constant on the
+    /// position-sorted merge, and lexer errors never occur inside a
+    /// string token's range, so the evictors always sort first and no
+    /// guard-blind in-string fix can ever render. If the two caps
+    /// diverge, this fails.
+    #[test]
+    fn a_flooded_stray_quote_still_grants_no_in_string_fix() {
+        // 130 unexpected-character errors, then a stray quote, then
+        // transport CRs the blind flip would have granted `\r` fixes.
+        let mut src = String::from("service App:\n");
+        for _ in 0..130 {
+            src.push_str("    ~\n");
+        }
+        src.push_str("    a = \"stray x\r    b = 2\r");
+        let (_, diags) = parse_to_ast_all(&src);
+        assert!(
+            diags.iter().all(|d| !d.to_string().contains("(fix")),
+            "no fix may render behind a suppressed unterminated-string error"
+        );
+        assert!(
+            diags.iter().any(|d| d.to_string().contains("suppressed")),
+            "the flood must report suppression honestly: {} diags",
+            diags.len()
+        );
+    }
+
+    /// The judge's size cap (D-B): a string token over
+    /// `MAX_JUDGED_TOKEN_BYTES` is never decode-judged — the policy
+    /// diagnostic stands with NO machine fix (fail-closed, the token
+    /// text never decoded); the same content under the cap keeps its
+    /// singular escape fix. Boundary-exact: the cap itself is judged,
+    /// one byte past it is not.
+    #[test]
+    fn an_oversized_string_token_refuses_machine_repair_and_keeps_the_diagnostic() {
+        let cap = 64 * 1024;
+        let rendered_0017 = |src: &str| -> Vec<String> {
+            let (_, diags) = parse_to_ast_all(src);
+            diags
+                .iter()
+                .map(|d| d.to_string())
+                .filter(|m| m.contains("NML0017"))
+                .collect()
+        };
+        // Token text = `"` + filler + C0 + `"`; filler sized so the
+        // token is exactly one byte OVER the cap…
+        let over = format!("service App:\n    x = \"{}\u{1}\"\n", "a".repeat(cap - 2));
+        let hits = rendered_0017(&over);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            !hits[0].contains("(fix"),
+            "an over-cap token must refuse machine repair: {}…",
+            &hits[0][..120.min(hits[0].len())]
+        );
+        // …and exactly AT the cap, where the fix is granted.
+        let at = format!("service App:\n    x = \"{}\u{1}\"\n", "a".repeat(cap - 3));
+        let hits = rendered_0017(&at);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0].contains("(fix: `\\u{1}`)"),
+            "at-cap content keeps its singular escape fix: {}…",
+            &hits[0][..120.min(hits[0].len())]
+        );
+    }
+
+    /// The in-string repair taxonomy (RFC 0023 D1): each ambiguity
+    /// class of NML0017/NML0018 content gets exactly its enumerated
+    /// resolution space — singular where one reading is provable,
+    /// alternatives where intent is genuinely open, and none at all in
+    /// token position, where any rewrite is a structural guess.
+    #[test]
+    fn in_string_policy_characters_carry_their_repair_taxonomy() {
+        let rendered_for = |src: &str, code: &str| -> String {
+            let (_, diags) = parse_to_ast_all(src);
+            let hits: Vec<String> = diags
+                .iter()
+                .map(|d| d.to_string())
+                .filter(|m| m.contains(code))
+                .collect();
+            assert_eq!(hits.len(), 1, "{src:?}: {diags:?}");
+            hits[0].clone()
+        };
+
+        // C0 in a string: the escape is the ONE value-preserving
+        // reading — singular, auto-appliable (NML0016's `\r` shape).
+        let m = rendered_for("service App:\n    x = \"a\u{1}b\"\n", "NML0017");
+        assert!(m.contains("(fix: `\\u{1}`)"), "{m}");
+
+        // The five unmapped C1 bytes (CP-1252 holes) are singular too.
+        let m = rendered_for("service App:\n    x = \"a\u{90}b\"\n", "NML0017");
+        assert!(m.contains("(fix: `\\u{90}`)"), "{m}");
+
+        // NEL: the one character in BOTH ambiguity classes — line
+        // break | kept byte | mojibake ellipsis. Three alternatives,
+        // rendered in full (no truncation tail), never auto-applied.
+        let m = rendered_for("service App:\n    x = \"a\u{85}b\"\n", "NML0017");
+        assert!(m.contains("(fixes: `\\n`, `\\u{85}`, `…`)"), "{m}");
+        assert!(!m.contains("more"), "three renders whole: {m}");
+
+        // A mapped C1 byte: keep it escaped, or repair the
+        // double-decode to what the CP-1252 author typed.
+        let m = rendered_for("service App:\n    x = \"a\u{93}b\"\n", "NML0017");
+        assert!(m.contains("(fixes: `\\u{93}`, `\u{201C}`)"), "{m}");
+
+        // LS/PS: a line break was meant, or the separator itself.
+        let m = rendered_for("service App:\n    x = \"a\u{2028}b\"\n", "NML0018");
+        assert!(m.contains("(fixes: `\\n`, `\\u{2028}`)"), "{m}");
+
+        // Bidi controls, interior FEFF, tags: remove | keep escaped —
+        // and the deletion alternative reads `remove`, in the singular
+        // arm's vocabulary, never an empty backtick pair.
+        let m = rendered_for("service App:\n    x = \"a\u{202E}b\"\n", "NML0018");
+        assert!(m.contains("(fixes: remove, `\\u{202E}`)"), "{m}");
+        let m = rendered_for("service App:\n    x = \"a\u{E0067}b\"\n", "NML0018");
+        assert!(m.contains("(fixes: remove, `\\u{E0067}`)"), "{m}");
+        let m = rendered_for("service App:\n    x = \"a\u{FEFF}b\"\n", "NML0018");
+        assert!(m.contains("(fixes: remove, `\\u{FEFF}`)"), "{m}");
+
+        // The in-string reading is granted by DECODE-JUDGED soundness
+        // (`escape_preserves_value`): the escape must leave the decoded
+        // value byte-identical. Every corrupting geometry refuses for
+        // exactly the reason it corrupts — blank edge lines are dropped
+        // from the value (r28: an applied `\r` fix turned `"body"`
+        // into `"body\n\r"` with a clean post-state), a blank middle
+        // line's blankness can hold min-indent up (r29: escaping it
+        // re-indented every line), the opening line's padding is
+        // dropped, and a preceding backslash glues the spliced escape
+        // into different text. Content lines keep their repairs.
+        let no_fix = |src: &str, code: &str| {
+            let (_, diags) = parse_to_ast_all(src);
+            let hits: Vec<String> = diags
+                .iter()
+                .map(|d| d.to_string())
+                .filter(|m| m.contains(code))
+                .collect();
+            assert!(!hits.is_empty(), "{src:?}: {diags:?}");
+            assert!(
+                hits.iter().all(|m| !m.contains("(fix")),
+                "no repair in a dropped edge line: {src:?}: {hits:?}"
+            );
+        };
+        // Aligned blank closing line (no NML0020 in play): bare CR, NEL.
+        no_fix(
+            "service App:\n    doc = \"\"\"\n        body\n        \u{D}\"\"\"\n",
+            "NML0016",
+        );
+        no_fix(
+            "service App:\n    doc = \"\"\"\n        body\n        \u{85}\"\"\"\n",
+            "NML0017",
+        );
+        // Blank opening line (CR not followed by LF).
+        no_fix(
+            "service App:\n    doc = \"\"\"\u{D}  \n        body\n        \"\"\"\n",
+            "NML0016",
+        );
+        // r29 geometries. A blank middle line whose indent is BELOW the
+        // content's min-indent: escaping makes it participate and drops
+        // min for every line (the whole value re-indents) — refused.
+        no_fix(
+            "service App:\n    doc = \"\"\"\n        body\n \u{D} \n        more\n        \"\"\"\n",
+            "NML0016",
+        );
+        // The empty-min corner: the ONLY body line is blank; escaping
+        // it changes min from 0 to its own indent — refused.
+        no_fix(
+            "service App:\n    doc = \"\"\"\n \u{D} \n\"\"\"\n",
+            "NML0016",
+        );
+        // A non-blank opening line's leading PADDING is dropped by the
+        // NML0019 recovery; an escape there would join the value with
+        // the padding after it — refused.
+        no_fix(
+            "service App:\n    doc = \"\"\" \u{C}hey\n        world\n        \"\"\"\n",
+            "NML0017",
+        );
+        // A raw backslash before the character glues the spliced escape
+        // into different text (`a\\` + `\\u{1}` reads as an escaped
+        // backslash then literal `u{1}`) — refused.
+        no_fix("service App:\n    x = \"a\\\u{1}b\"\n", "NML0017");
+        // A blank middle line ALIGNED with the content's min-indent is
+        // geometry-inert: its bytes are value bytes and the escape is
+        // exact — the repair stays (over-narrowing guard).
+        let m = rendered_for(
+            "service App:\n    doc = \"\"\"\n    body\n    \u{D} \n    more\n    \"\"\"\n",
+            "NML0016",
+        );
+        assert!(m.contains("(fix: `\\r`)"), "{m}");
+        // Opening-line CONTENT (after the dropped padding) is value
+        // bytes — the repair stays.
+        let m = rendered_for(
+            "service App:\n    doc = \"\"\"x\u{1}y\n        world\n        \"\"\"\n",
+            "NML0017",
+        );
+        assert!(m.contains("(fix: `\\u{1}`)"), "{m}");
+
+        // CONTENT lines keep their repairs — the middle of the body and
+        // a non-blank closing line are value bytes (over-narrowing guard).
+        let m = rendered_for(
+            "service App:\n    doc = \"\"\"\n        a\u{1}b\n        \"\"\"\n",
+            "NML0017",
+        );
+        assert!(m.contains("(fix: `\\u{1}`)"), "{m}");
+        let m = rendered_for(
+            "service App:\n    doc = \"\"\"\n        body\n        x\u{1}\"\"\"\n",
+            "NML0017",
+        );
+        assert!(m.contains("(fix: `\\u{1}`)"), "{m}");
+
+        // Behind an UNTERMINATED string (the A2 guard) the string
+        // reading is uncertain, so the in-string taxonomy must stay
+        // silent for EVERY policy kind — a bidi control swallowed by a
+        // stray quote gets the diagnostic, never the remove|escape
+        // alternatives.
+        let (_, diags) = parse_to_ast_all("service App:\n    a = \"stray\n    b = \"x\u{202E}y\n");
+        let bidi: Vec<String> = diags
+            .iter()
+            .map(|d| d.to_string())
+            .filter(|m| m.contains("NML0018"))
+            .collect();
+        assert!(!bidi.is_empty(), "{diags:?}");
+        assert!(
+            bidi.iter().all(|m| !m.contains("(fix")),
+            "no repair behind an uncertain string reading: {bidi:?}"
+        );
+
+        // TOKEN position: no repair, either class — the character is
+        // structure there, and a rewrite would be a guess.
+        for src in [
+            "service App:\n    x\u{85} = 1\n",
+            "service App:\n    x\u{2028} = 1\n",
+            "service App:\n    x\u{E0067} = 1\n",
+            "service App:\n    x\u{1} = 1\n",
+        ] {
+            let (_, diags) = parse_to_ast_all(src);
+            for d in &diags {
+                let m = d.to_string();
+                assert!(
+                    !m.contains("(fix"),
+                    "token position carries no repair: {src:?}: {m}"
+                );
+            }
+        }
+    }
+
+    /// The sentinel-judged remove grant (D-C): the *remove* arm of a
+    /// bidi/FEFF/tag character's enumerated alternatives is offered
+    /// ONLY where deletion provably removes just that character — the
+    /// sentinel judgment (decode with a marker escape vs. decode with
+    /// the deletion) plus the delete-splice lex-integrity clause (the
+    /// spliced text must stay ONE clean String token). Where either
+    /// refuses, the set COLLAPSES to the singular escape fix — one
+    /// suggestion, auto-appliable, never a phantom remove.
+    #[test]
+    fn the_remove_arm_is_sentinel_judged_and_collapses_where_unsound() {
+        use crate::diagnostic::codes;
+        let d18 = |src: &str| -> Vec<crate::diagnostic::Diagnostic> {
+            let (_, diags) = parse_to_ast_all(src);
+            diags
+                .into_iter()
+                .filter(|d| d.code == Some(codes::INVISIBLE_CHARACTER))
+                .collect()
+        };
+        let escape_only = |src: &str, escape: &str| {
+            let hits = d18(src);
+            assert_eq!(hits.len(), 1, "{src:?}: {hits:?}");
+            let suggestions = &hits[0].suggestions;
+            assert_eq!(
+                suggestions.len(),
+                1,
+                "an unsound removal must collapse to the escape alone: {src:?}: {suggestions:?}"
+            );
+            assert_eq!(suggestions[0].replacement, escape, "{src:?}");
+        };
+        let remove_and_escape = |src: &str, escape: &str| {
+            let hits = d18(src);
+            assert_eq!(hits.len(), 1, "{src:?}: {hits:?}");
+            let suggestions = &hits[0].suggestions;
+            assert_eq!(suggestions.len(), 2, "{src:?}: {suggestions:?}");
+            assert!(
+                suggestions.iter().any(|s| s.replacement.is_empty()),
+                "sound removal keeps the remove arm: {src:?}: {suggestions:?}"
+            );
+            assert!(
+                suggestions.iter().any(|s| s.replacement == escape),
+                "{src:?}: {suggestions:?}"
+            );
+        };
+
+        // Sentinel EXHAUSTION: a value already holding all sixteen
+        // candidates U+E000–E00F leaves the picker nothing to mark
+        // with — the judgment refuses fail-closed and the set
+        // collapses, even in an otherwise-safe position. (The escape
+        // still auto-applies: exhaustion costs the remove arm, never
+        // the repair — the error-index NML0018 sentence states this
+        // split.)
+        let all16: String = ('\u{E000}'..='\u{E00F}').collect();
+        escape_only(
+            &format!("service App:\n    x = \"{all16}a\u{FEFF}b\"\n"),
+            "\\u{FEFF}",
+        );
+        // Picker SKIP: only U+E000 taken — the picker moves to U+E001
+        // and the sound remove arm survives.
+        remove_and_escape(
+            "service App:\n    x = \"\u{E000}a\u{FEFF}b\"\n",
+            "\\u{FEFF}",
+        );
+
+        // P1 — last-line blank flip: deleting the FEFF turns the final
+        // body line blank, which the edge trim then DROPS from the
+        // value ("body\n⟨char⟩" would silently become "body"). The
+        // sentinel judgment refuses; the escape stands alone.
+        escape_only(
+            "service App:\n    doc = \"\"\"\n        body\n        \u{FEFF}\"\"\"\n",
+            "\\u{FEFF}",
+        );
+        // P7 — middle-line min-indent flip: the FEFF's line holds the
+        // body's min-indent DOWN (indent 1 under content at 8);
+        // deleting it turns the line blank, min-indent jumps, and the
+        // whole value re-indents. Refused; escape alone.
+        escape_only(
+            "service App:\n    doc = \"\"\"\n        body\n \u{FEFF}\n        more\n        \"\"\"\n",
+            "\\u{FEFF}",
+        );
+        // P2 — quote merge: the FEFF separates `""` from `"`; deleting
+        // it glues them into a CLOSING `\"\"\"` and the rest of the file
+        // is re-tokenized (decode of the old token text cannot see
+        // this — the delete-splice still decodes to the "right" value,
+        // which is exactly why the lex-integrity clause exists).
+        // Refused; escape alone.
+        let p2 = "service App:\n    doc = \"\"\"\n        a\n        \"\"\u{FEFF}\"\n        \"\"\"\n    port = 1\n";
+        escape_only(p2, "\\u{FEFF}");
+        // …and applying that ONE offered fix leaves a file that parses
+        // clean with the value preserved (the escape spells the same
+        // character the raw byte carried).
+        let hits = d18(p2);
+        let sug = &hits[0].suggestions[0];
+        let mut fixed = String::new();
+        fixed.push_str(&p2[..sug.span.start]);
+        fixed.push_str(&sug.replacement);
+        fixed.push_str(&p2[sug.span.end..]);
+        let (_, diags) = parse_to_ast_all(&fixed);
+        assert!(
+            diags.is_empty(),
+            "the applied escape must land clean: {diags:?}"
+        );
+        let before = decode_value(&first_value_node(&parse(p2).syntax())).expect("value");
+        let after = decode_value(&first_value_node(&parse(&fixed).syntax())).expect("value");
+        assert_eq!(before.value, after.value, "the fix preserves the value");
+        // The four-quote corner: `\"\"` ⟨char⟩ `\"\"` — deletion makes
+        // `\"\"\"\"`, an early close plus a stray quote. Same refusal.
+        escape_only(
+            "service App:\n    doc = \"\"\"\n        a\n        \"\"\u{FEFF}\"\"\n        \"\"\"\n    port = 1\n",
+            "\\u{FEFF}",
+        );
+        // P12 — CR glue: the FEFF sits between a bare CR and an LF;
+        // deleting it fuses them into a CRLF line ending, and the CR
+        // silently leaves the VALUE (transport now, content before).
+        // The sentinel judgment refuses; escape alone.
+        escape_only(
+            "service App:\n    doc = \"\"\"\n        x\r\u{FEFF}\n        y\n        \"\"\"\n",
+            "\\u{FEFF}",
+        );
+
+        // Sound geometries keep the full enumeration — a mid-paragraph
+        // FEFF in a multiline body, and a single-line bidi control.
+        remove_and_escape(
+            "service App:\n    doc = \"\"\"\n        a\u{FEFF}b\n        \"\"\"\n",
+            "\\u{FEFF}",
+        );
+        remove_and_escape("service App:\n    x = \"a\u{202E}b\"\n", "\\u{202E}");
+    }
+
     #[test]
     fn leading_bom_accepted_interior_feff_rejected() {
         let src = "\u{FEFF}service App:\n    port = 1\n";

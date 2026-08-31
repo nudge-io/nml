@@ -348,14 +348,192 @@ fn decode_fallback(node: &SyntaxNode, sink: &mut ValueErrors) -> SpannedValue {
 
 // ── scalar decoders (spec: Strings; pinned by cst::tests + the fuzz batteries) ──
 
+/// The per-token in-string repair judge: decodes the token's value
+/// ONCE, then answers "is splicing this escape VALUE-PRESERVING —
+/// does the decoded value come out byte-identical?" per candidate.
+/// Judged against decode ITSELF rather than any mirrored geometry: a
+/// policy character in a multiline string's blank edge line, in a
+/// blank middle line whose blankness holds min-indent up, in the
+/// opening line's dropped padding, or glued to a preceding backslash
+/// all refuse here for exactly the reason the applied repair would
+/// corrupt — and a future decode change can never open a gap, because
+/// decode is the single source of truth. One judge per token bounds a
+/// flood of policy characters in one string to one unmodified-text
+/// decode, not one per character.
+pub(super) struct RepairJudge<'t> {
+    tok_text: &'t str,
+    tok_start: usize,
+    /// The token's decoded value — the baseline every judgment compares
+    /// against. `None` for a token past [`Self::MAX_JUDGED_TOKEN_BYTES`]:
+    /// no decode ran, and every judgment fails closed (the diagnostic
+    /// stands, no machine repair).
+    before: Option<String>,
+}
+
+impl<'t> RepairJudge<'t> {
+    /// Size cap on what the judge will decode-judge, in token-text
+    /// bytes. Bounds the decode judgment AND the delete-splice relex
+    /// ([`Self::remove_preserves_value`]): past it the judge stores no
+    /// baseline and refuses every repair, fail-closed. Measured basis
+    /// (r34, release, M-series): at most `MAX_ERRORS` (128) distinct
+    /// tokens can carry judged policy errors, and a maximal battery —
+    /// 128 at-cap tokens each forcing a full sentinel-picker scan plus
+    /// the marked/deleted decodes and the relex — costs ~83 ms of
+    /// judging against ~56 ms of base pipeline on the 8.4 MB file that
+    /// carries it: same order as the parse itself, linear, and hard-
+    /// capped. Only hostile inputs get near this; real embedded blobs
+    /// (a PEM certificate is ~4 KB) are unaffected.
+    const MAX_JUDGED_TOKEN_BYTES: usize = 64 * 1024;
+
+    pub(super) fn new(tok_text: &'t str, tok_start: usize) -> Self {
+        let before = if tok_text.len() > Self::MAX_JUDGED_TOKEN_BYTES {
+            // Over the cap: never decoded — the judge answers `false`
+            // to every question rather than pay unbounded decode work.
+            None
+        } else {
+            let mut sink = ValueErrors::default();
+            Some(decode_string(tok_text, tok_start, &mut sink))
+        };
+        RepairJudge {
+            tok_text,
+            tok_start,
+            before,
+        }
+    }
+
+    /// Fail-closed on any span that does not cleanly address the
+    /// token's text — or on an over-cap token, which holds no decoded
+    /// baseline (refused before any splice string is built).
+    pub(super) fn escape_preserves_value(&self, span: Span, escape: &str) -> bool {
+        let Some(before) = &self.before else {
+            return false;
+        };
+        let Some((rel_start, rel_end)) = self.splice_window(span) else {
+            return false;
+        };
+        let spliced = self.spliced(rel_start, rel_end, escape);
+        let mut sink = ValueErrors::default();
+        let after = decode_string(&spliced, self.tok_start, &mut sink);
+        *before == after
+    }
+
+    /// Is DELETING the character at `span` provably value-preserving —
+    /// does it remove JUST that character's contribution and nothing
+    /// else? Two judgments, both against the machinery itself, both
+    /// required (D-C):
+    ///
+    /// * **The sentinel judgment.** Splice a private-use sentinel's
+    ///   escape at the span: its decode must contain the sentinel
+    ///   exactly once (the deleted character's contribution, marked);
+    ///   the delete-splice's decode must equal that with the sentinel
+    ///   removed. Any structural side effect of the deletion — a line
+    ///   flipping blank into the edge trim, min-indent moving, a CR
+    ///   gluing to a following LF — makes the two decodes disagree,
+    ///   without being named here.
+    /// * **Lex integrity** ([`spliced_stays_one_string_token`], the C1
+    ///   clause). The delete-splice must still lex as exactly ONE
+    ///   clean String token covering every byte: a deletion that
+    ///   merges quote runs (`""` + `"` → `"""`) rewrites the FILE's
+    ///   token structure, which no decode of the old token text can
+    ///   see.
+    ///
+    /// The sentinel is the first of U+E000..=U+E00F absent from the
+    /// decoded value; a value holding all sixteen refuses (fail-closed,
+    /// hostile-only). Over-cap tokens refuse before any work.
+    pub(super) fn remove_preserves_value(&self, span: Span) -> bool {
+        let Some(before) = &self.before else {
+            return false;
+        };
+        let Some((rel_start, rel_end)) = self.splice_window(span) else {
+            return false;
+        };
+        let Some(sentinel) = ('\u{E000}'..='\u{E00F}').find(|c| !before.contains(*c)) else {
+            return false;
+        };
+        let marked = self.spliced(
+            rel_start,
+            rel_end,
+            &crate::source_policy::unicode_escape(sentinel),
+        );
+        let mut sink = ValueErrors::default();
+        let s = decode_string(&marked, self.tok_start, &mut sink);
+        if s.chars().filter(|c| *c == sentinel).count() != 1 {
+            return false;
+        }
+        let deleted = self.spliced(rel_start, rel_end, "");
+        if !spliced_stays_one_string_token(&deleted) {
+            return false;
+        }
+        let mut sink = ValueErrors::default();
+        let d = decode_string(&deleted, self.tok_start, &mut sink);
+        let mut expected = s;
+        expected.retain(|c| c != sentinel);
+        d == expected
+    }
+
+    /// The span's window into the token text, checked — `None` unless
+    /// the span cleanly addresses it (the shared fail-closed geometry
+    /// gate of both judgments).
+    fn splice_window(&self, span: Span) -> Option<(usize, usize)> {
+        let rel_start = span.start.checked_sub(self.tok_start)?;
+        let rel_end = span.end.checked_sub(self.tok_start)?;
+        (rel_start <= rel_end
+            && rel_end <= self.tok_text.len()
+            && self.tok_text.is_char_boundary(rel_start)
+            && self.tok_text.is_char_boundary(rel_end))
+        .then_some((rel_start, rel_end))
+    }
+
+    /// The token text with `insert` substituted over the window.
+    fn spliced(&self, rel_start: usize, rel_end: usize, insert: &str) -> String {
+        let mut spliced = String::with_capacity(self.tok_text.len() + insert.len());
+        spliced.push_str(&self.tok_text[..rel_start]);
+        spliced.push_str(insert);
+        spliced.push_str(&self.tok_text[rel_end..]);
+        spliced
+    }
+}
+
+/// The C1 lex-integrity clause of [`RepairJudge::remove_preserves_value`]:
+/// does `text` still lex as exactly ONE clean String token covering
+/// every byte? The WHOLE token vector is checked — a deletion that
+/// closes the string early leaves the remainder as further tokens, and
+/// one that unbalances the delimiters leaves lex errors; both refuse.
+fn spliced_stays_one_string_token(text: &str) -> bool {
+    let lexed = super::lexer::lex(text);
+    if !lexed.errors.is_empty() {
+        return false;
+    }
+    match lexed.tokens.as_slice() {
+        [tok] => tok.kind == SyntaxKind::String && tok.offset == 0 && tok.text.len() == text.len(),
+        _ => false,
+    }
+}
+
 /// Decode a string token's raw text (`"…"` or `"""…"""`) into its value: strip
 /// the delimiters, process escapes, and (triple-quoted) resolve the body in
 /// the text-block order — see [`decode_multiline`]. `tok_start` is the
 /// token's source offset, so escape errors get char-precise spans.
 fn decode_string(raw: &str, tok_start: usize, sink: &mut ValueErrors) -> String {
     if let Some(body) = raw.strip_prefix("\"\"\"") {
-        let body = body.strip_suffix("\"\"\"").unwrap_or(body);
-        decode_multiline(body, tok_start + 3, sink)
+        let (body, terminated) = match body.strip_suffix("\"\"\"") {
+            Some(b) => {
+                // Lexer parity: the scanner pairs `\` with its next
+                // byte, so an ODD trailing backslash run consumes one
+                // of these closing quotes as an escape — the token is
+                // lexer-UNTERMINATED even though its text ends in
+                // `"""` (a maximal trailing run is only enterable at
+                // its first byte, so termination is exactly run
+                // parity). Through NML0020 the odd arm is unreachable
+                // — that gate also needs a BLANK closing line, and a
+                // blank line carries no backslashes — but the flag
+                // must mean what its name says for the NEXT consumer.
+                let run = b.bytes().rev().take_while(|c| *c == b'\\').count();
+                (b, run % 2 == 0)
+            }
+            None => (body, false),
+        };
+        decode_multiline(body, tok_start + 3, terminated, sink)
     } else if let Some(body) = raw.strip_prefix('"') {
         let body = body.strip_suffix('"').unwrap_or(body);
         let mut out = String::with_capacity(body.len());
@@ -475,22 +653,10 @@ fn decode_unicode_escape(
     }
 }
 
-/// Decode a triple-quoted body in the text-block order (spec: Strings; the
-/// order Java's JEP 378 specifies): **transport first** — split RAW lines
-/// (a CRLF's CR belongs to the terminator), trim the blank first/last
-/// lines, compute min-indent — **then content**: decode escapes per
-/// retained line slice at its true source offset, so escape errors span
-/// exact bytes with no remapping. Content therefore can never steer
-/// transport interpretation, and escaped whitespace survives dedent
-/// ("protected space", `\s`). Shape rules enforced here, all with
-/// recovery: content on the opening line (NML0019 — the line joins the
-/// value but is excluded from indent arithmetic), tabs in body indentation
-/// (NML0005's principle, extended), a misaligned own-line closing
-/// delimiter (NML0020, machine-fixable — moving it is provably
-/// value-preserving), and `\` before a line break as Java/Swift line
-/// continuation (odd trailing-backslash run; dangling on the last line is
-/// the string-ends-mid-escape error).
-fn decode_multiline(body: &str, body_start: usize, sink: &mut ValueErrors) -> String {
+/// Split a multiline body into `(offset, line)` pairs, CRLF-trimmed (a
+/// CRLF's CR belongs to the terminator) — [`decode_multiline`]'s line
+/// reading.
+fn split_body_lines(body: &str) -> Vec<(usize, &str)> {
     let bytes = body.as_bytes();
     let mut lines: Vec<(usize, &str)> = Vec::new();
     let mut start = 0;
@@ -505,8 +671,38 @@ fn decode_multiline(body: &str, body_start: usize, sink: &mut ValueErrors) -> St
         }
     }
     lines.push((start, &body[start..]));
+    lines
+}
 
-    let is_blank = |l: &str| l.chars().all(char::is_whitespace);
+/// A line the multiline edge trim treats as blank (whitespace-only —
+/// which counts NEL/LS/PS and a bare CR, all `char::is_whitespace`).
+fn blank_line(l: &str) -> bool {
+    l.chars().all(char::is_whitespace)
+}
+
+/// Decode a triple-quoted body in the text-block order (spec: Strings; the
+/// order Java's JEP 378 specifies): **transport first** — split RAW lines
+/// ([`split_body_lines`]), trim the blank first/last
+/// lines, compute min-indent — **then content**: decode escapes per
+/// retained line slice at its true source offset, so escape errors span
+/// exact bytes with no remapping. Content therefore can never steer
+/// transport interpretation, and escaped whitespace survives dedent
+/// ("protected space", `\s`). Shape rules enforced here, all with
+/// recovery: content on the opening line (NML0019 — the line joins the
+/// value but is excluded from indent arithmetic), tabs in body indentation
+/// (NML0005's principle, extended), a misaligned own-line closing
+/// delimiter (NML0020, machine-fixable — moving it is provably
+/// value-preserving), and `\` before a line break as Java/Swift line
+/// continuation (odd trailing-backslash run; dangling on the last line is
+/// the string-ends-mid-escape error).
+fn decode_multiline(
+    body: &str,
+    body_start: usize,
+    terminated: bool,
+    sink: &mut ValueErrors,
+) -> String {
+    let lines = split_body_lines(body);
+
     let space_indent = |l: &str| l.chars().take_while(|c| *c == ' ').count();
 
     // NML0019: content begins on a NEW line. Recovery keeps the author's
@@ -515,7 +711,7 @@ fn decode_multiline(body: &str, body_start: usize, sink: &mut ValueErrors) -> St
     // from indent arithmetic, so it cannot steer dedent.
     let mut work: Vec<(usize, &str)> = Vec::new();
     if let Some((off, first)) = lines.first().copied() {
-        if !is_blank(first) {
+        if !blank_line(first) {
             let at = off + (first.len() - first.trim_start().len());
             sink.push(NmlError::syntax(
                 crate::error::ParseErrorKind::MultilineOpeningContent,
@@ -529,7 +725,7 @@ fn decode_multiline(body: &str, body_start: usize, sink: &mut ValueErrors) -> St
     // way); remember a trimmed own-line closing for the alignment check.
     let mut e = lines.len();
     let mut closing: Option<(usize, &str)> = None;
-    if e > 1 && is_blank(lines[e - 1].1) {
+    if e > 1 && blank_line(lines[e - 1].1) {
         closing = Some(lines[e - 1]);
         e -= 1;
     }
@@ -537,7 +733,7 @@ fn decode_multiline(body: &str, body_start: usize, sink: &mut ValueErrors) -> St
 
     let min_indent = retained
         .iter()
-        .filter(|(_, l)| !is_blank(l))
+        .filter(|(_, l)| !blank_line(l))
         .map(|(_, l)| space_indent(l))
         .min()
         .unwrap_or(0);
@@ -546,17 +742,27 @@ fn decode_multiline(body: &str, body_start: usize, sink: &mut ValueErrors) -> St
     // indent — the only geometry where the delimiter-anchored reading and
     // the min-indent reading could disagree, closed by making them agree.
     // Machine-fixable: rewriting the closing line's indent is provably
-    // value-preserving (the line is edge-trimmed either way).
-    if let Some((c_off, c_line)) = closing {
-        let found = space_indent(c_line);
-        if !retained.is_empty() && found != min_indent {
-            sink.push(NmlError::syntax(
-                crate::error::ParseErrorKind::MultilineClosingMisaligned {
-                    expected: min_indent,
-                    found,
-                },
-                Span::new(body_start + c_off, body_start + c_off + c_line.len()),
-            ));
+    // value-preserving (the line is edge-trimmed either way). Gated on
+    // TERMINATION: the rule's subject is the closing delimiter, and on
+    // an unterminated string the trailing blank line is a recovery
+    // artifact, not the closing quotes — NML0003 tells the real story,
+    // and the phantom "fix" rewrote whitespace at EOF (a probe grew the
+    // file by 8 bytes). The decode-layer completion of the guard's
+    // principle: trust the string reading only where it is certain.
+    // The gate is diagnostic-only — edge trim, min-indent, and the
+    // decoded value are termination-blind.
+    if terminated {
+        if let Some((c_off, c_line)) = closing {
+            let found = space_indent(c_line);
+            if !retained.is_empty() && found != min_indent {
+                sink.push(NmlError::syntax(
+                    crate::error::ParseErrorKind::MultilineClosingMisaligned {
+                        expected: min_indent,
+                        found,
+                    },
+                    Span::new(body_start + c_off, body_start + c_off + c_line.len()),
+                ));
+            }
         }
     }
 
@@ -564,7 +770,7 @@ fn decode_multiline(body: &str, body_start: usize, sink: &mut ValueErrors) -> St
         // Tabs in body indentation: NML0005's principle — column arithmetic
         // must not depend on editor settings — applies to dedent too.
         // Blank lines are exempt, as in layout.
-        if !is_blank(l) {
+        if !blank_line(l) {
             let ws = l.len() - l.trim_start().len();
             if l[..ws].contains('\t') {
                 sink.push(NmlError::syntax(

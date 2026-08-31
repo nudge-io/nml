@@ -943,9 +943,16 @@ impl fmt::Display for Rendered<'_> {
                     if i > 0 {
                         f.write_str(", ")?;
                     }
-                    f.write_str("`")?;
-                    write_sanitized(f, &s.replacement)?;
-                    f.write_str("`")?;
+                    // A deletion alternative says so, in the singular
+                    // arm's vocabulary — backticks stay reserved for
+                    // verbatim replacement text.
+                    if s.replacement.is_empty() {
+                        f.write_str("remove")?;
+                    } else {
+                        f.write_str("`")?;
+                        write_sanitized(f, &s.replacement)?;
+                        f.write_str("`")?;
+                    }
                 }
                 if many.len() > RENDERED_FIXES {
                     write!(f, ", … and {} more", many.len() - RENDERED_FIXES)?;
@@ -1052,6 +1059,18 @@ mod tests {
         // still renders no `(did you mean ""?)` nonsense.
         let legacy = Diagnostic::error("x").with_suggestion("", Span::new(1, 5));
         assert_eq!(legacy.rendered_message(), "x");
+    }
+
+    /// A deletion among ALTERNATIVES renders `remove` in the plural
+    /// arm, exactly as the singular arm renders it — backticks stay
+    /// reserved for verbatim replacement text, so an empty backtick
+    /// pair can never appear.
+    #[test]
+    fn a_deletion_alternative_renders_remove_in_the_plural_arm() {
+        let d = Diagnostic::error("x")
+            .with_fix("", Span::new(0, 1))
+            .with_fix("\\u{202E}", Span::new(0, 1));
+        assert_eq!(d.rendered_message(), "x (fixes: remove, `\\u{202E}`)");
     }
 
     #[test]

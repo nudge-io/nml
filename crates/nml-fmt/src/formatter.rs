@@ -704,12 +704,13 @@ fn format_string(out: &mut String, s: &str, depth: usize, escape_braces: bool) {
 /// rejects — a formatter emitting a raw ESC or bidi control would be
 /// writing NML0017/NML0018 into the file it produces).
 fn push_value_char(out: &mut String, ch: char) {
-    use std::fmt::Write as _;
     match ch {
         '\\' => out.push_str("\\\\"),
         '\r' => out.push_str("\\r"),
         c if nml_core::source_policy::must_escape(c) => {
-            let _ = write!(out, "\\u{{{:X}}}", c as u32);
+            // The policy's own spelling — the same string the NML0017/
+            // NML0018 messages advise and their machine repairs insert.
+            out.push_str(&nml_core::source_policy::unicode_escape(c));
         }
         c => out.push(c),
     }
@@ -980,7 +981,7 @@ mod tests {
         // the source policy live, so a formatter that laundered an
         // escape into a raw banned byte (the pre-closed-class defect for
         // NEL/CSI/LS/PS) fails here, not in a user's tree.
-        let source = "service App:\n    ansi = \"\\u{1B}[0m\"\n    bidi = \"\\u{202E}\"\n    cr = \"a\\rb\"\n    nel = \"\\u{85}\"\n    csi = \"\\u{9B}\"\n    ls = \"\\u{2028}\"\n    ps = \"\\u{2029}\"\n";
+        let source = "service App:\n    ansi = \"\\u{1B}[0m\"\n    bidi = \"\\u{202E}\"\n    cr = \"a\\rb\"\n    nel = \"\\u{85}\"\n    csi = \"\\u{9B}\"\n    ls = \"\\u{2028}\"\n    ps = \"\\u{2029}\"\n    tag = \"\\u{E0067}\"\n";
         roundtrip(source);
         idempotent(source);
         let formatted = format_source(source).unwrap();
@@ -991,7 +992,8 @@ mod tests {
         assert!(formatted.contains("\\u{9B}"), "{formatted}");
         assert!(formatted.contains("\\u{2028}"), "{formatted}");
         assert!(formatted.contains("\\u{2029}"), "{formatted}");
-        for raw in ['\u{85}', '\u{9B}', '\u{2028}', '\u{2029}'] {
+        assert!(formatted.contains("\\u{E0067}"), "{formatted}");
+        for raw in ['\u{85}', '\u{9B}', '\u{2028}', '\u{2029}', '\u{E0067}'] {
             assert!(
                 !formatted.contains(raw),
                 "a raw banned byte in formatter output: {formatted:?}"

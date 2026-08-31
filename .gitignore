@@ -30,3 +30,4 @@ editors/vscode/dist/
 editors/vscode/server/
 editors/vscode/.vscode-test/
 docs/DOCUMENTATION-PLAN.md
+docs/rfcs/

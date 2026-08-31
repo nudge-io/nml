@@ -2331,6 +2331,118 @@ async fn an_empty_verbatim_fix_is_titled_remove() {
     assert!(remove["isPreferred"].is_null(), "{remove}");
 }
 
+/// The D1 repair taxonomy at the editor: an in-string NEL's THREE
+/// alternatives (line break | kept byte | mojibake ellipsis) arrive as
+/// three separate quick-fix actions, none preferred — the editor
+/// presents the resolution space and a human picks; nothing may
+/// auto-apply a guess.
+#[tokio::test]
+async fn in_string_alternatives_are_separate_never_preferred_actions() {
+    let base = temp_dir("nel-alternatives");
+    let ws = demo_workspace(&base);
+    let mut harness = Harness::new(Store::at(base.join("store")));
+    harness.initialize(&ws).await;
+
+    let app = ws.join("nel.nml");
+    let text = "service Api:\n    note = \"x\u{85}y\"\n";
+    fs::write(&app, text).expect("write app");
+    let report = harness.open(&app, text).await;
+    let diags = report["diagnostics"].as_array().expect("diagnostics");
+    let nel = diags
+        .iter()
+        .find(|d| d["code"] == json!("NML0017"))
+        .unwrap_or_else(|| panic!("no NML0017 in {report}"))
+        .clone();
+    assert_eq!(
+        nel["data"]["suggestions"].as_array().map(Vec::len),
+        Some(3),
+        "the wire carries the whole resolution space: {nel}"
+    );
+    let result = harness
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                "range": nel["range"],
+                "context": { "diagnostics": [nel] },
+            }),
+        )
+        .await;
+    let actions: Vec<Value> = result.as_array().cloned().unwrap_or_default();
+    for title in ["Apply fix: `\\n`", "Apply fix: `\\u{85}`", "Apply fix: `…`"] {
+        let action = actions
+            .iter()
+            .find(|a| a["title"] == json!(title))
+            .unwrap_or_else(|| panic!("no {title:?} action in {result}"));
+        assert!(
+            action["isPreferred"].is_null(),
+            "an alternative must never be preferred: {action}"
+        );
+    }
+    // The mojibake repair's edit really is the ellipsis, in place.
+    let repair = actions
+        .iter()
+        .find(|a| a["title"] == json!("Apply fix: `…`"))
+        .expect("repair action");
+    let edits = &repair["edit"]["changes"][file_uri(&app).as_str()];
+    assert_eq!(edits[0]["newText"], json!("…"), "{repair}");
+}
+
+/// The D-C collapse at the editor: a FEFF holding two quote runs
+/// apart has NO sound removal (deleting it would glue a closing
+/// delimiter), so the wire carries ONE suggestion — the escape — and
+/// the code-action list offers exactly the escape quick-fix, with no
+/// `Remove` action for the editor to present.
+#[tokio::test]
+async fn an_unsound_remove_collapses_to_the_escape_action_alone() {
+    let base = temp_dir("collapsed-remove");
+    let ws = demo_workspace(&base);
+    let mut harness = Harness::new(Store::at(base.join("store")));
+    harness.initialize(&ws).await;
+
+    let app = ws.join("collapsed.nml");
+    let text = "service Api:\n    doc = \"\"\"\n        a\n        \"\"\u{FEFF}\"\n        \"\"\"\n    port = 1\n";
+    fs::write(&app, text).expect("write app");
+    let report = harness.open(&app, text).await;
+    let diags = report["diagnostics"].as_array().expect("diagnostics");
+    let feff = diags
+        .iter()
+        .find(|d| d["code"] == json!("NML0018"))
+        .unwrap_or_else(|| panic!("no NML0018 in {report}"))
+        .clone();
+    assert_eq!(
+        feff["data"]["suggestions"].as_array().map(Vec::len),
+        Some(1),
+        "an unsound removal must collapse to the escape alone: {feff}"
+    );
+    assert_eq!(
+        feff["data"]["suggestions"][0]["replacement"],
+        json!("\\u{FEFF}"),
+        "{feff}"
+    );
+    let result = harness
+        .request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": { "uri": file_uri(&app) },
+                "range": feff["range"],
+                "context": { "diagnostics": [feff] },
+            }),
+        )
+        .await;
+    let actions: Vec<Value> = result.as_array().cloned().unwrap_or_default();
+    assert!(
+        actions
+            .iter()
+            .any(|a| a["title"] == json!("Apply fix: `\\u{FEFF}`")),
+        "the escape quick-fix is offered: {result}"
+    );
+    assert!(
+        actions.iter().all(|a| a["title"] != json!("Remove")),
+        "no phantom Remove action may reach the editor: {result}"
+    );
+}
+
 /// A structural deletion whose resolution is TWO splices — the entry's
 /// row plus the colon drop on the emptied clause-carrying header —
 /// arrives as one action with one `WorkspaceEdit` holding both

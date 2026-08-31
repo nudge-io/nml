@@ -4,6 +4,57 @@
 
 ### Added
 
+- **In-string machine repairs for raw policy characters
+  (NML0017/NML0018)** — a control or invisible character inside a
+  string literal now carries its value-preserving repair(s), the way
+  NML0016's in-string CR already carried `\r`. Where one reading is
+  provable the fix is singular and `nml fix` auto-applies it (a C0 or
+  unmapped-C1 byte becomes its escape); where intent is genuinely
+  ambiguous the alternatives are enumerated and NEVER auto-applied —
+  the editor offers each as its own action, and the CLI counts the
+  finding as not auto-fixable: NEL offers `\n` | `\u{85}` | `…` (the
+  Windows-1252 double-decode reading — NEL's message hint teaches all
+  three, mirroring its repair arms), the other 26 CP-1252-mapped C1 bytes
+  offer escape | mojibake repair, LS/PS offer `\n` | escape, and bidi
+  controls, interior BOMs, and tag characters offer remove | escape —
+  with the remove arm itself judged: it is offered only where deletion
+  provably removes just that character (a sentinel-marked decode
+  comparison, plus a relex proving the deletion leaves the string ONE
+  clean token — a FEFF holding two quote runs apart, or sitting
+  between a CR and an LF, has no sound removal), and where removal is
+  refused the set collapses to the singular escape fix, which then
+  auto-applies. (`ParseErrorKind::InvisibleCharacter` gains a
+  `remove_sound` field — technically breaking for external code
+  matching that variant with named fields; `..` patterns are
+  unaffected.)
+  `nml fix` also converges capped floods in one run: when more
+  same-message findings exist than the 128-diagnostic bound renders,
+  the convergence gate now charges instances that re-surface from
+  behind the cap against the truncation marker's exact reported count
+  (previously such a round was read as failed and the run crawled
+  one fix per round into its budget); the fix summary's
+  "not auto-fixable" count no longer includes advisory info rows, and
+  when findings were suppressed past the diagnostic limit the summary
+  discloses them beside the count ("(N more suppressed past the
+  diagnostic limit)") — hidden findings are unknowns, never folded
+  into the classified count.
+  Token-position characters still carry no repair (any rewrite is a
+  structural guess), and every in-string repair is gated on decode
+  itself: the escape is offered only where splicing it leaves the
+  decoded value byte-identical, so a character in a multiline string's
+  blank edge line, in a blank line whose blankness holds min-indent up,
+  in the opening line's dropped padding, or glued to a preceding
+  backslash refuses — the exact geometries where an applied escape
+  silently changed the value. The judgment itself is bounded: a string
+  token past 64 KiB is never decode-judged, so its policy diagnostics
+  stand with no machine repair (fail-closed; hostile-only in practice —
+  a PEM-sized blob is ~4 KB). Under the hood the fix-vs-did-you-mean textual
+  heuristic is gone: each error kind now declares its repair class
+  (`Repairs` — none, did-you-mean, singular fix, or alternatives), and
+  diagnostic messages, repair text, and formatter output all share one
+  escape-spelling function, so the advised and emitted spellings can
+  never drift.
+
 - **RFC 0019: instance layer composition (`uses`) and sealed fields** —
   slice 1 (the language kernel). An instance block may declare
   `uses <ref>, …` in its header; the stack linearizes by C3 (in NML's
@@ -281,7 +332,12 @@
   hint teaches both. `nml fmt` previously re-rendered those escapes as
   RAW bytes (so a formatted file could newly fail) — it now emits the
   escapes, restoring "formatted output never carries a character the
-  parser rejects" as a tested invariant.
+  parser rejects" as a tested invariant. The Unicode tag block
+  U+E0000–U+E007F (128 code points — a deprecated invisible mirror of
+  ASCII) joins the NML0018 set: a raw tag sequence hides an ASCII
+  payload inside what displays as ordinary text, and previously drew
+  zero diagnostics anywhere; emoji tag sequences are content and are
+  written with escapes (`\u{1F3F4}\u{E0067}…`).
 
 - **Quoted-literal migration teaching extended (NML0001)** — quoted
   numbers (`port = "3000"`) and quoted bools (`admin = "true"`) against
@@ -424,7 +480,10 @@
     escaped newlines/whitespace are content, never indentation. Content
     must begin on the line after the opening `"""` (NML0019), an
     own-line closing `"""` must align with the content (NML0020,
-    machine-fixable), tabs may not appear in body indentation
+    machine-fixable — and gated on termination: an unterminated
+    string's trailing blank line is a recovery artifact, not the
+    closing quotes, so it reports only the missing delimiter), tabs
+    may not appear in body indentation
     (NML0005 extended), and `\` before a line break is Java/Swift line
     continuation. Line endings are transport: LF and CRLF documents are
     byte-identical in value (fuzz-verified).

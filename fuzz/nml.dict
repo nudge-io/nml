@@ -111,3 +111,22 @@
 "// "
 "#live"
 "#restart"
+
+# ── hostile characters (source-character policy) ────────────────────────
+# Raw bytes the policy must diagnose, never pass or mangle. U+E0067
+# (TAG LATIN SMALL LETTER G): the invisible-ASCII tag block.
+"\xf3\xa0\x81\xa7"
+# U+FEFF raw (interior BOM), U+202E (RLO bidi), U+0085 (NEL), U+2028 (LS)
+"\xef\xbb\xbf"
+"\xe2\x80\xae"
+"\xc2\x85"
+"\xe2\x80\xa8"
+# Private-use sentinels U+E000/U+E00F: the remove-judgment's marker
+# range — values already holding them steer the sentinel picker (and
+# all-16-present is its fail-closed refusal).
+"\xee\x80\x80"
+"\xee\x80\x8f"
+# Quote runs: the delete-splice relex corners (quote-merge shapes).
+"\"\""
+"\"\"\""
+"\"\"\"\""
