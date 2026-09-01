@@ -1,0 +1,467 @@
+model d1:
+    child d2
+
+model d2:
+    child d3
+
+model d3:
+    child d4
+
+model d4:
+    child d5
+
+model d5:
+    child d6
+
+model d6:
+    child d7
+
+model d7:
+    child d8
+
+model d8:
+    child d9
+
+model d9:
+    child d10
+
+model d10:
+    child d11
+
+model d11:
+    child d12
+
+model d12:
+    child d13
+
+model d13:
+    child d14
+
+model d14:
+    child d15
+
+model d15:
+    child d16
+
+model d16:
+    child d17
+
+model d17:
+    child d18
+
+model d18:
+    child d19
+
+model d19:
+    child d20
+
+model d20:
+    child d21
+
+model d21:
+    child d22
+
+model d22:
+    child d23
+
+model d23:
+    child d24
+
+model d24:
+    child d25
+
+model d25:
+    child d26
+
+model d26:
+    child d27
+
+model d27:
+    child d28
+
+model d28:
+    child d29
+
+model d29:
+    child d30
+
+model d30:
+    child d31
+
+model d31:
+    child d32
+
+model d32:
+    child d33
+
+model d33:
+    child d34
+
+model d34:
+    child d35
+
+model d35:
+    child d36
+
+model d36:
+    child d37
+
+model d37:
+    child d38
+
+model d38:
+    child d39
+
+model d39:
+    child d40
+
+model d40:
+    leaf string
+
+model cfgd:
+    root d1
+
+cfgd base:
+    root:
+        child:
+            child:
+                child:
+                    child:
+                        child:
+                            child:
+                                child:
+                                    child:
+                                        child:
+                                            child:
+                                                child:
+                                                    child:
+                                                        child:
+                                                            child:
+                                                                child:
+                                                                    child:
+                                                                        child:
+                                                                            child:
+                                                                                child:
+                                                                                    child:
+                                                                                        child:
+                                                                                            child:
+                                                                                                child:
+                                                                                                    child:
+                                                                                                        child:
+                                                                                                            child:
+                                                                                                                child:
+                                                                                                                    child:
+                                                                                                                        child:
+                                                                                                                            child:
+                                                                                                                                child:
+                                                                                                                                    child:
+                                                                                                                                        child:
+                                                                                                                                            child:
+                                                                                                                                                child:
+                                                                                                                                                    child:
+                                                                                                                                                        child:
+                                                                                                                                                            child:
+                                                                                                                                                                child:
+                                                                                                                                                                    leaf = "v0"
+
+cfgd l1 uses base:
+    root:
+        child:
+            child:
+                child:
+                    child:
+                        child:
+                            child:
+                                child:
+                                    child:
+                                        child:
+                                            child:
+                                                child:
+                                                    child:
+                                                        child:
+                                                            child:
+                                                                child:
+                                                                    child:
+                                                                        child:
+                                                                            child:
+                                                                                child:
+                                                                                    child:
+                                                                                        child:
+                                                                                            child:
+                                                                                                child:
+                                                                                                    child:
+                                                                                                        child:
+                                                                                                            child:
+                                                                                                                child:
+                                                                                                                    child:
+                                                                                                                        child:
+                                                                                                                            child:
+                                                                                                                                child:
+                                                                                                                                    child:
+                                                                                                                                        child:
+                                                                                                                                            child:
+                                                                                                                                                child:
+                                                                                                                                                    child:
+                                                                                                                                                        child:
+                                                                                                                                                            child:
+                                                                                                                                                                child:
+                                                                                                                                                                    leaf = "v1"
+
+cfgd l2 uses l1:
+    root:
+        child:
+            child:
+                child:
+                    child:
+                        child:
+                            child:
+                                child:
+                                    child:
+                                        child:
+                                            child:
+                                                child:
+                                                    child:
+                                                        child:
+                                                            child:
+                                                                child:
+                                                                    child:
+                                                                        child:
+                                                                            child:
+                                                                                child:
+                                                                                    child:
+                                                                                        child:
+                                                                                            child:
+                                                                                                child:
+                                                                                                    child:
+                                                                                                        child:
+                                                                                                            child:
+                                                                                                                child:
+                                                                                                                    child:
+                                                                                                                        child:
+                                                                                                                            child:
+                                                                                                                                child:
+                                                                                                                                    child:
+                                                                                                                                        child:
+                                                                                                                                            child:
+                                                                                                                                                child:
+                                                                                                                                                    child:
+                                                                                                                                                        child:
+                                                                                                                                                            child:
+                                                                                                                                                                child:
+                                                                                                                                                                    leaf = "v2"
+
+cfgd l3 uses l2:
+    root:
+        child:
+            child:
+                child:
+                    child:
+                        child:
+                            child:
+                                child:
+                                    child:
+                                        child:
+                                            child:
+                                                child:
+                                                    child:
+                                                        child:
+                                                            child:
+                                                                child:
+                                                                    child:
+                                                                        child:
+                                                                            child:
+                                                                                child:
+                                                                                    child:
+                                                                                        child:
+                                                                                            child:
+                                                                                                child:
+                                                                                                    child:
+                                                                                                        child:
+                                                                                                            child:
+                                                                                                                child:
+                                                                                                                    child:
+                                                                                                                        child:
+                                                                                                                            child:
+                                                                                                                                child:
+                                                                                                                                    child:
+                                                                                                                                        child:
+                                                                                                                                            child:
+                                                                                                                                                child:
+                                                                                                                                                    child:
+                                                                                                                                                        child:
+                                                                                                                                                            child:
+                                                                                                                                                                child:
+                                                                                                                                                                    leaf = "v3"
+
+cfgd l4 uses l3:
+    root:
+        child:
+            child:
+                child:
+                    child:
+                        child:
+                            child:
+                                child:
+                                    child:
+                                        child:
+                                            child:
+                                                child:
+                                                    child:
+                                                        child:
+                                                            child:
+                                                                child:
+                                                                    child:
+                                                                        child:
+                                                                            child:
+                                                                                child:
+                                                                                    child:
+                                                                                        child:
+                                                                                            child:
+                                                                                                child:
+                                                                                                    child:
+                                                                                                        child:
+                                                                                                            child:
+                                                                                                                child:
+                                                                                                                    child:
+                                                                                                                        child:
+                                                                                                                            child:
+                                                                                                                                child:
+                                                                                                                                    child:
+                                                                                                                                        child:
+                                                                                                                                            child:
+                                                                                                                                                child:
+                                                                                                                                                    child:
+                                                                                                                                                        child:
+                                                                                                                                                            child:
+                                                                                                                                                                child:
+                                                                                                                                                                    leaf = "v4"
+
+cfgd l5 uses l4:
+    root:
+        child:
+            child:
+                child:
+                    child:
+                        child:
+                            child:
+                                child:
+                                    child:
+                                        child:
+                                            child:
+                                                child:
+                                                    child:
+                                                        child:
+                                                            child:
+                                                                child:
+                                                                    child:
+                                                                        child:
+                                                                            child:
+                                                                                child:
+                                                                                    child:
+                                                                                        child:
+                                                                                            child:
+                                                                                                child:
+                                                                                                    child:
+                                                                                                        child:
+                                                                                                            child:
+                                                                                                                child:
+                                                                                                                    child:
+                                                                                                                        child:
+                                                                                                                            child:
+                                                                                                                                child:
+                                                                                                                                    child:
+                                                                                                                                        child:
+                                                                                                                                            child:
+                                                                                                                                                child:
+                                                                                                                                                    child:
+                                                                                                                                                        child:
+                                                                                                                                                            child:
+                                                                                                                                                                child:
+                                                                                                                                                                    leaf = "v5"
+
+cfgd l6 uses l5:
+    root:
+        child:
+            child:
+                child:
+                    child:
+                        child:
+                            child:
+                                child:
+                                    child:
+                                        child:
+                                            child:
+                                                child:
+                                                    child:
+                                                        child:
+                                                            child:
+                                                                child:
+                                                                    child:
+                                                                        child:
+                                                                            child:
+                                                                                child:
+                                                                                    child:
+                                                                                        child:
+                                                                                            child:
+                                                                                                child:
+                                                                                                    child:
+                                                                                                        child:
+                                                                                                            child:
+                                                                                                                child:
+                                                                                                                    child:
+                                                                                                                        child:
+                                                                                                                            child:
+                                                                                                                                child:
+                                                                                                                                    child:
+                                                                                                                                        child:
+                                                                                                                                            child:
+                                                                                                                                                child:
+                                                                                                                                                    child:
+                                                                                                                                                        child:
+                                                                                                                                                            child:
+                                                                                                                                                                child:
+                                                                                                                                                                    leaf = "v6"
+
+cfgd l7 uses l6:
+    root:
+        child:
+            child:
+                child:
+                    child:
+                        child:
+                            child:
+                                child:
+                                    child:
+                                        child:
+                                            child:
+                                                child:
+                                                    child:
+                                                        child:
+                                                            child:
+                                                                child:
+                                                                    child:
+                                                                        child:
+                                                                            child:
+                                                                                child:
+                                                                                    child:
+                                                                                        child:
+                                                                                            child:
+                                                                                                child:
+                                                                                                    child:
+                                                                                                        child:
+                                                                                                            child:
+                                                                                                                child:
+                                                                                                                    child:
+                                                                                                                        child:
+                                                                                                                            child:
+                                                                                                                                child:
+                                                                                                                                    child:
+                                                                                                                                        child:
+                                                                                                                                            child:
+                                                                                                                                                child:
+                                                                                                                                                    child:
+                                                                                                                                                        child:
+                                                                                                                                                            child:
+                                                                                                                                                                child:
+                                                                                                                                                                    leaf = "v7"
+

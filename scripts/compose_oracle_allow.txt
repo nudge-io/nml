@@ -1,0 +1,48 @@
+# RFC 0025 — intended behavior differences between the Phase-1 tag and
+# the Phase-3 engine (the changelog of intended differences, Phase 5).
+# One substring per line, matched against the harvested test name or
+# fixture path. Each row = one INTENDED flip, with its reason.
+#
+# K: the token materializes under the COMPOSED arm — the foreign
+# `name` no longer lands (RFC 0025 §3).
+item_token_materializes_under_the_composed_arm
+# K3: the zero-item verdict reads the COMPOSED arm — no NML2079 under
+# a foreign arm's reading (RFC 0025 §3).
+item_zero_item_verdict_under_the_composed_arm
+# B2: the fold precedes materialization — an NML2043-invalid `+` token
+# never doubles as a stated discriminator, so no switch and no NML2060
+# (RFC 0025 §2).
+an_invalid_token_discriminator_never_switches
+# P6: the token-restatement strip is deleted — an authored equal-value
+# restatement of a sealed `+` field is NML2060 equal-value (RFC 0025 §3).
+an_authored_restatement_of_a_sealed_token_is_stripped_today
+# Row 1 of the loser table: a rejected switch's body diagnoses under
+# its OWN arm — its zero-item verdicts appear (RFC 0025 §4).
+a_rejected_switch_loser_reads_the_survivors_vocabulary_today
+# Row 2 of the loser table: a switch-DISPLACED body diagnoses under its
+# own arm — the displaced base's `hosts = []` is NML2079 there
+# (RFC 0025 §4).
+zero_item_sealed_list_entry_does_not_block_a_switch
+# One fold per group: the pairwise engine re-recorded an item's interior
+# provenance at every pairwise step (duplicate rows; a row for an
+# intermediate winner a later switch displaced). The n-ary merge records
+# each composed field once — the effective row per path is unchanged
+# (RFC 0025 §3; provenance lookups are path-keyed, multiplicity was
+# noise).
+three_layer_identity_item_provenance_is_the_base_span
+item_scope_notes_follow_a_switched_head
+item_scope_notes_point_at_the_base_item
+item_scope_union_faces_fire_with_item_paths
+# K-class corollary: an array-spelled base item (`xs = ["a"]`) now
+# carries its identity token in the composed body — the whole-layer
+# pipeline materialized tokens BEFORE array re-spelling, so these items
+# never got one, and the strip then deleted the upper copy: the composed
+# item lost its token entirely (RFC 0025 §3 materializes once, into the
+# lowest surviving body, after the fold).
+one_layer_stating_a_field_twice_is_one_layer
+
+# Phase-3 renamed the two pins below (the harvest-time corpus keys on
+# the OLD names above; a fresh harvest emits the new ones — both rows
+# name the same intended flips):
+an_authored_restatement_of_a_sealed_token_is_nml2060
+a_rejected_switch_loser_diagnoses_under_its_own_arm
