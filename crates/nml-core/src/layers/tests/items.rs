@@ -1155,14 +1155,15 @@ flow t uses base:
     assert!(has_name, "the + token materializes through the arm");
 }
 
-/// The gather-drop token mask (r42 fold, r43-probed): a dropped
-/// SHORTHAND item's `.shared`-shifted reading is masked at its token
-/// field — the list-wide `.ikind = "b"` never reaches it, so the drop
-/// diagnoses under its own default arm, where the undeclared
-/// `extras = []` is silent. The NAMED twin has no token: the shared
-/// discriminator reaches it, flips its reading to the arm where
-/// `extras` IS a list, and the dropped interior's NML2079 surfaces.
-/// One rule (RFC 0005 §10), both directions pinned.
+/// A gather drop reads token-first (r44): a dropped SHORTHAND item is
+/// diagnosed through the lone-member pipeline — its token materializes
+/// before the layer's `.shared` distributes, so the list-wide
+/// `.ikind = "b"` never claims the field (RFC 0005 §10, order does the
+/// yielding), and `- "zzz"` reads as a STATED-UNKNOWN arm — no
+/// vocabulary, never a guess — where `extras = []` is silent. The
+/// NAMED twin has no token: the shared discriminator reaches it, flips
+/// its reading to the arm where `extras` IS a list, and the dropped
+/// interior's NML2079 surfaces. One rule, both directions pinned.
 #[test]
 fn a_dropped_items_shared_reading_yields_to_its_token() {
     const S: &str = "\
@@ -1204,7 +1205,8 @@ app top uses base:
         !diags
             .iter()
             .any(|d| d.code == Some(codes::ZERO_ITEM_LAYER_ENTRY)),
-        "the token mask keeps the shared discriminator OFF the drop: {diags:?}"
+        "the materialized token keeps the shared discriminator OFF the \
+         drop, and an unknown arm reads with no vocabulary: {diags:?}"
     );
 
     let named_drop = shorthand_drop.replace("- \"zzz\":", "- zzz:");
@@ -1221,5 +1223,168 @@ app top uses base:
             .any(|d| d.code == Some(codes::ZERO_ITEM_LAYER_ENTRY) && d.message.contains("extras")),
         "a Named drop has no token — the shared write reaches and the \
          interior verdict surfaces under the shifted reading: {diags:?}"
+    );
+}
+
+/// The LOST direction (r44): a dropped within-layer DUPLICATE reads
+/// through its token — `- "b": extras = []` diagnoses under arm "b",
+/// where `extras` IS a list, so the zero-item verdict it would have
+/// drawn composing alone surfaces on the drop too. (The mask-era
+/// projection read the drop under the DEFAULT arm, where `extras` is
+/// undeclared, and swallowed the warning its surviving twin drew.)
+#[test]
+fn a_dropped_duplicates_interior_warns_under_its_tokens_arm() {
+    const S: &str = "\
+model aArm:
+    ikind string+
+    va string
+
+model bArm:
+    ikind string+
+    extras []string
+
+oneof istep by ikind = \"a\":
+    \"a\" -> aArm
+    \"b\" -> bArm
+
+model app:
+    xs []istep #identity
+";
+    let src = "\
+app base:
+    xs:
+        - \"b\":
+            extras = [\"x\"]
+        - \"b\":
+            extras = []
+
+app top uses base:
+    xs:
+        - \"b\":
+            extras = [\"y\"]
+";
+    let (_, diags) = compose(S, src, "app", "top");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == Some(codes::IDENTITY_REDEFINITION)),
+        "{diags:?}"
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == Some(codes::ZERO_ITEM_LAYER_ENTRY) && d.message.contains("extras")),
+        "the dropped duplicate's token ascribes arm \"b\", where \
+         'extras' is a list — the zero-item verdict surfaces exactly \
+         as it would have composing alone: {diags:?}"
+    );
+}
+
+/// The FABRICATED direction (r44): a dropped duplicate's token
+/// ascribes arm "b", where `zs` is NOT a field — so the NML2079 the
+/// mask-era DEFAULT-arm reading fabricated (`zs` is a list only under
+/// arm "a", an arm the author never wrote) no longer fires.
+#[test]
+fn a_dropped_duplicates_reading_is_its_token_not_the_default_arm() {
+    const S: &str = "\
+model aArm:
+    ikind string+
+    zs []string
+
+model bArm:
+    ikind string+
+    note string
+
+oneof istep by ikind = \"a\":
+    \"a\" -> aArm
+    \"b\" -> bArm
+
+model app:
+    xs []istep #identity
+";
+    let src = "\
+app base:
+    xs:
+        - \"b\":
+            note = \"n\"
+        - \"b\":
+            zs = []
+
+app top uses base:
+    xs:
+        - \"b\":
+            note = \"n2\"
+";
+    let (_, diags) = compose(S, src, "app", "top");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == Some(codes::IDENTITY_REDEFINITION)),
+        "{diags:?}"
+    );
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.code == Some(codes::ZERO_ITEM_LAYER_ENTRY)),
+        "the drop's token ascribes arm \"b\" — 'zs' is not a list \
+         there, and the default arm's reading is not the author's: {diags:?}"
+    );
+}
+
+/// The OUT-OF-FAMILY find (r44, P8): no oneof in sight — a plain model
+/// list whose `+` token field is itself LIST-typed. An empty-array
+/// token materializes through the lone-member pipeline, so a surviving
+/// lone `[]` warns NML2079 (zero items in a composing layer) — and a
+/// DROPPED `[]` now warns it too, its token materialized exactly as
+/// its twin's. (The mask-era projection never materialized a drop's
+/// token, and the drop's zero-item verdict was silently swallowed.)
+#[test]
+fn a_dropped_items_empty_array_token_warns_like_its_surviving_twin() {
+    const S: &str = "\
+model step:
+    zs []string+
+    note string
+
+model app:
+    xs []step #identity
+";
+    // The twin: the same `[]` item SURVIVING as a lone singleton.
+    let survivor = "\
+app base:
+    xs = [[\"x\"], []]
+
+app top uses base:
+    xs = [[\"x\"]]
+";
+    let (_, diags) = compose(S, survivor, "app", "top");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == Some(codes::ZERO_ITEM_LAYER_ENTRY) && d.message.contains("zs")),
+        "a surviving lone `[]` materializes its token and warns: {diags:?}"
+    );
+
+    // The drop: the same `[]` item, unmatched under an established base.
+    let dropped = "\
+app base:
+    xs = [[\"x\"]]
+
+app top uses base:
+    xs = [[]]
+";
+    let (_, diags) = compose(S, dropped, "app", "top");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == Some(codes::UNMATCHED_OVERLAY_ITEM)),
+        "{diags:?}"
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == Some(codes::ZERO_ITEM_LAYER_ENTRY) && d.message.contains("zs")),
+        "the dropped item's empty-array token materializes into 'zs' \
+         and the zero-item verdict surfaces exactly as its surviving \
+         twin's — the masked reading swallowed it: {diags:?}"
     );
 }

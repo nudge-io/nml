@@ -152,8 +152,11 @@ fn prepared_member_body(
 /// (composition never materializes it), so a list-wide `.name` keeps
 /// reaching a Named item.
 /// The member's token-field mask for `.shared` distribution (RFC 0005
-/// §10): a Shorthand member's `+` field, read from its own model — the
-/// ONE derivation the group path and the drop diagnosis share.
+/// §10): a Shorthand member's `+` field, read from its own model —
+/// the MULTI-member group path's stand-in for the token the post-fold
+/// injection will claim (a lone member needs no mask: its token is
+/// already in the body when `.shared` distributes —
+/// [`prepare_lone_member`]).
 fn token_mask(
     index: &SchemaIndex,
     target: &ItemTarget,
@@ -174,6 +177,42 @@ fn distribute_shared_level(body: &Body, shared: &[SharedProperty], mask: Option<
         .filter(|sp| mask != Some(sp.name.name.as_str()))
         .collect();
     crate::resolve::merge_shared_into_body(body, &selected)
+}
+
+/// The LONE-member pipeline (RFC 0025 §§3-4), shared by the surviving
+/// singleton's compose and the gather drop's diagnosis: no fold to
+/// precede, so the member's identity token materializes into the body
+/// FIRST, under its own pre-token reading (lenient — an explicit value
+/// wins), then the layer's list-level `.shared` distributes and yields
+/// to the now-present token by order (RFC 0005 §10), then the reading
+/// derives from the result. One pipeline, two consumers: a drop is
+/// diagnosed exactly as it would have composed alone, its token
+/// carrying the author's arm ascription (§4 — its OWN reading; a token
+/// naming no arm reads as stated-unknown, never a guess).
+fn prepare_lone_member<'i>(
+    index: &'i SchemaIndex,
+    target: &'i ItemTarget,
+    shared: &[SharedProperty],
+    item: &ListItem,
+    body: Body,
+) -> (Body, Vocab<'i>) {
+    let body = match (&item.kind, member_model(index, target, &body)) {
+        (ListItemKind::Shorthand { value, .. }, Some(m)) => {
+            let token = crate::identity::ItemToken {
+                value: value.clone(),
+            };
+            let materialized = crate::identity::materialize_token(&token, &body, m);
+            if materialized.validatable {
+                materialized.body
+            } else {
+                body
+            }
+        }
+        _ => body,
+    };
+    let body = distribute_shared_level(&body, shared, None);
+    let vocab = member_vocab(index, target, &body);
+    (body, vocab)
 }
 
 /// Token-only prehash (kind-blind): buckets candidates for identity
@@ -442,20 +481,20 @@ impl<'a, 'd> Merger<'a, 'd> {
             }
         }
         // §4 — a gather drop is a loser with no group (a dropped member
-        // never anchors one): its interior diagnoses under its own
-        // reading, over the shared-distributed body it would have
-        // brought. No token is materialized into a drop — the mask
-        // below stands in for the token's yielding claim (RFC 0005
-        // §10), so a `.shared` naming the field never writes it.
+        // never anchors one): its interior diagnoses under its OWN
+        // reading, through the very pipeline a surviving singleton
+        // composes by ([`prepare_lone_member`]) — token materialized
+        // first, then `.shared` distributed (order does the yielding,
+        // RFC 0005 §10), then the reading derived — so a drop and its
+        // surviving twin read alike, the token carrying the author's
+        // arm ascription into the diagnosis.
         let index = self.index;
         for (li, item) in &drops {
             let drop_path = format!("{path}[{}]", ItemKey::of(&item.kind).segment());
             let (layer, _, shared, _) = &per_layer[*li];
             self.diagnose_discards(&drop_path, std::slice::from_ref(item), &Vec::new(), |it| {
                 prepared_member_body(index, target, shared, it, false).map(|b| {
-                    let mask = token_mask(index, target, it, &b);
-                    let b = distribute_shared_level(&b, shared, mask.as_deref());
-                    let vocab = member_vocab(index, target, &b);
+                    let (b, vocab) = prepare_lone_member(index, target, shared, it, b);
                     (*layer, Cow::Owned(b), vocab)
                 })
             });
@@ -503,30 +542,12 @@ impl<'a, 'd> Merger<'a, 'd> {
             let (_, _, shared, _) = &per_layer[group.members[0].0];
             let composed = match prepared.into_iter().next() {
                 Some((layer, item, Some(body))) => {
-                    // No fold to precede: the singleton's token
-                    // materializes under its own reading FIRST (lenient
-                    // — an explicit value wins), then the layer's
-                    // list-level `.shared` distributes and yields to the
-                    // now-present token by order (RFC 0005 §10), then
-                    // the body deep-normalizes under that reading — the
-                    // whole-layer pass's exact pipeline for an unpaired
-                    // item.
-                    let body = match (&item.kind, member_model(index, target, &body)) {
-                        (ListItemKind::Shorthand { value, .. }, Some(m)) => {
-                            let token = crate::identity::ItemToken {
-                                value: value.clone(),
-                            };
-                            let materialized = crate::identity::materialize_token(&token, &body, m);
-                            if materialized.validatable {
-                                materialized.body
-                            } else {
-                                body
-                            }
-                        }
-                        _ => body,
-                    };
-                    let body = distribute_shared_level(&body, shared, None);
-                    let vocab = member_vocab(index, target, &body);
+                    // The lone-member pipeline ([`prepare_lone_member`]:
+                    // token first, then `.shared`, then the reading),
+                    // then the body deep-normalizes under that reading —
+                    // the whole-layer pass's exact treatment of an
+                    // unpaired item.
+                    let (body, vocab) = prepare_lone_member(index, target, shared, item, body);
                     let deep = normalize_level(
                         index,
                         vocab,
