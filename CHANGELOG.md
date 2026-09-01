@@ -4,6 +4,39 @@
 
 ### Added
 
+- **Normalize-on-merge (RFC 0025, phases 0–4)** — layer composition now
+  runs ONE walk: the merge decides at each level over the raw,
+  array-ref-inlined supplies, normalizes only the survivors under the
+  decided variant, diagnoses discarded bodies by subtraction under
+  their own readings, and folds an identity-item group once — before
+  its token materializes, into the lowest surviving body only. The
+  composition plan (`build_arm_plan` and its per-position decision
+  traces), the per-layer whole-body normalization pass, and the
+  token-restatement strip are deleted; one normalizer with a depth
+  policy (`ThisLevel`/`Deep`) serves the merge and the seal backstop
+  (defaulting keeps the shared positionalizer, `apply_positional`),
+  and every compose finding is emitted through a sink
+  ordered by a total key (stack position, source, span, code, message).
+  The plan-authority and boundary-assertion narrative of earlier
+  releases is superseded: the boundary NML2086 assertion stays and is
+  now proven live by a fold-tamper seam. Behavior changes, each pinned:
+  an identity item's `+` token and its zero-item verdicts now read the
+  COMPOSED arm (previously the item's own default arm injected a
+  foreign token silently); an NML2043-invalid token never doubles as a
+  stated discriminator; an authored equal-value restatement of a sealed
+  `+` field is NML2060 (previously silently stripped); rejected and
+  switch-displaced bodies — root and dotted — are diagnosed under
+  their OWN stated arms, nested positions included; an array-spelled
+  base item's composed body now carries its identity token. Diagnostic
+  order within one layer follows span order (cross-layer stack order is
+  unchanged); pairwise-intermediate provenance rows (duplicates, and
+  rows for later-displaced winners) collapse to one row per composed
+  field. Phase 4 closes the arc with a pure move of `layers.rs`
+  into the `layers/` module directory (grants, instances, policy,
+  linearize, entries, decide, seal, normalize, `merge/{mod,oneof,union,
+  items}` and a per-battery `tests/` tree) — public surface, test
+  counts, composed output and timings unchanged.
+
 - **In-string machine repairs for raw policy characters
   (NML0017/NML0018)** — a control or invisible character inside a
   string literal now carries its value-preserving repair(s), the way

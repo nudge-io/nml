@@ -50,7 +50,7 @@ use crate::types::{Directive, PrimitiveType, SpannedValue, Value};
 /// Where an effective value came from. `Span` is byte offsets into ONE file,
 /// so provenance always carries the file; a schema-synthesized default has no
 /// source location at all.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum Origin {
     File {
         file: PathBuf,

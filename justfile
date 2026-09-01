@@ -131,6 +131,39 @@ fuzz target='number' time='60':
         fuzz/corpus/{{target}} fuzz/seeds/{{target}} \
         -- -max_total_time={{time}} -dict=fuzz/nml.dict
 
+# The RFC 0025 timing cross-check: hyperfine over `nml check` on the five
+# generated composition stacks (tests/fixtures/layers/perf/). The precise
+# gate is a SAME-SESSION two-binary comparison — absolutes drift across
+# machines — so run it once before and once after an engine change and
+# compare; the in-process tripwires
+# (`cargo test -p nml-core --release -- --ignored perf_`) are the
+# portable coarse gate. Fails loudly when hyperfine is absent.
+perf-layers:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v hyperfine >/dev/null || {
+        echo "error: hyperfine is not installed (brew install hyperfine)" >&2
+        echo "the portable gate: cargo test -p nml-core --release -- --ignored perf_" >&2
+        exit 1
+    }
+    cargo build --release -p nml-cli
+    for f in tests/fixtures/layers/perf/*.nml; do
+        hyperfine --warmup 3 --min-runs 20 "target/release/nml check $f"
+    done
+
+# The RFC 0025 two-binary compose oracle (dev-time; CI never holds the
+# tagged binary). Harvest the battery corpus, then compare an oracle
+# binary (built from the Phase-1 tag) against the working tree:
+#   NML_CORPUS_DUMP=/tmp/nml-corpus cargo test -p nml-core --lib layers
+#   just oracle-layers /path/to/tagged/nml /tmp/nml-corpus
+# The allow-list (scripts/compose_oracle_allow.txt) is the changelog of
+# intended differences; anything else fails.
+oracle-layers oracle corpus='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -p nml-cli
+    python3 scripts/compose_oracle.py --oracle "{{oracle}}"         ${NML_ORACLE_CORPUS:+--corpus "$NML_ORACLE_CORPUS"}         {{ if corpus != '' { '--corpus "' + corpus + '"' } else { '' } }}
+
 # Clean build artifacts
 clean:
     cargo clean

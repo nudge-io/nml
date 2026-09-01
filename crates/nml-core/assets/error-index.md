@@ -1889,7 +1889,9 @@ supplying the list, so it neither replaces nor empties anything — and
 at a union position it never establishes a variant either (the lowest
 layer that *supplies* establishes; RFC 0019 errata E7). Because the
 author may have *meant* "clear the base list" (an operation with no
-merge spelling), it is always diagnosed, never silently ignored.
+merge spelling), it is always diagnosed, never silently ignored — a
+discarded body included: it is diagnosed under its own readings
+(RFC 0025).
 
 **Fix:** delete the entry, or supply the items the layer should
 contribute. Emptying a base list is not expressible; where entries must
@@ -1982,12 +1984,10 @@ restate the structural value where one is established.
 **Internal composition invariant violated.** The compose engine reached
 a decision it holds to be unreachable.
 
-Examples: a union-only verdict at a oneof position; a planned union
-position whose supplies no longer match its plan. The engine fails safe
+Example: a union-only verdict at a oneof position. The engine fails safe
 and loud rather than composing something silently wrong — the message
 names the position and says what happened to the layer's contribution:
-it was not composed, or (for a plan that no longer matches) composition
-fell back to a local fold and the plan was ignored. It should never
+it was not composed. It should never
 appear on valid or invalid input alike. The editor guards its compose
 pass the same way: an internal error degrades to raw-text findings plus
 this code at the top of the buffer, never a dark buffer.

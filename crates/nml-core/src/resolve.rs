@@ -418,7 +418,9 @@ pub fn apply_shared_properties(body: &Body) -> Body {
 
 /// Recurse into a (just-merged) item's own body so ITS scopes apply their
 /// own shared properties. Bodyless scalars and references have no scopes.
-fn apply_shared_in_item(item: ListItem) -> ListItem {
+/// `pub(crate)`: the merge's deep pass runs it over passthrough and
+/// modifier-block items (RFC 0025 §2).
+pub(crate) fn apply_shared_in_item(item: ListItem) -> ListItem {
     let span = item.span;
     match item.kind {
         ListItemKind::Named { name, body } => ListItem {
@@ -465,7 +467,9 @@ pub fn apply_array_shared_properties(array_body: &ArrayBody) -> Vec<ListItem> {
         .collect()
 }
 
-fn merge_shared_into_item(item: &ListItem, shared: &[&SharedProperty]) -> ListItem {
+/// `pub(crate)`: layer composition's ThisLevel distributes a body's own
+/// `.shared` lines one level into its direct items (RFC 0025 §1).
+pub(crate) fn merge_shared_into_item(item: &ListItem, shared: &[&SharedProperty]) -> ListItem {
     match &item.kind {
         ListItemKind::Named { name, body } => ListItem {
             kind: ListItemKind::Named {
@@ -492,7 +496,10 @@ fn merge_shared_into_item(item: &ListItem, shared: &[&SharedProperty]) -> ListIt
     }
 }
 
-fn merge_shared_into_body(body: &Body, shared: &[&SharedProperty]) -> Body {
+/// `pub(crate)`: layer composition's item gather distributes a layer's
+/// list-level `.shared` into that layer's members before the group fold
+/// (RFC 0025 §3).
+pub(crate) fn merge_shared_into_body(body: &Body, shared: &[&SharedProperty]) -> Body {
     let existing_names: Vec<&str> = body
         .entries
         .iter()

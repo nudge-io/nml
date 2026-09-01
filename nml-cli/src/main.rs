@@ -360,6 +360,7 @@ fn cmd_fmt(args: &[String]) -> Result<(), String> {
 fn cmd_check(args: &[String]) -> Result<(), String> {
     let mut schema_dir: Option<PathBuf> = None;
     let mut strict = false;
+    let mut dump_compose = false;
     let mut file_args: Vec<&String> = Vec::new();
 
     let mut i = 0;
@@ -372,6 +373,12 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
             schema_dir = Some(PathBuf::from(&args[i]));
         } else if args[i] == "--strict" {
             strict = true;
+        } else if args[i] == "--dump-compose" {
+            // Hidden (RFC 0025 Phase 1): the oracle's observable — the
+            // composed bodies, origins, and rendered diagnostics as
+            // JSON, for the two-binary comparison. Not in usage; not a
+            // stability surface.
+            dump_compose = true;
         } else {
             file_args.push(&args[i]);
         }
@@ -494,6 +501,45 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
             &file,
             &nml_core::layers::OpenContext,
         );
+        if dump_compose {
+            // One JSON object per composing declaration: name, composed
+            // body, provenance, and the diagnostics in the sink's total
+            // order (`rendered_message` — the sanitizer's spelling).
+            let file_ref = composed.validation_file.as_ref();
+            let mut dump = Vec::new();
+            for (idx, origins) in &composed.origins {
+                let name = file_ref
+                    .and_then(|f| f.declarations.get(*idx))
+                    .and_then(|d| match &d.kind {
+                        nml_core::ast::DeclarationKind::Block(b) => Some(b.name.name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let body = file_ref
+                    .and_then(|f| f.declarations.get(*idx))
+                    .and_then(|d| match &d.kind {
+                        nml_core::ast::DeclarationKind::Block(b) => Some(&b.body),
+                        _ => None,
+                    });
+                dump.push(serde_json::json!({
+                    "declaration": name,
+                    "body": body,
+                    "origins": origins,
+                }));
+            }
+            let out = serde_json::json!({
+                "declarations": dump,
+                "diagnostics": composed
+                    .diagnostics
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out).expect("compose dump serializes")
+            );
+        }
         for diag in &composed.diagnostics {
             first_code = first_code.or(report(&path, &source_map, diag));
             if matches!(diag.severity, Severity::Error) {

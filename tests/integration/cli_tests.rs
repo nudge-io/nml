@@ -2798,6 +2798,50 @@ fn fix_never_rewrites_the_phantom_closing_of_an_unterminated_string() {
 }
 
 #[test]
+fn a_shared_write_to_a_named_items_typed_field_reaches_and_mismatches() {
+    // Q2u (RFC 0025 test plan): a list-wide `.shared` write REACHES a
+    // Named item's typed field (a Named key's `name` is lenient, and
+    // its other fields are ordinary merge targets), so a type-wrong
+    // shared value surfaces as NML2008 against the COMPOSED body — the
+    // composed artifact validates like the same body authored plainly.
+    let dir = std::env::temp_dir().join("nml-layers-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("q2u-shared-mismatch.nml");
+    let src = "\
+model itemq:
+    name string
+    size number
+
+model flowq:
+    steps []itemq #identity
+
+flowq base:
+    steps:
+        - h2:
+            size = 1
+
+flowq t uses base:
+    steps:
+        .size = \"big\"
+        - h2:
+            name = \"n\"
+";
+    std::fs::write(&f, src).unwrap();
+    let out = nml_bin()
+        .args(["check", f.to_str().unwrap()])
+        .output()
+        .expect("failed to run nml");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("NML2008")
+            && stderr.contains("expected number, got string")
+            && stderr.contains("'size'"),
+        "the shared write reaches the item and mismatches: {stderr}"
+    );
+}
+
+#[test]
 fn fix_leaves_a_cr_terminated_file_byte_identical() {
     // A bare CR in token position has NO machine fix: on a CR-terminated
     // ("old Mac") file every CR is a line ending, and deleting it glues

@@ -23,7 +23,7 @@ use crate::ast::{
     ListItemKind, NestedBlock, Property,
 };
 use crate::model::{FieldType, ModelDef, OneOfDef};
-use crate::schema_index::{FieldTarget, NameableVariant, SchemaIndex};
+use crate::schema_index::{FieldTarget, SchemaIndex};
 use crate::span::Span;
 use crate::types::{SpannedValue, Value};
 
@@ -81,62 +81,65 @@ pub fn materialize_named(name: &Identifier, body: &Body, model: &ModelDef) -> Ma
 pub fn materialize_item(item: &ListItem, model: &ModelDef) -> Materialized {
     match &item.kind {
         ListItemKind::Named { name, body } => materialize_named(name, body, model),
-        // Scalar key → the positional (`+`) field, injected into the item's body (the
-        // optional `- "/api": <body>` form) or a fresh one. No `+` field ⇒ dropped key,
-        // and the item has no placement, so it is not validatable.
+        // Scalar key → the positional (`+`) field, via the one token
+        // primitive ([`materialize_token`]) so layer composition can
+        // inject the same token into a survivor body the item does not
+        // own (RFC 0025 §3).
         ListItemKind::Shorthand { value, body } => {
-            match model.fields.iter().find(|f| f.shorthand) {
-                // A bare arm-set shorthand field (RFC 0007 §4.3 ⑤): the scalar
-                // fills it via the canonical embedding `s ⇒ [else -> s]` — a
-                // one-arm block whose `else` target mirrors the scalar's form,
-                // exactly as the arm block itself distinguishes `-> Foo` from
-                // `-> "foo"`. A scalar with no name/string form (e.g. a number)
-                // is surfaced as loudly as the plain-scalar path's downstream
-                // type error would be — never a silent empty target.
-                Some(field) if matches!(field.field_type, FieldType::Arms { .. }) => {
-                    match arm_fill_target(value) {
-                        Some(target) => Materialized {
-                            body: inject_arm(
-                                body.as_ref().unwrap_or(&EMPTY_BODY),
-                                &field.name,
-                                target,
-                                value.span,
-                            ),
-                            diagnostics: Vec::new(),
-                            validatable: true,
-                        },
-                        None => Materialized {
-                            body: Body::fresh(Vec::new()),
-                            diagnostics: vec![error(
-                                crate::diagnostic::codes::ARM_SHORTHAND_MISMATCH,
-                                format!(
-                                    "a {} cannot fill the arm-set shorthand field '{}' on model \
-                                 '{}' (an arm target is a name or a string)",
-                                    value.value.type_name(),
-                                    field.name,
-                                    model.name
-                                ),
-                                value.span,
-                            )],
-                            validatable: false,
-                        },
-                    }
-                }
-                Some(field) => Materialized {
-                    body: inject(
-                        body.as_ref().unwrap_or(&EMPTY_BODY),
-                        &field.name,
-                        value.clone(),
-                    ),
+            let token = ItemToken {
+                value: value.clone(),
+            };
+            materialize_token(&token, body.as_ref().unwrap_or(&EMPTY_BODY), model)
+        }
+        // Links — never materialized, never validated as inline instances.
+        ListItemKind::Reference(_) | ListItemKind::Role(_) => Materialized {
+            body: Body::fresh(Vec::new()),
+            diagnostics: Vec::new(),
+            validatable: false,
+        },
+    }
+}
+
+/// A scalar list item's identity token — the group's key WITH its source
+/// span (RFC 0025 §3): layer composition materializes it into the lowest
+/// surviving body of an identity group, before the body merge, and the
+/// injected property must keep the token's span so downstream findings
+/// point at the item.
+pub(crate) struct ItemToken {
+    pub(crate) value: SpannedValue,
+}
+
+/// Materialize a scalar identity token into `body` against `model` — the
+/// positional (`+`) field rule, extracted from [`materialize_item`]'s
+/// shorthand arm so the merge can inject a group's token into a survivor
+/// body the item does not own (RFC 0025 §3). No `+` field ⇒ dropped key,
+/// and the placement is not validatable.
+pub(crate) fn materialize_token(token: &ItemToken, body: &Body, model: &ModelDef) -> Materialized {
+    let value = &token.value;
+    match model.fields.iter().find(|f| f.shorthand) {
+        // A bare arm-set shorthand field (RFC 0007 §4.3 ⑤): the scalar
+        // fills it via the canonical embedding `s ⇒ [else -> s]` — a
+        // one-arm block whose `else` target mirrors the scalar's form,
+        // exactly as the arm block itself distinguishes `-> Foo` from
+        // `-> "foo"`. A scalar with no name/string form (e.g. a number)
+        // is surfaced as loudly as the plain-scalar path's downstream
+        // type error would be — never a silent empty target.
+        Some(field) if matches!(field.field_type, FieldType::Arms { .. }) => {
+            match arm_fill_target(value) {
+                Some(target) => Materialized {
+                    body: inject_arm(body, &field.name, target, value.span),
                     diagnostics: Vec::new(),
                     validatable: true,
                 },
                 None => Materialized {
                     body: Body::fresh(Vec::new()),
                     diagnostics: vec![error(
-                        crate::diagnostic::codes::DROPPED_ITEM_KEY,
+                        crate::diagnostic::codes::ARM_SHORTHAND_MISMATCH,
                         format!(
-                            "the value has no shorthand field on model '{}' and would be dropped",
+                            "a {} cannot fill the arm-set shorthand field '{}' on model \
+                             '{}' (an arm target is a name or a string)",
+                            value.value.type_name(),
+                            field.name,
                             model.name
                         ),
                         value.span,
@@ -145,10 +148,21 @@ pub fn materialize_item(item: &ListItem, model: &ModelDef) -> Materialized {
                 },
             }
         }
-        // Links — never materialized, never validated as inline instances.
-        ListItemKind::Reference(_) | ListItemKind::Role(_) => Materialized {
-            body: Body::fresh(Vec::new()),
+        Some(field) => Materialized {
+            body: inject(body, &field.name, value.clone()),
             diagnostics: Vec::new(),
+            validatable: true,
+        },
+        None => Materialized {
+            body: Body::fresh(Vec::new()),
+            diagnostics: vec![error(
+                crate::diagnostic::codes::DROPPED_ITEM_KEY,
+                format!(
+                    "the value has no shorthand field on model '{}' and would be dropped",
+                    model.name
+                ),
+                value.span,
+            )],
             validatable: false,
         },
     }
@@ -327,52 +341,50 @@ fn error(
 /// property: materializing first makes the field present, and the lenient shared-merge
 /// then yields to it.
 pub fn apply_positional(index: &SchemaIndex, root: &str, body: &Body) -> Body {
-    let no_plan = crate::layers::ArmPlan::default();
     match index.model(root) {
-        Some(model) => Positionalizer {
-            index,
-            plan: &no_plan,
-        }
-        .model_body(model, body, 0, Some("")),
+        Some(model) => apply_positional_model(index, model, body),
         // A non-model root carries no list-of-`+`-model fields to materialize here.
         None => body.clone(),
     }
 }
 
-/// [`apply_positional`] with RFC 0019's discriminator pre-pass plan: at
-/// each oneof position (keyed by dotted field path from the root, `""` =
-/// a oneof root) the STACK's folded effective arm overrides the layer's
-/// own authored-else-default consult, so a layer that omits the
-/// discriminator materializes against the arm the stack actually
-/// composes. A oneof root (unreachable through plain
-/// [`apply_positional`]) materializes here against its planned arm.
-pub(crate) fn apply_positional_planned(
+/// [`apply_positional`] against a MODEL vocabulary directly — the merge's
+/// deep-normalization entry point (RFC 0025 §1: the `Deep` positional leg
+/// under a `Vocab::Model`), also serving the seal scan's probe.
+pub(crate) fn apply_positional_model(index: &SchemaIndex, model: &ModelDef, body: &Body) -> Body {
+    Positionalizer { index }.model_body(model, body, 0)
+}
+
+/// [`apply_positional`] over a LIST body against its element type — the
+/// merge's deep-normalization entry point for `Vocab::Items` (a bare-list
+/// winner's or loser's interior, RFC 0025 §§2, 4).
+pub(crate) fn apply_positional_items(
     index: &SchemaIndex,
-    root: &str,
+    element: &FieldType,
     body: &Body,
-    plan: &crate::layers::ArmPlan<'_>,
 ) -> Body {
-    let pos = Positionalizer { index, plan };
-    // The root resolves in the ONE order every pass shares (`nameable`:
-    // a model before a oneof of the same name).
-    match index.nameable(root) {
-        Some(NameableVariant::Model(model)) => pos.model_body(model, body, 0, Some("")),
-        Some(NameableVariant::OneOf(oneof)) => pos.oneof_body(oneof, body, 0, Some("")),
-        None => body.clone(),
-    }
+    Positionalizer { index }.list_body(element, body, 0)
+}
+
+/// Positional materialization against a resolved target — the arm-set
+/// leg of the merge's deep pass (RFC 0025 §2): each inline arm body of a
+/// winning set materializes its nested lists under the arm target's own
+/// reading.
+pub(crate) fn apply_positional_against(
+    index: &SchemaIndex,
+    target: FieldTarget<'_>,
+    body: &Body,
+    depth: u32,
+) -> Body {
+    Positionalizer { index }.positional_against(target, body, depth)
 }
 
 struct Positionalizer<'a> {
     index: &'a SchemaIndex,
-    /// The stack's planned vocabularies (oneof arms AND union variants,
-    /// dotted path-keyed). Empty outside layer composition. `path: None`
-    /// in the walkers below means "out of plan scope" (inside list items
-    /// and arm sets — their positions are never planned).
-    plan: &'a crate::layers::ArmPlan<'a>,
 }
 
 impl Positionalizer<'_> {
-    fn model_body(&self, model: &ModelDef, body: &Body, depth: u32, path: Option<&str>) -> Body {
+    fn model_body(&self, model: &ModelDef, body: &Body, depth: u32) -> Body {
         if depth >= MAX_POSITIONAL_DEPTH {
             return body.clone();
         }
@@ -386,7 +398,7 @@ impl Positionalizer<'_> {
                     span: entry.span,
                     kind: BodyEntryKind::NestedBlock(NestedBlock {
                         name: nb.name.clone(),
-                        body: self.recurse_field(model, &nb.name.name, &nb.body, depth, path),
+                        body: self.recurse_field(model, &nb.name.name, &nb.body, depth),
                     }),
                 },
                 _ => entry.clone(),
@@ -395,19 +407,10 @@ impl Positionalizer<'_> {
         body.with_entries(entries)
     }
 
-    fn recurse_field(
-        &self,
-        model: &ModelDef,
-        field_name: &str,
-        body: &Body,
-        depth: u32,
-        path: Option<&str>,
-    ) -> Body {
+    fn recurse_field(&self, model: &ModelDef, field_name: &str, body: &Body, depth: u32) -> Body {
         let Some(field) = model.fields.iter().find(|f| f.name == field_name) else {
             return body.clone();
         };
-        let child = path.map(|p| crate::layers::join_path(p, field_name));
-        let child = child.as_deref();
         if let FieldType::List(inner) = &field.field_type {
             return self.list_body(inner, body, depth + 1);
         }
@@ -419,25 +422,13 @@ impl Positionalizer<'_> {
         // validator and defaulter. `union_variants` unwraps a modifier wrapper,
         // so `|slot (a | b)` materializes like a plain union.
         if let Some(variants) = field.field_type.union_variants() {
-            // The PLAN's variant overrides the layer's own consult (a
-            // layer that omits its `as` under an established non-default
-            // variant must materialize against the stack's variant, not
-            // its shape's guess) — same rule as planned oneof arms.
-            if let Some(v) = child.and_then(|p| self.plan.planned_union_variant(p)) {
-                match self.index.nameable(v) {
-                    Some(NameableVariant::Model(m)) => {
-                        return self.model_body(m, body, depth + 1, child);
-                    }
-                    Some(NameableVariant::OneOf(o)) => {
-                        return self.oneof_body(o, body, depth + 1, child);
-                    }
-                    None => {}
-                }
-            }
-            // Unplanned and oracle-ambiguous: materialize NOTHING — the
-            // resolver's first-wins guess would inject that variant's
-            // positional machinery into a body compose refuses to assign
-            // a variant (the validator's NML2052 owns it).
+            // Oracle-ambiguous: materialize NOTHING — the resolver's
+            // first-wins guess would inject that variant's positional
+            // machinery into a body compose refuses to assign a variant
+            // (the validator's NML2052 owns it). RFC 0025 deleted the
+            // plan's override: a body materializes under its OWN reading,
+            // and the merge injects a group's token where the stack's
+            // decided variant differs (§3).
             if self
                 .index
                 .ambiguous_union_variants(variants, body)
@@ -446,8 +437,8 @@ impl Positionalizer<'_> {
                 return body.clone();
             }
             return match self.index.resolve_type_in_body(&field.field_type, body) {
-                FieldTarget::Model(m) => self.model_body(m, body, depth + 1, None),
-                FieldTarget::OneOf(o) => self.oneof_body(o, body, depth + 1, None),
+                FieldTarget::Model(m) => self.model_body(m, body, depth + 1),
+                FieldTarget::OneOf(o) => self.oneof_body(o, body, depth + 1),
                 FieldTarget::Arms { target, .. } => self.arm_set_body(target, body, depth + 1),
                 FieldTarget::ListOf(_, _) => {
                     match variants.iter().find(|v| matches!(v, FieldType::List(_))) {
@@ -459,8 +450,8 @@ impl Positionalizer<'_> {
             };
         }
         match self.index.resolve_field(field) {
-            FieldTarget::Model(m) => self.model_body(m, body, depth + 1, child),
-            FieldTarget::OneOf(o) => self.oneof_body(o, body, depth + 1, child),
+            FieldTarget::Model(m) => self.model_body(m, body, depth + 1),
+            FieldTarget::OneOf(o) => self.oneof_body(o, body, depth + 1),
             FieldTarget::Arms { target, .. } => self.arm_set_body(target, body, depth + 1),
             _ => body.clone(),
         }
@@ -476,30 +467,25 @@ impl Positionalizer<'_> {
 
     fn positional_against(&self, target: FieldTarget<'_>, body: &Body, depth: u32) -> Body {
         match target {
-            FieldTarget::Model(m) => self.model_body(m, body, depth, None),
-            FieldTarget::OneOf(o) => self.oneof_body(o, body, depth, None),
+            FieldTarget::Model(m) => self.model_body(m, body, depth),
+            FieldTarget::OneOf(o) => self.oneof_body(o, body, depth),
             _ => body.clone(),
         }
     }
 
     /// Recurse into a `oneof` instance's selected variant so nested shorthand lists
-    /// materialize. The variant is the PLAN's arm at this position when one exists
-    /// (layer composition's stack-effective arm), else resolved from the authored
-    /// discriminator, else the union's default arm — mirroring the defaulter's
+    /// materialize. The variant is resolved from the authored discriminator, else
+    /// the union's default arm — the body's OWN reading, mirroring the defaulter's
     /// `oneof_body` (the discriminator itself is injected later, by
     /// `apply_defaults`). An unresolvable discriminator leaves the body unchanged.
-    fn oneof_body(&self, oneof: &OneOfDef, body: &Body, depth: u32, path: Option<&str>) -> Body {
-        let planned = path.and_then(|p| self.plan.planned_arm(p));
+    fn oneof_body(&self, oneof: &OneOfDef, body: &Body, depth: u32) -> Body {
         let authored = body.entries.iter().find_map(|e| match &e.kind {
             BodyEntryKind::Property(p) if p.name.name == oneof.discriminator => {
                 p.value.value.as_str()
             }
             _ => None,
         });
-        let Some(disc) = planned
-            .or(authored)
-            .or(oneof.default_discriminator.as_deref())
-        else {
+        let Some(disc) = authored.or(oneof.default_discriminator.as_deref()) else {
             return body.clone();
         };
         match oneof
@@ -508,7 +494,7 @@ impl Positionalizer<'_> {
             .find(|(v, _)| v.as_str() == disc)
             .and_then(|(_, m)| self.index.model(m))
         {
-            Some(variant) => self.model_body(variant, body, depth, path),
+            Some(variant) => self.model_body(variant, body, depth),
             None => body.clone(),
         }
     }
@@ -589,7 +575,7 @@ impl Positionalizer<'_> {
                         span: item.span,
                         kind: ListItemKind::Shorthand {
                             value: value.clone(),
-                            body: Some(self.model_body(m, &materialized.body, depth + 1, None)),
+                            body: Some(self.model_body(m, &materialized.body, depth + 1)),
                         },
                     }
                 } else {
@@ -601,7 +587,7 @@ impl Positionalizer<'_> {
                 span: item.span,
                 kind: ListItemKind::Named {
                     name: name.clone(),
-                    body: self.model_body(m, body, depth + 1, None),
+                    body: self.model_body(m, body, depth + 1),
                 },
             },
             // References/links — never materialized.
