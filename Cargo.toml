@@ -54,4 +54,4 @@ tower-lsp = "0.20"
 # ≥1.17: tower-lsp's own requirement; the workspace's honest floor (verified
 # by the CI minimal-versions job).
 tokio = { version = "1.17", features = ["full"] }
-rowan = "0.16"
+rowan = "0.17"
