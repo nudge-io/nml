@@ -82,7 +82,7 @@ doctor:
     if [ "$r" = yes ] && rustup target list --installed 2>/dev/null | grep -q '^wasm32-wasip1$'; then w=yes; else w=no; fi
     check "$w" "wasm32-wasip1 target" "gate-wasm, gate-ext-e2e" "rustup target add wasm32-wasip1" no
     if [ "$r" = yes ] && rustup toolchain list 2>/dev/null | grep -q '^nightly'; then ng=yes; else ng=no; fi
-    check "$ng" "nightly toolchain" "gate-fuzz, gate-minimal-versions, gate-api" "rustup toolchain install nightly" no
+    check "$ng" "nightly toolchain" "gate-fuzz, gate-minimal-versions" "rustup toolchain install nightly" no
     have cargo-deny && cd_=yes || cd_=no
     check "$cd_" "cargo-deny" "gate-supply-chain" "cargo install cargo-deny" no
     have cargo-fuzz && cf=yes || cf=no
@@ -339,38 +339,29 @@ fmt-check:
 # rust-ci.yml `api`. The PUBLIC API contract — the library half of the
 # `--json` wire's. Regenerates nothing: it CHECKS the committed records,
 # then asks the classifier whether what moved is breaking. Both tools are
-# pinned WITH the toolchain (rustdoc's JSON rendering moves with the
-# compiler; bump all three in one reviewed change) and installed here, so
-# CI and a local run install the same versions. `cargo public-api` builds
-# rustdoc JSON with a nightly toolchain (not the active one — the pin file
-# still governs fmt/clippy/check); this recipe installs a DATED nightly with
-# rustdoc (rolling `nightly` sometimes ships without rustdoc for a day).
-# `NML_UPDATE_GOLDEN=1 just
-# gate-api` rewrites the records AFTER the stamp and the CHANGELOG entry
+# pinned here (bump the tool, `RUSTDOC_NIGHTLY` in scripts/api_record.py,
+# and the records in one reviewed change). `cargo public-api` on stable
+# switches to generic `nightly` for rustdoc JSON; the gate sets
+# `RUSTUP_TOOLCHAIN=nightly`, installs/updates that channel, and clears
+# `target/doc` so CI never reuses stale JSON from an older nightly. `NML_UPDATE_GOLDEN=1
+# just gate-api` rewrites the records AFTER the stamp and the CHANGELOG entry
 # moved — never before. The baseline is `NML_API_BASELINE`, else
 # `origin/main` where that ref exists, else `HEAD` (a clone with no
 # remote still gets a verdict about its own uncommitted work).
 gate-api:
     #!/usr/bin/env bash
     set -euo pipefail
-    # cargo-public-api 0.52 floor (crates.io README compatibility matrix).
-    # Bump with the tool + records in one reviewed change — not rolling `nightly`,
-    # which can lack rustdoc on any given day (rustup-components-history).
-    rustdoc_nightly="${NML_RUSTDOC_NIGHTLY:-nightly-2025-08-02}"
-    echo "gate-api: installing ${rustdoc_nightly} (default profile — rustdoc JSON) for cargo public-api"
-    # Do not use `--profile minimal --component rustdoc`: on many dated nightlies
-    # rustdoc is not a separate downloadable component for that channel (CI fails
-    # with "component rustdoc … is unavailable"), while the default profile still
-    # ships rustdoc as part of its component set.
-    rustup toolchain install "$rustdoc_nightly"
-    rustup run "$rustdoc_nightly" rustdoc --version
-    # Build the plugins with the workspace pin (rust-toolchain.toml). cargo-semver-checks
-    # 0.50 needs rustc >= 1.93; the rustdoc nightly is 1.90 and is only for JSON at run
-    # time (cargo-public-api's matrix names which nightly *outputs* it reads, not which
-    # compiler must build the `cargo install` artifacts). Installing under the nightly
-    # fails CI with "Failed to install cargo-semver-checks" after public-api succeeds.
+    # Workspace stable for `cargo install` and `cargo semver-checks`; pinned
+    # nightly for `cargo public-api` (see scripts/api_record.py).
+    unset RUSTUP_TOOLCHAIN
+    rustdoc_nightly="$(python3 -c 'import importlib.util; s=importlib.util.spec_from_file_location("api_record", "scripts/api_record.py"); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.RUSTDOC_NIGHTLY)')"
+    echo "gate-api: workspace toolchain (rust-toolchain.toml); rustdoc JSON via ${rustdoc_nightly}"
+    rustup toolchain install
+    rustup toolchain install "${rustdoc_nightly}" --profile minimal
+    rustup update "${rustdoc_nightly}"
+    rustdoc --version
     cargo install --locked cargo-public-api@0.52.0 cargo-semver-checks@0.50.0
-    export RUSTUP_TOOLCHAIN="$rustdoc_nightly"
+    rm -rf target/doc
     python3 scripts/api_record.py
     base="${NML_API_BASELINE:-}"
     if [ -z "$base" ]; then

@@ -115,17 +115,40 @@ function assertSupervisionMatchesOnPosix(expected: "wasm" | "native"): void {
 /** The extension host's direct children, with their command lines. `pgrep`
  *  exits 1 when nothing matches — which is a legitimate answer here (the wasm
  *  lane expects no children at all), so it reads as the empty list; anything
- *  else is the tool failing and must not be read as "no children". */
+ *  else is the tool failing and must not be read as "no children".
+ *
+ *  On Linux, `pgrep -fl` prints the process *name* (`code` for VS Code's
+ *  `process.execPath`), not the argv that carries `launchSupervisor.js`; procps
+ *  `-a` is the full command line. Elsewhere, list pids with `pgrep -P` and ask
+ *  `ps` for each child's command. */
 function childrenOfThisHost(): string {
+  const ppid = String(process.pid);
+  let pids: string;
   try {
-    return execFileSync("pgrep", ["-P", String(process.pid), "-fl"], {
-      encoding: "utf8",
-    }).trim();
+    pids = execFileSync("pgrep", ["-P", ppid], { encoding: "utf8" }).trim();
   } catch (err) {
     const status = (err as { status?: number | null }).status;
     if (status === 1) return "";
     throw err;
   }
+  if (!pids) return "";
+
+  if (process.platform === "linux") {
+    try {
+      return execFileSync("pgrep", ["-P", ppid, "-a"], { encoding: "utf8" }).trim();
+    } catch (err) {
+      const status = (err as { status?: number | null }).status;
+      if (status === 1) return "";
+      throw err;
+    }
+  }
+
+  const pidList = pids.split(/\s+/).join(",");
+  return execFileSync("ps", ["-o", "command=", "-p", pidList], { encoding: "utf8" })
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
 }
 
 /** How long ONE wait below may last. Generous: the first pull waits on

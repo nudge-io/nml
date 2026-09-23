@@ -544,7 +544,7 @@ fn report(
     // sanitizing `Rendered`).
     out::err(format_args!(
         "{}:{}:{}: {}: {}",
-        sanitized(own),
+        sanitized(&path.display().to_string()),
         line,
         column,
         out::severity_prefix(diag, true),
@@ -792,7 +792,7 @@ pub(crate) fn sanitized(text: &str) -> String {
 /// TYPED, a foreign one by its key.
 fn note_line<'d>(
     ws: Option<&workspace::Workspace>,
-    _path: &Path,
+    path: &Path,
     source_map: &nml_core::span::SourceMap,
     own: &str,
     foreign: &mut std::collections::HashMap<&'d str, Option<Foreign>>,
@@ -803,7 +803,7 @@ fn note_line<'d>(
     // A same-file note keeps the path AS TYPED beside the finding's own
     // prefix (the key is the wire's spelling, not the terminal's).
     if note.source == own {
-        note.line(own)
+        note.line(&path.display().to_string())
     } else {
         note.line(&note.source)
     }
