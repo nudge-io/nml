@@ -30,12 +30,20 @@ nml-lsp   # speaks LSP over stdio
 
 A tool that uses NML for its config files can expose the server itself, with
 its own schemas built in — users who open your config files get completion
-and validation for *your* models:
+and validation for *your* models. One call is the whole `<your-tool> lsp`
+subcommand:
 
-```rust
-// the body of `<your-tool> lsp`
-nml_lsp::serve(your_embedded_schema_package());
+```rust source=docs/guides/examples/cookbook/examples/embed_lsp.rs
+    let ended = nml_lsp::serve(package).await;
 ```
+
+`serve` is async, and it answers: `SessionEnd` is how the session ended, and
+`ended.exit_code()` is the code LSP 3.17 prescribes for it — return that from
+`main`, or map the ending onto your tool's own codes. The neutral server,
+with no package of yours in it, is `nml_lsp::serve_stdio()`. Those three
+names are this crate's whole public API; everything else is its own.
+[Embed the language server](https://github.com/nudge-io/nml/blob/main/docs/guides/embed-the-lsp.md)
+is the full recipe, with the four things the editor requires of your binary.
 
 The NML VS Code extension discovers `<tool> lsp` providers declared in
 `nml-project.nml` (behind workspace trust) and falls back to the neutral

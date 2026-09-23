@@ -50,7 +50,7 @@ commitment, demonstrated by the migrations already shipped (`=>` → `->`,
 | Surface | Stability |
 |---|---|
 | Language syntax & semantics | Versioned; breaking only in 0.x minors, with fixers |
-| Documented Rust API (`nml-core`, `nml-validate`, `nml-fmt`, `nml-lsp`) | Versioned on two axes — `apiVersion` for a removal or a reshape, `revision` for an addition — recorded item by item in `docs/api/<crate>.api.txt` and named in the CHANGELOG: [the public Rust API record](#the-public-rust-api-record) below |
+| Documented Rust API (`nml-core`, `nml-validate`, `nml-fmt`, `nml-lsp`) | Versioned on two axes — `apiVersion` for a removal or a reshape, `revision` for an addition — recorded item by item in `docs/api/<crate>.api.txt` and named in the CHANGELOG (an item behind a cargo feature is in neither, and is not a stable interface): [the public Rust API record](#the-public-rust-api-record) below |
 | CLI subcommands, flags, and **exit codes** | Versioned |
 | Schema package format | Gated by an explicit `formatVersion`; readers reject versions they don't support. A new manifest key (`budgetUnits`; a binding's `layers:` grant) is an addition, not a bump: the vocabulary is closed, so an older reader refuses a manifest carrying it at load as an unknown property — precisely, never silently — and a bump would make every newer manifest unreadable, the ones that never use the key included; `formatVersion` moves for a change of syntax or of an existing key's meaning |
 | Structured diagnostics (`Suggestion` spans/replacements, LSP wire shape) | Versioned |
@@ -162,6 +162,19 @@ three without cloning anything.
 - **The ledger** is one CHANGELOG entry per stamp — `**public API
   apiVersion A, revision R**` — saying what moved. A stamp with no entry,
   or an entry with no stamp, fails the build.
+- **What the record does NOT carry** is an item behind a cargo feature.
+  It is generated with no features on, so the `test-support` items of
+  `nml-validate` and `nml-lsp` — helpers their own test crates drive —
+  have no line, no stamp and no promise. Turning such a feature on in a
+  production build takes you outside this contract deliberately.
+
+The record is kept SMALL on purpose, and that is the other half of what it
+promises: before a new item is recorded, its author measures who outside the
+crate would reach it, and an item only the crate's own tests need goes behind
+`test-support` instead. `nml-lsp`'s public surface is two entry points and
+one result type for that reason — so expect a removal now and then of
+something that was never meant for you, and read the record, not the module
+list, for what you may rely on.
 
 Why a record at all, when semver exists: these crates are consumed **by
 path and by pinned rev**, never from crates.io, so cargo's own version

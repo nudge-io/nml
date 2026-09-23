@@ -444,6 +444,139 @@ fn kernel_sources(dir: &Path, top: bool, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Every name a kernel file RE-EXPORTS out of the crate's filesystem leaf,
+/// as a sentence — `None` when it publishes none.
+///
+/// `nml_validate::fs` is the crate's leaf at its own path, and the kernel
+/// is its CONSUMER, not its shop window: an embedder that could still
+/// reach `StdFs` or `read_beneath` through `nml_validate::workspace` would
+/// have two names for one item and no way to tell which is the contract.
+/// The module-arrow ratchet (`tests/module_arrows.rs`) keeps the arrow
+/// `workspace -> fs` out of `mod.rs`, but `workspace::paths -> fs` and the
+/// parent-child `workspace -> workspace::paths` are BOTH unpinned by
+/// design (a child may read the leaf; a parent-child arrow is the module
+/// tree's own shape) — so a `pub use crate::fs::StdFs;` in a child, plus a
+/// `pub use paths::StdFs;` in `mod.rs`, would put the leaf back on the
+/// kernel's surface with every pinned arrow intact. This refuses the first
+/// half, the one the second cannot do without: a re-export names its path,
+/// so a parent can only republish what a child published first.
+///
+/// A plain `use crate::fs::…` is the kernel READING the leaf, which is the
+/// whole point of the leaf; only `pub` is the crate's surface.
+fn republished_leaf(text: &str) -> Option<String> {
+    #[derive(Default)]
+    struct Exports(Vec<String>);
+
+    impl Exports {
+        fn check(&mut self, tree: &syn::UseTree, prefix: &mut Vec<String>) {
+            match tree {
+                syn::UseTree::Path(p) => {
+                    prefix.push(ident(&p.ident));
+                    self.check(&p.tree, prefix);
+                    prefix.pop();
+                }
+                syn::UseTree::Name(n) => {
+                    prefix.push(ident(&n.ident));
+                    self.record(prefix);
+                    prefix.pop();
+                }
+                syn::UseTree::Rename(r) => {
+                    prefix.push(ident(&r.ident));
+                    self.record(prefix);
+                    prefix.pop();
+                }
+                // `pub use crate::fs::*;` names no leaf and re-exports
+                // every one of them.
+                syn::UseTree::Glob(_) => self.record(prefix),
+                syn::UseTree::Group(g) => {
+                    for t in &g.items {
+                        self.check(t, prefix);
+                    }
+                }
+            }
+        }
+
+        fn record(&mut self, prefix: &[String]) {
+            if prefix.iter().any(|segment| segment == "fs") {
+                self.0.push(format!("pub use `{}`", prefix.join("::")));
+            }
+        }
+    }
+
+    impl<'ast> Visit<'ast> for Exports {
+        fn visit_item_use(&mut self, i: &'ast syn::ItemUse) {
+            if matches!(i.vis, syn::Visibility::Public(_)) {
+                let mut prefix = Vec::new();
+                self.check(&i.tree, &mut prefix);
+            }
+        }
+    }
+
+    let file = match parse_rust(text) {
+        Ok(file) => file,
+        Err(e) => return Some(format!("not valid Rust: {e}")),
+    };
+    let mut exports = Exports::default();
+    exports.visit_file(&file);
+    exports.0.into_iter().next()
+}
+
+/// The kernel publishes no name of the filesystem leaf.
+#[test]
+fn source_ratchet_workspace_republishes_no_filesystem_name() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/workspace");
+    let mut sources = Vec::new();
+    kernel_sources(&dir, true, &mut sources);
+    assert!(!sources.is_empty(), "the kernel scan found no sources");
+    for entry in sources {
+        let text = std::fs::read_to_string(&entry).expect("source reads");
+        assert_eq!(
+            republished_leaf(&text),
+            None,
+            "{}: the kernel re-exports the crate's filesystem leaf — \
+             `nml_validate::fs` is its own path, and one item must not \
+             answer to two names",
+            entry.display()
+        );
+    }
+}
+
+/// …and the ratchet FIRES on the real kernel when one re-export is let
+/// through, in `mod.rs` and in a child alike — the child being the case
+/// the module-arrow ratchet cannot see.
+#[test]
+fn source_ratchet_catches_one_leaf_re_export_added_to_a_kernel_file() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/workspace");
+    for file in ["mod.rs", "paths.rs"] {
+        let text = std::fs::read_to_string(dir.join(file)).expect("source reads");
+        assert_eq!(republished_leaf(&text), None, "{file}");
+        for line in [
+            "pub use crate::fs::StdFs;",
+            "pub use crate::fs::{read_beneath, write_beneath};",
+            "pub use crate::fs::*;",
+            "pub use super::super::fs::PathFs as Oracle;",
+        ] {
+            assert!(
+                republished_leaf(&format!("{text}\n{line}\n")).is_some(),
+                "{file} + `{line}`: the re-export was not caught"
+            );
+        }
+        // Reading the leaf is not publishing it, whichever way it is
+        // spelled short of `pub`.
+        for allowed in [
+            "use crate::fs::StdFs;",
+            "pub(crate) use crate::fs::StdFs;",
+            "pub(super) use crate::fs::StdFs;",
+        ] {
+            assert_eq!(
+                republished_leaf(&format!("{text}\n{allowed}\n")),
+                None,
+                "{file} + `{allowed}`: reading the leaf is not republishing it"
+            );
+        }
+    }
+}
+
 /// Layer A has no ambient authority (A15): every kernel source under
 /// `src/workspace/` parses and walks clean (see the module comment above
 /// for what the walk proves).

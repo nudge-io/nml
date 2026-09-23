@@ -1,6 +1,7 @@
 //! The A7 table's totality and the disclosure rules of its messages.
 
 use super::*;
+use crate::fs::FsError;
 use crate::workspace::diag::{code_for, path_finding};
 use crate::workspace::discover::MAX_TOTAL_LIVE_INPUT_BYTES;
 use nml_core::diagnostic::{Suggestion, codes};
@@ -374,8 +375,9 @@ fn path_error_is_a_std_error_with_the_a7_sentence() {
 /// a repository with dependencies installed would have failed.
 #[test]
 fn the_gates_row_table_is_total_over_skip_and_its_silent_reasons_stay_silent() {
+    use crate::fs::EntryKind;
     use crate::workspace::diag::skipped;
-    use crate::workspace::{EntryKind, Skip, Skipped};
+    use crate::workspace::{Skip, Skipped};
     use nml_core::diagnostic::Severity;
     let at = |s: &str| SourceKey::checked(s).expect(s);
     let row = |why: Skip, closed: bool| {

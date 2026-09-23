@@ -206,6 +206,106 @@ fn a_fifo_named_nml_in_the_workspace_never_hangs_the_index_sweep() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The NEUTRAL server's own wiring, measured on the binary an editor
+/// starts.
+///
+/// `serve_stdio()` takes no argument, so everything the neutral server is
+/// made of is decided inside it — and the per-user schema-package store
+/// (the RFC 0035 in-cache channel, `Store::user()` reading
+/// `NML_SCHEMA_STORE_DIR`) is the part with no other witness. Every other
+/// pin in this file points the binary at an EMPTY store on purpose, so a
+/// `serve_stdio` wired storeless would pass all of them; this is the one
+/// that asks the binary to bind a document through a package it can only
+/// have found in that store.
+#[test]
+fn the_neutral_server_binds_through_the_per_user_store() {
+    let base = std::env::temp_dir().join(format!("nml-lsp-store-channel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let guard = Scratch(base.clone());
+    let store = base.join("store");
+    std::fs::create_dir_all(&store).expect("store dir");
+    nml_validate::test_support::publish_demo(&nml_validate::store::Store::at(&store));
+
+    let ws = base.join("ws");
+    std::fs::create_dir_all(&ws).expect("workspace dir");
+    std::fs::write(
+        ws.join("nml-project.nml"),
+        "project P:\n    schemaPackages:\n        - demo\n",
+    )
+    .expect("project file");
+    std::fs::write(ws.join("demo.nml"), "").expect("demo.nml");
+    let ws = dunce::canonicalize(&ws).expect("canonical workspace");
+    let file = ws.join("demo.nml");
+    let uri = |p: &std::path::Path| format!("file://{}", p.display());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nml-lsp"))
+        .env("NML_SCHEMA_STORE_DIR", &store)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nml-lsp");
+    let disarm = arm_watchdog(&child);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+
+    write_frame(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"capabilities": {}, "rootUri": uri(&ws)}}),
+    );
+    assert!(
+        response_to(&mut reader, &mut stdin, 1).is_some(),
+        "`initialize` must answer"
+    );
+    write_frame(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+    );
+    // `nml/schemaInfo` resolves the document from the manifest chain on
+    // demand, so no open and no index sweep is a precondition of the
+    // answer — which is what keeps this a pin on the WIRING and not on
+    // the order two concurrent handlers happen to finish in.
+    write_frame(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "nml/schemaInfo",
+                "params": {"uri": uri(&file)}}),
+    );
+    let answer = response_to(&mut reader, &mut stdin, 2).expect("`nml/schemaInfo` must answer");
+    let info = &answer["result"];
+    assert_eq!(
+        info["bound"],
+        json!(true),
+        "the neutral server read no package store: {answer}"
+    );
+    assert_eq!(info["package"], json!("demo"), "{answer}");
+    assert_eq!(
+        info["source"],
+        json!("store current"),
+        "the binding did not come from the store: {answer}"
+    );
+
+    write_frame(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"}),
+    );
+    let shutdown = response_to(&mut reader, &mut stdin, 3).expect("`shutdown` must answer");
+    assert!(
+        shutdown.get("result").is_some(),
+        "`shutdown` was refused, not served: {shutdown:?}"
+    );
+    let _ = disarm.send(());
+    write_frame(
+        &mut stdin,
+        &json!({"jsonrpc": "2.0", "method": "exit", "params": null}),
+    );
+    drop(stdin);
+    drop(reader);
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(guard);
+}
+
 /// A scratch directory removed when the guard drops.
 struct Scratch(std::path::PathBuf);
 
@@ -254,7 +354,7 @@ fn exit_within(child: &mut Child, budget: Duration) -> Option<std::process::Exit
 /// before it. tower-lsp refuses ORDINARY requests before `initialize`
 /// (`Server not initialized`), so a reading in which `exit` were refused the
 /// same way would leave an editor that gave up mid-handshake with a process
-/// it could only kill — and the [`nml_lsp::ExitSignal`] that decides the
+/// it could only kill — and the [`nml_lsp::test_support::ExitSignal`] that decides the
 /// ending sits UPSTREAM of that lifecycle layer, which is the thing this pin
 /// is about. Measured before the ending existed: alive after `exit`, exit
 /// code 0 when it eventually went.

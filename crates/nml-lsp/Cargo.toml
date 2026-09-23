@@ -27,7 +27,7 @@ nml-validate = { workspace = true }
 nml-fmt = { workspace = true }
 serde_json = { workspace = true }
 tower-lsp = { workspace = true }
-# `NmlService` (see `lib.rs`) is a `tower::Service` around tower-lsp's own
+# `NmlService` (see `session.rs`) is a `tower::Service` around tower-lsp's own
 # `LspService`: one look at the raw `initialize` params for the capability
 # lsp-types cannot deserialize. tower-service 0.3 — the trait tower-lsp's
 # `Server::serve` requires — is what this re-exports, and the crate is already
@@ -53,7 +53,7 @@ rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
 # the workspace's full tokio. `wasm32` (the in-editor neutral server, run under
 # VS Code's `wasm-wasi-core`) gets ONLY the wasm-supported subset — `net`/`fs`/
 # multi-thread pull in `mio`, which does not build on wasm. The runtime shell
-# uses exactly this subset; the stdio transport is target-split in `serve`.
+# uses exactly this subset; the stdio transport is target-split in `transport`.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
 
@@ -66,14 +66,22 @@ tokio = { version = "1.17", default-features = false, features = [
     "sync",
     "time",
 ] }
-# The wasm synchronous pump (`lib::wasm_pump`) drives the service directly:
+# The wasm synchronous pump (`transport::pump`) drives the service directly:
 # `futures` for stream draining and `serde` for framing the JSON-RPC wire
 # (`tower`, the Service/ready/call surface, is a dependency on every target).
 # Native drives via tower-lsp's own `Server::serve`, so these are wasm-only.
 futures = { version = "0.3", default-features = false }
 serde = { workspace = true }
 
+[features]
+# What the integration harness and the CLI's parity test drive directly
+# (`lib.rs` `test_support`): enabled by those test crates alone, never by a
+# build, so nothing behind it is in the recorded public API.
+test-support = []
+
 [dev-dependencies]
+# The crate's own integration tests enable `test-support` for themselves.
+nml-lsp = { path = ".", features = ["test-support"] }
 nml-validate = { workspace = true, features = ["test-support"] }
 # In-process duplex harness (tests/harness.rs): `tower` drives the LspService
 # as a plain `tower::Service` (`service.ready().await.call(..)`), `futures`

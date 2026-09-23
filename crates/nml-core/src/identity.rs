@@ -180,7 +180,7 @@ pub fn materialize_arm_inline(name: &Identifier, body: &Body, model: &ModelDef) 
 /// Recurse into each inline arm target inside an arm-set body — shared by the
 /// positional and defaulting passes so depth accounting and `resolve_type_in_body`
 /// selection stay identical.
-pub fn map_inline_arm_bodies(
+pub(crate) fn map_inline_arm_bodies(
     v: &FieldType,
     body: &Body,
     index: &SchemaIndex,
@@ -214,7 +214,7 @@ pub fn map_inline_arm_bodies(
 /// Apply `transform` to every routing arm in `body`, leaving other entries
 /// untouched. Shared by the positional and defaulting passes when recursing
 /// into arm-set fields with inline targets.
-pub fn map_arm_bodies(body: &Body, mut transform: impl FnMut(&Arm) -> Arm) -> Body {
+pub(crate) fn map_arm_bodies(body: &Body, mut transform: impl FnMut(&Arm) -> Arm) -> Body {
     let entries = body
         .entries
         .iter()

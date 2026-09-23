@@ -33,7 +33,7 @@ use nml_core::query::{BlockQuery, StringList};
 /// declaring a newer `formatVersion` must be rejected *before*
 /// meta-validation (`PackageError::UnsupportedFormatVersion`) so consumers
 /// can degrade gracefully (RFC 0030's `formatVersion` contract).
-pub const SUPPORTED_FORMAT_VERSION: u64 = 1;
+pub(crate) const SUPPORTED_FORMAT_VERSION: u64 = 1;
 
 /// The meta-schema validating `<name>.package.nml` manifests. Shipped as the
 /// builtin package (see [`builtin_meta_package`]).
@@ -177,7 +177,7 @@ impl PackageManifest {
     /// RFC 0030 meta-validation: a binding fully shadowed by an earlier one
     /// can never win under first-match-wins — every one of its globs is
     /// subsumed by some earlier binding's glob (exact language inclusion,
-    /// `glob::subsumes`). Conservative by construction: zero false positives.
+    /// `glob::subsumes_budgeted`). Conservative by construction: zero false positives.
     /// Spans are byte offsets into the manifest text — exactly the text an
     /// editor maps against when the resolved file IS the manifest, so the
     /// warning lands on the shadowed binding itself. Publishers may escalate
@@ -343,7 +343,7 @@ impl PackageError {
     /// the code rides the wire like every other loader rule's. `None`
     /// for every other variant: a `Manifest` and a `Sources` carry their
     /// findings, a `MissingSource` is a sentence about a file.
-    pub fn gate_finding(&self) -> Option<Diagnostic> {
+    pub(crate) fn gate_finding(&self) -> Option<Diagnostic> {
         match self {
             Self::UnsupportedFormatVersion { .. } => Some(
                 Diagnostic::error(self.to_string()).with_code(codes::UNSUPPORTED_FORMAT_VERSION),
@@ -564,7 +564,7 @@ impl SchemaPackage {
     /// the referent `nml binding` prints (`files[1] = "…"`) and the
     /// D-0d-1 conflict names; grant rules are unnamed strings, so the
     /// index is the only stable handle.
-    pub fn binding_match(&self, path: &str) -> Option<(&ValidatorBinding, usize)> {
+    pub(crate) fn binding_match(&self, path: &str) -> Option<(&ValidatorBinding, usize)> {
         self.manifest.validators.iter().find_map(|b| {
             b.files
                 .iter()
@@ -654,7 +654,7 @@ fn find_manifest(dir: &Path) -> Result<String, PackageError> {
 /// Declared source file names are plain names, never paths: a manifest can
 /// never reach outside its own directory. Shared by every resolution path
 /// (store slots, workspace manifests, embedded bundles).
-pub fn check_plain_file_name(file: &str) -> Result<(), String> {
+pub(crate) fn check_plain_file_name(file: &str) -> Result<(), String> {
     if file.contains('/') || file.contains('\\') || file.contains("..") || file.is_empty() {
         return Err("declared file names must be plain file names".to_string());
     }
@@ -1230,7 +1230,7 @@ fn extract_validators(
 /// `cause.message`.
 ///
 /// LIMIT: reach=content guards=output surface=kernel shown="160 bytes" — bytes of a manifest glob a loader finding echoes before eliding its middle
-pub const MAX_GLOB_ECHO_BYTES: usize = 160;
+pub(crate) const MAX_GLOB_ECHO_BYTES: usize = 160;
 
 /// A glob as a MESSAGE spells it: itself when short, else its head and
 /// its tail around its exact byte count. Cut on CHARACTER boundaries —
@@ -2333,6 +2333,30 @@ oneof record by kind:
             p.binding_for("sub/nudge.nml").is_none(),
             "globs are root-relative"
         );
+    }
+
+    /// The format number the specification names, as a LITERAL on both
+    /// sides. The gate is `required > SUPPORTED_FORMAT_VERSION`, and
+    /// every other assertion about it compares the REPORTED `supported`
+    /// with the constant itself — so raising the constant leaves all of
+    /// them green while the build silently accepts a manifest written
+    /// for a format it does not implement, which is the degradation
+    /// contract failing in the direction nobody looks.
+    #[test]
+    fn the_next_manifest_format_is_refused_and_this_one_is_named() {
+        assert_eq!(SUPPORTED_FORMAT_VERSION, 1);
+        let next = MANIFEST.replace("formatVersion = 1", "formatVersion = 2");
+        assert_ne!(
+            next, MANIFEST,
+            "the fixture must declare the format this gate is about"
+        );
+        match SchemaPackage::from_parts(&next, resolve) {
+            Err(PackageError::UnsupportedFormatVersion {
+                required: 2,
+                supported: 1,
+            }) => {}
+            other => panic!("a manifest one format ahead must be refused as 2 over 1: {other:?}"),
+        }
     }
 
     /// The TEXT-SCAN fallback (manifests that fail to parse): the

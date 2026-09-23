@@ -202,8 +202,6 @@ pub struct Facets<T> {
 
 /// The RFC 0018 numeric bound — [`FacetBoundOf`] over [`Number`](crate::types::Number).
 pub type FacetBound = FacetBoundOf<crate::types::Number>;
-/// The RFC 0018 numeric `multipleOf` — [`FacetMultipleOf`] over `Number`.
-pub type FacetMultiple = FacetMultipleOf<crate::types::Number>;
 /// Facets on a `number` field.
 pub type NumberFacets = Facets<crate::types::Number>;
 /// Facets on a `duration` field.
@@ -499,6 +497,9 @@ impl std::fmt::Display for FieldType {
 
 #[cfg(test)]
 mod facet_tests {
+    /// The RFC 0018 numeric `multipleOf` — [`FacetMultipleOf`] over `Number`.
+    type FacetMultiple = FacetMultipleOf<crate::types::Number>;
+
     use super::*;
     use crate::types::Number;
 

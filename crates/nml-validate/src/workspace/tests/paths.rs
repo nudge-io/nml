@@ -2,6 +2,7 @@
 //! probe log as the executable form of the no-existence-oracle rule.
 
 use super::*;
+use crate::fs::{EntryKind, FsError, LstatFs, OverlayFs};
 use crate::workspace::mock::{Probe, Spelling};
 
 /// The RFC's operator tree: an `admin/` subtree the tenant must never

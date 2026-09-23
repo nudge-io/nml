@@ -16,7 +16,8 @@ use std::path::Path;
 
 use libfuzzer_sys::fuzz_target;
 use nml_validate::workspace::{MockFs, Spelling};
-use nml_validate::workspace::{EntryKind, SourceKey, Trust, WorkspaceRoot};
+use nml_validate::workspace::{SourceKey, Trust, WorkspaceRoot};
+use nml_validate::fs::EntryKind;
 
 const DIRS: [&str; 6] = ["a", "A", "b", "lnk", "caf\u{e9}", "cafe\u{301}"];
 const LEAVES: [&str; 3] = ["x.nml", "y.nml", "z.nml"];

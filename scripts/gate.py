@@ -200,6 +200,12 @@ class DocReference:
 
 
 @dataclass
+class UndocumentedRecipe:
+    name: str
+    line: int
+
+
+@dataclass
 class Findings:
     ungated: list[WorkflowCommand] = field(default_factory=list)
     missing_recipes: list[WorkflowCommand] = field(default_factory=list)
@@ -207,6 +213,7 @@ class Findings:
     ci_recipes: set[str] = field(default_factory=set)
     exemptions: list[Exemption] = field(default_factory=list)
     dead_doc_references: list[DocReference] = field(default_factory=list)
+    undocumented_recipes: list[UndocumentedRecipe] = field(default_factory=list)
 
 
 # A recipe name as a document spells it. Two shapes, because documents use
@@ -262,6 +269,28 @@ def just_recipes() -> dict[str, list[str]]:
                 d for d in m.group(2).split() if re.fullmatch(r"[a-z][a-z0-9-]*", d)
             ]
     return recipes
+
+
+def recipe_descriptions(text: str | None = None) -> dict[str, tuple[str, int]]:
+    """Every recipe in the justfile, name -> (the description `just --list`
+    shows for it, its line).
+
+    `just` takes that description from the comment line IMMEDIATELY above the
+    recipe, so a new recipe inserted inside another recipe's comment block
+    takes that recipe's description away and keeps a fragment of its last
+    sentence — silently, because both files still parse."""
+    described: dict[str, tuple[str, int]] = {}
+    previous = ""
+    for number, raw in enumerate((text if text is not None else JUSTFILE.read_text()).splitlines(), 1):
+        if not raw.startswith((" ", "\t")) and raw.strip():
+            m = re.match(r"^([a-z][a-z0-9-]*)(?:\s+[^:]*?)?:(?!=)", raw)
+            if m:
+                described[m.group(1)] = (
+                    previous[1:].strip() if previous.startswith("#") else "",
+                    number,
+                )
+        previous = raw
+    return described
 
 
 def workflow_steps() -> list[tuple[str, str, str, str]]:
@@ -370,6 +399,9 @@ def check() -> Findings:
     for name in recipes:
         if name.startswith("gate-") and name not in referenced:
             findings.orphan_recipes.append(name)
+    for name, (description, number) in recipe_descriptions().items():
+        if not description:
+            findings.undocumented_recipes.append(UndocumentedRecipe(name, number))
     for path in tracked_text_files():
         rel = str(path.relative_to(REPO)) if path.is_relative_to(REPO) else str(path)
         if rel in DOC_EXEMPT or not path.is_file() or path.is_symlink():
@@ -443,6 +475,18 @@ def report(findings: Findings) -> int:
             f"    {ref.text}\n"
             "  Name the recipe that exists. A document is the other half of "
             "the one-name rule: a second spelling drifts silently.",
+            file=sys.stderr,
+        )
+    for recipe in findings.undocumented_recipes:
+        failed = True
+        print(
+            f"gate contract: justfile:{recipe.line} recipe `{recipe.name}` has no "
+            "description, so `just --list` — the index every contributor reads — "
+            "shows it as a bare name.\n"
+            "  Put a one-line `# …` comment directly above it. If the recipe was "
+            "added inside ANOTHER recipe's comment block, move it out first: `just` "
+            "reads the line immediately above a recipe as its description, so the "
+            "insertion takes that recipe's description away.",
             file=sys.stderr,
         )
     return 1 if failed else 0
@@ -779,6 +823,68 @@ def doc_rule_self_test() -> int:
     return 0
 
 
+# The description rule itself: `just --list` is the contributor's index, and
+# a recipe loses its line there silently. The third case is the whole point —
+# `stolen` is documented until `thief` is inserted under its comment block.
+SELF_TEST_JUSTFILE = """\
+# Build it.
+build:
+    cargo build
+
+undocumented:
+    cargo doc
+
+# Run some of them.
+# The last line is the description.
+test-some ARG:
+    cargo test {{ARG}}
+
+# A block that explains at length,
+# and ends on the line `just` will show.
+thief:
+    echo one
+
+stolen:
+    echo two
+"""
+
+SELF_TEST_DESCRIPTIONS: tuple[tuple[str, str], ...] = (
+    ("build", "Build it."),
+    ("undocumented", ""),
+    ("test-some", "The last line is the description."),
+    ("thief", "and ends on the line `just` will show."),
+    ("stolen", ""),
+)
+
+
+def recipe_description_self_test() -> int:
+    """The description rule, on a justfile that carries every shape: a
+    documented recipe, one with none, one with arguments, and the theft —
+    a recipe inserted under another's comment block, which leaves the one
+    below it with no description at all."""
+    got = recipe_descriptions(SELF_TEST_JUSTFILE)
+    for name, want in SELF_TEST_DESCRIPTIONS:
+        if name not in got or got[name][0] != want:
+            print(
+                f"self-test: FAILED — the description rule read "
+                f"{got.get(name, ('<missing>',))[0]!r} for `{name}`, expected {want!r}.",
+                file=sys.stderr,
+            )
+            return 1
+    if len(got) != len(SELF_TEST_DESCRIPTIONS):
+        print(
+            f"self-test: FAILED — the description rule found {sorted(got)}, "
+            f"expected {sorted(n for n, _ in SELF_TEST_DESCRIPTIONS)}.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"self-test: the description rule reads {len(SELF_TEST_DESCRIPTIONS)} recipes "
+        "correctly, the stolen one included"
+    )
+    return 0
+
+
 def fingerprint_self_test() -> int:
     """The tree fingerprint must move for every way one tree differs from
     another — including the one it used to miss.
@@ -856,6 +962,8 @@ def self_test() -> int:
     if (code := fingerprint_self_test()) != 0:
         return code
     if (code := doc_rule_self_test()) != 0:
+        return code
+    if (code := recipe_description_self_test()) != 0:
         return code
     if (code := red_report_self_test()) != 0:
         return code

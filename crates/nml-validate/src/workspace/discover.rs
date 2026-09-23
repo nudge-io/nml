@@ -339,7 +339,7 @@ impl EntryBudget {
 /// like the entry bounds ([`EntryBudget`]) and not read from the
 /// constants at the charge, so the default test lane has the same seam
 /// for the byte backstop that it has for the entry one
-/// ([`discover_byte_scaled`]): the universe-wide byte bound is a
+/// (`discover_byte_scaled`, the tests' scaled walk): the universe-wide byte bound is a
 /// gigabyte, which no default-lane test can reach and which therefore
 /// went unpinned. Never a runtime knob.
 #[derive(Debug, Clone, Copy)]

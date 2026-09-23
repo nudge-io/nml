@@ -5,6 +5,7 @@
 use super::*;
 use nml_core::diagnostic::codes;
 
+use crate::fs::{EntryKind, FsError};
 use crate::workspace::discover::{
     MAX_ENTRIES, MAX_LIVE_INPUT_BYTES, MAX_TOTAL_ENTRIES, MAX_TOTAL_LIVE_INPUT_BYTES,
 };
@@ -4018,7 +4019,8 @@ fn the_hidden_audit_counts_unkeyable_nml_names_and_is_incomplete_at_an_unkeyable
 /// `.txt` so named is no content and no row.
 #[test]
 fn a_backslash_named_entry_is_skipped_not_joined() {
-    use crate::workspace::{EntryKind, Skip};
+    use crate::fs::EntryKind;
+    use crate::workspace::Skip;
     let ws = Ws::new()
         .manifest("demo.package.nml", "demo", &[], TENANTS)
         .file("tenants/cu/plain.flow.nml")
@@ -4152,7 +4154,8 @@ fn the_walks_files_and_skipped_rows_come_out_in_their_stated_order() {
 /// as a plain-named one is not.
 #[test]
 fn an_unkeyable_symlink_and_a_nml_named_special_entry_are_reported_by_kind() {
-    use crate::workspace::{EntryKind, Skip};
+    use crate::fs::EntryKind;
+    use crate::workspace::Skip;
     let ws = Ws::new()
         .manifest("demo.package.nml", "demo", &[], TENANTS)
         .file("tenants/cu/plain.flow.nml");

@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nml_core::diagnostic::{Diagnostic, codes};
+use nml_validate::fs::{EntryKind, MAX_SOURCE_BYTES, ReadError, StdFs, read_beneath};
 use nml_validate::schema::SchemaValidator;
 use nml_validate::workspace::{
-    AuditBudget, ClaimOrigin, Discovery, Endpoint, EntryKind, ExternalClaim, ExternalClass,
-    Governing, InputKind, MAX_SOURCE_BYTES, PathError, ReadError, Resolved, RootOrigin, Shadow,
-    Skip, SourceKey, StdFs, Truncation, Trust, Universe, WorkspaceRoot, ambiguous_claim_summary,
-    audit_hidden, audit_incomplete, discover, path_finding_typed, read_beneath, read_input,
-    resolve_file, skipped as skipped_row, skipped_under,
+    AuditBudget, ClaimOrigin, Discovery, Endpoint, ExternalClaim, ExternalClass, Governing,
+    InputKind, PathError, Resolved, RootOrigin, Shadow, Skip, SourceKey, Truncation, Trust,
+    Universe, WorkspaceRoot, ambiguous_claim_summary, audit_hidden, audit_incomplete, discover,
+    path_finding_typed, read_input, resolve_file, skipped as skipped_row, skipped_under,
 };
 
 /// A `--schema` directory the run cannot read IN FULL is the INVOCATION's
@@ -69,7 +69,7 @@ pub fn require_schema_dir(dir: &Path) -> Result<(), String> {
 pub fn read_schema_dir(dir: &Path) -> Result<Vec<(PathBuf, String)>, String> {
     let opened = std::fs::read_dir(dir)
         .map_err(|e| schema_dir_error(dir, &io_reason(&e, "cannot read the directory")))?;
-    schema_sources_of(nml_validate::workspace::listing(Ok(opened)), dir)?
+    schema_sources_of(nml_validate::fs::listing(Ok(opened)), dir)?
         .into_iter()
         .map(|path| {
             read_schema_source(&path)
@@ -96,7 +96,7 @@ pub fn read_schema_dir(dir: &Path) -> Result<Vec<(PathBuf, String)>, String> {
 /// sentence, so no path into the tool reads a source the other would
 /// refuse. The reason never carries `io::Error`'s `(os error N)` tail.
 fn read_schema_source(path: &Path) -> Result<String, String> {
-    use nml_validate::workspace::OpenError;
+    use nml_validate::fs::OpenError;
     let at = crate::leaf_under_parent(path)?;
     read_beneath(
         &at.dir,
@@ -122,7 +122,7 @@ fn read_schema_source(path: &Path) -> Result<String, String> {
 /// unreadable ENTRY is pinned without a filesystem that fails per
 /// entry: a refused listing is the invocation's mistake.
 fn schema_sources_of(
-    listing: nml_validate::workspace::Listing,
+    listing: nml_validate::fs::Listing,
     dir: &Path,
 ) -> Result<Vec<PathBuf>, String> {
     let entries =
@@ -219,7 +219,7 @@ mod read_ratchet {
     /// than a `Take`. Each file is checked to still exist and each row
     /// to still be NEEDED, so a row cannot outlive the code it excuses.
     const ALLOWED: &[(&str, &str, &str)] = &[(
-        "crates/nml-lsp/src/lib.rs",
+        "crates/nml-lsp/src/transport/framing.rs",
         "read_exact",
         "the JSON-RPC body: the buffer is sized from a `Content-Length` already refused past \
          `MAX_FRAME_BYTES`, so the read is bounded by the buffer",
@@ -400,7 +400,8 @@ mod read_ratchet {
         assert!(
             offenders.is_empty(),
             "an UNBOUNDED read ({} product sources scanned). Route it through \
-             `nml_validate::workspace::{{read_beneath, read_leaf, read_input}}` under a published \
+             `nml_validate::fs::{{read_beneath, read_leaf}}` or `workspace::read_input` under a \
+             published \
              bound, or `.take(bound)` it, or add (file, token, why) to ALLOWED:\n{}",
             scanned.len(),
             offenders.join("\n")
@@ -470,7 +471,7 @@ mod read_ratchet {
 #[cfg(test)]
 mod schema_dir_tests {
     use super::*;
-    use nml_validate::workspace::FsError;
+    use nml_validate::fs::FsError;
     use std::ffi::OsString;
 
     /// The `--schema` listing goes through the kernel's rule: a listing
@@ -1029,7 +1030,7 @@ impl Workspace {
             .map_err(|e| {
                 let why = match e {
                     // The leaf became a link: the CLI's own advice.
-                    ReadError::Open(e @ nml_validate::workspace::OpenError::Symlink { .. }) => {
+                    ReadError::Open(e @ nml_validate::fs::OpenError::Symlink { .. }) => {
                         crate::leaf_advice(e)
                     }
                     // Everything else in the OS's own words, as the
@@ -1421,7 +1422,7 @@ fn write_under(
     path: &Path,
     contents: &str,
 ) -> Result<(), String> {
-    nml_validate::workspace::write_beneath(root.path(), components, contents.as_bytes())
+    nml_validate::fs::write_beneath(root.path(), components, contents.as_bytes())
         .map_err(|e| format!("failed to write {}: {}", path.display(), e.into_io()))
 }
 

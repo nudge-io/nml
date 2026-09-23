@@ -8385,7 +8385,7 @@ fn limits_publishes_the_bounds_and_their_reach() {
     // protection while the headers were read unbounded).
     assert!(
         stdout.contains("nml-validate::store::MAX_POINTER_BYTES")
-            && stdout.contains("nml-lsp::MAX_HEADER_BYTES"),
+            && stdout.contains("nml-lsp::transport::framing::MAX_HEADER_BYTES"),
         "{stdout}"
     );
 
@@ -8416,7 +8416,7 @@ fn limits_publishes_the_bounds_and_their_reach() {
     assert_eq!(index["surface"], "editor");
     let frame = r
         .iter()
-        .find(|row| row["name"] == "nml-lsp::MAX_FRAME_BYTES")
+        .find(|row| row["name"] == "nml-lsp::transport::framing::MAX_FRAME_BYTES")
         .expect("the frame bound is published");
     assert_eq!(frame["reach"], "peer");
     assert!(

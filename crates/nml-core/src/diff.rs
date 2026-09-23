@@ -415,8 +415,15 @@ pub fn synthesize_config_root(root_name: &str, fields: &[ConfigRootField]) -> Mo
 /// (RFC 0019). A NON-identifier spelling the parser can never produce, so
 /// a real field named `uses` cannot collide; consumers that enumerate
 /// diff paths recognize base-layer swaps by this constant.
+/// The key under which a block's `uses` list travels in a wrapped body —
+/// an embedder that diffs whole files (the platform's config reload and
+/// schema-conformance passes do) reads it back by this name.
 pub const USES_DIFF_KEY: &str = "(uses)";
 
+/// A parsed [`File`] as the [`Body`] the differ walks: every block or array
+/// declaration becomes one entry, a block's `uses` list travelling as the
+/// synthetic [`USES_DIFF_KEY`] property. With [`config_root_fields_from_files`]
+/// this is how an embedder diffs two whole configuration files.
 pub fn wrap_file_as_body(file: &File) -> Body {
     let mut entries = Vec::new();
     for decl in &file.declarations {
@@ -2311,6 +2318,33 @@ mod tests {
         let with_field = parse("flow t:\n    uses = \"a\"\n");
         let wf = wrap_file_as_body(&with_field);
         assert!(!serde_json::to_string(&wf).unwrap().contains(USES_DIFF_KEY));
+    }
+
+    /// The synthetic key is a NAME on the wire, not an implementation
+    /// detail: it rides the diffable body a reload differ renders, so
+    /// renaming it renames a property path an operator reads. Every
+    /// assertion written against the constant alone renames WITH it —
+    /// this one names the string, both where it must appear and where it
+    /// must not.
+    #[test]
+    fn the_uses_clause_travels_under_the_name_the_parser_cannot_mint() {
+        assert_eq!(USES_DIFF_KEY, "(uses)");
+        let parse = |src: &str| crate::cst::parse_to_ast(src).unwrap();
+        let wired = serde_json::to_string(&wrap_file_as_body(&parse(
+            "flow tenant uses prodBase:\n    label = \"x\"\n",
+        )))
+        .unwrap();
+        assert!(
+            wired.contains("(uses)"),
+            "the uses list must ride the body under its published name: {wired}"
+        );
+        let plain =
+            serde_json::to_string(&wrap_file_as_body(&parse("flow t:\n    uses = \"a\"\n")))
+                .unwrap();
+        assert!(
+            !plain.contains("(uses)"),
+            "a real field named `uses` must not be spelled as the synthetic key: {plain}"
+        );
     }
 
     use super::*;

@@ -894,7 +894,8 @@ mod tests {
     /// no copy) and the kernel's selector reads exactly them.
     #[test]
     fn input_caps_are_census_rows_read_from_the_kernel() {
-        use nml_validate::workspace::{InputKind, MAX_MANIFEST_BYTES, MAX_SOURCE_BYTES, input_cap};
+        use nml_validate::fs::{MAX_MANIFEST_BYTES, MAX_SOURCE_BYTES};
+        use nml_validate::workspace::{InputKind, input_cap};
         let row = |name: &str| {
             LIMITS
                 .iter()
@@ -985,8 +986,7 @@ mod tests {
             let shown = limit.shown;
             let accepted = shown == value.to_string()
                 || shown == format!("{value} bytes")
-                || u64::try_from(value)
-                    .is_ok_and(|v| shown == nml_validate::workspace::human_bytes(v))
+                || u64::try_from(value).is_ok_and(|v| shown == nml_validate::fs::human_bytes(v))
                 || shown
                     .strip_prefix('~')
                     .and_then(|rest| rest.split_once(' '))

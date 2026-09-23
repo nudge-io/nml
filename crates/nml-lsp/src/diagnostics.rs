@@ -218,26 +218,6 @@ impl ParsedBuffer {
     }
 }
 
-/// Parse `source` and run [`compute_parsed`] over it.
-pub fn compute(
-    source: &str,
-    mode: &SchemaMode<'_>,
-    config: &DiagnosticConfig,
-    uri: Option<&tower_lsp::lsp_types::Url>,
-    source_name: &str,
-    locate: &dyn Fn(&str) -> Option<(tower_lsp::lsp_types::Url, String)>,
-) -> Vec<Diagnostic> {
-    compute_parsed(
-        source,
-        ParsedBuffer::parse(source),
-        mode,
-        config,
-        uri,
-        source_name,
-        locate,
-    )
-}
-
 /// The instance-side diagnostics of an already-parsed buffer. Parses
 /// nothing itself — the one-parse-per-publish pin reads
 /// `nml_core::cst::parses_on_this_thread` across this call. `source_name`
@@ -972,6 +952,27 @@ fn validate_value_templates(
 mod tests {
 
     use super::*;
+
+    /// Parse `source` and run [`compute_parsed`] over it — the tests' one-call
+    /// path; the server parses once per publish and calls `compute_parsed`.
+    fn compute(
+        source: &str,
+        mode: &SchemaMode<'_>,
+        config: &DiagnosticConfig,
+        uri: Option<&tower_lsp::lsp_types::Url>,
+        source_name: &str,
+        locate: &dyn Fn(&str) -> Option<(tower_lsp::lsp_types::Url, String)>,
+    ) -> Vec<Diagnostic> {
+        compute_parsed(
+            source,
+            ParsedBuffer::parse(source),
+            mode,
+            config,
+            uri,
+            source_name,
+            locate,
+        )
+    }
 
     /// [`schema_source_pass`] over a freshly extracted source.
     fn source_pass(source: &str, vocab: &crate::packages::VocabularyMatch) -> Vec<Diagnostic> {

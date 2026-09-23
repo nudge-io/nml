@@ -12,7 +12,5 @@ async fn main() -> std::process::ExitCode {
     // package via `nml_lsp::serve` from their `<tool> lsp` subcommand instead.
     // The code is the protocol's (LSP 3.17 §exit): 0 after `shutdown`, 1
     // without it.
-    nml_lsp::serve_stdio(nml_lsp::server::NmlLanguageServer::new)
-        .await
-        .exit_code()
+    nml_lsp::serve_stdio().await.exit_code()
 }

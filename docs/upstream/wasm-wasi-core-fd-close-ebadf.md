@@ -88,5 +88,5 @@ finite, and the host's fd table is not reused.
 
 The wrapper only opens; the listing itself (its sort, its kinds, the refusal
 of a whole listing on one unreadable entry) is the validation kernel's one
-rule (`nml_validate::workspace::listing`), the same the native oracle runs —
+rule (`nml_validate::fs::listing`), the same the native oracle runs —
 the wrapper yields entries exactly as `std` does, errors included.

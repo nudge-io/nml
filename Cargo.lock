@@ -552,6 +552,7 @@ dependencies = [
  "futures",
  "nml-core",
  "nml-fmt",
+ "nml-lsp",
  "nml-validate",
  "rustix",
  "serde",

@@ -39,7 +39,7 @@ const UNION_SHORTHAND_MSG: &str =
 /// Validates instance declarations against model definitions.
 ///
 /// In default mode, unknown properties are reported as warnings and blocks
-/// with no matching model are silently skipped.  Call [`Self::strict`] to
+/// with no matching model are silently skipped.  Call [`SchemaValidator::strict`] to
 /// promote unknown-property diagnostics to errors and to detect blocks /
 /// arrays whose keyword has no model definition.
 ///
@@ -197,7 +197,7 @@ impl SchemaValidator {
 
     /// Mark this validator's schema set as a closed vocabulary (RFC 0012) —
     /// see the field docs. Called by the package layer only.
-    pub fn closed_vocabulary(mut self) -> Self {
+    pub(crate) fn closed_vocabulary(mut self) -> Self {
         self.closed_vocabulary = true;
         self
     }
@@ -305,7 +305,7 @@ impl SchemaValidator {
     }
 
     /// An "unknown property" diagnostic (warning by default, error under
-    /// [`Self::strict`]) with a near-miss suggestion against the model's
+    /// [`SchemaValidator::strict`]) with a near-miss suggestion against the model's
     /// declared fields when one is close enough. The suggestion span is the
     /// property-name token, so the quick-fix is machine-applicable.
     fn unknown_property_diagnostic(&self, name: &str, model: &ModelDef, span: Span) -> Diagnostic {
@@ -608,7 +608,7 @@ impl SchemaValidator {
         self.index.model(name)
     }
 
-    pub fn find_enum(&self, name: &str) -> Option<&EnumDef> {
+    pub(crate) fn find_enum(&self, name: &str) -> Option<&EnumDef> {
         self.index.enum_def(name)
     }
 
@@ -683,7 +683,11 @@ impl SchemaValidator {
     }
 
     /// [`Self::validate_definitions`], streamed into `diagnostics`.
-    pub fn validate_definitions_into(&self, file: &File, diagnostics: &mut dyn DiagnosticSink) {
+    pub(crate) fn validate_definitions_into(
+        &self,
+        file: &File,
+        diagnostics: &mut dyn DiagnosticSink,
+    ) {
         for decl in &file.declarations {
             if let DeclarationKind::Block(block) = &decl.kind {
                 let keyword = block.keyword.name.as_str();
@@ -3375,7 +3379,7 @@ fn type_has_facets(t: &FieldType) -> bool {
 /// double-report. Safe on a PARTIAL schema view (the LSP's open-buffer
 /// registry): an unresolvable model or enum reference degrades to a
 /// value-shape check, never a false "unknown definition".
-pub fn default_diagnostics(schema: &ExtractedSchema) -> Vec<Diagnostic> {
+pub(crate) fn default_diagnostics(schema: &ExtractedSchema) -> Vec<Diagnostic> {
     // The clone is deliberate. `SchemaValidator` owns its definitions,
     // and threading a borrowed one through would widen its API for a
     // measured 46 µs on a real 85-model schema set — a quarter of one

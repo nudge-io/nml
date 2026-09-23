@@ -288,7 +288,7 @@ pub(crate) fn currency_codes() -> impl Iterator<Item = &'static str> {
 }
 
 /// Returns the ISO 4217 exponent (minor unit count) for a currency code.
-pub fn currency_exponent(code: &str) -> Option<u8> {
+pub(crate) fn currency_exponent(code: &str) -> Option<u8> {
     CURRENCY_BANDS
         .iter()
         .find_map(|(codes, exponent)| codes.contains(&code).then_some(*exponent))

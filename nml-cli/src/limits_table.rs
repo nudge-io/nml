@@ -454,7 +454,7 @@ pub const LIMITS: &[Limit] = &[
         what: "files an uncovered universe loads for one diagnostics pull",
     },
     Limit {
-        path: "crates/nml-lsp/src/lib.rs",
+        path: "crates/nml-lsp/src/transport/framing.rs",
         name: "MAX_FRAME_BYTES",
         expr: "256 * 1024 * 1024",
         shown: "256 MiB",
@@ -464,7 +464,7 @@ pub const LIMITS: &[Limit] = &[
         what: "bytes of one JSON-RPC frame the wasm transport will allocate",
     },
     Limit {
-        path: "crates/nml-lsp/src/lib.rs",
+        path: "crates/nml-lsp/src/transport/framing.rs",
         name: "MAX_HEADER_BYTES",
         expr: "8 * 1024",
         shown: "8 KiB",

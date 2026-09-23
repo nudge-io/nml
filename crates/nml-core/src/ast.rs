@@ -649,7 +649,7 @@ fn ident(f: &mut impl FnMut(crate::span::SpanSite), kind: &'static str, id: &Ide
 
 /// A value's span and every span nested in it (template expressions, array
 /// items, fallback arms).
-pub fn value_spans(
+pub(crate) fn value_spans(
     f: &mut impl FnMut(crate::span::SpanSite),
     kind: &'static str,
     v: &SpannedValue,
@@ -683,7 +683,10 @@ pub fn value_spans(
 }
 
 /// A directive's whole span and its argument's.
-pub fn directive_spans(f: &mut impl FnMut(crate::span::SpanSite), d: &crate::types::Directive) {
+pub(crate) fn directive_spans(
+    f: &mut impl FnMut(crate::span::SpanSite),
+    d: &crate::types::Directive,
+) {
     site(f, "Directive", d.span);
     if let Some(arg) = &d.arg {
         value_spans(f, "Directive.arg", arg);

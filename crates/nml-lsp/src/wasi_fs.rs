@@ -42,13 +42,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use nml_validate::workspace::{DirEntryLike, EntryKind};
+use nml_validate::fs::{DirEntryLike, EntryKind};
 
 /// One directory entry as the kernel's listing rule consumes it. The kind
 /// is resolved when the entry is read — from `readdir`'s own type byte
 /// where the host gives one, else by `lstat` — so an entry whose kind
 /// cannot be read is an `Err` in the listing, which the kernel's rule
-/// (`nml_validate::workspace::listing`) refuses the whole listing on,
+/// (`nml_validate::fs::listing`) refuses the whole listing on,
 /// exactly as the native oracle does.
 pub(crate) struct Entry(OsString, EntryKind);
 
@@ -219,7 +219,7 @@ mod lister {
     use std::ffi::OsString;
     use std::path::Path;
 
-    use nml_validate::workspace::EntryKind;
+    use nml_validate::fs::EntryKind;
     use rustix::fs::{Dir, FileType, Mode, OFlags};
 
     #[cfg(unix)]
@@ -293,7 +293,7 @@ mod lister {
     use std::ffi::OsString;
     use std::path::Path;
 
-    use nml_validate::workspace::EntryKind;
+    use nml_validate::fs::EntryKind;
 
     pub(super) fn read_dir(dir: &Path) -> std::io::Result<Vec<(OsString, EntryKind)>> {
         let mut out = Vec::new();
@@ -354,7 +354,7 @@ mod tests {
         std::os::unix::fs::symlink("b-file", base.join("c-link")).expect("link");
         let mut mine = super::read_dir(&base).expect("lister");
         mine.sort();
-        let native = nml_validate::workspace::listing(std::fs::read_dir(&base)).expect("native");
+        let native = nml_validate::fs::listing(std::fs::read_dir(&base)).expect("native");
         assert_eq!(mine, native, "the lister and the native oracle must agree");
         let _ = std::fs::remove_dir_all(&base);
     }

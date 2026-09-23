@@ -1,4 +1,12 @@
-//! Layer A's ONLY window on the world (RFC 0019 item 0, A15′).
+//! The crate's ONE filesystem leaf (E28/E35), and Layer A's ONLY window on
+//! the world (RFC 0019 item 0, A15′): the race-free `openat`-beneath chain,
+//! the capped reader, the listing rule and the [`PathFs`]/[`LstatFs`]
+//! oracle. It draws NO arrow to any other module, and three layers need it
+//! — the workspace kernel, `package` (a package directory's manifest and
+//! sources) and `store` (a slot pointer) — so it is the CRATE's leaf, not
+//! the kernel's, published at its own path since apiVersion 5 (the module
+//! whose subject is which binding governs a file no longer publishes
+//! twenty-two filesystem names).
 //!
 //! Every filesystem observation the workspace kernel makes goes through
 //! the injected [`PathFs`] oracle — a Layer-A function is a pure function
@@ -13,9 +21,8 @@
 //! longer contains this directory at all. It is the CRATE's leaf
 //! (`src/fs/`): the workspace kernel, `package` and `store` all read
 //! through it, and it draws no arrow back to any of them
-//! (`tests/module_arrows.rs`). Its one PUBLIC spelling is
-//! `workspace::{read_beneath, read_leaf, …}`, re-exported by its first
-//! consumer, so no downstream name moved with the directory.
+//! (`tests/module_arrows.rs`), and it is published at its own path —
+//! `nml_validate::fs::{read_beneath, read_leaf, …}` — for every front end.
 //!
 //! The oracle is ONE component primitive plus two helpers. [`LstatFs::child`]
 //! is `lstat` first, then — only when the entry is not a symlink — the

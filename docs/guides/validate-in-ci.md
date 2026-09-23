@@ -550,8 +550,8 @@ nml limits --json | jq -r 'select(.reach=="content") | "\(.name)\t\(.value)"'
 | `nml-lsp::server::MAX_LOCATE_BYTES` | 8 MiB | content | memory | editor | bytes read when locating a related note's file |
 | `nml-lsp::server::MAX_SUGGESTION_ACTIONS` | 8 | content | output | editor | code actions minted from one diagnostic's suggestions |
 | `nml-lsp::server::MAX_UNIVERSE_FILES` | 128 | content | memory | editor | files an uncovered universe loads for one diagnostics pull |
-| `nml-lsp::MAX_FRAME_BYTES` | 256 MiB | peer | memory | editor | bytes of one JSON-RPC frame the wasm transport will allocate |
-| `nml-lsp::MAX_HEADER_BYTES` | 8 KiB | peer | memory | editor | bytes of one JSON-RPC header line the wasm transport will read |
+| `nml-lsp::transport::framing::MAX_FRAME_BYTES` | 256 MiB | peer | memory | editor | bytes of one JSON-RPC frame the wasm transport will allocate |
+| `nml-lsp::transport::framing::MAX_HEADER_BYTES` | 8 KiB | peer | memory | editor | bytes of one JSON-RPC header line the wasm transport will read |
 <!-- nml limits: end -->
 
 `source` is the workspace KEY of the file — on a located finding, a

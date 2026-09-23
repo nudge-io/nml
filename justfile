@@ -113,6 +113,7 @@ doctor:
 gate-contract:
     python3 scripts/gate.py check
     python3 scripts/gate.py self-test
+    python3 scripts/api_reach.py --self-test
 
 # rust-ci.yml `lint`: formatting, lints, and rustdoc as a build product.
 gate-lint:
@@ -299,14 +300,17 @@ build-lsp-debug:
 install-bin: build-lsp
     cp target/release/nml-lsp ~/.cargo/bin/nml-lsp
 
+# Install the extension's pnpm dependencies (the other ext recipes' first step).
 install-ext-deps:
     corepack enable || true
     pnpm install
 
+# Typecheck and compile the VS Code extension's TypeScript.
 compile-ext: install-ext-deps
     pnpm --filter nml-lang run check:toolchain
     pnpm --filter nml-lang run compile
 
+# Build the extension's .vsix, bundled WASM server included.
 package-ext: compile-ext gate-wasm
     cd editors/vscode && rm -f *.vsix && pnpm run package
 
@@ -335,6 +339,10 @@ fmt:
 # Check formatting without modifying (the pre-commit hook's step).
 fmt-check:
     cargo fmt --all -- --check
+
+# Who, outside its crate, names each recorded public item (before a `revision` bump).
+api-reach *ARGS:
+    python3 scripts/api_reach.py {{ARGS}}
 
 # rust-ci.yml `api`. The PUBLIC API contract — the library half of the
 # `--json` wire's. Regenerates nothing: it CHECKS the committed records,

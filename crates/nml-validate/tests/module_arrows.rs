@@ -55,9 +55,6 @@ const ALLOWED: &[(&str, &str)] = &[
     ("store", "glob"),
     ("store", "package"),
     ("workspace", "file_names"),
-    // the kernel is the leaf's first consumer and its public door: the
-    // ONE public spelling of the reader stays `workspace::read_beneath`
-    ("workspace", "fs"),
     ("workspace::claims", "fs"),
     ("workspace::claims", "glob"),
     ("workspace::claims", "package"),

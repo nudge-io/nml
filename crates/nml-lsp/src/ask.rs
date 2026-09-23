@@ -30,7 +30,7 @@ use tower_lsp::lsp_types::MessageType;
 /// Native (`tower_lsp::Server::serve`) reads input and writes output
 /// concurrently: it can. The wasm32 neutral server (RFC 0035) runs under
 /// VS Code's `wasm-wasi-core`, whose stdio model is synchronous, so
-/// [`crate::pump`] is a strict read→call→write loop — the request is not
+/// `crate::transport::pump` (the wasm32 build's transport) is a strict read→call→write loop — the request is not
 /// even WRITTEN until the handler returns, and the handler is waiting for
 /// its answer. It cannot, ever: the `await` never resolves, the pump never
 /// reads again, and the process outlives both `exit` and stdin's EOF —

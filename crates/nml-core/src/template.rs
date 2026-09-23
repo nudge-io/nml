@@ -5,7 +5,7 @@ use crate::types::TemplateSegment;
 ///
 /// The `string_start` byte offset is the position of the opening quote in the
 /// source file, used to compute accurate spans for each expression.
-pub fn parse_template_string(s: &str, string_start: usize) -> Vec<TemplateSegment> {
+pub(crate) fn parse_template_string(s: &str, string_start: usize) -> Vec<TemplateSegment> {
     scan(s, string_start, |literal, _| {
         TemplateSegment::Literal(literal.to_string())
     })

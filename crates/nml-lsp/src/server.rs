@@ -13,8 +13,8 @@ use nml_core::schema_index::{BodyShape, NameableVariant};
 use nml_core::span::Span;
 use nml_core::types::{PrimitiveType, Value};
 use nml_core::{FieldTarget, SchemaIndex};
+use nml_validate::fs::read_leaf;
 use nml_validate::schema::MembershipSemantics;
-use nml_validate::workspace::read_leaf;
 
 use crate::diagnostics::{self, SchemaMode};
 use crate::duration_lsp::{self, DurationUnitContext};
@@ -351,7 +351,7 @@ pub struct Inner {
     /// declared it can create one; undeclared, no such action is offered.
     creates_files: std::sync::atomic::AtomicBool,
     /// Client capability: `workspace.diagnostics.refreshSupport` (LSP 3.17's
-    /// spelling, read from the raw `initialize` params by [`crate::NmlService`];
+    /// spelling, read from the raw `initialize` params by [`crate::session::NmlService`];
     /// lsp-types 0.94.1's `workspace.diagnostic` spelling is read here) — the
     /// client re-pulls every open document on `workspace/diagnostic/refresh`
     /// (LSP 3.17). Declared, a pull that REDISCOVERS the universe (a
@@ -362,7 +362,7 @@ pub struct Inner {
     /// undeclared, they heal on their own next pull.
     refresh_diagnostics: std::sync::atomic::AtomicBool,
     /// LSP 3.17's own spelling of that capability as the LAST `initialize`
-    /// frame sent it, parked by [`crate::NmlService`] for the `initialize`
+    /// frame sent it, parked by [`crate::session::NmlService`] for the `initialize`
     /// HANDLER to take. The peek runs on every `initialize` frame — it is a
     /// look at raw JSON, upstream of tower-lsp's lifecycle — and tower-lsp
     /// refuses a duplicate `initialize` without running the handler; parking
@@ -474,11 +474,12 @@ impl NmlLanguageServer {
         )
     }
 
-    /// Embedder/test seam: identical to [`Self::new`] except the
+    /// Test seam (the in-process harness): identical to [`Self::new`] except the
     /// schema-package store is supplied by the caller instead of resolved from
     /// the user environment (`NML_SCHEMA_STORE_DIR` / platform data dir). The
     /// in-process test harness injects a tempdir store here; an embedder may
     /// inject its own store, or `None` to run storeless.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_store(client: Client, store: Option<nml_validate::store::Store>) -> Self {
         Self::build(
             client,
@@ -512,11 +513,7 @@ impl NmlLanguageServer {
                 refused_buffers: Mutex::new(HashMap::new()),
                 pending_index_roots: Mutex::new(Vec::new()),
                 membership,
-                resolver: packages::PackageResolver::with_injected(
-                    store,
-                    store_events_tx,
-                    injected,
-                ),
+                resolver: packages::PackageResolver::new(store, store_events_tx, injected),
                 insert_replace_support: std::sync::atomic::AtomicBool::new(false),
                 label_details_support: std::sync::atomic::AtomicBool::new(false),
                 explain_command: Mutex::new(None),
@@ -1511,7 +1508,7 @@ impl Inner {
         Some(tower_lsp::lsp_types::Diagnostic {
             range: tower_lsp::lsp_types::Range::new(zero, zero),
             severity: Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
-            message: nml_validate::workspace::too_large(Some(len), MAX_INDEX_BYTES, OPEN_DOCUMENT),
+            message: nml_validate::fs::too_large(Some(len), MAX_INDEX_BYTES, OPEN_DOCUMENT),
             source: Some("nml".to_string()),
             ..Default::default()
         })
@@ -5077,7 +5074,7 @@ impl NmlLanguageServer {
     /// Park what the raw `initialize` params of one frame said about
     /// `workspace.diagnostics.refreshSupport` — LSP 3.17's spelling, which
     /// lsp-types 0.94.1 drops on deserialization, read by
-    /// [`crate::NmlService`] from the request as the client sent it. Parked,
+    /// [`crate::session::NmlService`] from the request as the client sent it. Parked,
     /// not applied: only the `initialize` HANDLER — which runs for the one
     /// frame tower-lsp accepts — turns the capability on, so a duplicate
     /// `initialize` declares nothing. Written on every frame, so the
@@ -5545,7 +5542,7 @@ impl LanguageServer for NmlLanguageServer {
         );
         // lsp-types' spelling of the capability (`workspace.diagnostic`),
         // OR the specification's (`workspace.diagnostics`), which
-        // [`crate::NmlService`] read from the raw params of THIS frame
+        // [`crate::session::NmlService`] read from the raw params of THIS frame
         // before this handler ran and parked for the handler to take —
         // so the capabilities of an `initialize` tower-lsp REFUSED (a
         // duplicate: `invalid_request`, this handler never runs) reach
@@ -10747,7 +10744,7 @@ workflow VoiceAgent:
         )
         .unwrap();
         let (service, _socket) =
-            crate::build_service(|client| NmlLanguageServer::with_store(client, None));
+            crate::session::build_service(|client| NmlLanguageServer::with_store(client, None));
         let server = service.inner();
         let root = dunce::canonicalize(&ws).unwrap();
         server.workspace_roots.lock().unwrap().push(root.clone());
@@ -10814,7 +10811,7 @@ workflow VoiceAgent:
         )
         .unwrap();
         let (service, _socket) =
-            crate::build_service(|client| NmlLanguageServer::with_store(client, None));
+            crate::session::build_service(|client| NmlLanguageServer::with_store(client, None));
         let server = service.inner();
         let root = dunce::canonicalize(&*ws).unwrap();
         server.workspace_roots.lock().unwrap().push(root.clone());
@@ -10858,7 +10855,7 @@ workflow VoiceAgent:
         fs::write(&doc, "thing a:\n    v = \"x\"\n").unwrap();
 
         let (service, _socket) =
-            crate::build_service(|client| NmlLanguageServer::with_store(client, None));
+            crate::session::build_service(|client| NmlLanguageServer::with_store(client, None));
         let server = service.inner();
         // The client sends the INNER folder first.
         server
@@ -10897,7 +10894,7 @@ workflow VoiceAgent:
 
         // The handshake's own capture obeys the same rule.
         let (service, _socket) =
-            crate::build_service(|client| NmlLanguageServer::with_store(client, None));
+            crate::session::build_service(|client| NmlLanguageServer::with_store(client, None));
         let fresh = service.inner();
         let folder = |p: &std::path::Path, name: &str| WorkspaceFolder {
             uri: Url::from_file_path(p).unwrap(),

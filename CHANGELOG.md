@@ -803,6 +803,43 @@ Security group lists every change that made a silent outcome a refusal.
   error and no lint, as `nml check` prints none; a universe row located in
   the document it sits on (NML2081 at its item) sits at that item.
 
+- **public API apiVersion 7, revision 1** — BREAKING: the record becomes
+  the embedder's contract. Measured against every consumer (the workspace,
+  the cookbook, the docs, and the platform's 524 Rust files), `nml-lsp`
+  recorded 141 named items in 372 lines, and seven of them are what a
+  consumer that is not one of its own test crates reaches; now its surface
+  is `serve`, `serve_stdio` and `SessionEnd` (7 items, 25 lines) —
+  `serve_stdio()` takes no argument (the `init` closure only tests passed),
+  `From<SessionEnd> for ExitCode` is gone (`exit_code()` is the mapping),
+  and the ten names the integration harness and the parity test drive —
+  the service builder, the service and its exit signal, the server type
+  with its two constants, the resolver and its views — sit behind a
+  `test-support` feature those two test crates enable, never in the record.
+  The diagnostics, position and semantic-token modules are simply the
+  crate's own now. `nml-validate` publishes its filesystem leaf at
+  its own path: the twenty-two names `nml_validate::workspace` re-exported
+  (`StdFs`, `PathFs`, `LstatFs`, `read_beneath`, `read_leaf`, `EntryKind`,
+  `FsError`, …) are `nml_validate::fs::…`, and the ten-name nml-core facade
+  (`nml_validate::{parse, File, Document, SchemaIndex, ValueResolver,
+  Diagnostic, Severity, apply_defaults, from_body_defaulted,
+  from_document_defaulted}`) is removed — name `nml_core::…`, as every
+  consumer already did. `nml_core::SymbolTable` leaves the crate root
+  (`nml_core::symbols::SymbolTable` stays). Internal helpers no caller
+  outside their crate reached are crate-private: in `nml-validate`
+  `glob::{UnitGap, glob_reaches_dir, inferred_unit, subsumes, unit_gap,
+  unit_prefix_len}`, `package::{PackageError::gate_finding,
+  SchemaPackage::binding_match, check_plain_file_name, MAX_GLOB_ECHO_BYTES,
+  SUPPORTED_FORMAT_VERSION}`, `schema::{SchemaValidator::{closed_vocabulary,
+  find_enum, validate_definitions_into}, default_diagnostics}`; in
+  `nml-core` `ast::{directive_spans, value_spans}`,
+  `identity::{map_arm_bodies, map_inline_arm_bodies}`,
+  `money::currency_exponent`, `template::parse_template_string`,
+  `model::FacetMultiple`. The language's data model — every type, field,
+  variant and accessor, and the `diagnostic::codes` vocabulary — stays
+  public whether or not today's consumers read it. The census behind this
+  is `scripts/api_reach.py` (`just api-reach`), the review tool to run
+  before a `revision` bump for an addition.
+
 - **public API apiVersion 6, revision 1** — BREAKING: `SchemaPackage::from_parts`
   no longer carries a type parameter — the resolver returns
   `Result<String, String>` again (the `Into<Arc<str>>` generic overload is

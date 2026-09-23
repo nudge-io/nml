@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use nml_core::diagnostic::{Code, Diagnostic, Severity};
 use nml_core::layers::LayersWire;
 use nml_core::span::Span;
+use nml_validate::fs::{OpenError, ReadError, read_beneath};
 use nml_validate::schema::SchemaValidator;
-use nml_validate::workspace::{Governing, OpenError, ReadError, SymlinkVerdict, read_beneath};
+use nml_validate::workspace::{Governing, SymlinkVerdict};
 
 mod fix;
 mod invocation;
@@ -1495,7 +1496,7 @@ pub(crate) fn refuse_directory(
     resolved: &nml_validate::workspace::Resolved<'_>,
     path: &Path,
 ) -> Result<(), String> {
-    if resolved.kind == Some(nml_validate::workspace::EntryKind::Dir) {
+    if resolved.kind == Some(nml_validate::fs::EntryKind::Dir) {
         return Err(workspace::directory_not_entered(path));
     }
     Ok(())
@@ -2446,10 +2447,10 @@ fn binding_one(ws: &workspace::Workspace, file_arg: &str) -> i32 {
     // `check` refuses it at its open.
     let linked_dir = || {
         !universe.is_closed()
-            && resolved.kind == Some(nml_validate::workspace::EntryKind::Symlink)
+            && resolved.kind == Some(nml_validate::fs::EntryKind::Symlink)
             && std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir())
     };
-    if resolved.kind == Some(nml_validate::workspace::EntryKind::Dir) || linked_dir() {
+    if resolved.kind == Some(nml_validate::fs::EntryKind::Dir) || linked_dir() {
         exit_usage(&format!(
             "`{}` is a directory — nml binding takes files; name a file under it",
             path.display()
@@ -2800,9 +2801,9 @@ fn read_file(path: &Path, at: &LeafAt) -> Result<String, String> {
 /// only what the operator typed. An open universe's target read
 /// (`workspace::Workspace::open_target`) speaks it too: it opens at the
 /// same resolved leaf.
-pub(crate) fn leaf_advice(e: nml_validate::workspace::OpenError) -> String {
+pub(crate) fn leaf_advice(e: nml_validate::fs::OpenError) -> String {
     match e {
-        nml_validate::workspace::OpenError::Symlink { .. } => format!(
+        nml_validate::fs::OpenError::Symlink { .. } => format!(
             "{e} — the leaf became a link between its resolution and the open; nothing was \
              read — run again"
         ),
@@ -2930,9 +2931,9 @@ pub(crate) fn write_file_atomically(
 
 /// The write's own advice on a refused link (see [`leaf_advice`]).
 #[cfg(unix)]
-fn write_advice(e: nml_validate::workspace::OpenError) -> String {
+fn write_advice(e: nml_validate::fs::OpenError) -> String {
     match e {
-        nml_validate::workspace::OpenError::Symlink { .. } => format!(
+        nml_validate::fs::OpenError::Symlink { .. } => format!(
             "{e} — the leaf became a link between its resolution and the write; nothing was \
              written — run again"
         ),
@@ -2945,7 +2946,7 @@ fn write_advice(e: nml_validate::workspace::OpenError) -> String {
 /// by handle, never through a link.
 #[cfg(unix)]
 fn write_leaf(dir: &Path, leaf: &str, bytes: &[u8]) -> Result<(), String> {
-    nml_validate::workspace::write_beneath(dir, &[leaf], bytes).map_err(write_advice)
+    nml_validate::fs::write_beneath(dir, &[leaf], bytes).map_err(write_advice)
 }
 
 /// Elsewhere (Windows): the classify-then-write shape the read uses on

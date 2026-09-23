@@ -22,7 +22,7 @@ use tower_lsp::ClientSocket;
 use tower_lsp::jsonrpc::{Request, Response};
 use tower_lsp::lsp_types::Url;
 
-use nml_lsp::server::NmlLanguageServer;
+use nml_lsp::test_support::{MAX_INDEX_BYTES, NmlLanguageServer, SERVER_NAME};
 use nml_validate::package::SchemaPackage;
 use nml_validate::store::Store;
 use nml_validate::test_support::{
@@ -37,7 +37,7 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The in-process server plus both directions of its wire.
 struct Harness {
-    service: nml_lsp::NmlService,
+    service: nml_lsp::test_support::NmlService,
     socket: ClientSocket,
     /// Server→client notifications drained off the socket but not yet
     /// consumed by an assertion, in arrival order. Server→client *requests*
@@ -54,13 +54,14 @@ struct Harness {
 }
 
 impl Harness {
-    /// Build the service through the same `nml_lsp::build_service` owner the
-    /// binary uses — so `nml/schemaInfo` (and every future custom method) is
-    /// exercised through the real JSON-RPC route — but with the resolver's
-    /// store injected.
+    /// Build the service through the same `nml_lsp::test_support::build_service`
+    /// owner the binary uses — so `nml/schemaInfo` (and every future custom
+    /// method) is exercised through the real JSON-RPC route — but with the
+    /// resolver's store injected.
     fn new(store: Store) -> Self {
-        let (service, socket) =
-            nml_lsp::build_service(|client| NmlLanguageServer::with_store(client, Some(store)));
+        let (service, socket) = nml_lsp::test_support::build_service(|client| {
+            NmlLanguageServer::with_store(client, Some(store))
+        });
         Self {
             service,
             socket,
@@ -77,7 +78,7 @@ impl Harness {
     /// cache). Exercises `NmlLanguageServer::with_provider` through the same
     /// service builder the tool binary uses.
     fn new_provider(package: nml_validate::package::SchemaPackage, store: Store) -> Self {
-        let (service, socket) = nml_lsp::build_service(move |client| {
+        let (service, socket) = nml_lsp::test_support::build_service(move |client| {
             NmlLanguageServer::with_provider(client, package, Some(store))
         });
         Self {
@@ -370,6 +371,33 @@ fn file_uri(path: &Path) -> String {
         .to_string()
 }
 
+/// Matches the server's derived-root log spelling: canonical, forward
+/// slashes, no Windows `\\?\` prefix.
+fn message_path(path: &Path) -> String {
+    let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    strip_extended_prefix(&path)
+        .display()
+        .to_string()
+        .replace('\\', "/")
+}
+
+/// Windows extended-path spellings (`\\?\`, `\\?\UNC\`) are for syscalls;
+/// a log line spells the path without them. Everywhere else the path is
+/// already the spelling — one function, no per-platform rebinding.
+fn strip_extended_prefix(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
 /// A test's scratch directory, removed when the guard drops — on a red
 /// assertion too (thousands of `nml-lsp-harness-*` directories stood in
 /// `$TMPDIR` after rounds 80–84). Derefs to its path.
@@ -514,7 +542,7 @@ async fn the_handshake_identifies_the_server_for_both_flavors() {
             .await;
         assert_eq!(
             result["serverInfo"]["name"],
-            json!(nml_lsp::server::SERVER_NAME),
+            json!(SERVER_NAME),
             "{flavor}: serverInfo.name must name the NML server: {result}"
         );
         let version = result["serverInfo"]["version"]
@@ -2167,7 +2195,7 @@ async fn a_root_the_walk_cannot_enumerate_indexes_nothing_and_says_so() {
     );
 }
 
-/// An indexed file is read up to [`nml_lsp::server::MAX_INDEX_BYTES`] —
+/// An indexed file is read up to [`MAX_INDEX_BYTES`] —
 /// the CLI's target bound; past it the file is not indexed and the
 /// editor says so, while the files beside it are indexed as ever.
 #[tokio::test]
@@ -2181,7 +2209,7 @@ async fn an_oversized_file_is_not_indexed_and_the_editor_says_so() {
     let big = ws.join("big.model.nml");
     fs::File::create(&big)
         .expect("create big")
-        .set_len(nml_lsp::server::MAX_INDEX_BYTES as u64 + 1)
+        .set_len(MAX_INDEX_BYTES as u64 + 1)
         .expect("size big");
     let app = ws.join("app.nml");
     fs::write(&app, "\n").expect("write app");
@@ -3930,7 +3958,7 @@ async fn a_watched_file_past_the_index_bound_is_refused_and_said() {
     let big = ws.join("big.model.nml");
     fs::File::create(&big)
         .expect("create big")
-        .set_len(nml_lsp::server::MAX_INDEX_BYTES as u64 + 1)
+        .set_len(MAX_INDEX_BYTES as u64 + 1)
         .expect("size big");
     harness
         .notify(
@@ -3973,7 +4001,7 @@ async fn a_watched_file_past_the_index_bound_is_refused_and_said() {
     // by the same event and its model is offered.
     let text = "model watchedmodel:\n    a number\n";
     let mut padded = text.to_string();
-    padded.push_str(&" ".repeat(nml_lsp::server::MAX_INDEX_BYTES - text.len()));
+    padded.push_str(&" ".repeat(MAX_INDEX_BYTES - text.len()));
     fs::write(&big, padded).expect("rewrite big at the cap");
     harness
         .notify(
@@ -4349,7 +4377,7 @@ async fn a_document_outside_every_folder_resolves_under_the_kernels_derived_root
     let derived_log = format!(
         "derived a workspace root at `{}` (derivedVcsFence) for documents outside every \
          workspace folder",
-        repo.display()
+        message_path(&repo)
     );
     let mut said = 0;
     loop {
@@ -4566,7 +4594,7 @@ async fn an_open_buffer_past_the_index_bound_is_refused_with_one_row() {
     harness.initialize(&ws).await;
     let broken = "thing t\n    v = = 1\n";
     let mut over = broken.to_string();
-    over.push_str(&" ".repeat(nml_lsp::server::MAX_INDEX_BYTES + 1 - broken.len()));
+    over.push_str(&" ".repeat(MAX_INDEX_BYTES + 1 - broken.len()));
     let parses_before = nml_core::cst::parses_on_this_thread();
     let report = harness.open(&app, &over).await;
     assert_eq!(
@@ -4586,7 +4614,7 @@ async fn an_open_buffer_past_the_index_bound_is_refused_with_one_row() {
         json!(format!(
             "too large: over 16 MiB ({} bytes) — an open document is read only up to 16 MiB \
              (16777216 bytes)",
-            nml_lsp::server::MAX_INDEX_BYTES + 1
+            MAX_INDEX_BYTES + 1
         )),
         "{report}"
     );
@@ -4630,7 +4658,7 @@ async fn an_open_buffer_past_the_index_bound_is_refused_with_one_row() {
     // Exactly the bound is parsed.
     let at_cap = ws.join("cap.nml");
     let mut text = broken.to_string();
-    text.push_str(&" ".repeat(nml_lsp::server::MAX_INDEX_BYTES - broken.len()));
+    text.push_str(&" ".repeat(MAX_INDEX_BYTES - broken.len()));
     let report = harness.open(&at_cap, &text).await;
     let messages: Vec<&str> = report["diagnostics"]
         .as_array()
@@ -4851,7 +4879,7 @@ async fn a_derived_fence_that_is_no_directory_or_a_shadow_above_it_is_disclosed(
         "derived a workspace root at `{}` (derivedVcsFence, within a .git FILE fence — a linked \
          worktree's, a submodule's or a planted entry) for documents outside every workspace \
          folder — open a workspace folder to fix the universe",
-        wt.display()
+        message_path(&wt)
     );
     loop {
         let params = harness
@@ -4878,8 +4906,8 @@ async fn a_derived_fence_that_is_no_directory_or_a_shadow_above_it_is_disclosed(
         "derived a workspace root at `{}` (derivedVcsFence, within the .git fence; SHADOWED by \
          the root marker `{}` above it) for documents outside every workspace folder — open a \
          workspace folder to fix the universe",
-        outer.join("inner/tenants/cu/flows").display(),
-        outer.join("demo.package.nml").display()
+        message_path(&outer.join("inner/tenants/cu/flows")),
+        message_path(&outer.join("demo.package.nml"))
     );
     loop {
         let params = harness
@@ -4921,7 +4949,7 @@ async fn closing_an_indexed_document_restores_its_disk_copy_under_the_bound() {
     );
     harness.open(&model, model_text).await;
     let mut over = model_text.to_string();
-    over.push_str(&" ".repeat(nml_lsp::server::MAX_INDEX_BYTES + 1 - model_text.len()));
+    over.push_str(&" ".repeat(MAX_INDEX_BYTES + 1 - model_text.len()));
     let change = |text: String| {
         json!({
             "textDocument": { "uri": file_uri(&model), "version": 2 },
@@ -6885,8 +6913,7 @@ async fn an_unloadable_manifest_lands_at_its_first_finding() {
     let store_base = base.join("store");
     fs::create_dir_all(&store_base).expect("create store dir");
     let (ws, manifest, manifest_text, tenant, text) = grant_workspace(&base, "");
-    let padding =
-        "// ".to_string() + &"x".repeat(nml_validate::workspace::MAX_MANIFEST_BYTES) + "\n";
+    let padding = "// ".to_string() + &"x".repeat(nml_validate::fs::MAX_MANIFEST_BYTES) + "\n";
     fs::write(&manifest, format!("{manifest_text}{padding}")).expect("oversized manifest");
     let mut harness = Harness::new(Store::at(&store_base));
     harness.initialize(&ws).await;

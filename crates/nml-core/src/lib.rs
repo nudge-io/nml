@@ -111,4 +111,3 @@ pub use project::ProjectConfig;
 pub use query::Document;
 pub use resolve::ValueResolver;
 pub use schema_index::{FieldTarget, SchemaIndex};
-pub use symbols::SymbolTable;

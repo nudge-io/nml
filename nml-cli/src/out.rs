@@ -555,7 +555,7 @@ mod api_contract {
     /// reads the declaration out of this file by name.
     ///
     /// UNPUBLISHED: a review stamp, not a bound — no `nml limits` row
-    pub const API_STAMP: (u32, u32) = (6, 1);
+    pub const API_STAMP: (u32, u32) = (7, 1);
 
     use nml_validate::test_support::scan::workspace;
 

@@ -135,7 +135,7 @@ mod tests {
         std::fs::create_dir(dir.join("a")).unwrap();
         std::os::unix::fs::symlink("b.nml", dir.join("c.nml")).unwrap();
         let shimmed = super::wasi_fs_through(|dir: &Path| std::fs::read_dir(dir));
-        let native = crate::workspace::StdFs;
+        let native = crate::fs::StdFs;
         let got = shimmed.list_dir(&dir).unwrap();
         assert_eq!(got, native.list_dir(&dir).unwrap());
         assert_eq!(
@@ -301,8 +301,9 @@ mod tests {
     fn the_kernels_answers_do_not_depend_on_listing_order() {
         use std::sync::Arc;
 
+        use crate::fs::StdFs;
         use crate::workspace::discover;
-        use crate::workspace::{InputKind, StdFs, WorkspaceRoot};
+        use crate::workspace::{InputKind, WorkspaceRoot};
 
         let dir = scratch("listing-order");
         std::fs::create_dir_all(dir.join(".git")).unwrap();

@@ -16,7 +16,7 @@
 //!
 //! Two layers. **Layer A** (`fs`, `paths`, `claims`, `grants`) has no
 //! ambient authority: every observation goes through the injected
-//! [`PathFs`], so a Layer-A function is a pure function of its
+//! [`crate::fs::PathFs`], so a Layer-A function is a pure function of its
 //! inputs and the oracle's answers — mockable, wasi-able, overlay-able.
 //! **Layer B** (`discover`, `diag`) reads texts through a caller-supplied
 //! reader, loads packages and speaks `Diagnostic`. A source ratchet keeps
@@ -33,9 +33,9 @@
 //! ```no_run
 //! use std::path::Path;
 //! use std::sync::Arc;
+//! use nml_validate::fs::{MAX_SOURCE_BYTES, StdFs, read_beneath};
 //! use nml_validate::workspace::{
-//!     Governing, InputKind, MAX_SOURCE_BYTES, StdFs, ValidatorMemo, WorkspaceRoot, discover,
-//!     read_beneath, read_input, resolve_file,
+//!     Governing, InputKind, ValidatorMemo, WorkspaceRoot, discover, read_input, resolve_file,
 //! };
 //!
 //! let fs = StdFs;
@@ -76,7 +76,7 @@
 //!     // A TARGET is read the way the front ends read one: anchored at the
 //!     // root, component by component, capped — never a bare by-path open.
 //!     let text = read_beneath(root.path(), &["tenants", "cu", "member-lookup.flow.nml"], MAX_SOURCE_BYTES, "a target")?;
-//!     for finding in validator.validate(&nml_validate::parse(&text)?) {
+//!     for finding in validator.validate(&nml_core::parse(&text)?) {
 //!         println!("{:?}: {} ({} suggestion(s))", finding.severity, finding.message, finding.suggestions.len());
 //!     }
 //! }
@@ -103,13 +103,6 @@ pub use claims::{
     Universe, UniverseState, ValidatorMemo, governing,
 };
 // The loader's tests pin the unit-gap rows; every product reader is a sibling of `diag`.
-#[cfg(unix)]
-pub use crate::fs::write_beneath;
-pub use crate::fs::{
-    DirEntryLike, EntryKind, FsError, Listing, LstatFs, MAX_MANIFEST_BYTES, MAX_SOURCE_BYTES,
-    OpenError, OverlayFs, PathFs, ReadError, StdFs, Step, WasiFs, human_bytes, listing,
-    open_beneath, read_beneath, read_leaf, too_large, wasi_fs_through,
-};
 #[cfg(test)]
 pub(crate) use diag::budget_unit_gaps;
 pub use diag::{

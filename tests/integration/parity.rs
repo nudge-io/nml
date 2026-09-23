@@ -39,11 +39,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use nml_lsp::packages::{OpenDocuments, PackageResolver, Resolution, WorkspaceView};
+use nml_lsp::test_support::{OpenDocuments, PackageResolver, Resolution, WorkspaceView};
+use nml_validate::fs::{PathFs, StdFs, wasi_fs_through};
 use nml_validate::package::builtin_meta_package;
 use nml_validate::workspace::{
-    ExternalClaim, ExternalClass, Governing, InputKind, PathFs, StdFs, WorkspaceRoot, discover,
-    read_input, resolve_file, wasi_fs_through,
+    ExternalClaim, ExternalClass, Governing, InputKind, WorkspaceRoot, discover, read_input,
+    resolve_file,
 };
 
 // ---------------------------------------------------------------------
@@ -287,6 +288,7 @@ fn editor_outcome(root: &Path, file: &Path, store: Option<&Path>, derived: bool)
     let resolver = PackageResolver::new(
         store.map(|dir| nml_validate::store::Store::at(dir.to_path_buf())),
         tx,
+        None,
     );
     let roots = if derived {
         Vec::new()

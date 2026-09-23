@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use nml_validate::workspace::{OpenError, ReadError, open_beneath, read_beneath, write_beneath};
+use nml_validate::fs::{OpenError, ReadError, open_beneath, read_beneath, write_beneath};
 
 /// The perf tier's iteration count (700 opens/writes per shape,
 /// 2,100 for the hard-link shape) — `#[ignore]`d, run with `cargo test -p

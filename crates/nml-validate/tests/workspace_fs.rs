@@ -8,8 +8,11 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-use nml_validate::workspace::{EntryKind, SymlinkVerdict};
-use nml_validate::workspace::{Keyed, PathError, SourceKey, StdFs, Trust, WorkspaceRoot};
+use nml_validate::fs::EntryKind;
+use nml_validate::fs::StdFs;
+#[cfg(unix)]
+use nml_validate::workspace::SymlinkVerdict;
+use nml_validate::workspace::{Keyed, PathError, SourceKey, Trust, WorkspaceRoot};
 
 /// A scratch directory that removes itself on every path — a failed
 /// assertion included (a leftover `target/tmp/workspace-fs-*` was the
@@ -198,7 +201,7 @@ fn derive_over_real_tree_finds_outermost_manifest_within_git_fence() {
         *root.origin(),
         nml_validate::workspace::RootOrigin::Derived {
             fence: nml_validate::workspace::Fence::Vcs {
-                kind: nml_validate::workspace::EntryKind::Dir
+                kind: nml_validate::fs::EntryKind::Dir
             },
             shadowed: Some(nml_validate::workspace::Shadow::Marker(
                 std::fs::canonicalize(&dir)
@@ -303,7 +306,7 @@ fn derive_refuses_a_searchable_but_unlistable_directory_instead_of_deriving_with
         assert_eq!(
             got,
             Err(nml_validate::workspace::RootError::Fs(
-                nml_validate::workspace::FsError::Denied
+                nml_validate::fs::FsError::Denied
             )),
             "an unlistable directory must refuse the derivation, not derive without its marker"
         );
@@ -381,7 +384,7 @@ fn derive_refuses_a_searchable_but_unlistable_directory_instead_of_deriving_with
     assert_eq!(
         got,
         Err(nml_validate::workspace::RootError::Fs(
-            nml_validate::workspace::FsError::Denied
+            nml_validate::fs::FsError::Denied
         )),
         "above a fence that is no directory an unseen marker is a refusal, so a blinded \
          listing refuses too"
@@ -400,7 +403,7 @@ fn derive_refuses_a_searchable_but_unlistable_directory_instead_of_deriving_with
 fn open_beneath_reads_regular_files_and_refuses_everything_else() {
     use std::io::Read;
 
-    use nml_validate::workspace::{OpenError, open_beneath};
+    use nml_validate::fs::{OpenError, open_beneath};
 
     let dir = scratch("beneath");
     let root = dir.join("proj");
@@ -554,7 +557,7 @@ fn open_beneath_reads_regular_files_and_refuses_everything_else() {
 fn write_beneath_replaces_through_the_parent_handle() {
     use std::os::unix::fs::PermissionsExt;
 
-    use nml_validate::workspace::{OpenError, write_beneath};
+    use nml_validate::fs::{OpenError, write_beneath};
 
     let dir = scratch("write-beneath");
     let root = dir.join("proj");
@@ -622,7 +625,7 @@ fn write_beneath_replaces_through_the_parent_handle() {
 fn write_beneath_never_mints_set_id_or_sticky_bits() {
     use std::os::unix::fs::PermissionsExt;
 
-    use nml_validate::workspace::write_beneath;
+    use nml_validate::fs::write_beneath;
 
     let dir = scratch("write-mode");
     let root = dir.join("proj");
@@ -670,7 +673,7 @@ fn write_beneath_creates_the_temp_at_the_originals_mode() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use nml_validate::workspace::write_beneath;
+    use nml_validate::fs::write_beneath;
 
     let dir = scratch("write-temp-mode");
     let root = dir.join("proj");
@@ -723,7 +726,7 @@ fn write_beneath_creates_the_temp_at_the_originals_mode() {
 #[cfg(unix)]
 #[test]
 fn the_reader_never_blocks_and_refuses_every_non_regular_leaf() {
-    use nml_validate::workspace::{MAX_SOURCE_BYTES, ReadError, read_leaf};
+    use nml_validate::fs::{MAX_SOURCE_BYTES, ReadError, read_leaf};
     let dir = scratch("reader-leaf");
     std::fs::write(dir.join("f.nml"), "text\n").unwrap();
     std::os::unix::fs::symlink("f.nml", dir.join("l.nml")).unwrap();
@@ -743,7 +746,7 @@ fn the_reader_never_blocks_and_refuses_every_non_regular_leaf() {
                 "a declared schema source",
             )
             .map_err(|e| match e {
-                ReadError::Open(nml_validate::workspace::OpenError::Io(e)) => {
+                ReadError::Open(nml_validate::fs::OpenError::Io(e)) => {
                     format!("io:{:?}", e.kind())
                 }
                 other => other.to_string(),
@@ -786,9 +789,8 @@ fn the_reader_never_blocks_and_refuses_every_non_regular_leaf() {
 #[cfg(unix)]
 #[test]
 fn the_one_reader_caps_refuses_non_utf8_and_a_parent_that_is_a_link() {
-    use nml_validate::workspace::{
-        InputKind, OpenError, ReadError, input_cap, read_beneath, read_input, read_leaf,
-    };
+    use nml_validate::fs::{OpenError, ReadError, read_beneath, read_leaf};
+    use nml_validate::workspace::{InputKind, input_cap, read_input};
     let dir = scratch("one-reader");
     std::fs::create_dir_all(dir.join("root/tenants/cu")).unwrap();
     std::fs::create_dir_all(dir.join("outside")).unwrap();

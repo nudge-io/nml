@@ -32,7 +32,7 @@ nml-validate = { workspace = true, features = ["test-support"] }
 # BOTH front ends about one file: this binary, and the editor's real
 # resolver in process. It is the only place the two meet, so it is the
 # only place the crate depends on the server — test-only, never shipped.
-nml-lsp = { path = "../crates/nml-lsp" }
+nml-lsp = { path = "../crates/nml-lsp", features = ["test-support"] }
 tokio = { workspace = true }
 
 [[test]]

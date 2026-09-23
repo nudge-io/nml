@@ -154,6 +154,32 @@ git config core.hooksPath hooks
    the API record it rewrites the file at a stamp you already moved by
    hand, and refuses if the CHANGELOG does not name it.
 
+   The record makes an addition VISIBLE; it cannot ask whether anyone
+   needs it. Before bumping `revision` for a new public item, run
+   `just api-reach` (add `--consumer ../platform` for the embedder's
+   checkout): an item nothing outside its crate reaches is a candidate for
+   `pub(crate)`, and one only tests reach belongs behind a `test-support`
+   feature — `nml-lsp`'s public surface is two entry points and one result
+   type for exactly this reason.
+
+   It is a NAME census, so it asks the question rather than answering it:
+   a hit can be a word in a comment, and a miss only says that no tree you
+   pointed it at spells the name. The proof of a narrowing is the compiler,
+   against every consumer — the embedder's checkout included. Run it
+   without `--consumer` and an item only the embedder calls reads as
+   unreached — which is how two helpers the embedder's own modules call
+   were nearly made test-only here.
+
+   The census asks the question; the COMPILER answers it. Removing a
+   recorded item, or narrowing one to `pub(crate)`, is not landable on a
+   census alone — run it, and then compile every consumer:
+   `cargo check --workspace --all-targets` here, and
+   `NML_DOWNSTREAM=<embedder checkout> just gate downstream` there. A
+   census reads names; a consumer can call an item through a path no name
+   rule spells (`use nml_core::diff;` then `diff::f(..)`), and a
+   documented contract constant can be needed by a consumer that never
+   names it at all. Both have happened.
+
 ## Language changes (RFCs)
 
 Syntax or semantics changes go through an RFC in `docs/rfcs/` (kept

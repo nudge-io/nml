@@ -19,14 +19,14 @@ use std::sync::{Arc, Mutex};
 
 use nml_core::ProjectConfig;
 use nml_core::diagnostic::{Severity, codes};
+use nml_validate::fs::{OverlayFs, PathFs, read_leaf};
 use nml_validate::package::{PackageError, SchemaPackage, builtin_meta_package};
 use nml_validate::schema::SchemaValidator;
 use nml_validate::store::{Store, StoreError};
 use nml_validate::workspace::{
     ClaimClass, ClaimOrigin, Closure, Discovery, ExternalClaim, ExternalClass, Governing, Grant,
-    InputKind, OverlayFs, PathFs, RootError, RootOrigin, Skip, SourceKey, Truncation, Universe,
-    ValidatorMemo, WorkspaceRoot, discover, input_cap, read_input, read_leaf, resolve_file,
-    walk_skips_dir,
+    InputKind, RootError, RootOrigin, Skip, SourceKey, Truncation, Universe, ValidatorMemo,
+    WorkspaceRoot, discover, input_cap, read_input, resolve_file, walk_skips_dir,
 };
 
 pub use nml_validate::workspace::BindingStep;
@@ -45,9 +45,6 @@ pub struct Binding {
     /// (RFC 0035 in-repo channel), an embedder's in-binary package, the
     /// per-user store's `current` slot, or the builtin meta package.
     pub class: ClaimClass,
-    /// The workspace manifest the binding was read from; `None` for a
-    /// package from outside the walk (injected, store, builtin).
-    pub manifest: Option<PathBuf>,
     pub step: BindingStep,
     /// The directory the binding glob matched under (the claim's anchor).
     pub root: PathBuf,
@@ -422,11 +419,7 @@ pub struct PackageResolver {
 }
 
 impl PackageResolver {
-    pub fn new(store: Option<Store>, events: tokio::sync::mpsc::Sender<StoreEvent>) -> Self {
-        Self::with_injected(store, events, None)
-    }
-
-    pub fn with_injected(
+    pub fn new(
         store: Option<Store>,
         events: tokio::sync::mpsc::Sender<StoreEvent>,
         injected: Option<SchemaPackage>,
@@ -463,7 +456,8 @@ impl PackageResolver {
     }
 
     /// Drop EVERY cached universe — the blunt instrument.
-    pub fn invalidate_claims(&self) {
+    #[cfg(test)]
+    fn invalidate_claims(&self) {
         self.forget_listings();
         self.universes
             .lock()
@@ -668,14 +662,12 @@ impl PackageResolver {
     /// The disk oracle for this build: the real filesystem natively; the
     /// wasm editor's membership-proving backend under wasi.
     #[cfg(not(target_os = "wasi"))]
-    fn disk(&self) -> nml_validate::workspace::StdFs {
-        nml_validate::workspace::StdFs
+    fn disk(&self) -> nml_validate::fs::StdFs {
+        nml_validate::fs::StdFs
     }
 
     #[cfg(target_os = "wasi")]
-    fn disk(
-        &self,
-    ) -> nml_validate::workspace::WasiFs<impl Fn(&Path) -> nml_validate::workspace::Listing> {
+    fn disk(&self) -> nml_validate::fs::WasiFs<impl Fn(&Path) -> nml_validate::fs::Listing> {
         // The shim only LISTS; the listing RULE — its sort, its kinds, and
         // the refusal of a whole listing on one unreadable entry — is the
         // kernel's one rule, the native oracle's. (A `filter_map` here
@@ -684,7 +676,7 @@ impl PackageResolver {
         // One snapshot per operation: within a single walk a directory is
         // listed at most once, so the walk cannot see a torn tree.
         let snapshot = self.listings.snapshot();
-        nml_validate::workspace::wasi_fs_through(move |dir: &Path| snapshot(dir))
+        nml_validate::fs::wasi_fs_through(move |dir: &Path| snapshot(dir))
     }
 
     /// The universe of `root` — a workspace folder's or a derived one —
@@ -738,7 +730,7 @@ impl PackageResolver {
             let disclosed = root.origin().needs_disclosure();
             let facts = root
                 .origin()
-                .fence_facts(&|path| path.display().to_string())
+                .fence_facts(&|path| absolute_message_path(path))
                 .filter(|_| disclosed)
                 .map(|facts| format!(", {facts}"))
                 .unwrap_or_default();
@@ -751,7 +743,7 @@ impl PackageResolver {
                 message: format!(
                     "derived a workspace root at `{}` ({}{facts}) for documents outside every \
                      workspace folder{advice}",
-                    root.path().display(),
+                    absolute_message_path(root.path()),
                     root.origin().tag()
                 ),
                 warning: disclosed,
@@ -799,13 +791,11 @@ impl PackageResolver {
                 // served the whole text to discovery, so a 5 MiB source
                 // the CLI refuses (NML2088, nothing validated) loaded
                 // here and the tenant's file was judged under it.
-                Some(text) if text.len() > input_cap(kind) => {
-                    Err(nml_validate::workspace::too_large(
-                        Some(text.len() as u64),
-                        input_cap(kind),
-                        &format!("a {}", kind.label()),
-                    ))
-                }
+                Some(text) if text.len() > input_cap(kind) => Err(nml_validate::fs::too_large(
+                    Some(text.len() as u64),
+                    input_cap(kind),
+                    &format!("a {}", kind.label()),
+                )),
                 Some(text) => Ok(text),
                 // The disk case is the kernel's own (`read_input`: the
                 // race-free chain under the root, the kind's cap, one
@@ -1198,14 +1188,6 @@ impl PackageResolver {
                         universe: Some(universe.state()),
                     };
                 };
-                // The claim's class IS the source (the kernel's one
-                // ladder); a workspace claim carries its manifest key by
-                // construction (`ClaimOrigin`), so there is no arm for a
-                // claim without one.
-                let manifest = match claim.origin() {
-                    ClaimOrigin::Workspace { manifest, .. } => Some(u.root().path_of(manifest)),
-                    ClaimOrigin::External { .. } => None,
-                };
                 let shadows_store = matches!(claim.origin(), ClaimOrigin::Workspace { .. })
                     && *step == BindingStep::Pinned
                     && self.store_has(claim.name());
@@ -1226,7 +1208,6 @@ impl PackageResolver {
                     binding_name: claimant.binding.name.clone(),
                     validator,
                     class: claim.class(),
-                    manifest,
                     step: *step,
                     root: u.root().path_of(&claimant.anchor),
                     shadows_store,
@@ -1544,6 +1525,29 @@ pub(crate) fn shadow_display(root: &Path, shadow: &Path) -> String {
     }
 }
 
+/// An absolute path in log lines and kernel-aligned prose: canonical,
+/// forward slashes, no Windows extended-path prefix — the spelling the CLI
+/// and harness pins use beside a derived-root disclosure.
+pub(crate) fn absolute_message_path(path: &Path) -> String {
+    let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let path = strip_extended_prefix(&path);
+    path.display().to_string().replace('\\', "/")
+}
+
+fn strip_extended_prefix(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
 /// A path for user-facing messages: workspace-root-relative, `/`-separated,
 /// falling back to the file name outside every root. Never absolute.
 pub(crate) fn display_path(path: &Path, roots: &[PathBuf]) -> String {
@@ -1565,7 +1569,8 @@ mod tests {
     /// silent `None`; a folder that verifies anchors the universe.
     #[test]
     fn a_folder_the_oracle_refuses_is_a_loud_refusal_never_silence() {
-        use nml_validate::workspace::{FsError, RootError, StdFs, WorkspaceRoot};
+        use nml_validate::fs::{FsError, StdFs};
+        use nml_validate::workspace::{RootError, WorkspaceRoot};
         let folder = std::path::Path::new("/workspace");
         match super::folder_anchor(folder, Err(RootError::Fs(FsError::NoRealpath))) {
             super::UniverseAnchor::Refused(sentence) => {
@@ -1589,8 +1594,8 @@ mod tests {
 
     use super::*;
 
+    use nml_validate::fs::ReadError;
     use nml_validate::test_support::{DEMO_CORE as CORE, DEMO_MANIFEST as MANIFEST, publish_demo};
-    use nml_validate::workspace::ReadError;
 
     /// A guard-owned scratch workspace (removed on drop, a red assertion
     /// included), canonicalized like every root the server holds.
@@ -1742,7 +1747,7 @@ mod tests {
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
             return; // root: the lock does not bite
         }
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let index = resolver.index(&ws, &view(&roots));
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1863,8 +1868,11 @@ mod tests {
         std::fs::write(project.join("demo.nml"), "").unwrap();
         std::fs::write(project.join("apps/site/app.nml"), "").unwrap();
 
-        let resolver =
-            PackageResolver::new(Some(Store::at(store_base.to_path_buf())), test_events().0);
+        let resolver = PackageResolver::new(
+            Some(Store::at(store_base.to_path_buf())),
+            test_events().0,
+            None,
+        );
         let roots = vec![ws.to_path_buf()];
         let view = view(&roots);
         for rel in ["demo.nml", "apps/site/app.nml"] {
@@ -1914,7 +1922,7 @@ mod tests {
         let huge = format!("{CORE}{}", " ".repeat(cap + 1 - CORE.len()));
         let buffers = vec![source.clone()];
         let docs = OneDoc::new(source, &huge);
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let v = WorkspaceView {
             roots: &roots,
@@ -1946,7 +1954,7 @@ mod tests {
         // fresh resolver: the cached universe is keyed by the store's
         // stamp, which a new `OneDoc` at the same path repeats).
         let docs = OneDoc::new(project.join("core.model.nml"), &huge[..cap]);
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let v = WorkspaceView {
             roots: &roots,
             buffers: &buffers,
@@ -1966,7 +1974,7 @@ mod tests {
     /// `/ws/ab`); an empty change set retains everything.
     #[test]
     fn create_under_one_root_invalidates_that_root_only() {
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         // The guards outlive the test; the cache is keyed by their paths.
         let scratch = [temp_ws("inv-a"), temp_ws("inv-ab"), temp_ws("inv-b")];
         let roots: Vec<PathBuf> = scratch.iter().map(|s| s.to_path_buf()).collect();
@@ -2006,7 +2014,7 @@ mod tests {
     /// gate green.
     #[test]
     fn a_watched_file_change_forgets_the_listings_memo_and_an_empty_one_does_not() {
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let scratch = temp_ws("listings-inv");
         let root = scratch.to_path_buf();
         std::fs::write(root.join("a.nml"), b"x").unwrap();
@@ -2056,7 +2064,7 @@ mod tests {
         std::fs::write(project.join("demo.package.nml"), MANIFEST).unwrap();
         std::fs::write(project.join("core.model.nml"), CORE).unwrap();
         std::fs::write(project.join("demo.nml"), "").unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let v = view(&roots);
         let _ = resolver.resolve(&project.join("demo.nml"), &v);
@@ -2124,11 +2132,8 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("demo.nml"), "").unwrap();
 
-        let resolver = PackageResolver::with_injected(
-            None,
-            test_events().0,
-            Some(demo_package_versioned("9.9.9")),
-        );
+        let resolver =
+            PackageResolver::new(None, test_events().0, Some(demo_package_versioned("9.9.9")));
         let roots = vec![ws.to_path_buf()];
         match resolver
             .resolve(&project.join("demo.nml"), &view(&roots))
@@ -2155,7 +2160,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("demo.nml"), "").unwrap();
 
-        let resolver = PackageResolver::with_injected(
+        let resolver = PackageResolver::new(
             Some(Store::at(store_base.to_path_buf())),
             test_events().0,
             Some(demo_package_versioned("9.9.9")),
@@ -2183,11 +2188,8 @@ mod tests {
         std::fs::write(project.join("demo.package.nml"), &manifest_text).unwrap();
         std::fs::write(project.join("core.model.nml"), CORE).unwrap();
 
-        let resolver = PackageResolver::with_injected(
-            None,
-            test_events().0,
-            Some(demo_package_versioned("9.9.9")),
-        );
+        let resolver =
+            PackageResolver::new(None, test_events().0, Some(demo_package_versioned("9.9.9")));
         let roots = vec![ws.to_path_buf()];
         match resolver
             .resolve(&project.join("demo.nml"), &view(&roots))
@@ -2219,8 +2221,11 @@ mod tests {
         )
         .unwrap();
 
-        let resolver =
-            PackageResolver::new(Some(Store::at(store_base.to_path_buf())), test_events().0);
+        let resolver = PackageResolver::new(
+            Some(Store::at(store_base.to_path_buf())),
+            test_events().0,
+            None,
+        );
         let roots = vec![ws.to_path_buf()];
         assert!(matches!(
             resolver
@@ -2260,8 +2265,11 @@ mod tests {
         )
         .unwrap();
 
-        let resolver =
-            PackageResolver::new(Some(Store::at(store_base.to_path_buf())), test_events().0);
+        let resolver = PackageResolver::new(
+            Some(Store::at(store_base.to_path_buf())),
+            test_events().0,
+            None,
+        );
         let roots = vec![ws.to_path_buf()];
         let resolved = resolver.resolve(&project.join("demo.nml"), &view(&roots));
         match resolved.resolution {
@@ -2294,8 +2302,11 @@ mod tests {
             "project P:\n    schemaPackages:\n        - ghost\n",
         )
         .unwrap();
-        let resolver =
-            PackageResolver::new(Some(Store::at(store_base.to_path_buf())), test_events().0);
+        let resolver = PackageResolver::new(
+            Some(Store::at(store_base.to_path_buf())),
+            test_events().0,
+            None,
+        );
         let roots = vec![ws.to_path_buf()];
         let resolved = resolver.resolve(&project.join("whatever.nml"), &view(&roots));
         assert!(matches!(resolved.resolution, Resolution::Unbound));
@@ -2320,7 +2331,8 @@ mod tests {
             "project P:\n    schemaPackages:\n        - \"../../etc\"\n",
         )
         .unwrap();
-        let resolver = PackageResolver::new(Some(Store::at(ws.join("store"))), test_events().0);
+        let resolver =
+            PackageResolver::new(Some(Store::at(ws.join("store"))), test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let resolved = resolver.resolve(&project.join("x.nml"), &view(&roots));
         assert!(matches!(resolved.resolution, Resolution::Unbound));
@@ -2344,7 +2356,7 @@ mod tests {
         std::fs::write(vendored.join("demo.package.nml"), MANIFEST).unwrap();
         std::fs::write(vendored.join("core.model.nml"), CORE).unwrap();
         std::fs::write(project.join("demo.nml"), "").unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         assert!(matches!(
             resolver
@@ -2375,7 +2387,7 @@ mod tests {
         let manifest_path = project.join("demo.package.nml");
         std::fs::write(&manifest_path, &mismatched).unwrap();
         std::fs::write(project.join("core.model.nml"), CORE).unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let resolved = resolver.resolve(&manifest_path, &view(&roots));
         assert!(
@@ -2416,8 +2428,11 @@ mod tests {
             "project P:\n    schemaPackages:\n        - demo\n",
         )
         .unwrap();
-        let resolver =
-            PackageResolver::new(Some(Store::at(store_base.to_path_buf())), test_events().0);
+        let resolver = PackageResolver::new(
+            Some(Store::at(store_base.to_path_buf())),
+            test_events().0,
+            None,
+        );
         let roots = vec![ws.to_path_buf()];
         let resolved = resolver.resolve(&project.join("x.nml"), &view(&roots));
         assert!(
@@ -2442,8 +2457,11 @@ mod tests {
         let project = ws.join("proj");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("unrelated.nml"), "").unwrap();
-        let resolver =
-            PackageResolver::new(Some(Store::at(store_base.to_path_buf())), test_events().0);
+        let resolver = PackageResolver::new(
+            Some(Store::at(store_base.to_path_buf())),
+            test_events().0,
+            None,
+        );
         let roots = vec![ws.to_path_buf()];
         let resolved = resolver.resolve(&project.join("unrelated.nml"), &view(&roots));
         assert!(matches!(resolved.resolution, Resolution::Unbound));
@@ -2459,7 +2477,7 @@ mod tests {
         let pkg_dir = store_base.join("schema-packages/demo");
         std::fs::write(pkg_dir.join("current"), "0.1.0+bad00000\nblake3:wrong\n").unwrap();
         let (tx, mut rx) = test_events();
-        let resolver = PackageResolver::new(Some(Store::at(store_base.to_path_buf())), tx);
+        let resolver = PackageResolver::new(Some(Store::at(store_base.to_path_buf())), tx, None);
         std::fs::create_dir_all(ws.join("proj")).unwrap();
         std::fs::write(
             ws.join("proj/nml-project.nml"),
@@ -2502,7 +2520,7 @@ mod tests {
         std::fs::write(project.join("x.nml"), "").unwrap();
 
         let (tx, mut rx) = test_events();
-        let resolver = PackageResolver::new(Some(Store::at(store_base.to_path_buf())), tx);
+        let resolver = PackageResolver::new(Some(Store::at(store_base.to_path_buf())), tx, None);
         let roots = vec![ws.to_path_buf()];
         for i in 0..70 {
             let content = if i % 2 == 0 { corrupt } else { valid.as_str() };
@@ -2584,7 +2602,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(project.join("core.model.nml"), CORE).unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let vocab = covered(
             resolver.vocabulary_for(&project.join("core.model.nml"), &view(&roots)),
@@ -2617,8 +2635,11 @@ mod tests {
         Store::at(store_base.to_path_buf())
             .publish(&nml_validate::test_support::demo_package_with_directives())
             .expect("publish");
-        let resolver =
-            PackageResolver::new(Some(Store::at(store_base.to_path_buf())), test_events().0);
+        let resolver = PackageResolver::new(
+            Some(Store::at(store_base.to_path_buf())),
+            test_events().0,
+            None,
+        );
         let roots = vec![ws.join("project")];
         std::fs::create_dir_all(&roots[0]).unwrap();
         let outside = store_base.join("schema-packages/demo/core.model.nml");
@@ -2644,8 +2665,11 @@ mod tests {
         std::fs::create_dir_all(project.join("schemas")).unwrap();
         std::fs::write(project.join("demo.nml"), "").unwrap();
         std::fs::write(project.join("schemas/extra.model.nml"), DEMO_CORE).unwrap();
-        let resolver =
-            PackageResolver::new(Some(Store::at(store_base.to_path_buf())), test_events().0);
+        let resolver = PackageResolver::new(
+            Some(Store::at(store_base.to_path_buf())),
+            test_events().0,
+            None,
+        );
         let roots = vec![ws.to_path_buf()];
         let vocab = covered(
             resolver.vocabulary_for(&project.join("schemas/extra.model.nml"), &view(&roots)),
@@ -2705,7 +2729,7 @@ mod tests {
         for i in 0..2100 {
             std::fs::write(project.join(format!("filler-{i}.txt")), "").unwrap();
         }
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let vocab = covered(
             resolver.vocabulary_for(&project.join("stray.model.nml"), &view(&roots)),
@@ -2720,7 +2744,7 @@ mod tests {
         let project = ws.join("proj");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("lonely.model.nml"), CORE).unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         assert!(matches!(
             resolver.vocabulary_for(&project.join("lonely.model.nml"), &view(&roots)),
@@ -2736,7 +2760,7 @@ mod tests {
         let manifest_path = project.join("demo.package.nml");
         std::fs::write(&manifest_path, MANIFEST).unwrap();
         std::fs::write(project.join("core.model.nml"), CORE).unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         match resolver.resolve(&manifest_path, &view(&roots)).resolution {
             Resolution::Bound(b) => {
@@ -2762,7 +2786,7 @@ mod tests {
         let manifest_path = project.join("demo.package.nml");
         let buffers = vec![manifest_path.clone()];
         let docs = OneDoc::new(manifest_path.clone(), MANIFEST);
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let v = WorkspaceView {
             roots: &roots,
@@ -2772,7 +2796,11 @@ mod tests {
         match resolver.resolve(&project.join("demo.nml"), &v).resolution {
             Resolution::Bound(b) => {
                 assert_eq!(b.class, ClaimClass::Workspace);
-                assert_eq!(b.manifest.as_deref(), Some(manifest_path.as_path()));
+                assert_eq!(
+                    Some(b.root.as_path()),
+                    manifest_path.parent(),
+                    "anchored at the unsaved manifest's directory"
+                );
             }
             Resolution::Unbound | Resolution::Refused => panic!("the unsaved manifest must bind"),
         }
@@ -2793,7 +2821,7 @@ mod tests {
         let manifest_path = project.join("demo.package.nml");
         let buffers = vec![manifest_path.clone()];
         let docs = OneDoc::new(manifest_path, MANIFEST);
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let v = WorkspaceView {
             roots: &roots,
@@ -2850,8 +2878,11 @@ mod tests {
         std::fs::write(inside.join("demo.nml"), "").unwrap();
         let elsewhere = temp_ws("shared-memo-elsewhere");
         std::fs::write(elsewhere.join("demo.nml"), "").unwrap();
-        let resolver =
-            PackageResolver::new(Some(Store::at(store_base.to_path_buf())), test_events().0);
+        let resolver = PackageResolver::new(
+            Some(Store::at(store_base.to_path_buf())),
+            test_events().0,
+            None,
+        );
         let roots = vec![ws.to_path_buf()];
         let view = view(&roots);
         resolver.resolve(&inside.join("demo.nml"), &view);
@@ -2900,8 +2931,11 @@ mod tests {
         std::fs::create_dir_all(elsewhere.join("sub")).unwrap();
         std::fs::write(elsewhere.join("sub/x.nml"), "").unwrap();
         assert!(!elsewhere.starts_with(&ws));
-        let resolver =
-            PackageResolver::new(Some(Store::at(store_base.to_path_buf())), test_events().0);
+        let resolver = PackageResolver::new(
+            Some(Store::at(store_base.to_path_buf())),
+            test_events().0,
+            None,
+        );
         let roots = vec![ws.to_path_buf()];
         let view = view(&roots);
         assert!(
@@ -2968,7 +3002,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(ws.join("src/d.model.nml"), ws.join("src/link.model.nml"))
             .unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let index = resolver.index(&ws, &view(&roots));
         let mut files = index.files;
@@ -3008,7 +3042,7 @@ mod tests {
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
             return; // root: the lock does not bite
         }
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let index = resolver.index(&ws, &view(&roots));
         assert!(index.files.is_empty(), "{:?}", index.files);
@@ -3079,7 +3113,7 @@ mod tests {
         std::fs::write(project.join("core.model.nml"), CORE).unwrap();
         std::fs::write(project.join("apps/site/app.nml"), "").unwrap();
         std::fs::write(project.join("docs/unclaimed.nml"), "").unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let unclaimed = resolver.resolve(&project.join("docs/unclaimed.nml"), &view(&roots));
         assert!(matches!(unclaimed.resolution, Resolution::Unbound));
@@ -3139,7 +3173,7 @@ mod tests {
         std::fs::write(ws.join("demo.package.nml"), &loud).unwrap();
         std::fs::write(ws.join("core.model.nml"), CORE).unwrap();
         std::fs::write(ws.join("apps/site/flows/x.nml"), "").unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let gap = |n: &DegradedNote| n.code == Some(nml_core::diagnostic::codes::BUDGET_UNIT_GAP);
         let file = resolver.resolve(&ws.join("apps/site/flows/x.nml"), &view(&roots));
@@ -3170,7 +3204,7 @@ mod tests {
             "    formatVersion = 1\n    budgetUnits:\n        - \"apps/*\"\n",
         );
         std::fs::write(ws.join("demo.package.nml"), &declared).unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let own = resolver.resolve(&ws.join("demo.package.nml"), &view(&roots));
         assert!(!own.notes.iter().any(gap), "{:?}", own.notes);
     }
@@ -3194,7 +3228,7 @@ mod tests {
             "package other:\n    version = \"0.1.0\"\n",
         )
         .unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let own = resolver.resolve(&ws.join("demo.package.nml"), &view(&roots));
         assert!(
@@ -3236,7 +3270,7 @@ mod tests {
         std::fs::write(ws.join("demo.package.nml"), &bad).unwrap();
         std::fs::write(ws.join("core.model.nml"), CORE).unwrap();
         std::fs::write(ws.join("apps/site/app.nml"), "").unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let rule = |n: &DegradedNote| n.code == Some(nml_core::diagnostic::codes::LAYER_GRANT_RULE);
         let file = resolver.resolve(&ws.join("apps/site/app.nml"), &view(&roots));
@@ -3281,7 +3315,7 @@ mod tests {
         assert_ne!(nested, MANIFEST);
         std::fs::write(ws.join("demo.package.nml"), &nested).unwrap();
         std::fs::write(ws.join("core.model.nml"), CORE).unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let gap = |n: &DegradedNote| n.code == Some(nml_core::diagnostic::codes::BUDGET_UNIT_GAP);
         let own = resolver.resolve(&ws.join("demo.package.nml"), &view(&roots));
@@ -3316,7 +3350,7 @@ mod tests {
             "project P:\n    autoAssociate = false\n",
         )
         .unwrap();
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let resolved = resolver.resolve(&project.join("apps/site/app.nml"), &view(&roots));
         assert!(
@@ -3380,7 +3414,7 @@ mod tests {
         ) {
             return; // root: the lock does not bite
         }
-        let resolver = PackageResolver::new(None, test_events().0);
+        let resolver = PackageResolver::new(None, test_events().0, None);
         let roots = vec![ws.to_path_buf()];
         let refused = resolver.resolve(&project.join("apps/site/app.nml"), &view(&roots));
         let other = resolver.resolve(&project.join("apps/other/app.nml"), &view(&roots));
@@ -3410,8 +3444,8 @@ mod tests {
 mod r92_tests {
     use super::*;
 
+    use nml_validate::fs::ReadError;
     use nml_validate::test_support::{DEMO_CORE as CORE, DEMO_MANIFEST as MANIFEST, publish_demo};
-    use nml_validate::workspace::ReadError;
 
     /// A workspace folder the oracle cannot canonicalize (removed while
     /// the editor was open, no buffer under it) has no universe: nothing
@@ -3420,7 +3454,7 @@ mod r92_tests {
     #[test]
     fn a_folder_that_no_longer_exists_indexes_nothing_and_denies_nothing() {
         let (events, _rx) = tokio::sync::mpsc::channel(8);
-        let resolver = PackageResolver::new(None, events);
+        let resolver = PackageResolver::new(None, events, None);
         let gone = std::env::temp_dir().join(format!("nml-pkg-gone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&gone);
         let roots = vec![gone.clone()];
@@ -3453,7 +3487,7 @@ mod r92_tests {
         let file = deep.join("x.flow.nml");
         std::fs::write(&file, "").unwrap();
         let (events, _rx) = tokio::sync::mpsc::channel(8);
-        let resolver = PackageResolver::new(None, events);
+        let resolver = PackageResolver::new(None, events, None);
         let roots = vec![ws.to_path_buf()];
         let view = WorkspaceView {
             roots: &roots,
@@ -3520,7 +3554,7 @@ mod r92_tests {
         std::fs::create_dir_all(ws.join(format!("tenants/{deep}"))).unwrap();
         std::fs::write(ws.join(format!("tenants/{deep}below.flow.nml")), "").unwrap();
         let (events, _rx) = tokio::sync::mpsc::channel(8);
-        let resolver = PackageResolver::new(None, events);
+        let resolver = PackageResolver::new(None, events, None);
         let roots = vec![ws.to_path_buf()];
         let view = WorkspaceView {
             roots: &roots,
@@ -3643,7 +3677,7 @@ mod r92_tests {
         let doc = inner.join("a.nml");
         std::fs::write(&doc, "").unwrap();
         let (events, _rx) = tokio::sync::mpsc::channel(8);
-        let resolver = PackageResolver::new(None, events);
+        let resolver = PackageResolver::new(None, events, None);
         // NO workspace folder: the document takes R1's third rung. The
         // buffer is what keeps the memo alive — without one the memo is
         // swept on every call and nothing could go stale.
@@ -3702,7 +3736,7 @@ mod r92_tests {
         std::fs::write(&doc, "").unwrap();
         std::fs::create_dir_all(ws.join("outer/.git")).unwrap();
         let (events, _rx) = tokio::sync::mpsc::channel(8);
-        let resolver = PackageResolver::new(None, events);
+        let resolver = PackageResolver::new(None, events, None);
         let roots: Vec<PathBuf> = Vec::new();
         let only_doc = vec![doc.clone()];
         let view = WorkspaceView {
@@ -3789,7 +3823,7 @@ mod r92_tests {
         std::fs::write(&doc, "").unwrap();
         std::fs::create_dir_all(ws.join("outer/.git")).unwrap();
         let (events, _rx) = tokio::sync::mpsc::channel(8);
-        let resolver = PackageResolver::new(None, events);
+        let resolver = PackageResolver::new(None, events, None);
         let roots: Vec<PathBuf> = Vec::new();
         let buffers = vec![doc.clone()];
         let view = WorkspaceView {
@@ -3855,7 +3889,7 @@ mod r92_tests {
         let doc = inner.join("one/app.nml");
         std::fs::write(&doc, "").unwrap();
         let (events, _rx) = tokio::sync::mpsc::channel(8);
-        let resolver = PackageResolver::new(None, events);
+        let resolver = PackageResolver::new(None, events, None);
         let outer_first = vec![outer.clone(), inner.clone()];
         let outer_view = WorkspaceView {
             roots: &outer_first,
@@ -3907,7 +3941,7 @@ mod r92_tests {
         std::fs::write(project.join("demo.nml"), "").unwrap();
         std::fs::write(project.join("core.model.nml"), CORE).unwrap();
         let (events, _rx) = tokio::sync::mpsc::channel(8);
-        let resolver = PackageResolver::new(None, events);
+        let resolver = PackageResolver::new(None, events, None);
         let roots = vec![ws.to_path_buf()];
         let none = WorkspaceView {
             roots: &roots,
@@ -3941,7 +3975,11 @@ mod r92_tests {
         {
             Resolution::Bound(b) => {
                 assert_eq!(b.class, ClaimClass::Workspace);
-                assert_eq!(b.manifest.as_deref(), Some(manifest_path.as_path()));
+                assert_eq!(
+                    Some(b.root.as_path()),
+                    manifest_path.parent(),
+                    "anchored at the unsaved manifest's directory"
+                );
             }
             Resolution::Unbound | Resolution::Refused => panic!("the late buffer must bind"),
         }
@@ -3963,7 +4001,8 @@ mod r92_tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("demo.nml"), "").unwrap();
         let (events, _rx) = tokio::sync::mpsc::channel(8);
-        let resolver = PackageResolver::new(Some(Store::at(store_base.to_path_buf())), events);
+        let resolver =
+            PackageResolver::new(Some(Store::at(store_base.to_path_buf())), events, None);
         let roots = vec![ws.to_path_buf()];
         let view = WorkspaceView {
             roots: &roots,

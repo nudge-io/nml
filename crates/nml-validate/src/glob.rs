@@ -93,7 +93,7 @@ const MAX_SUBSUMES_STATES: usize = 10_000;
 /// The last run keeps every pinned row and settles both
 /// (`unit_inference_rules_compared` executes all three rules over the
 /// same layouts).
-pub fn unit_prefix_len(pattern: &str) -> Option<usize> {
+pub(crate) fn unit_prefix_len(pattern: &str) -> Option<usize> {
     let segments: Vec<&str> = pattern.split('/').collect();
     let directories = if segments.last() == Some(&"**") {
         segments.len()
@@ -127,13 +127,13 @@ pub fn unit_prefix_len(pattern: &str) -> Option<usize> {
 /// sits BEFORE the boundary (`tenants/**/flows/**`, `**/tenants/*/**`):
 /// no fixed depth can be declared until the layout is respelled.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnitGap {
+pub(crate) struct UnitGap {
     pub delegated: String,
     pub inferred: String,
     pub unbounded: bool,
 }
 
-pub fn unit_gap(pattern: &str) -> Option<UnitGap> {
+pub(crate) fn unit_gap(pattern: &str) -> Option<UnitGap> {
     let boundary = unit_prefix_len(pattern)?;
     let segments: Vec<&str> = pattern.split('/').collect();
     let directories = if segments.last() == Some(&"**") {
@@ -159,7 +159,7 @@ pub fn unit_gap(pattern: &str) -> Option<UnitGap> {
 /// `*` (a `**` at the boundary is the delegation point itself). `None`
 /// for a glob that infers no unit, or whose wildcards have no fixed
 /// depth above the boundary (a `**` before it): no pattern names it.
-pub fn inferred_unit(pattern: &str) -> Option<String> {
+pub(crate) fn inferred_unit(pattern: &str) -> Option<String> {
     let boundary = unit_prefix_len(pattern)?;
     let segments: Vec<&str> = pattern.split('/').collect();
     let dirs = &segments[..=boundary];
@@ -216,7 +216,7 @@ pub fn unit_nests_inside(outer: &str, inner: &str) -> bool {
 /// case a match-the-file test misses. Same DP as [`glob_match`], asking
 /// whether some PROPER prefix of the pattern consumes all of `dir`'s
 /// segments (the remainder then matches at least one more segment).
-pub fn glob_reaches_dir(pattern: &str, dir: &str) -> bool {
+pub(crate) fn glob_reaches_dir(pattern: &str, dir: &str) -> bool {
     let mut pat: Vec<&str> = Vec::new();
     for seg in pattern.split('/') {
         if seg == "**" && pat.last() == Some(&"**") {
@@ -826,12 +826,16 @@ impl Nfa {
 /// Over-cap patterns (rejected by `glob_match`) subsume nothing and are
 /// subsumed by anything that could match nothing — callers only pass
 /// meta-validated patterns, so treat them as incomparable (false).
-pub fn subsumes(a: &str, b: &str) -> bool {
+/// The tests' oracle: one comparison under the state bound alone. The
+/// product analysis goes through [`subsumes_budgeted`], which also spends the
+/// per-manifest work budget (`MAX_SHADOW_WORK`).
+#[cfg(test)]
+pub(crate) fn subsumes(a: &str, b: &str) -> bool {
     subsumes_within(a, b, MAX_SUBSUMES_STATES).unwrap_or(false)
 }
 
-/// [`subsumes`] drawing on a budget SHARED with every other pair in the
-/// same analysis, spending from `remaining` the work the walk did.
+/// One comparison drawing on a budget SHARED with every other pair in
+/// the same analysis, spending from `remaining` the work the walk did.
 ///
 /// [`MAX_SUBSUMES_STATES`] bounds ONE comparison; it bounds no analysis
 /// that makes many. A caller comparing every glob against every earlier
@@ -862,6 +866,7 @@ pub(crate) fn subsumes_budgeted(a: &str, b: &str, remaining: &mut usize) -> bool
 /// what [`MAX_SUBSUMES_STATES`] buys — that a pathological pair is
 /// answered by the budget, not by the automata — instead of only timing
 /// it.
+#[cfg(test)]
 fn subsumes_within(a: &str, b: &str, max_states: usize) -> Option<bool> {
     subsumes_counted(a, b, max_states, usize::MAX).0
 }
@@ -875,8 +880,9 @@ fn subsumes_cost(states: usize, automata: usize) -> usize {
     states.saturating_mul(automata).max(1)
 }
 
-/// [`subsumes_within`] plus the work it did ([`subsumes_cost`]) — what a
-/// shared budget is spent from ([`subsumes_budgeted`]). A pair refused
+/// One comparison under an explicit state budget, plus the work it did
+/// ([`subsumes_cost`]) — what a shared budget is spent from
+/// ([`subsumes_budgeted`]). A pair refused
 /// on its segment count alone costs the minimum, never zero: a budget
 /// nothing can spend is no budget.
 fn subsumes_counted(a: &str, b: &str, max_states: usize, max_work: usize) -> (Option<bool>, usize) {

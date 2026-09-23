@@ -24,10 +24,8 @@ use std::path::{Path, PathBuf};
 
 use libfuzzer_sys::fuzz_target;
 use nml_validate::workspace::{MAX_COMPONENTS, MockFs};
-use nml_validate::workspace::{
-    AuditBudget, EntryKind, InputKind, Skip, SourceKey, WorkspaceRoot, audit_hidden, discover,
-    walk_skips_dir,
-};
+use nml_validate::workspace::{AuditBudget, InputKind, Skip, SourceKey, WorkspaceRoot, audit_hidden, discover, walk_skips_dir};
+use nml_validate::fs::EntryKind;
 
 const NAMES: [&str; 10] = [
     "a",
