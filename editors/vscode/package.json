@@ -175,7 +175,7 @@
     "bundle:wasm": "node scripts/bundleWasm.mjs",
     "bundle:js": "node scripts/bundleJs.mjs",
     "test:unit": "tsc -b tsconfig.json tsconfig.test.json && mocha --ui tdd out/test/unit/**/*.js && pnpm run test:engine-policy && pnpm run test:lockfile-policy && pnpm run test:toolchain-policy",
-    "test:real": "node scripts/compile.mjs && mocha --ui tdd --timeout 30000 --exit out/test/real/*.js",
+    "test:real": "node scripts/runRealTests.mjs",
     "pretest": "node scripts/vscodePrepublish.mjs",
     "test": "vscode-test",
     "vscode:prepublish": "node scripts/vscodePrepublish.mjs",

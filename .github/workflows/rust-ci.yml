@@ -13,7 +13,8 @@ name: Rust CI
 # toolchain: msrv (the floor from Cargo.toml, forced via RUSTUP_TOOLCHAIN —
 # the env var outranks the pin file), minimal-versions' nightly resolver
 # step (reached via explicit `cargo +nightly`), and the api job's rustdoc JSON
-# build (nightly via dtolnay/rust-toolchain plus `just gate-api`). New stables land via
+# build (nightly via dtolnay/rust-toolchain plus `just gate-api`, dated not
+# rolling). New stables land via
 # canary.yml + a reviewed toolchain-bump PR — never by drift.
 on:
   workflow_call:
@@ -205,10 +206,13 @@ jobs:
       # file's active toolchain). Installed here so a cached `just gate-api`
       # on a runner that never ran the recipe still has it; the recipe
       # re-installs/updates the same channel before `cargo public-api`.
+      # Same dated nightly as `just gate-api` (not rolling `nightly` — rustdoc
+      # is not always published on the channel tip).
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (SHA-pinned; channel via toolchain input)
         with:
-          toolchain: nightly
+          toolchain: nightly-2025-08-02
           profile: minimal
+          components: rustdoc
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       # The gate runner. Every gate command lives in the justfile and
       # NOWHERE else — `just gate-contract` fails this build if a workflow

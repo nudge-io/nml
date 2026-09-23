@@ -343,7 +343,9 @@ fmt-check:
 # compiler; bump all three in one reviewed change) and installed here, so
 # CI and a local run install the same versions. `cargo public-api` builds
 # rustdoc JSON with a nightly toolchain (not the active one — the pin file
-# still governs fmt/clippy/check); this recipe installs it. `NML_UPDATE_GOLDEN=1 just
+# still governs fmt/clippy/check); this recipe installs a DATED nightly with
+# rustdoc (rolling `nightly` sometimes ships without rustdoc for a day).
+# `NML_UPDATE_GOLDEN=1 just
 # gate-api` rewrites the records AFTER the stamp and the CHANGELOG entry
 # moved — never before. The baseline is `NML_API_BASELINE`, else
 # `origin/main` where that ref exists, else `HEAD` (a clone with no
@@ -351,9 +353,13 @@ fmt-check:
 gate-api:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "gate-api: installing nightly (+ rustdoc) for cargo public-api rustdoc JSON"
-    rustup toolchain install nightly --profile minimal --component rustdoc
-    rustup run nightly rustc --version
+    # cargo-public-api 0.52 floor (crates.io README compatibility matrix).
+    # Bump with the tool + records in one reviewed change — not rolling `nightly`,
+    # which can lack rustdoc on any given day (rustup-components-history).
+    rustdoc_nightly="${NML_RUSTDOC_NIGHTLY:-nightly-2025-08-02}"
+    echo "gate-api: installing ${rustdoc_nightly} (+ rustdoc) for cargo public-api rustdoc JSON"
+    rustup toolchain install "$rustdoc_nightly" --profile minimal --component rustdoc
+    rustup run "$rustdoc_nightly" rustc --version
     cargo install --locked cargo-public-api@0.52.0 cargo-semver-checks@0.50.0
     python3 scripts/api_record.py
     base="${NML_API_BASELINE:-}"

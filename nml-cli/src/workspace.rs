@@ -75,7 +75,7 @@ pub fn read_schema_dir(dir: &Path) -> Result<Vec<(PathBuf, String)>, String> {
             read_schema_source(&path)
                 .map(|text| (path.clone(), text))
                 .map_err(|why| {
-                    schema_dir_error(dir, &format!("cannot read {}: {why}", path.display()))
+                    schema_dir_error(dir, &format!("cannot read {}: {why}", message_path(&path)))
                 })
         })
         .collect()
@@ -139,7 +139,7 @@ fn schema_sources_of(
 
 /// `--schema <dir>: <why>`, marked as the invocation's mistake (exit 2).
 fn schema_dir_error(dir: &Path, why: &str) -> String {
-    crate::out::usage_error(format!("--schema {}: {why}", dir.display()))
+    crate::out::usage_error(format!("--schema {}: {why}", message_path(dir)))
 }
 
 /// An I/O failure's reason in the tool's own words — never `io::Error`'s
@@ -628,6 +628,10 @@ pub const MAX_TARGET_BYTES: usize = 16 * 1024 * 1024;
 /// sides are physical paths (`current_dir` is `getcwd`; every path here
 /// is canonical), so the comparison never crosses a link.
 pub(crate) fn display_path(path: &Path) -> String {
+    forward_slashes(display_path_inner(path))
+}
+
+fn display_path_inner(path: &Path) -> String {
     let Ok(cwd) = std::env::current_dir() else {
         return path.display().to_string();
     };
@@ -644,6 +648,25 @@ pub(crate) fn display_path(path: &Path) -> String {
         }
         Err(_) => path.display().to_string(),
     }
+}
+
+/// Paths in kernel-aligned prose (errors, schema refusals): forward
+/// slashes on every platform, like source keys.
+pub(crate) fn message_path(path: &Path) -> String {
+    forward_slashes(path.display().to_string())
+}
+
+/// The root path on `--json` rows — `canonicalize`'s spelling on each OS
+/// (`\\?\` on Windows when the API returns it).
+pub(crate) fn wire_root_path(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+fn forward_slashes(s: String) -> String {
+    s.replace('\\', "/")
 }
 
 /// Absolutize a path against the current directory: the kernel has no
@@ -1231,14 +1254,12 @@ pub(crate) fn root_facts_of(root: &WorkspaceRoot) -> crate::out::RootFacts {
     let (fence, shadowed) = match root.origin() {
         RootOrigin::Derived { fence, shadowed } => (
             fence.entry_tag(),
-            shadowed
-                .as_ref()
-                .map(|s| s.path().to_string_lossy().into_owned()),
+            shadowed.as_ref().map(|s| wire_root_path(s.path())),
         ),
         RootOrigin::Explicit | RootOrigin::Editor => (None, None),
     };
     crate::out::RootFacts {
-        path: root.path().to_string_lossy().into_owned(),
+        path: wire_root_path(root.path()),
         origin: root.origin().tag(),
         fence,
         shadowed,

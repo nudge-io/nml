@@ -36,15 +36,14 @@ function whyNotHere(reason: string): void {
   console.log(`      · not run on ${process.platform}: ${reason}`);
 }
 
-/** Each stage expires fast: what is under test is the LADDER and the kernel,
- *  not how long the extension is willing to wait. */
-const QUICK: TerminationProfile = {
-  label: "test",
-  stopMs: 50,
-  inputMs: 400,
-  termMs: 400,
-  killMs: 400,
-};
+/** Each stage expires fast on POSIX: what is under test is the LADDER and the
+ *  kernel, not how long the extension is willing to wait. On Windows the forced
+ *  stage is an async `taskkill /T /F` — loaded CI hosts need longer budgets than
+ *  a laptop. */
+const QUICK: TerminationProfile =
+  process.platform === "win32"
+    ? { label: "test", stopMs: 50, inputMs: 400, termMs: 3_000, killMs: 8_000 }
+    : { label: "test", stopMs: 50, inputMs: 400, termMs: 400, killMs: 400 };
 
 const HANG_SH = `#!/bin/sh
 # A provider that answers nothing, ignores every polite signal, and
@@ -211,6 +210,15 @@ function recordedPids(): number[] {
   return [...pids];
 }
 
+function escapeWmiLikeLiteral(marker: string): string {
+  return marker
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "''")
+    .replace(/\[/g, "[[]")
+    .replace(/%/g, "[%-]")
+    .replace(/_/g, "[_]");
+}
+
 /** Every process on the machine whose command line names the test
  *  directory — the net for a process the fixtures did NOT record. Each
  *  platform has its own listing tool, and a platform whose tool is MISSING
@@ -219,8 +227,9 @@ function recordedPids(): number[] {
  *  `pgrep` does not exist and the error was swallowed.) */
 function processesMentioning(marker: string): string {
   if (process.platform === "win32") {
+    const escaped = escapeWmiLikeLiteral(marker);
     const query =
-      `Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%${marker.replace(/'/g, "''").replace(/\\/g, "\\\\")}%'" | ` +
+      `Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%${escaped}%'" | ` +
       "ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }";
     return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", query], {
       encoding: "utf8",
@@ -247,7 +256,7 @@ async function stragglers(): Promise<string> {
   // killed child is a zombie until its parent reaps it. A leak is a process
   // that is still there after that grace, so the recorded pids get a bounded
   // wait — and only the ones that outlast it are reported.
-  const deadline = Date.now() + 1_500;
+  const deadline = Date.now() + (process.platform === "win32" ? 5_000 : 1_500);
   let leftover = recordedPids().filter(alive);
   while (leftover.length > 0 && Date.now() < deadline) {
     await sleep(25);

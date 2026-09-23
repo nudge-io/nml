@@ -6545,6 +6545,7 @@ fn a_fix_whose_write_fails_leaves_the_original_and_no_temp_behind() {
 /// no other surface was unsanitized. Now `check` and `validate` print
 /// exactly ONE `: ok` line with no raw control byte; the `sanitized` →
 /// identity mutant at the success line is RED here.
+#[cfg(unix)]
 #[test]
 fn success_line_never_carries_raw_control_bytes() {
     let dir = workspace_copy("ok-line-hostile");
@@ -9825,7 +9826,7 @@ fn an_outside_target_is_refused_before_the_universe_walk() {
     let last = r.last().unwrap();
     assert_eq!(last["type"], "summary");
     assert!(
-        last["root"]["path"].as_str().unwrap().ends_with("/a"),
+        std::path::Path::new(last["root"]["path"].as_str().unwrap()).ends_with("a"),
         "{last}"
     );
     assert!(
@@ -10740,28 +10741,32 @@ fn the_remedy_blocks_lines_are_content_on_every_surface() {
     assert_eq!(code, 0, "{stdout}{stderr}");
 
     // A hostile key (on a fresh copy — the manifest above now grants):
-    // the escape on every surface, the raw byte on none.
-    let dir = workspace_copy("remedy-content-hostile");
-    let root = dir.to_str().unwrap();
-    let esc = dir.join("tenants/cu/e\u{1b}[31mv.flow.nml");
-    std::fs::write(&esc, &flow).unwrap();
-    let (code, _, stderr) = run(&["check", "--root", root, esc.to_str().unwrap()]);
-    assert_eq!(code, 1, "{stderr}");
-    assert!(
-        stderr.contains("- \"tenants/cu/e\\u{1B}[31mv.flow.nml\"") && !stderr.contains('\x1b'),
-        "{stderr}"
-    );
-    let (_, stdout, _) = run(&["check", "--json", "--root", root, esc.to_str().unwrap()]);
-    assert!(!stdout.contains('\x1b'), "{stdout}");
-    let row = rows_of(&stdout)
-        .into_iter()
-        .find(|r| r["code"] == "NML2064")
-        .unwrap();
-    assert_eq!(
-        row["suggestions"][0]["edits"][0]["lines"][2],
-        "                - \"tenants/cu/e\\u{1B}[31mv.flow.nml\"",
-        "{row}"
-    );
+    // the escape on every surface, the raw byte on none. Windows rejects
+    // several of these spellings as path names.
+    #[cfg(unix)]
+    {
+        let dir = workspace_copy("remedy-content-hostile");
+        let root = dir.to_str().unwrap();
+        let esc = dir.join("tenants/cu/e\u{1b}[31mv.flow.nml");
+        std::fs::write(&esc, &flow).unwrap();
+        let (code, _, stderr) = run(&["check", "--root", root, esc.to_str().unwrap()]);
+        assert_eq!(code, 1, "{stderr}");
+        assert!(
+            stderr.contains("- \"tenants/cu/e\\u{1B}[31mv.flow.nml\"") && !stderr.contains('\x1b'),
+            "{stderr}"
+        );
+        let (_, stdout, _) = run(&["check", "--json", "--root", root, esc.to_str().unwrap()]);
+        assert!(!stdout.contains('\x1b'), "{stdout}");
+        let row = rows_of(&stdout)
+            .into_iter()
+            .find(|r| r["code"] == "NML2064")
+            .unwrap();
+        assert_eq!(
+            row["suggestions"][0]["edits"][0]["lines"][2],
+            "                - \"tenants/cu/e\\u{1B}[31mv.flow.nml\"",
+            "{row}"
+        );
+    }
 }
 
 /// `nml fix` edits the file it was given, only: the remedy block's edit
@@ -11080,8 +11085,8 @@ fn a_schema_source_is_read_under_the_declared_source_bound() {
                     // counts sit beside both.
                     "error: --schema {}: cannot read {}: too large: over 4 MiB (4194305 bytes) — \
                      a schema source is read only up to 4 MiB (4194304 bytes)\n",
-                    dir.join("schemas").display(),
-                    source.display()
+                    dir.join("schemas").display().to_string().replace('\\', "/"),
+                    source.display().to_string().replace('\\', "/")
                 ),
                 "the kernel's one sentence, once, before any target"
             );

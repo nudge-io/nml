@@ -361,7 +361,7 @@ fn long_path_enametoolong(typed: &Path) -> bool {
     let Ok(it) = std::fs::read_dir(&p) else {
         return true;
     };
-    for e in it.flatten() {
+    if let Some(e) = it.flatten().next() {
         let child = p.join(e.file_name());
         return std::fs::read_dir(&child).is_err();
     }

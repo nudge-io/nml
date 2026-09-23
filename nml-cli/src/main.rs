@@ -10,7 +10,7 @@ use nml_core::diagnostic::{Code, Diagnostic, Severity};
 use nml_core::layers::LayersWire;
 use nml_core::span::Span;
 use nml_validate::schema::SchemaValidator;
-use nml_validate::workspace::{Governing, ReadError, SymlinkVerdict, read_beneath};
+use nml_validate::workspace::{Governing, OpenError, ReadError, SymlinkVerdict, read_beneath};
 
 mod fix;
 mod invocation;
@@ -2709,7 +2709,7 @@ fn ok_line(
     if out::quiet() {
         return;
     }
-    let path = sanitized(&path.display().to_string());
+    let path = sanitized(key.as_str());
     match declarations {
         Some(n) => out::say(format_args!("{path}: ok ({n} declaration(s))")),
         None => out::say(format_args!(
@@ -2782,10 +2782,14 @@ fn read_file(path: &Path, at: &LeafAt) -> Result<String, String> {
     )
     .map_err(|e| {
         let why = match e {
-            ReadError::Open(e) => leaf_advice(e),
+            ReadError::Open(OpenError::NotRegular { dir: true, .. }) => {
+                "is a directory".to_string()
+            }
+            ReadError::Open(e @ OpenError::Symlink { .. }) => leaf_advice(e),
+            ReadError::Open(e) => e.to_string(),
             e => e.to_string(),
         };
-        format!("failed to read {}: {why}", path.display())
+        format!("failed to read {}: {why}", workspace::message_path(path))
     })
 }
 
@@ -2868,8 +2872,21 @@ fn split_typed(path: &Path) -> Result<LeafAt, String> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("{} names no file", path.display()))?
+        .ok_or_else(|| format!("{} names no file", workspace::message_path(path)))?
         .to_string();
+    if name.is_empty() {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => path,
+        };
+        if dir.is_dir() {
+            return Err(format!(
+                "failed to read {}: is a directory",
+                workspace::message_path(path)
+            ));
+        }
+        return Err(format!("{} names no file", workspace::message_path(path)));
+    }
     let dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
