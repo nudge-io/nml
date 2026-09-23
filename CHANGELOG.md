@@ -803,6 +803,15 @@ Security group lists every change that made a silent outcome a refusal.
   error and no lint, as `nml check` prints none; a universe row located in
   the document it sits on (NML2081 at its item) sits at that item.
 
+- **public API apiVersion 5, revision 1** — BREAKING: the record moved
+  with the pinned nightly rustdoc (1.100.0-nightly, 2026-09-22). Auto-trait
+  impl lines now carry `&'a mut S` / `&'a F` where-clauses
+  (`nml_core::diagnostic::Filtered`, `nml_validate::workspace::OverlayFs`,
+  and the same family on `OverlayFs`'s `Send`/`Sync`/`Unpin` lines); many
+  inherent methods now spell their return type as `Self` instead of the
+  crate path. No intentional API removal — the gate treats any changed line
+  as a break.
+
 - **public API apiVersion 4, revision 1** — BREAKING: two signatures
   changed, four items added. `nml_lsp::serve` and `nml_lsp::serve_stdio`
   return `nml_lsp::SessionEnd` — how the session ended, for the embedder to

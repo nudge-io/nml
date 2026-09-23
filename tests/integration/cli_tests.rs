@@ -4037,6 +4037,25 @@ impl AsRef<Path> for Scratch {
     }
 }
 
+/// Matches [`nml_cli::workspace::message_path`]: forward slashes, no
+/// Windows extended-path prefix (`\\?\`).
+fn message_path(path: &Path) -> String {
+    #[cfg(windows)]
+    let path = {
+        let s = path.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            std::path::PathBuf::from(format!(r"\\{rest}"))
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            std::path::PathBuf::from(rest)
+        } else {
+            path.to_path_buf()
+        }
+    };
+    #[cfg(not(windows))]
+    let path = path.to_path_buf();
+    path.display().to_string().replace('\\', "/")
+}
+
 /// A stray token where a declaration starts recovers as a declaration with
 /// no name; two of them once reported `duplicate declaration ''` at 1:1 —
 /// FIRST, ahead of the parse finding that names the stray token, and under
@@ -7955,7 +7974,7 @@ fn a_no_fence_derivation_is_disclosed_on_stderr() {
         format!(
             "note: workspace root {}  (derived: no .git fence found, so the target's own \
              directory is the workspace root — pass --root to pin)\n",
-            bare.display().to_string().replace('\\', "/")
+            message_path(&bare)
         ),
         "{stderr}"
     );
@@ -11352,13 +11371,14 @@ fn fmt_refuses_a_block_dedented_to_the_item_column_and_leaves_the_file_untouched
                 stray:\n        allowRefs:\n            - \"y\"\n    - b:\n        files:\n            \
                 - \"z/**\"\n";
     std::fs::write(&path, text).unwrap();
-    let path = path.display().to_string();
+    let path_arg = path.display().to_string();
     let line = format!(
-        "{path}:5:5: error[NML0002]: expected a list item, a property, a modifier or a shared \
-         property in an array body, found a nested block\n"
+        "{}:5:5: error[NML0002]: expected a list item, a property, a modifier or a shared \
+         property in an array body, found a nested block\n",
+        message_path(&path)
     );
     for verb in ["parse", "check", "fmt"] {
-        let (code, stdout, stderr) = run(&[verb, &path]);
+        let (code, stdout, stderr) = run(&[verb, &path_arg]);
         assert_eq!(code, 1, "{verb}: {stderr}");
         assert!(stderr.contains(&line), "{verb}: want {line:?} in {stderr}");
         assert!(
@@ -11368,7 +11388,7 @@ fn fmt_refuses_a_block_dedented_to_the_item_column_and_leaves_the_file_untouched
         assert!(!stdout.contains("formatted"), "{verb}: {stdout}");
     }
     assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "untouched");
-    let (code, rows) = json_rows(&["fmt", "--json", &path]);
+    let (code, rows) = json_rows(&["fmt", "--json", &path_arg]);
     assert_eq!(code, 1);
     let row = rows
         .iter()
