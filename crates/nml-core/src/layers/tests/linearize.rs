@@ -183,8 +183,17 @@ fn deep_chain_fails_at_discovery_without_deep_recursion() {
 
 #[test]
 fn depth_cap_16_is_2066() {
+    // r75 (the pin census): the cap is the published constant — a chain
+    // two links short of it composes; a chain at it is NML2066.
+    let mut short = String::from("thing l0:\n    v = \"0\"\n");
+    for i in 1..MAX_STACK_DEPTH - 1 {
+        short.push_str(&format!("\nthing l{i} uses l{}:\n    v = \"{i}\"\n", i - 1));
+    }
+    let top = format!("l{}", MAX_STACK_DEPTH - 2);
+    let (resolved, diags) = compose(LIN_SCHEMA, &short, "thing", &top);
+    assert!(resolved.is_some(), "{diags:?}");
     let mut src = String::from("thing l0:\n    v = \"0\"\n");
-    for i in 1..=16 {
+    for i in 1..=MAX_STACK_DEPTH {
         src.push_str(&format!("\nthing l{i} uses l{}:\n    v = \"{i}\"\n", i - 1));
     }
     let (resolved, diags) = compose(LIN_SCHEMA, &src, "thing", "l16");
@@ -553,4 +562,65 @@ thing top uses a, b, c:
         "renders the cycle's pairwise steps: {}",
         d.message
     );
+}
+
+/// The did-you-mean vocabulary is DECLARATION order, not the order a
+/// hash map happens to hold its keys in.
+///
+/// `suggest` breaks a distance tie toward the EARLIEST candidate, so an
+/// unordered vocabulary makes NML2059's and NML2062's hint a different
+/// name on each run of the same binary over the same file: a composition
+/// golden that drifts, a `--json` wire that is not a function of its
+/// input, and an editor that contradicts `nml check` about one buffer.
+///
+/// Judged over TWO orderings of one name set, which is what makes this a
+/// gate rather than a coin toss: a hash-ordered vocabulary answers both
+/// files with the same sequence — the key set and the table are the same
+/// — and so cannot match both declaration orders.
+#[test]
+fn the_did_you_mean_vocabulary_is_declaration_order() {
+    let names = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliet", "kilo", "lima",
+    ];
+    let reversed: Vec<&str> = names.iter().rev().copied().collect();
+    for order in [names.to_vec(), reversed] {
+        let src: String = order
+            .iter()
+            .map(|n| format!("thing {n}:\n    v = \"x\"\n\n"))
+            .collect();
+        let file = file_of(&src);
+        let instances = InstanceIndex::from_file("main.nml", &file);
+        assert_eq!(
+            instances.names().collect::<Vec<_>>(),
+            order,
+            "the instance vocabulary is not declaration order"
+        );
+    }
+}
+
+/// The user-visible half: NML2059's hint on a distance TIE is the
+/// first-declared candidate. Both orderings again — one hash-ordered
+/// answer cannot be both `a` and `b`.
+#[test]
+fn an_unresolved_ref_names_the_earliest_tied_candidate() {
+    for [first, second] in [["a", "b"], ["b", "a"]] {
+        let src = format!(
+            "thing {first}:\n    v = \"1\"\n\nthing {second}:\n    v = \"2\"\n\n\
+             thing t uses c:\n    v = \"t\"\n"
+        );
+        let index = index_from(LIN_SCHEMA);
+        let file = file_of(&src);
+        let composed = compose_file(&index, "main.nml", &file, &OpenContext);
+        let d = composed
+            .diagnostics
+            .iter()
+            .find(|d| d.code == Some(codes::UNRESOLVED_LAYER_REF))
+            .expect("NML2059 fires");
+        assert!(
+            d.message.contains(&format!("did you mean '{first}'?")),
+            "the earliest of two equidistant candidates: {}",
+            d.message
+        );
+    }
 }

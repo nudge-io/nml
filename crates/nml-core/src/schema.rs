@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::diagnostic::{Code, Diagnostic, Severity, codes};
-use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, ModelKind, OneOfDef};
+use crate::diagnostic::{Code, Diagnostic, Severity, Suggestion, codes};
+use crate::model::{EnumDef, FieldDef, FieldType, MixinRef, ModelDef, ModelKind, OneOfDef};
+use crate::span::Span;
 
 /// Schema definitions (models / enums / oneofs) extracted from a source file.
 /// Produced by [`crate::cst::extract`] over the CST; the validation/inheritance
 /// passes in this module operate on it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ExtractedSchema {
     pub models: Vec<ModelDef>,
     pub enums: Vec<EnumDef>,
@@ -34,9 +35,17 @@ fn at_def(diag: Diagnostic, source: &Option<String>) -> Diagnostic {
 /// Validate `oneof` declarations against the rest of the schema:
 /// - every arm model must be a declared `model`,
 /// - discriminator values must be unique within a union,
-/// - a union name must not collide with a model or enum name.
+/// - a union name must not collide with a model or enum name,
+/// - no arm carries a plain field named like the discriminator
+///   (`shadowed_discriminator`).
+///
+/// Over the definitions as EXTRACTED, before [`resolve_model_inheritance`]:
+/// the last rule reads each definition's own fields and walks `is` itself,
+/// so the definition that declares a shadowing field is still known and
+/// the row lands where the author edits.
 pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
-    let model_names: HashSet<&str> = schema.models.iter().map(|m| m.name.as_str()).collect();
+    let models: HashMap<&str, &ModelDef> =
+        schema.models.iter().map(|m| (m.name.as_str(), m)).collect();
     let trait_names: HashSet<&str> = schema
         .models
         .iter()
@@ -59,7 +68,7 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
             )
         };
 
-        if model_names.contains(oneof.name.as_str()) || enum_names.contains(oneof.name.as_str()) {
+        if models.contains_key(oneof.name.as_str()) || enum_names.contains(oneof.name.as_str()) {
             errors.push(err(codes::ONEOF_NAME_COLLISION, format!(
                 "name '{}' is declared as both a oneof and a model/enum; names must be unique across model/enum/oneof",
                 oneof.name
@@ -88,7 +97,7 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
                         oneof.name, value, model
                     ),
                 ));
-            } else if !model_names.contains(model.as_str()) {
+            } else if !models.contains_key(model.as_str()) {
                 errors.push(err(
                     codes::ONEOF_INTEGRITY,
                     format!(
@@ -97,35 +106,8 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
                     ),
                 ));
             }
-            // A variant model declaring a PLAIN field named like the
-            // discriminator can never have it set: an instance's property of
-            // that name is always claimed AS the discriminator (validation
-            // strips it before variant checks; completion suppresses the
-            // field's values, RFC 0015). Advisory (RFC 0008
-            // severity-at-source): legal, always suspicious. Modifier-form
-            // fields (`|kind`) are distinct authoring and do not shadow.
-            if let Some(m) = schema.models.iter().find(|m| &m.name == model) {
-                if m.fields.iter().any(|f| {
-                    f.name == oneof.discriminator
-                        && !matches!(f.field_type, FieldType::Modifier(_))
-                        // `#sealed` on the discriminator-named field is RFC
-                        // 0019's sanctioned spelling for "this oneof forbids
-                        // arm switching" — the field being unsettable is the
-                        // point, not an accident worth warning about.
-                        && !f.directives.iter().any(|d| d.name == "sealed")
-                }) {
-                    errors.push(at_def(
-                        Diagnostic::warning(format!(
-                            "oneof '{}' arm \"{}\": model '{}' declares a field '{}' named \
-                             like the discriminator — an instance's '{}' property is always \
-                             read as the discriminator, so the field can never be set",
-                            oneof.name, value, model, oneof.discriminator, oneof.discriminator
-                        ))
-                        .with_code(codes::SHADOWED_DISCRIMINATOR)
-                        .with_span(oneof.span),
-                        &oneof.source,
-                    ));
-                }
+            if let Some(arm) = models.get(model.as_str()) {
+                shadowed_discriminator(&models, oneof, value, arm, &mut errors);
             }
         }
 
@@ -188,6 +170,157 @@ pub fn find_oneof_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
     }
 
     errors
+}
+
+/// NML2054 for one arm. A plain field named like the union's discriminator
+/// — declared on the arm model or reaching it through `is` — can never be
+/// set: an instance's property of that name is always claimed AS the
+/// discriminator (validation strips it before the variant checks;
+/// completion suppresses the field's values, RFC 0015). Required, it makes
+/// every instance unsatisfiable — a missing-field error on a property the
+/// instance states; optional, it is a declaration nothing can fill. An
+/// error at load, with the one spelling the language sanctions kept: an
+/// OPTIONAL `#sealed` field of that name is the seal ("this oneof forbids
+/// arm switching", RFC 0019) — being unsettable is its point. Modifier-form
+/// fields (`|kind`) are distinct authoring and never shadow; a trait arm
+/// has no instances (its own error) and is not judged.
+///
+/// Located where the author edits, with the exact remedy when there is
+/// one: an own field at the field, its DELETION the suggestion — no
+/// instance can have set it, so nothing depends on it; an own required
+/// seal at the field, the `?` that makes it the sanctioned spelling the
+/// suggestion; an inherited field at the arm's `is` reference that brings
+/// it in, with no suggestion — the field may be live in the mixin's other
+/// users, so which remedy (rename the discriminator, drop the mixin,
+/// delete the field where it is declared) is the author's. Every row
+/// carries the union's declaration as a note.
+fn shadowed_discriminator(
+    models: &HashMap<&str, &ModelDef>,
+    oneof: &OneOfDef,
+    value: &str,
+    arm: &ModelDef,
+    errors: &mut Vec<Diagnostic>,
+) {
+    if arm.is_trait() {
+        return;
+    }
+    let disc = oneof.discriminator.as_str();
+    let Some((origin, field, via)) = field_origin(models, arm, disc) else {
+        return;
+    };
+    if matches!(field.field_type, FieldType::Modifier(_)) {
+        return;
+    }
+    let sealed = field.directives.iter().any(|d| d.name == "sealed");
+    if sealed && field.optional {
+        return;
+    }
+    let site = format!(
+        "oneof '{}' arm \"{value}\": model '{}'",
+        oneof.name, arm.name
+    );
+    let claim = format!("an instance's '{disc}' property is always read as the discriminator");
+    let optional_seal = format!("`{disc} {}? #sealed`", field.field_type);
+    let diag = match via {
+        None if sealed => Diagnostic::error(format!(
+            "{site} seals the discriminator with a required field '{disc}' — {claim}, so a \
+             required field can never be satisfied; declare it optional: {optional_seal}"
+        ))
+        .with_span(field.span)
+        .with_suggestion(Suggestion::fix("?").at(Span::empty(field.type_span.end))),
+        None if !field.optional => Diagnostic::error(format!(
+            "{site} declares a required field '{disc}' named like the discriminator — {claim}, \
+             so no instance can satisfy it (a missing-field error on a property it states); \
+             delete it (to forbid arm switching instead, seal it: {optional_seal})"
+        ))
+        .with_span(field.span)
+        .with_suggestion(Suggestion::delete().at(field.span)),
+        None => Diagnostic::error(format!(
+            "{site} declares a field '{disc}' named like the discriminator — {claim}, so the \
+             field can never be set; delete it (to forbid arm switching instead, seal it: \
+             {optional_seal})"
+        ))
+        .with_span(field.span)
+        .with_suggestion(Suggestion::delete().at(field.span)),
+        Some(mixin) => {
+            let remedy = if sealed {
+                format!("declare it optional where it is declared: {optional_seal}")
+            } else {
+                format!(
+                    "rename the discriminator, drop `is {}`, or delete the field where it is \
+                     declared",
+                    mixin.name
+                )
+            };
+            Diagnostic::error(format!(
+                "{site} inherits a field '{disc}' named like the discriminator from {} '{}' — \
+                 {claim}, so the field can never be set in this arm; {remedy}",
+                origin.kind.label(),
+                origin.name
+            ))
+            .with_span(mixin.span)
+            .with_related_in(
+                field.span,
+                format!("field '{disc}' declared here"),
+                origin.source.clone(),
+            )
+        }
+    };
+    errors.push(at_def(
+        diag.with_code(codes::SHADOWED_DISCRIMINATOR)
+            .with_related_in(
+                oneof.span,
+                format!("oneof '{}' selects its arm by '{disc}' here", oneof.name),
+                oneof.source.clone(),
+            ),
+        &arm.source,
+    ));
+}
+
+/// The definition that supplies the field `name` to `model`'s instances,
+/// the field, and the `is` reference of `model` it arrives through (`None`
+/// when `model` declares it): the model's own field when it declares one
+/// of that name — in either form, an own name overrides every inherited
+/// one — else the first `is` target, in clause order, whose own chain
+/// declares it. Exactly the precedence [`resolve_model_inheritance`] gives
+/// the resolved field, read off the unresolved definitions so the
+/// declaring definition is still known. A definition is entered once, so
+/// a cyclic chain (its own error) terminates.
+fn field_origin<'a>(
+    models: &HashMap<&str, &'a ModelDef>,
+    model: &'a ModelDef,
+    name: &str,
+) -> Option<(&'a ModelDef, &'a FieldDef, Option<&'a MixinRef>)> {
+    fn own<'a>(model: &'a ModelDef, name: &str) -> Option<&'a FieldDef> {
+        model.fields.iter().find(|f| f.name == name)
+    }
+    fn walk<'a>(
+        models: &HashMap<&str, &'a ModelDef>,
+        model: &'a ModelDef,
+        name: &str,
+        seen: &mut HashSet<&'a str>,
+    ) -> Option<(&'a ModelDef, &'a FieldDef)> {
+        if !seen.insert(model.name.as_str()) {
+            return None;
+        }
+        if let Some(f) = own(model, name) {
+            return Some((model, f));
+        }
+        model.extends.iter().find_map(|parent| {
+            models
+                .get(parent.name.as_str())
+                .and_then(|p| walk(models, p, name, seen))
+        })
+    }
+    if let Some(f) = own(model, name) {
+        return Some((model, f, None));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    seen.insert(model.name.as_str());
+    model.extends.iter().find_map(|parent| {
+        let p = models.get(parent.name.as_str())?;
+        walk(models, p, name, &mut seen).map(|(origin, f)| (origin, f, Some(parent)))
+    })
 }
 
 /// Validate enum definitions: duplicate variants (both authored forms name
@@ -299,8 +432,13 @@ pub fn find_composition_errors(schema: &ExtractedSchema) -> Vec<Diagnostic> {
                     ))
                     .with_code(codes::UNKNOWN_MIXIN)
                     .with_span(parent.span);
-                    if let Some(s) = crate::suggest::suggest(&parent.name, defs.keys().copied()) {
-                        diag = diag.with_suggestion(s, parent.span);
+                    // The candidates in DECLARATION order, from the same
+                    // models `defs` indexes: the suggester breaks ties
+                    // toward the earliest, so a hash-ordered vocabulary
+                    // would make this hint a different name on each run.
+                    let candidates = schema.models.iter().map(|m| m.name.as_str());
+                    if let Some(s) = crate::suggest::suggest(&parent.name, candidates) {
+                        diag = diag.with_suggestion(Suggestion::did_you_mean(s).at(parent.span));
                     }
                     diag
                 }
@@ -716,6 +854,78 @@ pub fn find_extends_cycles(schema: &ExtractedSchema) -> Vec<Diagnostic> {
         },
     );
     errors
+}
+
+/// Every span the extracted schema carries — definitions, mixin references,
+/// fields (whole and type), facet bounds, defaults and directives — each
+/// named by the field that holds it; the schema-side twin of
+/// [`crate::ast::for_each_span`].
+pub fn for_each_span(schema: &ExtractedSchema, f: &mut impl FnMut(crate::span::SpanSite)) {
+    for m in &schema.models {
+        site(f, "ModelDef", m.span);
+        for e in &m.extends {
+            site(f, "MixinRef", e.span);
+        }
+        for field in &m.fields {
+            site(f, "FieldDef", field.span);
+            site(f, "FieldDef.type_span", field.type_span);
+            field_type_spans(f, &field.field_type);
+            if let Some(d) = &field.default_value {
+                crate::ast::value_spans(f, "FieldDef.default_value", d);
+            }
+            for d in &field.directives {
+                crate::ast::directive_spans(f, d);
+            }
+        }
+    }
+    for e in &schema.enums {
+        site(f, "EnumDef", e.span);
+    }
+    for o in &schema.oneofs {
+        site(f, "OneOfDef", o.span);
+    }
+}
+
+fn site(f: &mut impl FnMut(crate::span::SpanSite), kind: &'static str, span: crate::span::Span) {
+    // Every schema site is a whole node's or a whole token's span; the two
+    // sub-token shapes reach a schema only through `crate::ast::value_spans`.
+    f(crate::span::SpanSite::aligned(kind, span));
+}
+
+fn field_type_spans(f: &mut impl FnMut(crate::span::SpanSite), t: &crate::model::FieldType) {
+    use crate::model::{FieldType, PrimitiveFacets};
+    match t {
+        FieldType::Primitive { facets, .. } => match facets {
+            PrimitiveFacets::Number(facets) => facet_spans(f, facets),
+            PrimitiveFacets::Duration(facets) => facet_spans(f, facets),
+            PrimitiveFacets::None => {}
+        },
+        FieldType::List(inner) | FieldType::Modifier(inner) | FieldType::Set(inner) => {
+            field_type_spans(f, inner)
+        }
+        FieldType::Union(variants) => {
+            for v in variants {
+                field_type_spans(f, v);
+            }
+        }
+        FieldType::Arms { key, target } => {
+            field_type_spans(f, key);
+            field_type_spans(f, target);
+        }
+        FieldType::ModelRef(_) => {}
+    }
+}
+
+fn facet_spans<T>(f: &mut impl FnMut(crate::span::SpanSite), facets: &crate::model::Facets<T>) {
+    if let Some(b) = &facets.min {
+        site(f, "FacetBound.min", b.span);
+    }
+    if let Some(b) = &facets.max {
+        site(f, "FacetBound.max", b.span);
+    }
+    if let Some(m) = &facets.multiple_of {
+        site(f, "FacetMultipleOf", m.span);
+    }
 }
 
 #[cfg(test)]
@@ -1145,6 +1355,7 @@ mod tests {
                 directives: Vec::new(),
                 doc: None,
                 span: crate::span::Span::empty(0),
+                type_span: crate::span::Span::empty(0),
             }],
             span: crate::span::Span::empty(0),
         };
@@ -1179,6 +1390,7 @@ mod tests {
             directives: Vec::new(),
             doc: None,
             span: crate::span::Span::empty(0),
+            type_span: crate::span::Span::empty(0),
         };
         let model = |name: &str, extends: &[&str], f: &str| ModelDef {
             kind: ModelKind::Model,
@@ -1259,45 +1471,257 @@ mod tests {
         );
     }
 
+    /// The NML2054 rows of `src`, through the loader's call order.
+    fn shadow_rows(src: &str) -> Vec<Diagnostic> {
+        find_oneof_errors(&extract_src(src))
+            .into_iter()
+            .filter(|e| e.code == Some(codes::SHADOWED_DISCRIMINATOR))
+            .collect()
+    }
+
+    fn span_of(src: &str, needle: &str) -> Span {
+        token_at(src, needle, needle.len())
+    }
+
+    /// The `len`-byte span starting where `needle` first occurs.
+    fn token_at(src: &str, needle: &str, len: usize) -> Span {
+        let start = src.find(needle).expect("needle in source");
+        Span::new(start, start + len)
+    }
+
     #[test]
-    fn oneof_shadowed_discriminator_warns_plain_field_only() {
-        // A PLAIN variant field named like the discriminator: advisory.
-        let schema = extract_src(
-            "model logM:\n    kind string?\n\noneof mail by kind:\n    \"log\" -> logM\n",
-        );
-        let errs = find_oneof_errors(&schema);
-        let shadow: Vec<_> = errs
-            .iter()
-            .filter(|e| e.code == Some(crate::diagnostic::codes::SHADOWED_DISCRIMINATOR))
-            .collect();
-        assert_eq!(shadow.len(), 1, "exactly one advisory: {errs:?}");
+    fn a_plain_field_named_like_the_discriminator_is_an_error_at_the_field_with_its_deletion() {
+        // Optional or required, sealed or not: an own plain field of the
+        // discriminator's name is an ERROR located at the field's content
+        // (not the indentation), carrying its deletion as the one
+        // suggestion and the union's declaration as a note.
+        for decl in ["kind string?", "kind string", "kind (va | vb)"] {
+            let src = format!(
+                "model va:\n    p string\n\nmodel vb:\n    q string\n\nmodel logM:\n    \
+                 // the entry's kind\n    {decl}\n    msg string?\n\noneof mail by kind:\n    \
+                 \"log\" -> logM\n"
+            );
+            let rows = shadow_rows(&src);
+            assert_eq!(rows.len(), 1, "{decl}: {rows:?}");
+            let row = &rows[0];
+            assert!(matches!(row.severity, Severity::Error), "{decl}: {row:?}");
+            assert_eq!(row.span, Some(span_of(&src, decl)), "{decl}: at the field");
+            // The honest consequence per shape: an optional field is a
+            // declaration nothing can fill; a required one fails every
+            // instance on a property it states.
+            let expected = if decl == "kind string?" {
+                "oneof 'mail' arm \"log\": model 'logM' declares a field 'kind' named like \
+                 the discriminator — an instance's 'kind' property is always read as the \
+                 discriminator, so the field can never be set; delete it"
+            } else {
+                "oneof 'mail' arm \"log\": model 'logM' declares a required field 'kind' named \
+                 like the discriminator — an instance's 'kind' property is always read as the \
+                 discriminator, so no instance can satisfy it (a missing-field error on a \
+                 property it states); delete it"
+            };
+            assert!(row.message.contains(expected), "{decl}: {}", row.message);
+            assert_eq!(
+                row.suggestions,
+                vec![Suggestion::delete().at(span_of(&src, decl))],
+                "{decl}: the deletion, anchored at the field"
+            );
+            assert_eq!(row.related.len(), 1, "{decl}: the union's note");
+            assert_eq!(
+                row.related[0].span.start,
+                src.find("oneof mail").expect("the union"),
+                "{decl}: the note at the union's declaration"
+            );
+            assert_eq!(
+                row.related[0].message,
+                "oneof 'mail' selects its arm by 'kind' here"
+            );
+        }
+        // The seal is spelled in the message with the field's own type.
+        let row = &shadow_rows(
+            "model logM:\n    kind (va | vb)\n\nmodel va:\n    p string\n\nmodel vb:\n    \
+             q string\n\noneof mail by kind:\n    \"log\" -> logM\n",
+        )[0];
         assert!(
-            matches!(shadow[0].severity, crate::diagnostic::Severity::Warning),
-            "advisory, not an error: {:?}",
-            shadow[0]
+            row.message.ends_with("seal it: `kind (va | vb)? #sealed`)"),
+            "{}",
+            row.message
         );
-        // The modifier form (`|kind`) is distinct authoring — no shadow.
-        let schema2 = extract_src(
+    }
+
+    #[test]
+    fn the_modifier_form_and_the_optional_seal_never_shadow() {
+        // The modifier form (`|kind`) is distinct authoring; an OPTIONAL
+        // `#sealed` field of the discriminator's name is RFC 0019's
+        // no-arm-switching spelling — being unsettable is its point.
+        for src in [
             "model logM:\n    |kind string?\n\noneof mail by kind:\n    \"log\" -> logM\n",
-        );
-        assert!(
-            find_oneof_errors(&schema2)
-                .iter()
-                .all(|e| e.code != Some(crate::diagnostic::codes::SHADOWED_DISCRIMINATOR)),
-            "modifier-form fields do not shadow"
-        );
-        // `#sealed` on the discriminator-named field is RFC 0019's
-        // sanctioned no-arm-switching spelling — being unsettable is the
-        // point, so the advisory must not fire.
-        let schema3 = extract_src(
             "model logM:\n    kind string? #sealed\n\noneof mail by kind:\n    \"log\" -> logM\n",
+            // Inherited, the seal is the same spelling (a trait sealing
+            // every arm it is mixed into).
+            "trait sealed:\n    kind string? #sealed\n\nmodel logM is sealed:\n    m string?\n\n\
+             oneof mail by kind:\n    \"log\" -> logM\n",
+            // An own modifier form shadows an inherited plain field — the
+            // arm's resolved field IS the modifier, which never shadows.
+            "trait t:\n    kind string?\n\nmodel logM is t:\n    |kind string?\n\noneof mail by \
+             kind:\n    \"log\" -> logM\n",
+            // No field of the name anywhere: nothing to judge.
+            "model logM:\n    msg string?\n\noneof mail by kind:\n    \"log\" -> logM\n",
+        ] {
+            assert!(shadow_rows(src).is_empty(), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_required_seal_is_refused_with_the_optional_spelling_as_its_fix() {
+        // `kind string #sealed` — required — is the unsatisfiable shape
+        // wearing the seal's directive: an error at the field, the `?`
+        // that makes it the sanctioned spelling as the one suggestion,
+        // inserted at the type's end — after its facets, before a default or a
+        // directive (the field's type is immaterial: it is never set).
+        let src = "model logM:\n    kind number(min = 1) #sealed\n\noneof mail by kind:\n    \
+                   \"log\" -> logM\n";
+        let rows = shadow_rows(src);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert!(matches!(row.severity, Severity::Error), "{row:?}");
+        assert_eq!(row.span, Some(span_of(src, "kind number(min = 1) #sealed")));
+        assert_eq!(
+            row.message,
+            "oneof 'mail' arm \"log\": model 'logM' seals the discriminator with a required \
+             field 'kind' — an instance's 'kind' property is always read as the \
+             discriminator, so a required field can never be satisfied; declare it \
+             optional: `kind number(min = 1)? #sealed`"
+        );
+        let after_type = span_of(src, "number(min = 1)").end;
+        assert_eq!(
+            row.suggestions,
+            vec![Suggestion::fix("?").at(Span::empty(after_type))],
+            "the `?` at the type's end"
+        );
+        assert_eq!(row.related.len(), 1, "the union's note rides every row");
+    }
+
+    #[test]
+    fn an_inherited_field_named_like_the_discriminator_is_located_at_the_mixin_with_no_fix() {
+        // The field reaches the arm through `is`: the row is at the arm's
+        // reference that brings it in, names the declaring definition,
+        // carries NO suggestion (the field may be live in the mixin's other
+        // users) and notes the field and the union.
+        let src = "trait tagged:\n    kind string?\n\nmodel logM is tagged:\n    msg string?\n\n\
+                   model note is tagged:\n    text string?\n\noneof mail by kind:\n    \
+                   \"log\" -> logM\n";
+        let rows = shadow_rows(src);
+        assert_eq!(rows.len(), 1, "one row, for the arm alone: {rows:?}");
+        let row = &rows[0];
+        assert_eq!(
+            row.span,
+            Some(token_at(src, "tagged:\n    msg", 6)),
+            "at `is tagged`"
+        );
+        assert_eq!(
+            row.message,
+            "oneof 'mail' arm \"log\": model 'logM' inherits a field 'kind' named like the \
+             discriminator from trait 'tagged' — an instance's 'kind' property is always \
+             read as the discriminator, so the field can never be set in this arm; rename \
+             the discriminator, drop `is tagged`, or delete the field where it is declared"
+        );
+        assert!(row.suggestions.is_empty(), "{row:?}");
+        assert_eq!(row.related.len(), 2);
+        assert_eq!(row.related[0].span, span_of(src, "kind string?"));
+        assert_eq!(row.related[0].message, "field 'kind' declared here");
+        assert_eq!(
+            row.related[1].message,
+            "oneof 'mail' selects its arm by 'kind' here"
+        );
+
+        // Through a base MODEL, two levels deep: the arm's DIRECT reference
+        // is the site, the declaring definition is named.
+        let src = "model root:\n    kind string\n\nmodel base is root:\n    x string?\n\n\
+                   model logM is base:\n    msg string?\n\noneof mail by kind:\n    \
+                   \"log\" -> logM\n";
+        let rows = shadow_rows(src);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].span,
+            Some(token_at(src, "base:\n    msg", 4)),
+            "at `is base`"
         );
         assert!(
-            find_oneof_errors(&schema3)
-                .iter()
-                .all(|e| e.code != Some(crate::diagnostic::codes::SHADOWED_DISCRIMINATOR)),
-            "the sealed-discriminator spelling draws no NML2054 noise"
+            rows[0].message.contains("from model 'root'")
+                && rows[0].message.contains("drop `is base`"),
+            "{}",
+            rows[0].message
         );
+
+        // An own field overrides an inherited one: the row is the OWN
+        // field's (at the field, with the deletion), never the mixin's.
+        let src = "trait tagged:\n    kind string?\n\nmodel logM is tagged:\n    kind string?\n    \
+                   msg string?\n\noneof mail by kind:\n    \"log\" -> logM\n";
+        let rows = shadow_rows(src);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let own = src.rfind("kind string?").expect("the arm's own field");
+        assert_eq!(
+            rows[0].span,
+            Some(Span::new(own, own + "kind string?".len()))
+        );
+        assert_eq!(rows[0].suggestions.len(), 1, "the deletion");
+
+        // The first `is` target in clause order supplies the field —
+        // `resolve_model_inheritance`'s precedence — so the row is at it.
+        let src = "trait a:\n    x string?\n\ntrait b:\n    kind string?\n\ntrait c:\n    kind \
+                   string?\n\nmodel logM is a, b, c:\n    msg string?\n\noneof mail by kind:\n    \
+                   \"log\" -> logM\n";
+        let rows = shadow_rows(src);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].message.contains("from trait 'b'"),
+            "{}",
+            rows[0].message
+        );
+
+        // An inherited REQUIRED seal: the same site, the seal's remedy.
+        let src = "trait tagged:\n    kind string #sealed\n\nmodel logM is tagged:\n    msg \
+                   string?\n\noneof mail by kind:\n    \"log\" -> logM\n";
+        let rows = shadow_rows(src);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0]
+                .message
+                .ends_with("declare it optional where it is declared: `kind string? #sealed`"),
+            "{}",
+            rows[0].message
+        );
+        assert!(
+            rows[0].suggestions.is_empty(),
+            "never a fix into another definition"
+        );
+    }
+
+    #[test]
+    fn the_shadow_rule_skips_uninstantiable_and_unknown_arms_and_terminates_on_a_cycle() {
+        // A trait arm is its own error (no instances to be ill-formed); an
+        // unknown arm is its own error; a cyclic `is` chain is its own
+        // error and the walk still terminates.
+        let src = "trait t:\n    kind string?\n\noneof mail by kind:\n    \"log\" -> t\n    \
+                   \"gone\" -> ghost\n";
+        let errs = find_oneof_errors(&extract_src(src));
+        assert!(
+            errs.iter()
+                .any(|e| e.code == Some(codes::TRAIT_ONEOF_VARIANT))
+        );
+        assert!(errs.iter().any(|e| e.code == Some(codes::ONEOF_INTEGRITY)));
+        assert!(
+            errs.iter()
+                .all(|e| e.code != Some(codes::SHADOWED_DISCRIMINATOR)),
+            "{errs:?}"
+        );
+        let src = "model a is b:\n    x string?\n\nmodel b is a:\n    y string?\n\noneof mail by \
+                   kind:\n    \"a\" -> a\n";
+        assert!(shadow_rows(src).is_empty());
+        // ... and finds a field declared past the cycle's entry.
+        let src = "model a is b:\n    x string?\n\nmodel b is a:\n    kind string?\n\noneof mail \
+                   by kind:\n    \"a\" -> a\n";
+        assert_eq!(shadow_rows(src).len(), 1);
     }
 
     #[test]
@@ -1868,6 +2292,28 @@ mod composition_tests {
         assert_eq!(s.replacement, "monitored");
         let span = d.span.expect("span");
         assert_eq!(&src[span.start..span.end], "monitred");
+    }
+
+    /// The `is`-target vocabulary is DECLARATION order: `suggest` breaks a
+    /// distance tie toward the earliest candidate, so a hash-ordered one
+    /// made this hint a different name on each run of the same binary over
+    /// the same file. Judged over TWO orderings of one name set — one
+    /// hash-ordered answer cannot be both.
+    #[test]
+    fn an_unknown_is_target_names_the_earliest_tied_candidate() {
+        for [first, second] in [["ax", "ay"], ["ay", "ax"]] {
+            let src = format!(
+                "trait {first}:\n    t duration?\n\ntrait {second}:\n    u duration?\n\n\
+                 model endpoint is az:\n    url string?\n"
+            );
+            let errs = find(&src);
+            assert_eq!(codes_of(&errs), vec!["NML2020"]);
+            let s = errs[0].suggestions.first().expect("suggestion");
+            assert_eq!(
+                s.replacement, first,
+                "the earliest of two equidistant targets"
+            );
+        }
     }
 
     #[test]

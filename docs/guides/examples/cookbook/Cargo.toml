@@ -1,5 +1,5 @@
 # The cookbook's compiled truth: one example target per recipe page in
-# docs/guides/. `just docs-test` builds and RUNS every example (each must
+# docs/guides/. `just gate-docs` builds and RUNS every example (each must
 # print "recipe OK"), and the pages' Rust listings are `source=`-synced from
 # these files — a recipe that stops compiling or drifts from its page fails
 # CI by name.

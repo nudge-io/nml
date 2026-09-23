@@ -4,6 +4,16 @@
 Idempotence — `format(format(x)) == format(x)` — is what makes it safe on
 every save, in pre-commit hooks, and in `<your-tool> fmt`.
 
+**The style your users will see is specified**, normatively, in
+[`spec/style.md`](../../spec/style.md) — point them at it rather than
+explaining it twice. The short version, because it is what surprises
+people: layout is regenerated (indentation, trailing whitespace, the
+spacing between tokens), but the choices the grammar leaves free belong to
+the author and are PRESERVED — a blank line, an aligned `->` column, a
+string's delimiter, whether a value sits on its `=`'s line or the next
+one. The formatter never inserts a blank line and never aligns anything
+itself, so it also never repairs an alignment an edit broke.
+
 ```rust source=docs/guides/examples/cookbook/examples/format_files.rs
     let once = format_source(messy)?;
     let twice = format_source(&once)?;

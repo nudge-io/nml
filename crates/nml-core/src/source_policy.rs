@@ -68,7 +68,7 @@ pub(crate) fn check(source: &str) -> (Vec<NmlError>, usize) {
             },
             _ => continue,
         };
-        if errors.len() < crate::cst::MAX_ERRORS {
+        if errors.len() < crate::diagnostic::MAX_ERRORS {
             errors.push(NmlError::syntax(kind, Span::new(i, i + ch.len_utf8())));
         } else {
             suppressed += 1;
@@ -93,6 +93,39 @@ pub fn must_escape(ch: char) -> bool {
 /// drift apart.
 pub fn unicode_escape(ch: char) -> String {
     format!("\\u{{{:X}}}", ch as u32)
+}
+
+/// `s` as a single-line, double-quoted NML string literal the lexer
+/// decodes back to exactly `s` AS A STRING — the ONE speller for every
+/// surface that writes an NML literal (the formatter's literal, arm and
+/// discriminator branches, the editor's outline labels, hover values and
+/// completion snippets, the grant remedy's `allowRefs` entry): `"` and `\` escaped; a tab,
+/// line feed and CR as `\t`, `\n`, `\r`; every character raw source may
+/// not carry ([`must_escape`]) as its [`unicode_escape`]; and the first
+/// brace of a `{{` as `\u{7B}` — raw, the pair would make the literal a
+/// TEMPLATE string on reparse, a different type whose expression
+/// segments a manifest reader sets aside (the grant remedy for a file
+/// named `a{{b}}.flow.nml` spelled it raw and the pasted block granted
+/// nothing). The formatter's fixed point: formatting the literal
+/// changes nothing.
+pub fn string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '{' if chars.peek() == Some(&'{') => out.push_str("\\u{7B}"),
+            c if must_escape(c) => out.push_str(&unicode_escape(c)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// The Windows-1252 reading of a C1 code point (U+0080–U+009F): the
@@ -172,6 +205,53 @@ fn is_invisible(ch: char) -> bool {
 mod tests {
     use super::*;
 
+    /// A `{{` is spelled so the literal reparses as a STRING — a completion
+    /// snippet, an outline label or a remedy it produces never changes a
+    /// value's type to a template. Exact bytes: the formatter's fixed point.
+    #[test]
+    fn string_literal_never_spells_a_template() {
+        assert_eq!(string_literal("a{{b}}"), "\"a\\u{7B}{b}}\"");
+        assert_eq!(string_literal("plain"), "\"plain\"");
+    }
+
+    /// The one speller round-trips every hostile value through the lexer
+    /// as a plain STRING — never a template (`as_str` is `None` for one),
+    /// never a raw character a surface must escape.
+    #[test]
+    fn string_literal_round_trips_as_a_plain_string() {
+        for value in [
+            "a{{b}}",
+            "{{x}}",
+            "{{{",
+            "q\"uote",
+            "back\\slash",
+            "tab\tx",
+            "nl\nx",
+            "cr\rx",
+            "bidi\u{202e}x",
+            "esc\u{1b}x",
+            "nel\u{85}x",
+            "ls\u{2028}x",
+            "bom\u{feff}x",
+            "plain caf\u{e9}",
+        ] {
+            let lit = string_literal(value);
+            assert!(
+                !lit.chars().any(crate::diagnostic::needs_escape),
+                "{lit:?} carries a raw character a surface escapes"
+            );
+            let src = format!("thing t:\n    v = {lit}\n");
+            let file = crate::cst::parse_to_ast(&src)
+                .unwrap_or_else(|e| panic!("{value:?} spelled {lit}: {e:?}"));
+            let doc = crate::query::Document::new(&file);
+            assert_eq!(
+                doc.block("thing", "t").property("v").as_str(),
+                Some(value),
+                "{value:?} spelled {lit}"
+            );
+        }
+    }
+
     fn codes_of(src: &str) -> Vec<u16> {
         check(src)
             .0
@@ -248,9 +328,9 @@ mod tests {
 
     #[test]
     fn errors_bounded_with_suppressed_count() {
-        let src = "\u{1}".repeat(crate::cst::MAX_ERRORS + 7);
+        let src = "\u{1}".repeat(crate::diagnostic::MAX_ERRORS + 7);
         let (errors, suppressed) = check(&src);
-        assert_eq!(errors.len(), crate::cst::MAX_ERRORS);
+        assert_eq!(errors.len(), crate::diagnostic::MAX_ERRORS);
         assert_eq!(suppressed, 7);
     }
 

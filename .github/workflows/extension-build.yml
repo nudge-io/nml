@@ -10,6 +10,35 @@ permissions:
   contents: read
 
 jobs:
+  # The extension owns its server PROCESSES, and a process is an operating
+  # system's object: process groups, the death pipe and stdin EOF on POSIX; a
+  # job object with KILL_ON_JOB_CLOSE and `taskkill /T /F` on Windows. The two
+  # branches share no code, so a lane that runs on one platform tests half the
+  # design — and the Windows half was the half nothing anywhere ever executed.
+  # `gate-ext` is the unit + real-process suite; the real-process tests skip
+  # themselves WITH A REASON where a mechanism does not exist.
+  platforms:
+    name: unit · real processes (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: cargo install just --version 1.46.0 --locked
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          package_json_file: package.json
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Extension verify (deps · toolchain · typecheck · unit · real processes · bundle · audit)
+        run: just gate-ext
+
   build:
     name: build · typecheck · E2E · package
     runs-on: ubuntu-latest
@@ -27,10 +56,17 @@ jobs:
       # cargo actually uses target-less (E0463 "can't find crate for core").
       - run: rustup toolchain install && rustup target add wasm32-wasip1
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-      - name: Build the WASM neutral server
-        # --locked: this wasm ships inside the VSIX — the release artifact
+      # The gate runner — see rust-ci.yml's note. Every gate command lives
+      # in the justfile and nowhere else.
+      - run: cargo install just --version 1.46.0 --locked
+      - name: The wasm32 arm (check · clippy · release build)
+        # `--locked`: this wasm ships inside the VSIX — the release artifact
         # must be built from exactly the dependency set the gates verified.
-        run: cargo build -p nml-lsp --target wasm32-wasip1 --release --locked
+        # `just gate-wasm` also CLIPPIES the wasm target, which nothing did
+        # before: the synchronous pump and wasi_fs are cfg-gated code the
+        # native lanes never compile, so a lint regression there reached
+        # users through the bundled server unseen.
+        run: just gate-wasm
 
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
@@ -41,11 +77,8 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
-      - name: Install extension deps
-        run: pnpm install --frozen-lockfile
-
-      - name: Extension verify (toolchain · typecheck · unit · bundle · audit)
-        run: pnpm --filter nml-lang run verify:ci
+      - name: Extension verify (deps · toolchain · typecheck · unit · real processes · bundle · audit)
+        run: just gate-ext
 
       # `pnpm test` runs the pretest (vscodePrepublish: wasm + js + compile), then
       # drives a real headless VS Code (downloading it + `ms-vscode.wasm-wasi-core`)
@@ -56,14 +89,15 @@ jobs:
       # green suite, failing the job on cleanup the ephemeral runner would do
       # anyway. With an explicit server there is no wrapper cleanup to race:
       # the step's exit code is the test runner's, nothing else's.
-      - name: End-to-end tests (headless VS Code)
-        working-directory: editors/vscode
+      - name: End-to-end tests (headless VS Code, wasm AND native backends)
+        env:
+          DISPLAY: ":99"
         run: |
           Xvfb :99 -screen 0 1280x800x24 > /dev/null 2>&1 &
-          DISPLAY=:99 pnpm test
+          just gate-ext-e2e
 
       - name: Package the VSIX
-        run: pnpm --filter nml-lang run package
+        run: just gate-ext-package
 
       - name: Upload the VSIX artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -34,6 +34,32 @@ and the bundled WASM neutral server.
 folder. Relative paths are refused (cwd-dependent spawn is unpredictable).
 Rejected overrides fall through to bundled WASM, then `~/.cargo/bin/nml-lsp`.
 
+Every process-backed server (an override, the native default, a project's
+`<tool> lsp`) is spawned inside a `LaunchSandbox` (`pathSecurity.ts`), minted
+in one place and stamped by the one `processServer` constructor: an EMPTY
+private working directory under the extension's global storage, remade on each
+activation, plus an environment overlay that REMOVES the loader- and
+interpreter-injection variables. `vscode-languageclient` would otherwise
+default the working directory to the first workspace folder, where the fixed
+`lsp` argument is a script path for any interpreter the declared tool name
+resolves to; on Windows it would also be a directory the default DLL search
+order reads. The environment must be removed rather than omitted:
+`getEnvironment` in `vscode-languageclient/lib/node/main.js` copies all of
+`process.env` and overlays `options.env`, and Node's `spawn` drops only keys
+whose value is `undefined`.
+
+A project-declared `<tool> lsp` additionally carries a `ServerIdentityContract`
+(`serverAcquisition.ts`): once the client is running, `initializeResult
+.serverInfo.name` must be `nml-lsp`. A DIFFERENT name is a definite negative —
+the process is stopped, the stored approval withdrawn, and the operator told.
+A MISSING name, or no answer within `INITIALIZE_BUDGET_MS`
+(`serverSession.ts`), stands the provider down for the session with the
+approval untouched: neither is evidence against what the operator approved.
+The neutral server is never held to this — an operator who set
+`nml.server.path` chose that binary themselves. The trust algebra and
+every word the operator reads are in `providerTrust.ts`, which imports no
+`vscode` API so both are unit-tested.
+
 ## Raising the API floor (intentional upgrade)
 
 Do this in **one PR**, never via Dependabot alone:
@@ -42,7 +68,7 @@ Do this in **one PR**, never via Dependabot alone:
 2. Bump `engines.vscode` (e.g. `^1.125.0`).
 3. Bump `@types/vscode` to the **same** version (exact pin).
 4. Re-run `pnpm install` from the repo root and commit `pnpm-lock.yaml`.
-5. Run `pnpm run check:toolchain`, `pnpm run typecheck`, `pnpm run test:unit`, `pnpm test` (from `editors/vscode/`).
+5. Run `just gate-ext` and `just gate-ext-e2e` (the latter drives a real VS Code over both backends).
 6. Run `pnpm run package` (or let CI do it).
 7. Note the new minimum in the changelog and `INSTALL.md`.
 
@@ -67,6 +93,6 @@ after the release ages in.
   path changes in the pre-commit hook, and in `just lint-ext` / `just compile-ext`
 - Unit tests: `pnpm run test:engine-policy`, `pnpm run test:lockfile-policy`, `pnpm run test:toolchain-policy`
 
-**CI packaging note:** `vsce` 3.3.0 has no `--no-prepublish` flag, so CI runs
+**CI packaging note:** `vsce` (pinned 3.9.2) has no `--no-prepublish` flag, so CI runs
 `vscode:prepublish` during verify (bundle), E2E (`pretest`), and `package`. A
 future `package:ci` shortcut depends on upstream vsce support.

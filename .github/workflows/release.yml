@@ -20,6 +20,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Tag == package.json version
         run: |
+          # gate-contract: not-a-gate — release plumbing: it compares a git
+          # tag with a manifest version, which only exists on a tag push.
           pkg="$(jq -r .version editors/vscode/package.json)"
           tag="${GITHUB_REF_NAME#vscode-v}"
           if [ "$pkg" != "$tag" ]; then
@@ -69,6 +71,8 @@ jobs:
         id: vsix
         shell: bash
         run: |
+          # gate-contract: not-a-gate — validates the artifact a previous
+          # JOB uploaded; there is no local equivalent to run.
           shopt -s nullglob
           files=(vsix/*.vsix)
           if [ "${#files[@]}" -ne 1 ]; then
@@ -82,6 +86,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          # gate-contract: not-a-gate — creates the GitHub Release.
           vsix="${{ steps.vsix.outputs.path }}"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "$vsix" --clobber
@@ -100,15 +105,21 @@ jobs:
 
       - name: Install extension toolchain (pinned vsce + ovsx for publish)
         if: env.VSCE_PAT != '' || env.OVSX_PAT != ''
-        run: pnpm install --frozen-lockfile
+        run: |
+          # gate-contract: not-a-gate — installs the publish tooling.
+          pnpm install --frozen-lockfile
 
       # Both tools read their PAT from the environment (vsce: VSCE_PAT,
       # ovsx: OVSX_PAT), already set at the job level — never on argv, where
       # it would leak into process listings and step logs.
       - name: Publish to the VS Code Marketplace
         if: env.VSCE_PAT != ''
-        run: pnpm --filter nml-lang exec vsce publish --packagePath "${{ steps.vsix.outputs.path }}"
+        run: |
+          # gate-contract: not-a-gate — publishes; it checks nothing.
+          pnpm --filter nml-lang exec vsce publish --packagePath "${{ steps.vsix.outputs.path }}"
 
       - name: Publish to Open VSX
         if: env.OVSX_PAT != ''
-        run: pnpm --filter nml-lang exec ovsx publish "${{ steps.vsix.outputs.path }}"
+        run: |
+          # gate-contract: not-a-gate — publishes; it checks nothing.
+          pnpm --filter nml-lang exec ovsx publish "${{ steps.vsix.outputs.path }}"

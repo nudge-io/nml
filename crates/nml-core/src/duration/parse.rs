@@ -357,6 +357,34 @@ mod tests {
         );
     }
 
+    /// Every unit's magnitude domain is bounded AT the bound, not merely
+    /// somewhere past it: the largest magnitude the unit can carry decodes
+    /// to exactly that value, and one more is NML3006 naming that unit.
+    /// (`max_magnitude` binds on the value domain for the coarse units and
+    /// on `u64` storage for `ms`, `us` and `ns`.)
+    #[test]
+    fn each_units_largest_magnitude_decodes_and_one_more_is_out_of_range() {
+        for unit in DurationUnit::ALL {
+            let max = Duration::max_magnitude(unit);
+            let suffix = unit.suffix();
+            let at = decode(&[(&max.to_string(), suffix)])
+                .unwrap_or_else(|e| panic!("{max}{suffix} must decode: {e:?}"));
+            assert_eq!(at.total_nanos(), u128::from(max) * u128::from(unit.nanos()));
+            let past = (u128::from(max) + 1).to_string();
+            let kind = kind_of(&[(&past, suffix)]);
+            assert!(
+                matches!(
+                    kind,
+                    DurationErrorKind::OutOfRange {
+                        unit: u,
+                        negative: false,
+                    } if u == unit
+                ),
+                "{past}{suffix}: {kind:?}"
+            );
+        }
+    }
+
     #[test]
     fn duplicate_unit_in_source_is_nml3007_with_the_merged_fix() {
         let kind = kind_of(&[("1", "h"), ("2", "h")]);

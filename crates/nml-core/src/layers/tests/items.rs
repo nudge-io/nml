@@ -1043,6 +1043,37 @@ fn numeric_keyed_items_scatter_across_buckets() {
 }
 
 #[test]
+fn named_keyed_items_scatter_across_buckets() {
+    // Regression (DoS, round-85 mutant M13): a kind-only prehash for
+    // named, reference and role tokens collapses every keyed item into
+    // one bucket — the O(n²) identity scan again, invisible to the
+    // debug-lane scale ratio (parse cost hides it at 8,000 items) and
+    // to the release perf tier (64M short compares fit the bound).
+    // The bucketing's own property is pinned: distinct tokens scatter
+    // (DefaultHasher is keyed deterministically, so the count is
+    // exact), and the token — not the kind — is what buckets, so the
+    // same token under each kind still shares one bucket.
+    use std::collections::HashSet;
+    let n = 1_000;
+    for key in [ItemKey::Named, ItemKey::Reference, ItemKey::Role] {
+        let distinct: HashSet<u64> = (0..n)
+            .map(|i| token_prehash(&key(format!("n{i}"))))
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            n,
+            "distinct tokens scatter across buckets under {:?}",
+            key("n0".into())
+        );
+    }
+    assert_eq!(
+        token_prehash(&ItemKey::Named("a".into())),
+        token_prehash(&ItemKey::Reference("a".into())),
+        "the prehash is token-only: kinds are told apart inside the bucket"
+    );
+}
+
+#[test]
 fn cross_kind_items_do_not_widen_arm_scopes() {
     // The merge refuses cross-kind pairs (NML2063) and never composes
     // them — so a scalar item's SEALED arm must not attach to a
@@ -1161,15 +1192,18 @@ flow t uses base:
 /// `.ikind = "b"` never claims the field (RFC 0005 §10, order does the
 /// yielding), and `- "zzz"` reads as a STATED-UNKNOWN arm — no
 /// vocabulary, never a guess — where `extras = []` is silent. The
-/// NAMED twin has no token: the shared discriminator reaches it, flips
-/// its reading to the arm where `extras` IS a list, and the dropped
-/// interior's NML2079 surfaces. One rule, both directions pinned.
+/// silence PROVES no-vocabulary: `extras` is a list under the DEFAULT
+/// arm too, so a default-arm guess would warn. The NAMED twin has no
+/// token: the shared discriminator reaches it, flips its reading to the
+/// arm where `extras` IS a list, and the dropped interior's NML2079
+/// surfaces. One rule, both directions pinned.
 #[test]
 fn a_dropped_items_shared_reading_yields_to_its_token() {
     const S: &str = "\
 model aArm:
     ikind string+
     va string
+    extras []string
 
 model bArm:
     ikind string+
@@ -1386,5 +1420,48 @@ app top uses base:
         "the dropped item's empty-array token materializes into 'zs' \
          and the zero-item verdict surfaces exactly as its surviving \
          twin's — the masked reading swallowed it: {diags:?}"
+    );
+}
+
+/// The item gather's token bucketing is a COST CONTRACT, and the contract
+/// is a COUNT.
+///
+/// Its lookup used to scan every group gathered so far, per item —
+/// O(items²), an editor and CLI denial of service on a large list. The
+/// wall-clock pin over that axis (`perf_large_identity_lists_compose_fast`:
+/// 8,000 items under 5 s, on the release perf tier) passes with the
+/// bucketing DELETED, because the unbucketed scan still finishes well
+/// inside the bound — and so did every other test in this workspace. So
+/// the guard cannot be a clock. This counts the groups each item is
+/// compared against: linear in the list with the buckets, quadratic
+/// without, and the verdict does not move with the host's load.
+#[test]
+fn the_item_gather_is_linear_in_the_list() {
+    const ITEMS: usize = 300;
+    let mut src = String::from("flow base:\n    steps:\n");
+    for i in 0..ITEMS {
+        src.push_str(&format!("        - s{i}:\n            action = \"a\"\n"));
+    }
+    src.push_str("\nflow t uses base:\n    steps:\n");
+    for i in 0..ITEMS {
+        src.push_str(&format!("        - s{i}:\n            locator = \"l\"\n"));
+    }
+    let index = index_from(PAIR_SCHEMA);
+    let file = file_of(&src);
+    GROUP_SCANS.with(|c| c.set(0));
+    let composed = compose_file(&index, "main.nml", &file, &OpenContext);
+    assert!(
+        composed
+            .diagnostics
+            .iter()
+            .all(|d| d.severity != crate::diagnostic::Severity::Error),
+        "the stack composes clean: {:?}",
+        composed.diagnostics
+    );
+    let scans = GROUP_SCANS.with(|c| c.get());
+    assert!(
+        scans <= 8 * ITEMS,
+        "the gather was handed {scans} groups over {ITEMS} items — the token \
+         buckets are gone and the item scan is quadratic again"
     );
 }

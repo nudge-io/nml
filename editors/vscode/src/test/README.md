@@ -20,7 +20,7 @@ must be built and bundled first:
 # from the repo root
 corepack enable && pnpm install
 cargo build -p nml-lsp --target wasm32-wasip1 --release
-just verify-ext-full   # or: cd editors/vscode && pnpm test
+just gate-ext-e2e      # or: cd editors/vscode && pnpm test
 ```
 
 `@vscode/test-cli` downloads a throwaway VS Code into `.vscode-test/` and

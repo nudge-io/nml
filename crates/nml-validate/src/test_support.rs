@@ -1,6 +1,9 @@
 //! Shared test fixtures (feature `test-support`): the canonical demo
 //! package used across nml-validate and nml-lsp test suites — one owner
-//! instead of triplicated consts.
+//! instead of triplicated consts — and the one source lexer every
+//! source ratchet in the tree reads Rust through ([`scan`]).
+
+pub mod scan;
 
 use crate::package::SchemaPackage;
 

@@ -1,7 +1,7 @@
 {
   "name": "nml-lang",
   "displayName": "NML Language Support",
-  "description": "Syntax highlighting and language support for the NML configuration language",
+  "description": "Schema-aware editing for the NML configuration language: diagnostics, quick fixes, completions, hovers and formatting from a bundled language server",
   "version": "0.4.0",
   "publisher": "nudge",
   "license": "MIT OR Apache-2.0",
@@ -40,6 +40,11 @@
         "category": "NML"
       },
       {
+        "command": "nml.forgetProviderApprovals",
+        "title": "Forget Language Server Approvals",
+        "category": "NML"
+      },
+      {
         "command": "nml.showServerLog",
         "title": "Show Language Server Log",
         "category": "NML"
@@ -57,14 +62,14 @@
         "description": "Validate NML config against its schema, with completions and hovers.",
         "steps": [
           {
-            "id": "server",
-            "title": "Install the language server",
-            "description": "The neutral server is `nml-lsp`. Install it on your PATH (e.g. `cargo install --locked nml-lsp`, or copy it to `~/.cargo/bin/nml-lsp`), or point `nml.server.path` at it.\n[Open NML settings](command:workbench.action.openSettings?%22nml.server%22)",
+            "id": "open",
+            "title": "Open an NML file",
+            "description": "Open any `.nml` file — the bundled language server starts by itself; there is nothing to install. The status bar (bottom-right) names the schema package governing the file, or says `nml: no schema`; hover it for the content hash (`blake3:{hash8}`), the schema's source, binding and server. Errors, quick fixes, completions and hovers come from that schema.\n[Open a folder](command:workbench.action.files.openFolder)",
             "media": {
-              "markdown": "walkthroughs/server.md"
+              "markdown": "walkthroughs/open.md"
             },
             "completionEvents": [
-              "onSettingChanged:nml.server.path"
+              "onLanguage:nml"
             ]
           },
           {
@@ -76,12 +81,15 @@
             }
           },
           {
-            "id": "open",
-            "title": "Open an NML file",
-            "description": "Open any `.nml` file. The status bar (bottom-right) names the active schema package and version — hover for the content hash (`blake3:{hash8}`), delivery channel, binding, and server label. Errors, completions, and hovers come from that schema.\n[Open a folder](command:workbench.action.files.openFolder)",
+            "id": "server",
+            "title": "Use a native server (optional)",
+            "description": "The extension ships the neutral `nml-lsp` server as WebAssembly, so nothing needs installing. To run a native build instead — a very large tree, or a machine where the WASI host extension cannot run — point `nml.server.path` at an `nml-lsp` binary outside your workspace (until the crates.io release, `cargo install --locked --git https://github.com/nudge-io/nml nml-lsp` puts one at `~/.cargo/bin/nml-lsp`).\n[Open NML settings](command:workbench.action.openSettings?%22nml.server%22)",
             "media": {
-              "markdown": "walkthroughs/open.md"
-            }
+              "markdown": "walkthroughs/server.md"
+            },
+            "completionEvents": [
+              "onSettingChanged:nml.server.path"
+            ]
           }
         ]
       }
@@ -135,7 +143,7 @@
           "type": "string",
           "default": "",
           "scope": "machine",
-          "description": "Absolute path to the neutral nml-lsp binary (a leading ~/ expands to your home directory; other relative paths are refused). Defaults to ~/.cargo/bin/nml-lsp. Machine-scoped on purpose: a workspace cannot set it, so a repository can never redirect the language server at an untrusted binary. Paths inside an open workspace folder are refused (same RCE class as workspace-resident provider binaries)."
+          "description": "Absolute path to a native nml-lsp binary to run instead of the bundled WebAssembly server (a leading ~/ expands to your home directory; other relative paths are refused). Leave it empty — the default — to use the bundled server. Machine-scoped on purpose: a workspace cannot set it, and a path inside an open workspace folder is refused, so a repository can never point the editor at a binary it ships."
         },
         "nml.trace.server": {
           "type": "string",
@@ -167,11 +175,12 @@
     "bundle:wasm": "node scripts/bundleWasm.mjs",
     "bundle:js": "node scripts/bundleJs.mjs",
     "test:unit": "tsc -b tsconfig.json tsconfig.test.json && mocha --ui tdd out/test/unit/**/*.js && pnpm run test:engine-policy && pnpm run test:lockfile-policy && pnpm run test:toolchain-policy",
+    "test:real": "node scripts/compile.mjs && mocha --ui tdd --timeout 30000 --exit out/test/real/*.js",
     "pretest": "node scripts/vscodePrepublish.mjs",
     "test": "vscode-test",
     "vscode:prepublish": "node scripts/vscodePrepublish.mjs",
-    "package": "vsce package --no-dependencies --allow-missing-repository",
-    "verify": "pnpm run check:toolchain && pnpm run typecheck && pnpm run test:unit && pnpm run bundle:js",
+    "package": "vsce package --no-dependencies --allow-missing-repository && node scripts/verifyPackage.mjs",
+    "verify": "pnpm run check:toolchain && pnpm run typecheck && pnpm run test:unit && pnpm run test:real && pnpm run bundle:js",
     "verify:ci": "pnpm run verify && pnpm audit --audit-level=high",
     "verify:full": "pnpm run verify && pnpm test"
   },

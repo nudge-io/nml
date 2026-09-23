@@ -12,8 +12,8 @@ service NumberBoundaries:
     // Written scale is significant and preserved.
     taxRate = 0.20
     displayPrice = 2.50
-    // Trailing zeros beyond the 34-digit budget drop losslessly.
-    exactHalf = 0.50000000000000000000000000000000000
+    // The 34-digit budget, spent entirely on trailing zeros.
+    exactHalf = 0.5000000000000000000000000000000000
     // 35 written digits whose value needs only one: clamps into the
     // exponent, stays exact.
     tenPow34 = 10000000000000000000000000000000000

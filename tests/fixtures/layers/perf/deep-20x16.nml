@@ -428,4 +428,3 @@ cfgd l15 uses l14:
                                                                             child:
                                                                                 child:
                                                                                     leaf = "v15"
-

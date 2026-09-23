@@ -1,0 +1,8 @@
+tenants/cu/nml-project.nml: warning[NML2080]: project config `tenants/cu/nml-project.nml` is inert: it sits inside content claimed by binding 'tenantFlows' of demo.package.nml (files[0] = "tenants/**/*.flow.nml") — content, not configuration; its pins, autoAssociate, bindings and anchoring are ignored
+for more information, run: nml explain NML2080
+error: --schema tests/fixtures/workspace conflicts with the manifest that governs this file
+  --> tests/fixtures/workspace/tenants/cu/plain.flow.nml
+  = binding 'tenantFlows' of demo.package.nml claims it (files[0] = "tenants/**/*.flow.nml")
+  = a manifest-governed file validates under its binding's package; a CI flag cannot substitute another vocabulary inside a closed universe
+  = fix: drop --schema (the binding supplies the schema), or narrow the manifest's files glob if this file should not be claimed
+  = run `nml binding tests/fixtures/workspace/tenants/cu/plain.flow.nml` to see the governing claim

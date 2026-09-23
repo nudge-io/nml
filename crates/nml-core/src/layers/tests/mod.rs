@@ -17,6 +17,7 @@ use super::policy::*;
 use super::seal::*;
 use super::*;
 
+mod golden;
 mod grants;
 mod items;
 mod linearize;
@@ -35,9 +36,17 @@ fn index_from(schema: &str) -> SchemaIndex {
     SchemaIndex::build(ex.models, ex.enums, ex.oneofs)
 }
 
+/// The battery's sources parse clean — except for the repeats the merge
+/// batteries state on purpose (a body naming a field twice pins the
+/// merge's within-layer semantics), which the parse reports as NML2093
+/// and the composition golden records beside the merge's own findings.
 fn file_of(src: &str) -> File {
     let (file, diags) = crate::cst::parse_to_ast_all(src);
-    assert!(diags.is_empty(), "parse diags: {diags:?}");
+    let unexpected: Vec<&Diagnostic> = diags
+        .iter()
+        .filter(|d| d.code != Some(crate::diagnostic::codes::DUPLICATE_ENTRY))
+        .collect();
+    assert!(unexpected.is_empty(), "parse diags: {unexpected:?}");
     file
 }
 
@@ -56,39 +65,8 @@ fn compose_with(
     src: &str,
     root: &str,
     name: &str,
-    grants: &dyn LayerGrantProvider,
+    grants: &(dyn LayerGrantProvider + Sync),
 ) -> (Option<ResolvedInstance>, Vec<Diagnostic>) {
-    // RFC 0025 Phase 1 — the corpus harvest: under
-    // `NML_CORPUS_DUMP=<dir>`, every battery composition writes its
-    // inputs for the two-binary oracle comparison. Keyed by thread
-    // name PLUS a per-thread call counter — one test composes many
-    // times, and thread names repeat across processes.
-    if let Ok(dir) = std::env::var("NML_CORPUS_DUMP") {
-        use std::cell::Cell;
-        thread_local! {
-            static CALLS: Cell<u32> = const { Cell::new(0) };
-        }
-        let n = CALLS.with(|c| {
-            let v = c.get();
-            c.set(v + 1);
-            v
-        });
-        let thread = std::thread::current();
-        let test = thread.name().unwrap_or("anon").to_string();
-        let entry = serde_json::json!({
-            "test": test,
-            "schema": schema,
-            "source": src,
-            "root": root,
-            "declaration": name,
-        });
-        let file = format!("{}.{n}.json", test.replace(':', "_"));
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(
-            std::path::Path::new(&dir).join(file),
-            serde_json::to_string_pretty(&entry).expect("corpus entry serializes"),
-        );
-    }
     let index = index_from(schema);
     let file = file_of(src);
     let instances = InstanceIndex::from_file("main.nml", &file);
@@ -100,7 +78,12 @@ fn compose_with(
         .map(|r| instances.resolve_ref(&r.name).expect("ref resolves"))
         .collect();
     let local = block.body.clone();
-    resolve_layers(&index, &instances, declaring, root, &refs, &local, grants)
+    let composed = resolve_layers(&index, &instances, declaring, root, &refs, &local, grants);
+    // RFC 0025 Phase 5 (as amended): the funnel IS the corpus — this
+    // composition's observable, through `compose_file`, against the
+    // committed golden.
+    golden::observe_battery(schema, src, grants);
+    composed
 }
 
 /// The layer stack of a single-file instance index, by name — for
@@ -663,4 +646,95 @@ fn perf_compose(name: &str, bound: std::time::Duration) {
         "{name}: composed in {elapsed:?}, over the {bound:?} tripwire \
              — a complexity trap regressed (RFC 0025 §8)"
     );
+}
+
+/// The one-home key carries the SOURCE (item 0, step 0a): the same text at
+/// the same offset in two files is two findings — a span is an offset
+/// into one file — while an unstamped finding read from the checked file
+/// meets its stamped twin on one key (`finding_key_in`).
+#[test]
+fn finding_key_separates_same_text_in_two_sources() {
+    let d = Diagnostic::error("sealed").with_span(Span::new(0, 1));
+    let in_a = d.clone().with_source("a.nml".to_string());
+    let in_b = d.clone().with_source("b.nml".to_string());
+    assert_ne!(finding_key(&in_a), finding_key(&in_b));
+    assert_eq!(finding_key(&in_a), finding_key_in(&in_a, "b.nml"));
+    // Unstamped: keyed as the checked file's own finding.
+    assert_eq!(finding_key_in(&d, "a.nml"), finding_key(&in_a));
+    assert_ne!(finding_key_in(&d, "b.nml"), finding_key(&in_a));
+    assert_eq!(finding_key(&d).3, None);
+}
+
+/// RFC 0026 B-15: an overlay redefining a base property is composition,
+/// never a duplicate — the rule is per BODY, judged by the parse, before
+/// any merge.
+#[test]
+fn an_overlay_redefining_a_base_property_is_not_a_duplicate_entry() {
+    let schema = "model thing:\n    v string\n";
+    let src = "thing base:\n    v = \"a\"\n\nthing over uses base:\n    v = \"b\"\n";
+    let (file, parse_diags) = crate::cst::parse_to_ast_all(src);
+    assert!(parse_diags.is_empty(), "{parse_diags:?}");
+    let composed = compose_file(&index_from(schema), "main.nml", &file, &OpenContext);
+    assert!(
+        !codes_of(&composed.diagnostics).contains(&crate::diagnostic::codes::DUPLICATE_ENTRY),
+        "{:?}",
+        composed.diagnostics
+    );
+    let view = composed.validation_file.expect("the file composes");
+    let DeclarationKind::Block(over) = &view.declarations[1].kind else {
+        panic!("block");
+    };
+    assert_eq!(over.body.entries.len(), 1, "one composed `v`");
+}
+
+/// A repeat INSIDE a composing declaration's own body is the PARSE's
+/// finding, at the overlay's later `v` with the first as the note; the
+/// compose pass emits nothing for it (one emission, never a twin) and
+/// the merge collapses the repeat to one composed entry — a pass over
+/// the composed view could never have seen it.
+#[test]
+fn a_repeat_inside_a_composing_body_is_the_parses_finding_and_the_merge_collapses_it() {
+    let schema = "model thing:\n    v string\n";
+    let src = "thing base:\n    v = \"a\"\n\nthing over uses base:\n    v = \"b\"\n    v = \"c\"\n";
+    let (file, parse_diags) = crate::cst::parse_to_ast_all(src);
+    assert_eq!(
+        codes_of(&parse_diags),
+        [crate::diagnostic::codes::DUPLICATE_ENTRY],
+        "{parse_diags:?}"
+    );
+    assert_eq!(
+        parse_diags[0].span.map(|s| s.start),
+        src.match_indices("v = ").nth(2).map(|(i, _)| i)
+    );
+    assert_eq!(
+        parse_diags[0].related[0].span.start,
+        src.match_indices("v = ").nth(1).unwrap().0
+    );
+    let composed = compose_file(&index_from(schema), "main.nml", &file, &OpenContext);
+    assert!(
+        !codes_of(&composed.diagnostics).contains(&crate::diagnostic::codes::DUPLICATE_ENTRY),
+        "the compose pass judges no names: {:?}",
+        composed.diagnostics
+    );
+    let view = composed.validation_file.expect("the file composes");
+    let DeclarationKind::Block(over) = &view.declarations[1].kind else {
+        panic!("block");
+    };
+    assert_eq!(over.body.entries.len(), 1, "the merge collapsed the repeat");
+    // No schema anywhere: the parse judged the body regardless, and the
+    // structural compose pass over an empty index adds nothing.
+    let empty = SchemaIndex::build(vec![], vec![], vec![]);
+    let src = "thing t:\n    v = 1\n    v = 2\n";
+    let (file, parse_diags) = crate::cst::parse_to_ast_all(src);
+    assert_eq!(
+        codes_of(&parse_diags),
+        [crate::diagnostic::codes::DUPLICATE_ENTRY]
+    );
+    let composed = compose_file(&empty, "main.nml", &file, &OpenContext);
+    assert!(
+        composed.diagnostics.is_empty(),
+        "{:?}",
+        composed.diagnostics
+    );
+    assert!(composed.validation_file.is_none(), "nothing composes");
 }

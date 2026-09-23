@@ -48,7 +48,9 @@
 
 /// The typed **semantic AST** (`File`/`Declaration`/decoded `Value`s …) — the
 /// model that semantic consumers (validation, deserialization, defaulting) read.
-/// Produced by lowering the lossless [`cst`] (see [`cst::lower`]) — the
+/// Produced by lowering the lossless [`cst`] through its one parse funnel
+/// (`cst::parse_to_ast` and its siblings; the lowering itself is
+/// crate-private, so no AST bypasses the rules emitted beside it) — the
 /// production parse path (the pre-CST legacy parser is long removed).
 pub mod ast;
 /// RFC 0004 lossless CST: the production parser (resilient red/green tree with
@@ -70,6 +72,10 @@ pub mod defaults;
 pub mod diagnostic;
 pub mod diff;
 pub mod duration;
+/// The kernel's rule over names (NML1000 at the file scope, NML2093 in a
+/// body): a scope declares each name once — run beside every parse, so no
+/// consumer can skip it.
+mod entry_names;
 pub mod error;
 pub mod identity;
 pub mod layers;

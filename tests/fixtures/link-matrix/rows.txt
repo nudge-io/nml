@@ -1,0 +1,329 @@
+# The link matrix (RFC 0019 item 0, r69b item 8): one row per line,
+#   label | cwd | root | verb | spelling
+# cwd is relative to the half's base directory; root `-` = derived; tokens:
+#   <dir> the base as typed, <real> the base canonicalized, <L240> a 240-char
+#   component, <empty> an empty argument. Label tags: {ci} needs a
+#   lookup-insensitive filesystem, {locked} needs an effective chmod 0, {ab-free}
+#   marks a row whose a/b identity is NOT promised: the spelling names the link's
+#   target itself (`vendor`, present only in half a), walks the whole root, or
+#   reaches the author link through an operator alias outside the root (followed
+#   by design, E21) — its golden records both halves.
+# Seeded from the r56 fix matrix (F*, O*) and the r60 probe rows (R/N/A/P/C*).
+F1 fix --dry-run tenants/cu/lib/sub | proj | - | fix --dry-run | tenants/cu/lib/sub
+F2 fix --dry-run --root . tenants/cu/lib/sub | proj | . | fix --dry-run | tenants/cu/lib/sub
+F3 fix tenants/cu/lib/sub | proj | - | fix | tenants/cu/lib/sub
+F4 fix --root . tenants/cu/lib/sub | proj | . | fix | tenants/cu/lib/sub
+F5 fix --dry-run tenants/cu/lib/sub/ | proj | - | fix --dry-run | tenants/cu/lib/sub/
+F6 fix --dry-run --root . tenants/cu/lib/sub/ | proj | . | fix --dry-run | tenants/cu/lib/sub/
+F7 fix tenants/cu/lib/sub/ | proj | - | fix | tenants/cu/lib/sub/
+F8 fix --root . tenants/cu/lib/sub/ | proj | . | fix | tenants/cu/lib/sub/
+F9 fix --dry-run tenants/cu/lib/./sub | proj | - | fix --dry-run | tenants/cu/lib/./sub
+F10 fix --dry-run --root . tenants/cu/lib/./sub | proj | . | fix --dry-run | tenants/cu/lib/./sub
+F11 fix tenants/cu/lib/./sub | proj | - | fix | tenants/cu/lib/./sub
+F12 fix --root . tenants/cu/lib/./sub | proj | . | fix | tenants/cu/lib/./sub
+F13 fix --dry-run ./tenants/cu/lib/sub | proj | - | fix --dry-run | ./tenants/cu/lib/sub
+F14 fix --dry-run --root . ./tenants/cu/lib/sub | proj | . | fix --dry-run | ./tenants/cu/lib/sub
+F15 fix ./tenants/cu/lib/sub | proj | - | fix | ./tenants/cu/lib/sub
+F16 fix --root . ./tenants/cu/lib/sub | proj | . | fix | ./tenants/cu/lib/sub
+F17 fix --dry-run tenants/cu/lib/sub/deeper | proj | - | fix --dry-run | tenants/cu/lib/sub/deeper
+F18 fix --dry-run --root . tenants/cu/lib/sub/deeper | proj | . | fix --dry-run | tenants/cu/lib/sub/deeper
+F19 fix tenants/cu/lib/sub/deeper | proj | - | fix | tenants/cu/lib/sub/deeper
+F20 fix --root . tenants/cu/lib/sub/deeper | proj | . | fix | tenants/cu/lib/sub/deeper
+F21 fix --dry-run tenants/cu/lib/nope | proj | - | fix --dry-run | tenants/cu/lib/nope
+F22 fix --dry-run --root . tenants/cu/lib/nope | proj | . | fix --dry-run | tenants/cu/lib/nope
+F23 fix tenants/cu/lib/nope | proj | - | fix | tenants/cu/lib/nope
+F24 fix --root . tenants/cu/lib/nope | proj | . | fix | tenants/cu/lib/nope
+F25 fix --dry-run tenants/cu/lib/sub/deep.flow.nml | proj | - | fix --dry-run | tenants/cu/lib/sub/deep.flow.nml
+F26 fix --dry-run --root . tenants/cu/lib/sub/deep.flow.nml | proj | . | fix --dry-run | tenants/cu/lib/sub/deep.flow.nml
+F27 fix tenants/cu/lib/sub/deep.flow.nml | proj | - | fix | tenants/cu/lib/sub/deep.flow.nml
+F28 fix --root . tenants/cu/lib/sub/deep.flow.nml | proj | . | fix | tenants/cu/lib/sub/deep.flow.nml
+F29 fix --dry-run tenants/cu/lib/sub/../sub | proj | - | fix --dry-run | tenants/cu/lib/sub/../sub
+F30 fix --dry-run --root . tenants/cu/lib/sub/../sub | proj | . | fix --dry-run | tenants/cu/lib/sub/../sub
+F31 fix tenants/cu/lib/sub/../sub | proj | - | fix | tenants/cu/lib/sub/../sub
+F32 fix --root . tenants/cu/lib/sub/../sub | proj | . | fix | tenants/cu/lib/sub/../sub
+F33 fix --dry-run tenants/cu/../cu/lib/sub | proj | - | fix --dry-run | tenants/cu/../cu/lib/sub
+F34 fix --dry-run --root . tenants/cu/../cu/lib/sub | proj | . | fix --dry-run | tenants/cu/../cu/lib/sub
+F35 fix tenants/cu/../cu/lib/sub | proj | - | fix | tenants/cu/../cu/lib/sub
+F36 fix --root . tenants/cu/../cu/lib/sub | proj | . | fix | tenants/cu/../cu/lib/sub
+F37 fix --dry-run tenants/cu/lib2/sub | proj | - | fix --dry-run | tenants/cu/lib2/sub
+F38 fix --dry-run --root . tenants/cu/lib2/sub | proj | . | fix --dry-run | tenants/cu/lib2/sub
+F39 fix tenants/cu/lib2/sub | proj | - | fix | tenants/cu/lib2/sub
+F40 fix --root . tenants/cu/lib2/sub | proj | . | fix | tenants/cu/lib2/sub
+F41 fix --dry-run tenants/cu/lib2/ | proj | - | fix --dry-run | tenants/cu/lib2/
+F42 fix --dry-run --root . tenants/cu/lib2/ | proj | . | fix --dry-run | tenants/cu/lib2/
+F43 fix tenants/cu/lib2/ | proj | - | fix | tenants/cu/lib2/
+F44 fix --root . tenants/cu/lib2/ | proj | . | fix | tenants/cu/lib2/
+F45 fix --dry-run tenants/cu/fifo.flow.nml | proj | - | fix --dry-run | tenants/cu/fifo.flow.nml
+F46 fix --dry-run --root . tenants/cu/fifo.flow.nml | proj | . | fix --dry-run | tenants/cu/fifo.flow.nml
+F47 fix tenants/cu/fifo.flow.nml | proj | - | fix | tenants/cu/fifo.flow.nml
+F48 fix --root . tenants/cu/fifo.flow.nml | proj | . | fix | tenants/cu/fifo.flow.nml
+F49 fix --dry-run tenants/cu/lib/../lib/sub | proj | - | fix --dry-run | tenants/cu/lib/../lib/sub
+F50 fix --dry-run --root . tenants/cu/lib/../lib/sub | proj | . | fix --dry-run | tenants/cu/lib/../lib/sub
+F51 fix tenants/cu/lib/../lib/sub | proj | - | fix | tenants/cu/lib/../lib/sub
+F52 fix --root . tenants/cu/lib/../lib/sub | proj | . | fix | tenants/cu/lib/../lib/sub
+F53 fix --dry-run tenants/cu/lib/base.flow.nml | proj | - | fix --dry-run | tenants/cu/lib/base.flow.nml
+F54 fix --dry-run --root . tenants/cu/lib/base.flow.nml | proj | . | fix --dry-run | tenants/cu/lib/base.flow.nml
+F55 fix tenants/cu/lib/base.flow.nml | proj | - | fix | tenants/cu/lib/base.flow.nml
+F56 fix --root . tenants/cu/lib/base.flow.nml | proj | . | fix | tenants/cu/lib/base.flow.nml
+F57 fix --dry-run tenants/cu/lib | proj | - | fix --dry-run | tenants/cu/lib
+F58 fix --dry-run --root . tenants/cu/lib | proj | . | fix --dry-run | tenants/cu/lib
+F59 fix tenants/cu/lib | proj | - | fix | tenants/cu/lib
+F60 fix --root . tenants/cu/lib | proj | . | fix | tenants/cu/lib
+F61 fix --dry-run tenants/cu/leaf.flow.nml | proj | - | fix --dry-run | tenants/cu/leaf.flow.nml
+F62 fix --dry-run --root . tenants/cu/leaf.flow.nml | proj | . | fix --dry-run | tenants/cu/leaf.flow.nml
+F63 fix tenants/cu/leaf.flow.nml | proj | - | fix | tenants/cu/leaf.flow.nml
+F64 fix --root . tenants/cu/leaf.flow.nml | proj | . | fix | tenants/cu/leaf.flow.nml
+F65 fix --dry-run ./tenants/cu/lib/base.flow.nml | proj | - | fix --dry-run | ./tenants/cu/lib/base.flow.nml
+F66 fix --dry-run --root . ./tenants/cu/lib/base.flow.nml | proj | . | fix --dry-run | ./tenants/cu/lib/base.flow.nml
+F67 fix ./tenants/cu/lib/base.flow.nml | proj | - | fix | ./tenants/cu/lib/base.flow.nml
+F68 fix --root . ./tenants/cu/lib/base.flow.nml | proj | . | fix | ./tenants/cu/lib/base.flow.nml
+F69 fix --dry-run ./tenants/cu/lib/ | proj | - | fix --dry-run | ./tenants/cu/lib/
+F70 fix --dry-run --root . ./tenants/cu/lib/ | proj | . | fix --dry-run | ./tenants/cu/lib/
+F71 fix ./tenants/cu/lib/ | proj | - | fix | ./tenants/cu/lib/
+F72 fix --root . ./tenants/cu/lib/ | proj | . | fix | ./tenants/cu/lib/
+F73 fix --dry-run tenants/cu | proj | - | fix --dry-run | tenants/cu
+F74 fix --dry-run --root . tenants/cu | proj | . | fix --dry-run | tenants/cu
+F75 fix tenants/cu | proj | - | fix | tenants/cu
+F76 fix --root . tenants/cu | proj | . | fix | tenants/cu
+F77 fix --dry-run tenants/cu/ | proj | - | fix --dry-run | tenants/cu/
+F78 fix --dry-run --root . tenants/cu/ | proj | . | fix --dry-run | tenants/cu/
+F79 fix tenants/cu/ | proj | - | fix | tenants/cu/
+F80 fix --root . tenants/cu/ | proj | . | fix | tenants/cu/
+F81 fix --dry-run tenants/cu/. | proj | - | fix --dry-run | tenants/cu/.
+F82 fix --dry-run --root . tenants/cu/. | proj | . | fix --dry-run | tenants/cu/.
+F83 fix tenants/cu/. | proj | - | fix | tenants/cu/.
+F84 fix --root . tenants/cu/. | proj | . | fix | tenants/cu/.
+F85 fix --dry-run tenants/cu/./lib/ | proj | - | fix --dry-run | tenants/cu/./lib/
+F86 fix --dry-run --root . tenants/cu/./lib/ | proj | . | fix --dry-run | tenants/cu/./lib/
+F87 fix tenants/cu/./lib/ | proj | - | fix | tenants/cu/./lib/
+F88 fix --root . tenants/cu/./lib/ | proj | . | fix | tenants/cu/./lib/
+F89 fix --dry-run tenants/cu/leaf.flow.nml/ | proj | - | fix --dry-run | tenants/cu/leaf.flow.nml/
+F90 fix --dry-run --root . tenants/cu/leaf.flow.nml/ | proj | . | fix --dry-run | tenants/cu/leaf.flow.nml/
+F91 fix tenants/cu/leaf.flow.nml/ | proj | - | fix | tenants/cu/leaf.flow.nml/
+F92 fix --root . tenants/cu/leaf.flow.nml/ | proj | . | fix | tenants/cu/leaf.flow.nml/
+F93 fix --dry-run tenants/cu/leaf.flow.nml/. | proj | - | fix --dry-run | tenants/cu/leaf.flow.nml/.
+F94 fix --dry-run --root . tenants/cu/leaf.flow.nml/. | proj | . | fix --dry-run | tenants/cu/leaf.flow.nml/.
+F95 fix tenants/cu/leaf.flow.nml/. | proj | - | fix | tenants/cu/leaf.flow.nml/.
+F96 fix --root . tenants/cu/leaf.flow.nml/. | proj | . | fix | tenants/cu/leaf.flow.nml/.
+F97 fix --dry-run tenants/cu/lib/ | proj | - | fix --dry-run | tenants/cu/lib/
+F98 fix --dry-run --root . tenants/cu/lib/ | proj | . | fix --dry-run | tenants/cu/lib/
+F99 fix tenants/cu/lib/ | proj | - | fix | tenants/cu/lib/
+F100 fix --root . tenants/cu/lib/ | proj | . | fix | tenants/cu/lib/
+F101 fix --dry-run tenants/cu/lib/. | proj | - | fix --dry-run | tenants/cu/lib/.
+F102 fix --dry-run --root . tenants/cu/lib/. | proj | . | fix --dry-run | tenants/cu/lib/.
+F103 fix tenants/cu/lib/. | proj | - | fix | tenants/cu/lib/.
+F104 fix --root . tenants/cu/lib/. | proj | . | fix | tenants/cu/lib/.
+F105 fix --dry-run tenants/cu/lib/.. | proj | - | fix --dry-run | tenants/cu/lib/..
+F106 fix --dry-run --root . tenants/cu/lib/.. | proj | . | fix --dry-run | tenants/cu/lib/..
+F107 fix tenants/cu/lib/.. | proj | - | fix | tenants/cu/lib/..
+F108 fix --root . tenants/cu/lib/.. | proj | . | fix | tenants/cu/lib/..
+F109 fix --dry-run tenants/cu/lib/../ | proj | - | fix --dry-run | tenants/cu/lib/../
+F110 fix --dry-run --root . tenants/cu/lib/../ | proj | . | fix --dry-run | tenants/cu/lib/../
+F111 fix tenants/cu/lib/../ | proj | - | fix | tenants/cu/lib/../
+F112 fix --root . tenants/cu/lib/../ | proj | . | fix | tenants/cu/lib/../
+F113 fix --dry-run tenants/cu/lib/../.. | proj | - | fix --dry-run | tenants/cu/lib/../..
+F114 fix --dry-run --root . tenants/cu/lib/../.. | proj | . | fix --dry-run | tenants/cu/lib/../..
+F115 fix tenants/cu/lib/../.. | proj | - | fix | tenants/cu/lib/../..
+F116 fix --root . tenants/cu/lib/../.. | proj | . | fix | tenants/cu/lib/../..
+F117 fix --dry-run tenants/cu/lib/../../ | proj | - | fix --dry-run | tenants/cu/lib/../../
+F118 fix --dry-run --root . tenants/cu/lib/../../ | proj | . | fix --dry-run | tenants/cu/lib/../../
+F119 fix tenants/cu/lib/../../ | proj | - | fix | tenants/cu/lib/../../
+F120 fix --root . tenants/cu/lib/../../ | proj | . | fix | tenants/cu/lib/../../
+F121 fix --dry-run tenants/cu/lib/../../vendor | proj | - | fix --dry-run | tenants/cu/lib/../../vendor
+F122 fix --dry-run --root . tenants/cu/lib/../../vendor | proj | . | fix --dry-run | tenants/cu/lib/../../vendor
+F123 fix tenants/cu/lib/../../vendor | proj | - | fix | tenants/cu/lib/../../vendor
+F124 fix --root . tenants/cu/lib/../../vendor | proj | . | fix | tenants/cu/lib/../../vendor
+F125 fix --dry-run tenants/cu/lib/../base.flow.nml | proj | - | fix --dry-run | tenants/cu/lib/../base.flow.nml
+F126 fix --dry-run --root . tenants/cu/lib/../base.flow.nml | proj | . | fix --dry-run | tenants/cu/lib/../base.flow.nml
+F127 fix tenants/cu/lib/../base.flow.nml | proj | - | fix | tenants/cu/lib/../base.flow.nml
+F128 fix --root . tenants/cu/lib/../base.flow.nml | proj | . | fix | tenants/cu/lib/../base.flow.nml
+F129 fix --dry-run tenants/cu/lib/../lib/ | proj | - | fix --dry-run | tenants/cu/lib/../lib/
+F130 fix --dry-run --root . tenants/cu/lib/../lib/ | proj | . | fix --dry-run | tenants/cu/lib/../lib/
+F131 fix tenants/cu/lib/../lib/ | proj | - | fix | tenants/cu/lib/../lib/
+F132 fix --root . tenants/cu/lib/../lib/ | proj | . | fix | tenants/cu/lib/../lib/
+F133 fix --dry-run tenants/cu/lib/../lib/base.flow.nml | proj | - | fix --dry-run | tenants/cu/lib/../lib/base.flow.nml
+F134 fix --dry-run --root . tenants/cu/lib/../lib/base.flow.nml | proj | . | fix --dry-run | tenants/cu/lib/../lib/base.flow.nml
+F135 fix tenants/cu/lib/../lib/base.flow.nml | proj | - | fix | tenants/cu/lib/../lib/base.flow.nml
+F136 fix --root . tenants/cu/lib/../lib/base.flow.nml | proj | . | fix | tenants/cu/lib/../lib/base.flow.nml
+F137 fix --dry-run tenants/cu/lib/./ | proj | - | fix --dry-run | tenants/cu/lib/./
+F138 fix --dry-run --root . tenants/cu/lib/./ | proj | . | fix --dry-run | tenants/cu/lib/./
+F139 fix tenants/cu/lib/./ | proj | - | fix | tenants/cu/lib/./
+F140 fix --root . tenants/cu/lib/./ | proj | . | fix | tenants/cu/lib/./
+F141 fix --dry-run tenants/cu/lib/./base.flow.nml | proj | - | fix --dry-run | tenants/cu/lib/./base.flow.nml
+F142 fix --dry-run --root . tenants/cu/lib/./base.flow.nml | proj | . | fix --dry-run | tenants/cu/lib/./base.flow.nml
+F143 fix tenants/cu/lib/./base.flow.nml | proj | - | fix | tenants/cu/lib/./base.flow.nml
+F144 fix --root . tenants/cu/lib/./base.flow.nml | proj | . | fix | tenants/cu/lib/./base.flow.nml
+F145 fix --dry-run tenants/cu/lib// | proj | - | fix --dry-run | tenants/cu/lib//
+F146 fix --dry-run --root . tenants/cu/lib// | proj | . | fix --dry-run | tenants/cu/lib//
+F147 fix tenants/cu/lib// | proj | - | fix | tenants/cu/lib//
+F148 fix --root . tenants/cu/lib// | proj | . | fix | tenants/cu/lib//
+F149 fix --dry-run tenants/../tenants/cu/lib/ | proj | - | fix --dry-run | tenants/../tenants/cu/lib/
+F150 fix --dry-run --root . tenants/../tenants/cu/lib/ | proj | . | fix --dry-run | tenants/../tenants/cu/lib/
+F151 fix tenants/../tenants/cu/lib/ | proj | - | fix | tenants/../tenants/cu/lib/
+F152 fix --root . tenants/../tenants/cu/lib/ | proj | . | fix | tenants/../tenants/cu/lib/
+F153 fix --dry-run tenants/./cu | proj | - | fix --dry-run | tenants/./cu
+F154 fix --dry-run --root . tenants/./cu | proj | . | fix --dry-run | tenants/./cu
+F155 fix tenants/./cu | proj | - | fix | tenants/./cu
+F156 fix --root . tenants/./cu | proj | . | fix | tenants/./cu
+F157{ab-free} fix --dry-run . | proj | - | fix --dry-run | .
+F158{ab-free} fix --dry-run --root . . | proj | . | fix --dry-run | .
+F159{ab-free} fix . | proj | - | fix | .
+F160{ab-free} fix --root . . | proj | . | fix | .
+F161{ab-free} fix --dry-run ./ | proj | - | fix --dry-run | ./
+F162{ab-free} fix --dry-run --root . ./ | proj | . | fix --dry-run | ./
+F163{ab-free} fix ./ | proj | - | fix | ./
+F164{ab-free} fix --root . ./ | proj | . | fix | ./
+F165 fix --dry-run ../proj/tenants/cu | proj | - | fix --dry-run | ../proj/tenants/cu
+F166 fix --dry-run --root . ../proj/tenants/cu | proj | . | fix --dry-run | ../proj/tenants/cu
+F167 fix ../proj/tenants/cu | proj | - | fix | ../proj/tenants/cu
+F168 fix --root . ../proj/tenants/cu | proj | . | fix | ../proj/tenants/cu
+F169 fix --dry-run <dir>/proj/tenants/cu/lib/sub | proj | - | fix --dry-run | <dir>/proj/tenants/cu/lib/sub
+F170 fix --dry-run --root . <dir>/proj/tenants/cu/lib/sub | proj | . | fix --dry-run | <dir>/proj/tenants/cu/lib/sub
+F171 fix <dir>/proj/tenants/cu/lib/sub | proj | - | fix | <dir>/proj/tenants/cu/lib/sub
+F172 fix --root . <dir>/proj/tenants/cu/lib/sub | proj | . | fix | <dir>/proj/tenants/cu/lib/sub
+F173 fix --dry-run <dir>/proj/tenants/cu/lib/ | proj | - | fix --dry-run | <dir>/proj/tenants/cu/lib/
+F174 fix --dry-run --root . <dir>/proj/tenants/cu/lib/ | proj | . | fix --dry-run | <dir>/proj/tenants/cu/lib/
+F175 fix <dir>/proj/tenants/cu/lib/ | proj | - | fix | <dir>/proj/tenants/cu/lib/
+F176 fix --root . <dir>/proj/tenants/cu/lib/ | proj | . | fix | <dir>/proj/tenants/cu/lib/
+F177 fix --dry-run <dir>/proj/tenants/cu/lib/. | proj | - | fix --dry-run | <dir>/proj/tenants/cu/lib/.
+F178 fix --dry-run --root . <dir>/proj/tenants/cu/lib/. | proj | . | fix --dry-run | <dir>/proj/tenants/cu/lib/.
+F179 fix <dir>/proj/tenants/cu/lib/. | proj | - | fix | <dir>/proj/tenants/cu/lib/.
+F180 fix --root . <dir>/proj/tenants/cu/lib/. | proj | . | fix | <dir>/proj/tenants/cu/lib/.
+F181 fix --dry-run <dir>/proj/tenants/cu/lib/.. | proj | - | fix --dry-run | <dir>/proj/tenants/cu/lib/..
+F182 fix --dry-run --root . <dir>/proj/tenants/cu/lib/.. | proj | . | fix --dry-run | <dir>/proj/tenants/cu/lib/..
+F183 fix <dir>/proj/tenants/cu/lib/.. | proj | - | fix | <dir>/proj/tenants/cu/lib/..
+F184 fix --root . <dir>/proj/tenants/cu/lib/.. | proj | . | fix | <dir>/proj/tenants/cu/lib/..
+F185 fix --dry-run <dir>/proj/tenants/cu/lib/../.. | proj | - | fix --dry-run | <dir>/proj/tenants/cu/lib/../..
+F186 fix --dry-run --root . <dir>/proj/tenants/cu/lib/../.. | proj | . | fix --dry-run | <dir>/proj/tenants/cu/lib/../..
+F187 fix <dir>/proj/tenants/cu/lib/../.. | proj | - | fix | <dir>/proj/tenants/cu/lib/../..
+F188 fix --root . <dir>/proj/tenants/cu/lib/../.. | proj | . | fix | <dir>/proj/tenants/cu/lib/../..
+F189 fix --dry-run <dir>/proj/tenants/cu/lib | proj | - | fix --dry-run | <dir>/proj/tenants/cu/lib
+F190 fix --dry-run --root . <dir>/proj/tenants/cu/lib | proj | . | fix --dry-run | <dir>/proj/tenants/cu/lib
+F191 fix <dir>/proj/tenants/cu/lib | proj | - | fix | <dir>/proj/tenants/cu/lib
+F192 fix --root . <dir>/proj/tenants/cu/lib | proj | . | fix | <dir>/proj/tenants/cu/lib
+F193 fix --dry-run <dir>/proj/tenants/cu/leaf.flow.nml | proj | - | fix --dry-run | <dir>/proj/tenants/cu/leaf.flow.nml
+F194 fix --dry-run --root . <dir>/proj/tenants/cu/leaf.flow.nml | proj | . | fix --dry-run | <dir>/proj/tenants/cu/leaf.flow.nml
+F195 fix <dir>/proj/tenants/cu/leaf.flow.nml | proj | - | fix | <dir>/proj/tenants/cu/leaf.flow.nml
+F196 fix --root . <dir>/proj/tenants/cu/leaf.flow.nml | proj | . | fix | <dir>/proj/tenants/cu/leaf.flow.nml
+F197 fix --dry-run /tmp/..<dir>/proj/tenants/cu/lib/.. | proj | - | fix --dry-run | /tmp/..<dir>/proj/tenants/cu/lib/..
+F198 fix --dry-run --root . /tmp/..<dir>/proj/tenants/cu/lib/.. | proj | . | fix --dry-run | /tmp/..<dir>/proj/tenants/cu/lib/..
+F199 fix /tmp/..<dir>/proj/tenants/cu/lib/.. | proj | - | fix | /tmp/..<dir>/proj/tenants/cu/lib/..
+F200 fix --root . /tmp/..<dir>/proj/tenants/cu/lib/.. | proj | . | fix | /tmp/..<dir>/proj/tenants/cu/lib/..
+F201 fix --dry-run /tmp/..<dir>/proj/tenants/cu/lib/ | proj | - | fix --dry-run | /tmp/..<dir>/proj/tenants/cu/lib/
+F202 fix --dry-run --root . /tmp/..<dir>/proj/tenants/cu/lib/ | proj | . | fix --dry-run | /tmp/..<dir>/proj/tenants/cu/lib/
+F203 fix /tmp/..<dir>/proj/tenants/cu/lib/ | proj | - | fix | /tmp/..<dir>/proj/tenants/cu/lib/
+F204 fix --root . /tmp/..<dir>/proj/tenants/cu/lib/ | proj | . | fix | /tmp/..<dir>/proj/tenants/cu/lib/
+O1 open fix --dry-run link | o | . | fix --dry-run | link
+O2 open check link | o | . | check | link
+O3 open fix --dry-run link/ | o | . | fix --dry-run | link/
+O4 open fix --dry-run real/ | o | . | fix --dry-run | real/
+O5 open fix --dry-run real | o | . | fix --dry-run | real
+O6 open fix --dry-run . | o | . | fix --dry-run | .
+O7 open fix --dry-run real/.. | o | . | fix --dry-run | real/..
+O8 open fix --dry-run leaf.nml | o | . | fix --dry-run | leaf.nml
+O9 open fix --dry-run dangle | o | . | fix --dry-run | dangle
+O10 open fix --dry-run real/inner | o | . | fix --dry-run | real/inner
+O11 open fix --dry-run real/l.nml | o | . | fix --dry-run | real/l.nml
+R1{ab-free} --root @/proj fix . | proj | <dir>/proj | fix --dry-run | .
+R2{ab-free} --root @@/proj fix . | proj | <real>/proj | fix --dry-run | .
+R3{ab-free} derived fix . | proj | - | fix --dry-run | .
+R4{ab-free} --root @/proj fix vendor | proj | <dir>/proj | fix --dry-run | vendor
+R5{ab-free} --root @@/proj fix vendor | proj | <real>/proj | fix --dry-run | vendor
+R6{ab-free} derived fix vendor | proj | - | fix --dry-run | vendor
+R7 --root @/proj fix tenants/cu | proj | <dir>/proj | fix --dry-run | tenants/cu
+R8 --root @@/proj fix tenants/cu | proj | <real>/proj | fix --dry-run | tenants/cu
+R9 derived fix tenants/cu | proj | - | fix --dry-run | tenants/cu
+R10{ab-free} --root @/proj fix @@/proj/vendor (abs via real) | proj | <dir>/proj | fix --dry-run | <real>/proj/vendor
+R11{ab-free} --root @@/proj fix @/proj/vendor (abs via typed) | proj | <real>/proj | fix --dry-run | <dir>/proj/vendor
+R12 --root @/proj fix tenants/cu/lib/sub (must halt) | proj | <dir>/proj | fix --dry-run | tenants/cu/lib/sub
+R13 --root @@/proj fix tenants/cu/lib/sub (must halt) | proj | <real>/proj | fix --dry-run | tenants/cu/lib/sub
+R14 derived fix tenants/cu/lib/sub (must halt) | proj | - | fix --dry-run | tenants/cu/lib/sub
+R15{ab-free} --root proj/ fix vendor | proj | <dir>/proj/ | fix --dry-run | vendor
+R16{ab-free} --root proj/. fix vendor | proj | <dir>/proj/. | fix --dry-run | vendor
+R17{ab-free} --root proj/vendor/.. fix vendor | proj | <dir>/proj/vendor/.. | fix --dry-run | vendor
+R18{ab-free} --root ./ (cwd proj) fix ./vendor/ | proj | ./ | fix --dry-run | ./vendor/
+R19{ab-free} --root . fix vendor// (double sep) | proj | . | fix --dry-run | vendor//
+R20 --root . fix tenants/cu/lib/ (halt) | proj | . | fix --dry-run | tenants/cu/lib/
+R21 --root . fix tenants/cu/lib// (halt) | proj | . | fix --dry-run | tenants/cu/lib//
+N1{ab-free} fix proj/nope/../vendor | . | proj | fix --dry-run | proj/nope/../vendor
+N1c{ab-free} CHECK proj/nope/../vendor/base.flow.nml | . | proj | check | proj/nope/../vendor/base.flow.nml
+N1r{ab-free} fix proj/tenants/../vendor (existing sibling) | . | proj | fix --dry-run | proj/tenants/../vendor
+N2 fix proj/nope/../tenants/cu/lib/sub (kernel would halt at lib) | . | proj | fix --dry-run | proj/nope/../tenants/cu/lib/sub
+N2c CHECK proj/nope/../tenants/cu/lib/sub/deep.flow.nml | . | proj | check | proj/nope/../tenants/cu/lib/sub/deep.flow.nml
+N3{ab-free} fix proj/core.model.nml/../vendor (.. after a FILE) | . | proj | fix --dry-run | proj/core.model.nml/../vendor
+N3c{ab-free} CHECK proj/core.model.nml/../vendor/base.flow.nml | . | proj | check | proj/core.model.nml/../vendor/base.flow.nml
+A1{ab-free} fix alias-lib/sub | . | proj | fix --dry-run | alias-lib/sub
+A1c{ab-free} CHECK alias-lib/sub/deep.flow.nml | . | proj | check | alias-lib/sub/deep.flow.nml
+A2{ab-free} fix alias-lib | . | proj | fix --dry-run | alias-lib
+A3{ab-free} fix alias-toroot/vendor (alias at the author link to root) | . | proj | fix --dry-run | alias-toroot/vendor
+A3c{ab-free} CHECK alias-toroot/vendor/base.flow.nml | . | proj | check | alias-toroot/vendor/base.flow.nml
+A4 fix alias-chain/lib/sub (link->link->cu, then author link) | . | proj | fix --dry-run | alias-chain/lib/sub
+A5 fix alias-chain/real | . | proj | fix --dry-run | alias-chain/real
+A6{ab-free} fix alias-root/vendor | . | proj | fix --dry-run | alias-root/vendor
+A7 fix alias-root/tenants/cu/lib/sub (halt) | . | proj | fix --dry-run | alias-root/tenants/cu/lib/sub
+A8{ab-free} fix alias-root (leaf link) | . | proj | fix --dry-run | alias-root
+A9{ab-free} fix alias-root/ (leaf link + sep) | . | proj | fix --dry-run | alias-root/
+A10{ab-free} fix alias-root/. | . | proj | fix --dry-run | alias-root/.
+A11 fix alias-root/.. (parent of root via alias = outside) | . | proj | fix --dry-run | alias-root/..
+A12 fix alias-cu/.. (pops one canonical level: tenants) | . | proj | fix --dry-run | alias-cu/..
+A13 fix alias-cu/../cu/lib/sub (halt at lib) | . | proj | fix --dry-run | alias-cu/../cu/lib/sub
+A14 fix alias-cu/../cu/lib2/sub (halt at lib2) | . | proj | fix --dry-run | alias-cu/../cu/lib2/sub
+A15{ab-free} fix alias-cu/../../vendor (pops to root) | . | proj | fix --dry-run | alias-cu/../../vendor
+A16 fix alias-cu/../../../alias-v/sub (pops past root, re-enters via other alias) | . | proj | fix --dry-run | alias-cu/../../../alias-v/sub
+A17 fix proj/../alias-cu/lib/sub (.. beyond root re-entering via alias, halt) | . | proj | fix --dry-run | proj/../alias-cu/lib/sub
+A18{ab-free} fix proj/../alias-v/sub (walk of 2) | . | proj | fix --dry-run | proj/../alias-v/sub
+A19 fix proj/vendor/../../alias-v/sub | . | proj | fix --dry-run | proj/vendor/../../alias-v/sub
+A20 fix alias-cu/real/../lib/sub (halt) | . | proj | fix --dry-run | alias-cu/real/../lib/sub
+A21 fix alias-cu/toroot/../real (halt at toroot) | . | proj | fix --dry-run | alias-cu/toroot/../real
+A22 fix alias-cu/probe/../real (halt at probe) | . | proj | fix --dry-run | alias-cu/probe/../real
+A23 fix alias-cu/loop/x (author loop) | . | proj | fix --dry-run | alias-cu/loop/x
+A23c CHECK alias-cu/loop/x.nml | . | proj | check | alias-cu/loop/x.nml
+A24 fix proj/tenants/cu/loop | . | proj | fix --dry-run | proj/tenants/cu/loop
+A25 fix oloop/proj/vendor (operator loop outside) | . | proj | fix --dry-run | oloop/proj/vendor
+A25c CHECK oloop/proj/vendor/base.flow.nml | . | proj | check | oloop/proj/vendor/base.flow.nml
+A26 fix projx/vendor (sibling with root-prefix name) | . | proj | fix --dry-run | projx/vendor
+A26c CHECK projx/vendor/s.flow.nml | . | proj | check | projx/vendor/s.flow.nml
+A27 cwd alias-cu2 (physical getcwd) fix lib/sub | alias-cu2 | ../../proj | fix --dry-run | lib/sub
+A28 cwd alias-chain, fix real | alias-chain | ../../proj | fix --dry-run | real
+P1{locked} fix proj/tenants/cu/locked/sub (EACCES on lstat) | p | proj | fix --dry-run | proj/tenants/cu/locked/sub
+P1c{locked} CHECK proj/tenants/cu/locked/sub/l.flow.nml | p | proj | check | proj/tenants/cu/locked/sub/l.flow.nml
+P2{locked} fix proj/tenants/cu/locked (lstat ok, read_dir EACCES) | p | proj | fix --dry-run | proj/tenants/cu/locked
+P3{locked} fix olocked/link/vendor (EACCES while locating) | . | proj | fix --dry-run | olocked/link/vendor
+P3c{locked} CHECK olocked/link/vendor/base.flow.nml | . | proj | check | olocked/link/vendor/base.flow.nml
+P4{locked} fix proj/tenants/cu/locked/../real (.. after EACCES dir) | p | proj | fix --dry-run | proj/tenants/cu/locked/../real
+P4c{locked} CHECK proj/tenants/cu/locked/../real/r.flow.nml | p | proj | check | proj/tenants/cu/locked/../real/r.flow.nml
+C1{ci}{ab-free} fix proj/VENDOR (case variant) | . | proj | fix --dry-run | proj/VENDOR
+C1c{ci}{ab-free} CHECK proj/VENDOR/base.flow.nml | . | proj | check | proj/VENDOR/base.flow.nml
+C2{ci} --root PROJ fix vendor | . | PROJ | fix --dry-run | vendor
+C3{ci} fix proj/tenants/cu/café NFC | . | proj | fix --dry-run | proj/tenants/cu/café
+C4{ci} fix proj/tenants/cu/café NFD spelling | . | proj | fix --dry-run | proj/tenants/cu/café
+C4c{ci} CHECK NFD c.flow.nml | . | proj | check | proj/tenants/cu/café/c.flow.nml
+C5{ci} fix ALIAS-CU/real (case-variant alias name outside) | . | proj | fix --dry-run | ALIAS-CU/real
+C6{ci} fix ALIAS-CU/lib/sub (halt) | . | proj | fix --dry-run | ALIAS-CU/lib/sub
+C7{ci} fix TENANTS/CU/LIB/sub (case variant through author link: halt) | proj | . | fix --dry-run | TENANTS/CU/LIB/sub
+C8 fix - (dash) | proj | . | fix --dry-run | -
+C9 fix '' (empty) | proj | . | fix --dry-run | <empty>
+P5 fix long path > PATH_MAX | l/proj | . | fix --dry-run | tenants/cu/<L240>/<L240>/<L240>/<L240>/<L240>
+P5c CHECK long path z.flow.nml | l/proj | . | check | tenants/cu/<L240>/<L240>/<L240>/<L240>/<L240>/z.flow.nml
+P6 fix long path 3 comps (< PATH_MAX) | l/proj | . | fix --dry-run | tenants/cu/<L240>/<L240>/<L240>
+C12 fix tenants/cu/./lib/./sub (halt) | proj | . | fix --dry-run | tenants/cu/./lib/./sub
+C13 fix ./tenants/cu/real/. | proj | . | fix --dry-run | ./tenants/cu/real/.
+C14 fix tenants/cu/real/.. (walk cu) | proj | . | fix --dry-run | tenants/cu/real/..
+C15 fix tenants/cu/lib/sub/.. (halt) | proj | . | fix --dry-run | tenants/cu/lib/sub/..
+C16 fix ../proj/tenants/cu/real from cwd proj | proj | . | fix --dry-run | ../proj/tenants/cu/real
+C17 fix ../alias-cu/real from cwd proj | proj | . | fix --dry-run | ../alias-cu/real
+C18 fix ../alias-cu/lib/sub from cwd proj (halt) | proj | . | fix --dry-run | ../alias-cu/lib/sub
+C19 REAL fix alias-cu/toroot/vendor | . | proj | fix | alias-cu/toroot/vendor
+C20{ab-free} REAL fix alias-lib/sub | . | proj | fix | alias-lib/sub
+C21 fix proj/tenants/cu/toroot/tenants/cu/toroot/vendor (double) | . | proj | fix --dry-run | proj/tenants/cu/toroot/tenants/cu/toroot/vendor
+C22 BIND alias-cu/toroot/vendor/base.flow.nml | . | proj | binding | alias-cu/toroot/vendor/base.flow.nml
+C23 fix @/alias-cu/probe/vendor (abs via typed) root via real | . | <real>/proj | fix --dry-run | <dir>/alias-cu/probe/vendor
+C24 fix @@/alias-cu/probe/vendor (abs via real) root via typed | . | <dir>/proj | fix --dry-run | <real>/alias-cu/probe/vendor
+C25 fix /tmp/..@@/alias-cu/toroot/vendor | . | proj | fix --dry-run | /tmp/..<real>/alias-cu/toroot/vendor
+A29 fix alias-cu/../lib3/sub (depth after alias: must halt at lib3) | . | proj | fix --dry-run | alias-cu/../lib3/sub
+A29c CHECK alias-cu/../lib3/sub/deep.flow.nml | . | proj | check | alias-cu/../lib3/sub/deep.flow.nml
+A30 fix proj/tenants/cu/../lib3/sub (halt at lib3) | . | proj | fix --dry-run | proj/tenants/cu/../lib3/sub
+A31 fix alias-cu/../../tenants/lib3/sub (halt) | . | proj | fix --dry-run | alias-cu/../../tenants/lib3/sub
+A32 fix alias-cu/../lib3 (leaf link after alias-pop) | . | proj | fix --dry-run | alias-cu/../lib3
+A33 REAL fix alias-cu/../lib3/sub | . | proj | fix | alias-cu/../lib3/sub
+C26 fix tenants/cu (walk with loop, links inside) | proj | . | fix --dry-run | tenants/cu

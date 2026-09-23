@@ -1,5 +1,4 @@
 webServer DefaultWebServer:
-
     rootProfile:
         domain = "dev.nudge.io:8000"
 

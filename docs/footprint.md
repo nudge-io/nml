@@ -5,17 +5,18 @@ commands in this repo — rerun any of them yourself.
 
 ## Dependency footprint
 
-Measured with `cargo tree -e normal --prefix none | sort -u` (2026-07):
+Measured with `cargo tree -e normal --prefix none -p <crate> | sort -u | wc -l`
+(2026-09):
 
 | Crate | Direct deps | Total packages | Notes |
 |---|---|---|---|
-| `nml-core` | rowan, serde, thiserror | **19** | parsing, AST, query, serde bridge, defaults, diff, CST editing — **no tokio, no async, no I/O deps** |
-| `nml-fmt` | nml-core | 20 | the formatter adds *zero* third-party deps |
-| `nml-validate` | nml-core, blake3, dirs | **29** | schema validation + content-addressed packages/store |
-| `nml-lsp` | tower-lsp/tokio stack | 124 | it's a language *server* — only your `<tool> lsp` subcommand pays for it |
+| `nml-core` | rowan, serde, thiserror | **18** | parsing, AST, query, serde bridge, defaults, diff, CST editing — **no tokio, no async, no I/O deps** |
+| `nml-fmt` | nml-core | 19 | the formatter adds *zero* third-party deps |
+| `nml-validate` | nml-core, blake3, dirs | **31** | schema validation + content-addressed packages/store |
+| `nml-lsp` | tower-lsp/tokio stack | 128 | it's a language *server* — only your `<tool> lsp` subcommand pays for it |
 
 The layering is the point: embedding NML parsing + typed deserialization in
-your application costs 19 packages, all boring. The async stack exists only
+your application costs 18 packages, all boring. The async stack exists only
 in the crate whose job is serving editors.
 
 ## Binary size
@@ -26,7 +27,7 @@ example), release profile, unstripped, aarch64-macOS:
 
 ```text
 cargo build --release -p nml-cookbook --example deserialize
-782,096 bytes   (~0.75 MiB)
+908,080 bytes   (~0.87 MiB)
 ```
 
 ## Parse throughput
@@ -36,11 +37,12 @@ repo's entire `.nml` corpus — including the deliberately *invalid* fixtures,
 because resilient error recovery is part of the work — and reports:
 
 ```text
-parsed 58 files (34052 bytes) in 2.5ms — 12.7 MiB/s (resilient parse, 3 diagnostics)
+parsed 200 files (1001698 bytes) in 120.852042ms — 7.9 MiB/s (resilient parse, 15 diagnostics)
 ```
 
-Measured on an Apple-silicon laptop; the corpus is small files (~600 bytes
-median), so per-file overhead dominates — real-world single-file configs
+Measured on an Apple-silicon laptop (2026-09); the corpus is mostly small
+files — the median `.nml` in it is 91 bytes — so per-file overhead dominates
+and the MiB/s figure understates a real file: real-world single-file configs
 parse in tens of microseconds. Config parsing will not be your hot path;
 the number that matters is that it *rounds to zero* at startup, error
 recovery included.

@@ -1,0 +1,3 @@
+core main:
+    action = "type"
+    rateLimit = 10

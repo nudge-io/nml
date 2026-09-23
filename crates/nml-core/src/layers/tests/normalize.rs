@@ -488,7 +488,7 @@ holder38 top uses base:
 
 #[test]
 fn a_model_and_a_oneof_sharing_a_name_resolve_alike_on_every_pass() {
-    // A colliding name (NML1000/NML2016 at schema load — composition
+    // A colliding name (NML1000 at parse, NML2016 at schema load — composition
     // still runs over the loaded schema): the plan and normalization
     // resolved it model-first, the merge oneof-first, so a nested
     // union planned under `dup` the model merged under `dup` the

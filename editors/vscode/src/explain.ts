@@ -33,6 +33,9 @@ const CODE = /^NML\d{4}$/i;
 
 interface IndexEntry {
   code: string;
+  /** The bold lead the code's entry opens with — one line; absent from an
+   *  older server, whose `summary` then labels the row as it always did. */
+  headline?: string;
   summary: string;
 }
 
@@ -97,6 +100,7 @@ async function pickCode(
           )
           .map((e) => ({
             code: readString(e, "code")!,
+            headline: readString(e, "headline"),
             summary: readString(e, "summary")!,
           }))
       : undefined;
@@ -110,13 +114,17 @@ async function pickCode(
     );
     return undefined;
   }
+  // One line per code: the headline beside the code, the paragraph as
+  // the (truncated) detail a search still matches on.
   const items: QuickPickItem[] = index.map((entry) => ({
     label: entry.code,
-    description: entry.summary,
+    description: entry.headline ?? entry.summary,
+    detail: entry.headline ? entry.summary : undefined,
   }));
   const picked = await window.showQuickPick(items, {
     matchOnDescription: true,
-    placeHolder: "Explain a diagnostic code (search by code or summary)",
+    matchOnDetail: true,
+    placeHolder: "Explain a diagnostic code (search by code, headline or summary)",
   });
   return picked?.label;
 }

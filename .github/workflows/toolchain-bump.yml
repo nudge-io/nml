@@ -28,6 +28,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # gate-contract: not-a-gate — automation that OPENS a bump PR when
+          # stable moves; the gates then run on that PR.
           set -euo pipefail
           pinned="$(grep -m1 '^channel' rust-toolchain.toml | cut -d '"' -f 2)"
           # The release channel manifest's [pkg.rust] version line, e.g.

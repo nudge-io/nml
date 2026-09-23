@@ -74,6 +74,20 @@ pub enum SuggestionKind {
     /// — never by textual widening. Renders nothing in the message: the
     /// producer's prose states the action.
     Delete,
+    /// Structural insertion of the body entries `replacement` spells — a
+    /// snippet written at zero indentation, its newlines its structure —
+    /// as the LAST entry of the block, list item or declaration whose
+    /// NAME token span equals `span` (a remedy block: NML2064's `layers:`
+    /// grant under the binding). Singular and exact; the bytes — the
+    /// snippet at the body's own indentation, at the offset after its
+    /// last entry — are computed only by `resolve_suggestions` against
+    /// the target file's text, so every applier and every wire carries
+    /// the one edit; a block already holding an entry of the snippet's
+    /// head name is refused (`AlreadyPresent`) — an insertion never
+    /// doubles one. Renders nothing in the message: the CLI prints the
+    /// resolved block beneath the finding as its `help:`, the editor
+    /// offers it as a quick-fix on the file it edits.
+    Insert,
 }
 
 impl SuggestionKind {
@@ -86,6 +100,7 @@ impl SuggestionKind {
             SuggestionKind::DidYouMean => "didYouMean",
             SuggestionKind::Fix => "fix",
             SuggestionKind::Delete => "delete",
+            SuggestionKind::Insert => "insert",
         }
     }
 
@@ -96,6 +111,7 @@ impl SuggestionKind {
             "didYouMean" => Some(SuggestionKind::DidYouMean),
             "fix" => Some(SuggestionKind::Fix),
             "delete" => Some(SuggestionKind::Delete),
+            "insert" => Some(SuggestionKind::Insert),
             _ => None,
         }
     }
@@ -105,16 +121,129 @@ impl SuggestionKind {
 /// exact replacement text and the exact span it replaces. Produced wherever
 /// a correction is *derivable* (e.g. a did-you-mean), so editors can offer a
 /// one-keystroke quick-fix instead of leaving the suggestion trapped in
-/// message prose.
+/// message prose — and a remedy the reader pastes (rustc's `help:` with a
+/// suggested replacement) is one of these, never prose beside the finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Suggestion {
     /// The text to insert at `span` (for a string value: the bare content,
     /// without quotes — `span` covers the string's content, not its quotes).
+    /// For an [`Insert`](SuggestionKind::Insert): the entries to add, at
+    /// zero indentation.
     pub replacement: String,
-    /// The exact range the replacement substitutes.
+    /// The exact range the replacement substitutes; for a structural kind
+    /// the anchor the resolver relocates (a deletion's node, an insertion's
+    /// named block).
     pub span: Span,
     /// The exclusivity semantics — see [`SuggestionKind`].
     pub kind: SuggestionKind,
+    /// The file `span` indexes into, when it differs from the
+    /// diagnostic's own (`Diagnostic.source` vocabulary — a path);
+    /// `None` inherits the diagnostic's own
+    /// ([`Diagnostic::suggestion_source`]). An applier edits ONLY the file
+    /// it was asked to — a content file's finding may carry the edit an
+    /// operator applies to the manifest, and that edit is routed there,
+    /// never resolved against the content file's text.
+    pub source: Option<String>,
+}
+
+/// A suggestion's kind and payload before its anchor: the ONE way to build
+/// a [`Suggestion`] is `Suggestion::<kind>(payload).at(span)` — the payload
+/// arrives with the kind that gives it meaning, the span is REQUIRED by the
+/// type (there is no suggestion without one, and nothing else turns an
+/// `Unanchored` into a `Suggestion`), the file is optional and named
+/// ([`Suggestion::in_file`]). Two producers can never spell one builder
+/// with two argument orders: every fact has a name, none a position.
+///
+/// # Examples
+///
+/// ```
+/// use nml_core::diagnostic::{Diagnostic, Suggestion, SuggestionKind};
+/// use nml_core::span::Span;
+///
+/// // `hots = …` at bytes 12..16, where the model spells `host`.
+/// let fix = Suggestion::did_you_mean("host").at(Span::new(12, 16));
+/// assert_eq!(fix.kind, SuggestionKind::DidYouMean);
+/// assert_eq!(fix.replacement, "host");
+/// assert!(fix.source.is_none(), "the diagnostic\'s own file, until named");
+///
+/// // A content file\'s finding may carry the edit an operator applies to
+/// // the manifest: `in_file` routes it there.
+/// let elsewhere = Suggestion::insert("layers:\n    allowRefs:\n        - \"a\"")
+///     .at(Span::new(0, 0))
+///     .in_file("demo.package.nml");
+/// assert_eq!(elsewhere.source.as_deref(), Some("demo.package.nml"));
+///
+/// let diag = Diagnostic::error("unknown property \'hots\'".to_string()).with_suggestion(fix);
+/// assert_eq!(diag.suggestions.len(), 1);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "an unanchored suggestion is not a suggestion: call `.at(span)`"]
+pub struct Unanchored {
+    kind: SuggestionKind,
+    replacement: String,
+}
+
+impl Unanchored {
+    /// Anchor the suggestion: the exact range a verbatim replacement
+    /// substitutes; for a structural kind the node (a deletion) or the
+    /// NAME token (an insertion) the resolver relocates. The file is the
+    /// diagnostic's own until [`Suggestion::in_file`] names another.
+    pub fn at(self, span: Span) -> Suggestion {
+        Suggestion {
+            replacement: self.replacement,
+            span,
+            kind: self.kind,
+            source: None,
+        }
+    }
+}
+
+impl Suggestion {
+    /// A singular near-miss correction ([`SuggestionKind::DidYouMean`]).
+    pub fn did_you_mean(replacement: impl Into<String>) -> Unanchored {
+        Self::of(SuggestionKind::DidYouMean, replacement)
+    }
+
+    /// One of N mutually exclusive alternatives ([`SuggestionKind::Fix`])
+    /// — one suggestion per alternative.
+    pub fn fix(replacement: impl Into<String>) -> Unanchored {
+        Self::of(SuggestionKind::Fix, replacement)
+    }
+
+    /// A structural deletion ([`SuggestionKind::Delete`]) of the node
+    /// whose content span the anchor names — it carries no text.
+    pub fn delete() -> Unanchored {
+        Self::of(SuggestionKind::Delete, String::new())
+    }
+
+    /// A structural insertion ([`SuggestionKind::Insert`]) of the entries
+    /// `entries` spells (zero indentation) as the last of the body whose
+    /// owner's NAME token the anchor names.
+    pub fn insert(entries: impl Into<String>) -> Unanchored {
+        Self::of(SuggestionKind::Insert, entries)
+    }
+
+    /// A kind with its payload — the four named entries above are this
+    /// one's spellings, and a reader that holds a kind from a wire
+    /// ([`SuggestionKind::from_wire_name`]) comes in here. A deletion
+    /// carries no text whatever the wire said: its bytes are the
+    /// resolver's, never a payload's.
+    pub fn of(kind: SuggestionKind, replacement: impl Into<String>) -> Unanchored {
+        let replacement = match kind {
+            SuggestionKind::Delete => String::new(),
+            _ => replacement.into(),
+        };
+        Unanchored { kind, replacement }
+    }
+
+    /// The file the anchor indexes into, when it is not the diagnostic's
+    /// own (`Diagnostic.source` vocabulary — a path): an applier routes
+    /// the edit there and never resolves it against another file's text.
+    pub fn in_file(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
 }
 
 /// A stable diagnostic code (`NML0042`).
@@ -193,7 +322,7 @@ macro_rules! codes {
 /// 4000–4999 packages & store · 5000–5999 editor/LSP. Sites not yet assigned a code
 /// emit `None`; the docs plan's Phase 4 sweep completes coverage. Every code
 /// has a section in the error index (`docs/errors/README.md`) — enforced
-/// bidirectionally by `just docs-test`.
+/// bidirectionally by `just gate-docs`.
 pub mod codes {
     use super::Code;
 
@@ -255,6 +384,10 @@ pub mod codes {
         /// single values (chains live at properties or behind `const`
         /// names).
         FALLBACK_IN_LIST_ITEM = 21;
+        /// The source exceeds the parser's 4 GiB bound (token positions
+        /// are `u32`, as in `rowan`); the tree is empty and this is its
+        /// one finding — a resource bound, never a panic.
+        SOURCE_TOO_LARGE = 22;
 
         /// The same name is declared more than once in one namespace.
         DUPLICATE_DECLARATION = 1000;
@@ -410,9 +543,10 @@ pub mod codes {
         /// union — there is no variant to select, so the annotation has no
         /// meaning. Flagged rather than silently ignored (visible-never-silent).
         STRAY_TYPE_ANNOTATION = 2053;
-        /// A oneof variant model declares a field named like the
-        /// discriminator — unreachable, the property is always claimed as
-        /// the discriminator (advisory).
+        /// A oneof arm carries a plain field named like the discriminator
+        /// — unsettable, the property is always claimed as the
+        /// discriminator (an error at load; the optional `#sealed`
+        /// spelling is the seal and stays).
         SHADOWED_DISCRIMINATOR = 2054;
         /// A list item's BODY has nowhere to go: the element type is a
         /// scalar/union/collection with no fields to fill — the body-side
@@ -480,6 +614,29 @@ pub mod codes {
         /// zero items — it does not supply the list, and "empty the base
         /// list" has no merge spelling.
         ZERO_ITEM_LAYER_ENTRY = 2079;
+        /// RFC 0019 (warning): a project config, package manifest or root
+        /// marker inside content another manifest's binding claims is
+        /// inert — content, not configuration (resolution inputs must not
+        /// be author-writable).
+        INERT_RESOLUTION_INPUT = 2080;
+        /// RFC 0019 item 4: a validator binding's `layers:` grant breaks a
+        /// rule of the loader's own — an `allowRefs`/`denyRefs` glob the
+        /// matcher rejects (`**` must be a whole segment; the segment cap),
+        /// `maxStackDepth` above the language cap or not a whole number, or
+        /// `denyRefs` beside an empty `allowRefs` — refused at manifest LOAD,
+        /// located at the item. Load-time because an over-cap glob matches
+        /// nothing: fail-closed for an allow rule, fail-OPEN for a deny.
+        LAYER_GRANT_RULE = 2081;
+        /// RFC 0019: a package manifest's `[]directive` vocabulary declares
+        /// one of the language's merge-policy directives (`sealed`,
+        /// `identity`, `append`, `overlay`) — reserved names, refused at
+        /// manifest LOAD at the entry.
+        RESERVED_DIRECTIVE = 2082;
+        /// RFC 0019: a closed binding rejects content reached through a
+        /// symlinked path component (pipeline P4) — form 1: a component
+        /// is a symlink; form 2: the on-disk spelling cannot be verified
+        /// on this backend.
+        SYMLINKED_CONTENT_REJECTED = 2083;
         /// RFC 0019 (warning): an overlay assignment restates the effective
         /// lower value unchanged (`semantic_eq`) — a dead delta. Overlay- or
         /// sealed-policy scalar/object fields only.
@@ -496,6 +653,137 @@ pub mod codes {
         /// contribution is NOT composed — fail safe and loud, never
         /// silently wrong. Please report the input.
         INTERNAL_COMPOSE_INVARIANT = 2086;
+        /// RFC 0019 item 0 (rule 3): two or more live workspace manifests
+        /// claim one file — denied; the file validates under no binding
+        /// (never a nearest-wins shadow).
+        AMBIGUOUS_CLAIM = 2087;
+        /// RFC 0019 item 0 (E27(3)): a LIVE package manifest or project
+        /// config could not be loaded — unreadable, malformed, over its
+        /// byte cap, a declared source unavailable — so the universe is
+        /// closed-denied: nothing under it validates.
+        RESOLUTION_INPUT_UNLOADABLE = 2088;
+        /// RFC 0019 item 0 (A16): discovery could not enumerate part of
+        /// the universe — the entry bound was reached or a directory was
+        /// unreadable — so what it could not enumerate is closed-denied:
+        /// the whole universe when the root unit or the universe-wide
+        /// backstop is spent, and exactly one budget unit's subtree when
+        /// a tenant-shaped unit spends its own bound.
+        UNIVERSE_TRUNCATED = 2089;
+        /// RFC 0019 item 0: the gate over a directory found
+        /// `.nml` content the universe walk skipped by policy — a symlink
+        /// in an open universe, a FIFO, a dot-file, a file under a
+        /// dot-directory, a hidden directory too large to audit whole —
+        /// content a runtime could read that no verb judged: an error
+        /// the walking verbs fail on. A symlink the walk left whose name
+        /// is not `.nml`-shaped is named as a warning (what lies beneath
+        /// it is unknown). A symlinked `.nml` in a CLOSED universe is
+        /// NML2083, in the resolver's words.
+        UNJUDGED_CONTENT = 2090;
+        /// RFC 0019 item 0: the binding that governs a file cannot build
+        /// its validator — a declared schema source fails to load (a
+        /// parse error, a duplicate definition, a cycle) — so the file
+        /// validates under NO binding: an error on every file the binding
+        /// governs, naming the source's first finding; the manifest's
+        /// other bindings are unaffected, and the source document itself
+        /// keeps its own findings (it is where the operator repairs it).
+        VALIDATOR_UNBUILDABLE = 2091;
+        /// RFC 0019 item 4 (E38): a binding glob whose first wildcard
+        /// directory run is not its last (`tenants/*/flows/**`) delegates
+        /// content shallower than the budget unit inferred from its LAST
+        /// run, so the content between — `tenants/<x>/other/` — is the
+        /// root unit's, where one tenant's flood denies everyone. A
+        /// warning on the manifest, at the glob, silenced by an explicit
+        /// `budgetUnits` declaration (which replaces the inference).
+        BUDGET_UNIT_GAP = 2092;
+        /// A body declares the same name twice — `version = "1"` twice,
+        /// or a block `files:` beside an inline `files = […]` (two
+        /// spellings of one entry) — an error at the later occurrence,
+        /// the first a related note; no suggestion (which is meant is
+        /// unknowable). A manifest's `[]schema` and `[]validator` items
+        /// are named entries too (a binding is its name). Structural:
+        /// schema or not, before any merge.
+        DUPLICATE_ENTRY = 2093;
+        /// RFC 0030: a package manifest declares its `package` block and
+        /// each of its `[]schema`, `[]validator` and `[]directive` arrays
+        /// once — one slot per keyword, whatever the names; a second
+        /// declaration of one keyword is refused at the later keyword, the
+        /// first a related note. A loader rule: the manifest's NML2088
+        /// row carries it as its cause. (The SAME name twice is NML1000,
+        /// the file-scope rule, refused where the manifest is parsed.)
+        REPEATED_DECLARATION = 2094;
+        /// RFC 0030: a manifest needs a `package <name>:` block and at
+        /// least one `[]schema` source — a package with nothing to bind is
+        /// refused at load, never loaded as empty. A loader rule (cause
+        /// of the manifest's NML2088 row).
+        MISSING_DECLARATION = 2095;
+        /// RFC 0030: a package's name is a lowercase identifier
+        /// (`[a-z][a-z0-9-]*`) — it becomes a store path component and a
+        /// written pin entry. A loader rule (cause of NML2088).
+        INVALID_PACKAGE_NAME = 2096;
+        /// RFC 0030: a `[]schema`, `[]validator` or `[]directive` entry is
+        /// its name (`- core:` with a body), never a quoted or positional
+        /// item: a source is what a binding's `schemas` names, a binding is
+        /// what `nml binding` prints. A loader rule (cause of NML2088).
+        UNNAMED_ENTRY = 2097;
+        /// RFC 0030: a validator binding claims files and names schemas,
+        /// both non-empty — a binding with `files = []` or `schemas = []`
+        /// binds nothing, a mistake rather than a no-op. A loader rule
+        /// (cause of NML2088).
+        EMPTY_BINDING = 2098;
+        /// RFC 0030: a binding's `schemas` entries name the manifest's own
+        /// `[]schema` sources by logical name; a name no entry declares
+        /// is a dangling reference. A loader rule (cause of NML2088).
+        UNDECLARED_SCHEMA = 2099;
+        /// RFC 0019 item 0: a binding's `files` glob the matcher rejects
+        /// (`**` not a whole segment, a segment that names no key
+        /// component, over the segment cap) matches nothing — a binding
+        /// that silently claims nothing — so it is refused at load, at the
+        /// glob. A loader rule (cause of NML2088); the same rule over a
+        /// grant's `allowRefs`/`denyRefs` is NML2081.
+        INVALID_BINDING_GLOB = 2100;
+        /// RFC 0019 item 4 (RFC 0026 B-3): a declared `budgetUnits` entry
+        /// that is not a directory pattern (1 to the segment cap of
+        /// `/`-separated plain names or `*`, never `**`), or a declared unit
+        /// nesting inside another without a literal pinning one of the
+        /// outer unit's wildcards (`tenants/*` beside `tenants/*/*`) —
+        /// every directory the outer unit delegates would mint units of
+        /// its own beneath it. A loader rule (cause of NML2088), at
+        /// `budgetUnits`.
+        BUDGET_UNIT_RULE = 2101;
+        /// RFC 0030: the manifest's `formatVersion` is newer than the
+        /// package format this build understands — the compatibility gate,
+        /// checked BEFORE meta-validation so a newer publisher degrades an
+        /// older reader with one precise refusal, never a wall of
+        /// unknown-key findings. Cause of the manifest's NML2088 row; the
+        /// editor's store reports it for an installed package.
+        UNSUPPORTED_FORMAT_VERSION = 2102;
+        /// RFC 0030: a package directory (the editor's store slot) holds
+        /// more than one `<name>.package.nml` — it cannot say which package
+        /// it is. No CLI verb loads a package directory, so no transcript
+        /// demonstrates it; the loader's own test does.
+        MULTIPLE_MANIFESTS = 2103;
+        /// A template string (`"tenants/{{x}}"`) as an element of a
+        /// manifest list — `files`, `schemas`, `allowRefs`, `denyRefs`,
+        /// `budgetUnits`, `rootMarkers`, `modifiers`, `memberKeywords`,
+        /// `builtinRefs` hold plain literals naming files, keys, units or
+        /// markers. The meta-schema admits a template as a `string`; the
+        /// loader used to set it aside silently (a narrower `files`, a
+        /// dropped unit, a `denyRefs` veto that never fired). Refused at
+        /// the element through the loader's one list gate. A loader rule
+        /// (cause of the manifest's NML2088 row).
+        TEMPLATE_IN_LIST = 2104;
+        /// RFC 0019 item 0: a `[]schema` entry declares a `file` that is not
+        /// spelled as a schema source (`*.model.nml`, `*.schema.nml`). That
+        /// suffix is the ONE admission every reader shares — the walk that
+        /// finds an undeclared source beside a manifest, the `--schema`
+        /// directory scan, and the editor, which gates its registry, its
+        /// schema passes, completion and hover on the spelling — so a source
+        /// declared outside it was a schema to the loader and to nobody else:
+        /// `nml check` judged its directives while the editor opened no pass,
+        /// gave no row and no hover on the same buffer. The manifest's SHAPE,
+        /// refused at load, at the `file` value. A loader rule (cause of the
+        /// manifest's NML2088 row).
+        INVALID_SCHEMA_SOURCE_NAME = 2105;
 
         /// A money literal is malformed (unparseable amount or fraction).
         INVALID_MONEY = 3000;
@@ -531,7 +819,9 @@ pub mod codes {
         /// bindings — its globs can never match first (RFC 0030).
         SHADOWED_VALIDATOR = 4000;
 
-        /// A directive name is not in the covering package's vocabulary.
+        /// A directive name is neither a language merge-policy directive nor
+        /// in the covering package's declared vocabulary — the kernel's one
+        /// judge (`nml_validate::directives::Vocabulary`), every front end.
         UNKNOWN_DIRECTIVE = 5000;
         /// A directive's argument does not match its declared arity.
         DIRECTIVE_BAD_ARITY = 5001;
@@ -580,6 +870,28 @@ pub fn explain_summary(code: &str) -> Option<String> {
     summary_of(explain(code)?)
 }
 
+/// A code's one-line HEADLINE — the bold lead its index section opens
+/// with (`**Missing required field.** A required …` → `Missing required
+/// field.`): the sentence a list or a palette shows where a paragraph
+/// would not fit. `nml explain --list` prints it and the editor's
+/// explain palette labels with it; the [`explain_summary`] paragraph
+/// stays the hover's and the `--json` row's. Every section opens with a
+/// bold lead (a unit test holds the index to it); one that did not
+/// would headline with its whole summary.
+pub fn explain_headline(code: &str) -> Option<String> {
+    explain_summary(code).map(|summary| headline_of(&summary))
+}
+
+/// The bold lead of a summary, or the summary itself when it opens with
+/// none.
+fn headline_of(summary: &str) -> String {
+    summary
+        .strip_prefix("**")
+        .and_then(|rest| rest.split_once("**"))
+        .map(|(lead, _)| lead.trim().to_string())
+        .unwrap_or_else(|| summary.to_string())
+}
+
 /// First paragraph → one line → links policy. Shared by [`explain_summary`]
 /// (one code) and [`explain_index`] (all codes).
 fn summary_of(body: &str) -> Option<String> {
@@ -607,8 +919,25 @@ fn compose_document(head: &str, body: &str) -> String {
     let mut in_fence = false;
     for line in body.split_inclusive('\n') {
         let is_fence_delimiter = line.trim_start().starts_with("```");
+        if is_fence_delimiter && !in_fence {
+            // An OPENING fence keeps its language word and drops the
+            // docs-test tags after it (`check expect-error='[…]'`,
+            // `transcript=…`): they steer the repository's verification
+            // harness and mean nothing to a reader of `nml explain`.
+            in_fence = true;
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let language = line.trim_start()[3..]
+                .split_whitespace()
+                .next()
+                .unwrap_or_default();
+            doc.push_str(indent);
+            doc.push_str("```");
+            doc.push_str(language);
+            doc.push('\n');
+            continue;
+        }
         if is_fence_delimiter {
-            in_fence = !in_fence;
+            in_fence = false;
         }
         if in_fence || is_fence_delimiter {
             doc.push_str(line);
@@ -702,17 +1031,31 @@ pub struct Diagnostic {
     pub source: Option<String>,
     /// Machine-applicable edits, when derivable. One `DidYouMean` for a
     /// near-miss; N mutually exclusive `Fix` alternatives for diagnostics
-    /// with several valid resolutions (RFC 0015 D2). Empty = none.
+    /// with several valid resolutions (RFC 0015 D2); a structural
+    /// `Delete` or `Insert` (a remedy block — rustc's `help:` with a
+    /// suggested replacement — is one of these, in the file it edits,
+    /// never prose beside the finding). Empty = none.
     pub suggestions: Vec<Suggestion>,
     /// Secondary locations that explain the primary one (RFC 0009) — e.g.
     /// an unterminated string's opening quote, far from where the failure
     /// surfaces. The LSP maps these to spec-native
     /// `DiagnosticRelatedInformation`; the CLI prints `note:` lines.
     pub related: Vec<Related>,
+    /// The finding whose refusal this one reports, when this finding
+    /// wraps another under a code of its own — a manifest that failed
+    /// to load (NML2088) over the manifest's first finding, a binding
+    /// that cannot build its validator (NML2091) over its declared
+    /// source's — so the inner code, sentence and place ride the row as
+    /// facts (`cause` on the `--json` row) beside the verdict, never
+    /// only inside its sentence. Set by [`Self::caused_by`], which
+    /// keeps the rule in one place; `None` for every finding that
+    /// wraps nothing.
+    pub cause: Option<Box<Cause>>,
 }
 
 /// One secondary location on a [`Diagnostic`] — see [`Diagnostic::related`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Related {
     pub span: Span,
     pub message: String,
@@ -722,6 +1065,25 @@ pub struct Related {
     /// ([`Diagnostic::related_source`]). Renderers locate a note in ITS
     /// OWN file — a cross-file span through the wrong line index prints
     /// the right file with a wrong range.
+    pub source: Option<String>,
+}
+
+/// The finding a wrapping [`Diagnostic`] reports the refusal of — see
+/// [`Diagnostic::cause`]: its code, its sentence and its place. One
+/// level by construction: a cause carries no cause, and
+/// [`Diagnostic::caused_by`] takes a wrapped wrapper's own cause — the
+/// innermost, the one to act on — never a chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Cause {
+    pub code: Code,
+    pub message: String,
+    /// Where the finding sits in its file; `None` for a finding with
+    /// no place (a renderer then states none).
+    pub span: Option<Span>,
+    /// The file `span` indexes into (`Diagnostic.source` vocabulary);
+    /// `None` inherits the wrapping finding's own
+    /// ([`Diagnostic::cause_source`]), as a note's does.
     pub source: Option<String>,
 }
 
@@ -735,6 +1097,7 @@ impl Diagnostic {
             source: None,
             suggestions: Vec::new(),
             related: Vec::new(),
+            cause: None,
         }
     }
 
@@ -794,38 +1157,97 @@ impl Diagnostic {
     /// The file `rel`'s span indexes into: the note's own, else the
     /// diagnostic's — the ONE inheritance rule both renderers share.
     pub fn related_source<'s>(&'s self, rel: &'s Related) -> Option<&'s str> {
-        rel.source.as_deref().or(self.source.as_deref())
+        self.inherit(rel.source.as_deref())
     }
 
-    /// Attach a singular near-miss correction ([`SuggestionKind::DidYouMean`]).
-    pub fn with_suggestion(mut self, replacement: impl Into<String>, span: Span) -> Self {
-        self.suggestions.push(Suggestion {
-            replacement: replacement.into(),
-            span,
-            kind: SuggestionKind::DidYouMean,
-        });
+    /// Report `finding`'s refusal under this finding's own code:
+    /// `finding` becomes the cause ([`Cause`]) — its code, sentence and
+    /// place, in `source` (`None`: this finding's own file) — so a
+    /// consumer reads the underlying code as a fact, and `finding`'s
+    /// remedies ride this row ([`Suggestion`]), each stamped with its
+    /// file — its own, else `finding`'s, else `source`, else this row's
+    /// — so the edit reaches the CLI's `help:` block and `nml fix`'s
+    /// routing, and the editor's quick fix, wherever the row is shown
+    /// (a manifest's did-you-mean on the row a governed file carries).
+    /// The ONE rule of
+    /// what a cause is: a finding with no code makes none (this
+    /// finding's sentence and place already state all it says — a
+    /// refusal stated as a sentence; every rule of the manifest loader's
+    /// own has a code), and a finding reported
+    /// under its own code makes none (nothing is wrapped: the row IS
+    /// the finding — NML2081, NML2082). A wrapped finding that is itself a
+    /// wrapper contributes its own cause, the innermost, in that
+    /// cause's file — its own, else the wrapped finding's, else
+    /// `source` — never a chain.
+    pub fn caused_by(mut self, finding: &Diagnostic, source: Option<String>) -> Self {
+        // The remedies first, stamped explicitly: a front end may show
+        // this row on a document that is not the file the edit lands in
+        // (the editor's note on a governed file), and an unstamped edit
+        // would resolve against that document's text.
+        let carried: Vec<Suggestion> = finding
+            .suggestions
+            .iter()
+            .map(|s| {
+                let file = finding
+                    .suggestion_source(s)
+                    .map(str::to_owned)
+                    .or_else(|| source.clone())
+                    .or_else(|| self.source.clone());
+                match file {
+                    Some(file) => s.clone().in_file(file),
+                    None => s.clone(),
+                }
+            })
+            .collect();
+        self.suggestions.extend(carried);
+        let cause = match finding.cause.as_deref() {
+            Some(inner) => Some(Cause {
+                source: inner
+                    .source
+                    .clone()
+                    .or_else(|| finding.source.clone())
+                    .or(source),
+                ..inner.clone()
+            }),
+            None => finding.code.map(|code| Cause {
+                code,
+                message: finding.message.clone(),
+                span: finding.span,
+                source,
+            }),
+        };
+        self.cause = cause
+            .filter(|cause| Some(cause.code) != self.code)
+            .map(Box::new);
         self
     }
 
-    /// Attach one of N mutually exclusive fix alternatives
-    /// ([`SuggestionKind::Fix`]) — call once per alternative.
-    pub fn with_fix(mut self, replacement: impl Into<String>, span: Span) -> Self {
-        self.suggestions.push(Suggestion {
-            replacement: replacement.into(),
-            span,
-            kind: SuggestionKind::Fix,
-        });
-        self
+    /// The file the cause's span indexes into: its own, else this
+    /// finding's — the inheritance a note has ([`Self::related_source`]).
+    pub fn cause_source(&self) -> Option<&str> {
+        self.inherit(self.cause.as_deref().and_then(|c| c.source.as_deref()))
     }
 
-    /// Attach a structural deletion ([`SuggestionKind::Delete`]) of the
-    /// node whose content span equals `span`.
-    pub fn with_deletion(mut self, span: Span) -> Self {
-        self.suggestions.push(Suggestion {
-            replacement: String::new(),
-            span,
-            kind: SuggestionKind::Delete,
-        });
+    /// The file `s`'s span indexes into: the suggestion's own, else the
+    /// diagnostic's — the same inheritance a note has, so an applier
+    /// routes an edit to its file by one rule.
+    pub fn suggestion_source<'s>(&'s self, s: &'s Suggestion) -> Option<&'s str> {
+        self.inherit(s.source.as_deref())
+    }
+
+    fn inherit<'s>(&'s self, own: Option<&'s str>) -> Option<&'s str> {
+        own.or(self.source.as_deref())
+    }
+
+    /// Attach a machine-applicable edit — the ONE way a suggestion joins
+    /// a finding. The suggestion itself is built by its kind:
+    /// `Suggestion::did_you_mean("warn").at(span)`,
+    /// `Suggestion::fix("slot as a").at(span)` (once per alternative),
+    /// `Suggestion::delete().at(span)`,
+    /// `Suggestion::insert(block).at(span).in_file(manifest)` — every
+    /// fact named, no argument order to get wrong.
+    pub fn with_suggestion(mut self, suggestion: Suggestion) -> Self {
+        self.suggestions.push(suggestion);
         self
     }
 
@@ -848,6 +1270,109 @@ impl Diagnostic {
 
 /// See [`Diagnostic::rendered`].
 pub struct Rendered<'a>(&'a Diagnostic);
+
+/// Where a producer PUSHES its findings (RFC 0019 item 0). A
+/// `Vec<Diagnostic>` is a sink — the library's default: `validate`
+/// returns one, and every consumer that wants the whole list keeps it —
+/// and a front end may STREAM: the CLI's reporter tallies exactly and
+/// prints within its budget as each finding is derived, so a document
+/// yielding a million findings costs the run its printing budget, never
+/// a million materialized findings; the editor keeps the first
+/// [`Bounded`] tranche it publishes and counts the rest. Object-safe
+/// (`&mut dyn DiagnosticSink`), so the validator's forty threaded
+/// parameters carry no type parameter.
+pub trait DiagnosticSink {
+    fn push(&mut self, diag: Diagnostic);
+
+    /// Push every finding of a scratch collection (a sub-validation
+    /// admitted as a whole), in order.
+    fn absorb(&mut self, diags: Vec<Diagnostic>) {
+        for diag in diags {
+            self.push(diag);
+        }
+    }
+}
+
+impl DiagnosticSink for Vec<Diagnostic> {
+    fn push(&mut self, diag: Diagnostic) {
+        Vec::push(self, diag);
+    }
+
+    fn absorb(&mut self, diags: Vec<Diagnostic>) {
+        self.extend(diags);
+    }
+}
+
+/// Single cap on reported diagnostics, applied *at emission* by the lexer, the
+/// parser, lowering, value decoding, the source-character policy and the
+/// entry-name rule, then again on each merged list — so memory stays bounded
+/// during and after parsing on pathological input (RFC 0004 §9, "bounded
+/// output").
+///
+/// It lives here, with the diagnostic, because it is a diagnostic budget and
+/// not a parse fact: every pass that reports has one, and a pass the parser
+/// CALLS must be able to read its own cap without naming the parser. (It sat
+/// in `cst`, which `source_policy` and `entry_names` — both of them called
+/// from `cst` — reached up for; `entry_names` and `cst` were a dependency
+/// cycle whose only content was this line.)
+///
+/// LIMIT: reach=content guards=output surface=kernel shown="128" — parse/lex findings REPORTED per document; the rest are counted, never dropped silently
+pub(crate) const MAX_ERRORS: usize = 128;
+
+/// A sink that KEEPS the first findings up to `cap` entries of `out`
+/// (whatever `out` already held counts) and COUNTS the rest, exactly —
+/// a front end that publishes a bounded list holds no more than it
+/// publishes, and its "N further finding(s) not shown" row is the truth
+/// (the editor's `MAX_DIAGNOSTICS`, applied at the source).
+pub struct Bounded<'a> {
+    out: &'a mut Vec<Diagnostic>,
+    cap: usize,
+    /// The findings pushed past the cap.
+    pub elided: usize,
+}
+
+impl<'a> Bounded<'a> {
+    pub fn new(out: &'a mut Vec<Diagnostic>, cap: usize) -> Self {
+        Self {
+            out,
+            cap,
+            elided: 0,
+        }
+    }
+}
+
+impl DiagnosticSink for Bounded<'_> {
+    fn push(&mut self, diag: Diagnostic) {
+        if self.out.len() < self.cap {
+            self.out.push(diag);
+        } else {
+            self.elided += 1;
+        }
+    }
+}
+
+/// A sink that forwards only the findings `keep` admits — a front end's
+/// suppression applied AT THE SOURCE, ahead of a [`Bounded`] tranche, so
+/// the tranche holds only findings that will be published and the count
+/// past it never includes one the front end would have dropped.
+pub struct Filtered<'a, S: ?Sized> {
+    inner: &'a mut S,
+    keep: &'a dyn Fn(&Diagnostic) -> bool,
+}
+
+impl<'a, S: DiagnosticSink + ?Sized> Filtered<'a, S> {
+    pub fn new(inner: &'a mut S, keep: &'a dyn Fn(&Diagnostic) -> bool) -> Self {
+        Self { inner, keep }
+    }
+}
+
+impl<S: DiagnosticSink + ?Sized> DiagnosticSink for Filtered<'_, S> {
+    fn push(&mut self, diag: Diagnostic) {
+        if (self.keep)(&diag) {
+            self.inner.push(diag);
+        }
+    }
+}
 
 /// A character every rendering surface escapes and no machine-applied
 /// replacement may carry: every Unicode control (line breaks included —
@@ -885,11 +1410,13 @@ fn write_sanitized(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
 impl fmt::Display for Rendered<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write_sanitized(f, &self.0.message)?;
-        // Structural deletions are their own kind (`Delete`) and render
-        // nothing — the producer's prose states the action; the filters
-        // below select by kind, so `Delete` matches neither. The empty-
-        // replacement guard on did-you-means is defense in depth (no
-        // producer emits one): `(did you mean ""?)` reads as nonsense.
+        // Structural kinds (`Delete`, `Insert`) render nothing here — the
+        // producer's prose states the action, and an insertion's block is
+        // a front end's own surface (the CLI's `help:` beneath the row,
+        // the editor's quick-fix); the filters below select by kind, so
+        // neither matches. The empty-replacement guard on did-you-means is
+        // defense in depth (no producer emits one): `(did you mean ""?)`
+        // reads as nonsense.
         let dym: Vec<&Suggestion> = self
             .0
             .suggestions
@@ -985,6 +1512,37 @@ impl fmt::Display for Diagnostic {
 
 #[cfg(test)]
 mod tests {
+    /// A fence's docs-test tags never reach a reader — every opening
+    /// fence in every explain document is `\`\`\`<language>` alone, and the
+    /// fenced text itself is untouched.
+    #[test]
+    fn explain_documents_carry_no_fence_tags() {
+        let mut fences = 0usize;
+        for (code, _) in super::explain_index() {
+            let doc = super::explain_document(code).expect("every indexed code has a document");
+            let mut in_fence = false;
+            for line in doc.lines() {
+                let Some(info) = line.trim_start().strip_prefix("```") else {
+                    continue;
+                };
+                if !in_fence {
+                    fences += 1;
+                    assert!(
+                        !info.contains(char::is_whitespace),
+                        "{code}: an opening fence kept its tags: {line:?}"
+                    );
+                }
+                in_fence = !in_fence;
+            }
+        }
+        assert!(fences > 100, "the index has fenced examples: {fences}");
+        let doc = super::explain_document("NML2087").expect("NML2087");
+        assert!(
+            doc.contains("```text\n$ nml check --root . shared/x.flow.nml"),
+            "{doc}"
+        );
+    }
+
     use super::*;
 
     // Allocation invariants (uniqueness, band, ordering) are proven at
@@ -1013,25 +1571,184 @@ mod tests {
 
     /// Kind-aware rendering: N mutually exclusive fixes render capped, and a
     /// singular did-you-mean stays byte-identical to the historical form.
+    /// The wrapped finding's remedies ride the wrapper row, each in its
+    /// file — the suggestion's own, else the wrapped finding's, else the
+    /// `source` given, else the row's own — stamped explicitly, so a
+    /// renderer that shows the row on another document still routes the
+    /// edit to the file it lands in; the row's rendering carries the
+    /// did-you-mean hint the finding carried. A codeless finding's
+    /// remedy rides too (the cause rule is the code's, the remedy's is
+    /// the edit's).
+    #[test]
+    fn caused_by_carries_the_wrapped_findings_remedies_in_their_file() {
+        let span = Span::new(4, 10);
+        let inner = Diagnostic::error("unknown property 'versio'")
+            .with_code(codes::UNKNOWN_PROPERTY)
+            .with_span(span)
+            .with_suggestion(Suggestion::did_you_mean("version").at(span));
+        let row = Diagnostic::error("manifest failed to load")
+            .with_code(codes::RESOLUTION_INPUT_UNLOADABLE)
+            .with_source("demo.package.nml")
+            .caused_by(&inner, None);
+        assert_eq!(
+            row.suggestions,
+            vec![
+                Suggestion::did_you_mean("version")
+                    .at(span)
+                    .in_file("demo.package.nml")
+            ],
+            "the row's own file, stamped"
+        );
+        assert_eq!(
+            row.rendered_message(),
+            "manifest failed to load (did you mean \"version\"?)"
+        );
+        let given = Diagnostic::error("row")
+            .with_code(codes::RESOLUTION_INPUT_UNLOADABLE)
+            .caused_by(&inner, Some("given.nml".to_string()));
+        assert_eq!(given.suggestions[0].source.as_deref(), Some("given.nml"));
+        let owned = Diagnostic::error("row")
+            .with_code(codes::RESOLUTION_INPUT_UNLOADABLE)
+            .caused_by(
+                &inner.clone().with_source("own.nml"),
+                Some("given.nml".to_string()),
+            );
+        assert_eq!(
+            owned.suggestions[0].source.as_deref(),
+            Some("own.nml"),
+            "the wrapped finding's file wins over the one given"
+        );
+        let elsewhere = Diagnostic::error("x")
+            .with_code(codes::UNKNOWN_PROPERTY)
+            .with_span(span)
+            .with_suggestion(Suggestion::insert("y = 1").at(span).in_file("other.nml"));
+        let routed = Diagnostic::error("row")
+            .with_code(codes::RESOLUTION_INPUT_UNLOADABLE)
+            .with_source("demo.package.nml")
+            .caused_by(&elsewhere, None);
+        assert_eq!(
+            routed.suggestions[0].source.as_deref(),
+            Some("other.nml"),
+            "a suggestion's own file wins over everything"
+        );
+        let nowhere = Diagnostic::error("row")
+            .with_code(codes::RESOLUTION_INPUT_UNLOADABLE)
+            .caused_by(&inner, None);
+        assert_eq!(
+            nowhere.suggestions[0].source, None,
+            "no file known: unstamped"
+        );
+        // EVERY remedy rides, not the first: a finding offering N
+        // alternatives (one `Fix` each) hands the row all of them, each
+        // stamped with the file it edits.
+        let two = Diagnostic::error("slot is ambiguous")
+            .with_code(codes::UNKNOWN_PROPERTY)
+            .with_span(span)
+            .with_suggestion(Suggestion::fix("slot as a").at(span))
+            .with_suggestion(Suggestion::fix("slot as b").at(span));
+        let row = Diagnostic::error("row")
+            .with_code(codes::RESOLUTION_INPUT_UNLOADABLE)
+            .with_source("demo.package.nml")
+            .caused_by(&two, None);
+        assert_eq!(
+            row.suggestions,
+            vec![
+                Suggestion::fix("slot as a")
+                    .at(span)
+                    .in_file("demo.package.nml"),
+                Suggestion::fix("slot as b")
+                    .at(span)
+                    .in_file("demo.package.nml"),
+            ],
+            "every alternative rides, in order: {row:?}"
+        );
+        let codeless = Diagnostic::error("shape")
+            .with_span(span)
+            .with_suggestion(Suggestion::delete().at(span));
+        let row = Diagnostic::error("row")
+            .with_code(codes::RESOLUTION_INPUT_UNLOADABLE)
+            .with_source("m.nml")
+            .caused_by(&codeless, None);
+        assert!(row.cause.is_none() && row.suggestions.len() == 1, "{row:?}");
+    }
+
+    /// `caused_by` is the one rule of what a cause is: a coded finding
+    /// wrapped under another code rides as the cause (its code, sentence
+    /// and span; the file given, else the row's), a codeless finding
+    /// makes none, a finding reported under its own code makes none, and
+    /// a wrapped wrapper contributes its own cause — the innermost, in
+    /// its own file — never a chain.
+    #[test]
+    fn caused_by_keeps_the_innermost_coded_finding_and_nothing_else() {
+        use super::{Cause, Diagnostic, codes};
+        use crate::span::Span;
+        let inner = Diagnostic::error("dup")
+            .with_code(codes::DUPLICATE_ENTRY)
+            .with_span(Span::new(3, 7));
+        let row = Diagnostic::error("wrap")
+            .with_code(codes::RESOLUTION_INPUT_UNLOADABLE)
+            .with_source("m.nml")
+            .caused_by(&inner, None);
+        assert_eq!(
+            row.cause.as_deref(),
+            Some(&Cause {
+                code: codes::DUPLICATE_ENTRY,
+                message: "dup".to_string(),
+                span: Some(Span::new(3, 7)),
+                source: None,
+            })
+        );
+        assert_eq!(row.cause_source(), Some("m.nml"), "inherits the row's file");
+        let codeless = Diagnostic::error("shape").with_span(Span::new(0, 1));
+        assert!(
+            Diagnostic::error("wrap")
+                .with_code(codes::RESOLUTION_INPUT_UNLOADABLE)
+                .caused_by(&codeless, None)
+                .cause
+                .is_none(),
+            "a codeless finding hides no fact the row does not state"
+        );
+        let own = Diagnostic::error("grant").with_code(codes::LAYER_GRANT_RULE);
+        assert!(
+            Diagnostic::error("wrap")
+                .with_code(codes::LAYER_GRANT_RULE)
+                .caused_by(&own, None)
+                .cause
+                .is_none(),
+            "reported under its own code: nothing is wrapped"
+        );
+        let outer = Diagnostic::error("outer")
+            .with_code(codes::VALIDATOR_UNBUILDABLE)
+            .caused_by(&row, Some("elsewhere.nml".to_string()));
+        let cause = outer.cause.as_deref().expect("the innermost");
+        assert_eq!(cause.code, codes::DUPLICATE_ENTRY, "never a chain");
+        assert_eq!(
+            cause.source.as_deref(),
+            Some("m.nml"),
+            "the innermost's file: its own, else the wrapped finding's, else the one given"
+        );
+    }
+
     #[test]
     fn rendered_message_renders_fix_alternatives_capped() {
         let mut d = Diagnostic::error("ambiguous").with_span(Span::new(0, 4));
         for v in ["a", "b", "c", "d"] {
-            d = d.with_fix(format!("slot as {v}"), Span::new(0, 4));
+            d = d.with_suggestion(Suggestion::fix(format!("slot as {v}")).at(Span::new(0, 4)));
         }
         let out = d.rendered_message();
         assert!(
             out.contains("(fixes: `slot as a`, `slot as b`, `slot as c`, … and 1 more)"),
             "{out}"
         );
-        let single = Diagnostic::error("x").with_fix("slot as a", Span::new(0, 4));
+        let single = Diagnostic::error("x")
+            .with_suggestion(Suggestion::fix("slot as a").at(Span::new(0, 4)));
         assert!(single.rendered_message().contains("(fix: `slot as a`)"));
     }
 
     #[test]
     fn rendered_message_derives_hint_from_suggestion() {
-        let diag =
-            Diagnostic::error("invalid value \"wran\"").with_suggestion("warn", Span::new(1, 5));
+        let diag = Diagnostic::error("invalid value \"wran\"")
+            .with_suggestion(Suggestion::did_you_mean("warn").at(Span::new(1, 5)));
         assert_eq!(
             diag.rendered_message(),
             "invalid value \"wran\" (did you mean \"warn\"?)"
@@ -1042,13 +1759,67 @@ mod tests {
         );
     }
 
+    /// One door, every kind: the four named entries are `of`'s spellings and
+    /// build the exact struct — the kind, the payload, the anchor, no file;
+    /// `in_file` names the file; a deletion carries no text whatever the
+    /// caller (or a wire) handed it.
+    #[test]
+    fn every_kind_builds_through_one_door_to_the_exact_struct() {
+        let span = Span::new(3, 9);
+        let cases = [
+            (
+                Suggestion::did_you_mean("warn"),
+                SuggestionKind::DidYouMean,
+                "warn",
+            ),
+            (
+                Suggestion::fix("slot as a"),
+                SuggestionKind::Fix,
+                "slot as a",
+            ),
+            (Suggestion::delete(), SuggestionKind::Delete, ""),
+            (
+                Suggestion::insert("layers:\n    allowRefs:"),
+                SuggestionKind::Insert,
+                "layers:\n    allowRefs:",
+            ),
+        ];
+        for (built, kind, replacement) in cases {
+            let want = Suggestion {
+                replacement: replacement.to_string(),
+                span,
+                kind,
+                source: None,
+            };
+            assert_eq!(built.clone().at(span), want, "{kind:?}");
+            assert_eq!(
+                Suggestion::of(kind, replacement).at(span),
+                want,
+                "{kind:?} via `of`"
+            );
+            assert_eq!(
+                built.at(span).in_file("m.nml"),
+                Suggestion {
+                    source: Some("m.nml".to_string()),
+                    ..want
+                },
+                "{kind:?} in a file"
+            );
+        }
+        assert_eq!(
+            Suggestion::of(SuggestionKind::Delete, "not a payload").at(span),
+            Suggestion::delete().at(span),
+            "a deletion carries no text whatever it was handed"
+        );
+    }
+
     #[test]
     fn a_deletion_renders_nothing_and_stays_structural() {
         // `Delete` is structural (NML2060's "delete this assignment"):
         // the producer's prose states the action, so the renderer adds no
         // hint — and the suggestion survives for the resolver.
         let diag = Diagnostic::error("'x' is sealed — delete this assignment")
-            .with_deletion(Span::new(1, 5));
+            .with_suggestion(Suggestion::delete().at(Span::new(1, 5)));
         assert_eq!(
             diag.rendered_message(),
             "'x' is sealed — delete this assignment"
@@ -1057,8 +1828,49 @@ mod tests {
         assert_eq!(diag.suggestions[0].kind, SuggestionKind::Delete);
         // Defense in depth: an empty DID-YOU-MEAN (no producer emits one)
         // still renders no `(did you mean ""?)` nonsense.
-        let legacy = Diagnostic::error("x").with_suggestion("", Span::new(1, 5));
+        let legacy = Diagnostic::error("x")
+            .with_suggestion(Suggestion::did_you_mean("").at(Span::new(1, 5)));
         assert_eq!(legacy.rendered_message(), "x");
+    }
+
+    /// An insertion is structural like a deletion: the message renders
+    /// no hint (its block is a front end's own surface), and the edit
+    /// knows its file by the inheritance a note has — its own `source`,
+    /// else the diagnostic's.
+    #[test]
+    fn an_insertion_renders_nothing_and_knows_its_file() {
+        let own = Diagnostic::error("denied")
+            .with_source("a.nml")
+            .with_suggestion(Suggestion::insert("y = 1").at(Span::new(1, 5)));
+        assert_eq!(own.rendered_message(), "denied");
+        let [s] = own.suggestions.as_slice() else {
+            panic!("{:?}", own.suggestions);
+        };
+        assert_eq!(s.kind, SuggestionKind::Insert);
+        assert_eq!(s.replacement, "y = 1");
+        assert_eq!(own.suggestion_source(s), Some("a.nml"));
+        let foreign = Diagnostic::error("denied")
+            .with_source("a.nml")
+            .with_suggestion(
+                Suggestion::insert("y = 1")
+                    .at(Span::new(1, 5))
+                    .in_file("m.nml".to_string()),
+            );
+        assert_eq!(
+            foreign.suggestion_source(&foreign.suggestions[0]),
+            Some("m.nml")
+        );
+        assert_eq!(
+            Diagnostic::error("x")
+                .with_suggestion(Suggestion::insert("y = 1").at(Span::new(1, 5)))
+                .suggestion_source(&Suggestion {
+                    replacement: String::new(),
+                    span: Span::new(0, 0),
+                    kind: SuggestionKind::Insert,
+                    source: None,
+                }),
+            None
+        );
     }
 
     /// A deletion among ALTERNATIVES renders `remove` in the plural
@@ -1068,8 +1880,8 @@ mod tests {
     #[test]
     fn a_deletion_alternative_renders_remove_in_the_plural_arm() {
         let d = Diagnostic::error("x")
-            .with_fix("", Span::new(0, 1))
-            .with_fix("\\u{202E}", Span::new(0, 1));
+            .with_suggestion(Suggestion::fix("").at(Span::new(0, 1)))
+            .with_suggestion(Suggestion::fix("\\u{202E}").at(Span::new(0, 1)));
         assert_eq!(d.rendered_message(), "x (fixes: remove, `\\u{202E}`)");
     }
 
@@ -1079,6 +1891,7 @@ mod tests {
             SuggestionKind::DidYouMean,
             SuggestionKind::Fix,
             SuggestionKind::Delete,
+            SuggestionKind::Insert,
         ] {
             assert_eq!(SuggestionKind::from_wire_name(kind.wire_name()), Some(kind));
         }
@@ -1121,6 +1934,39 @@ mod tests {
             let s = explain_summary(&code.to_string())
                 .unwrap_or_else(|| panic!("{code} has no summary"));
             assert!(!s.is_empty());
+        }
+    }
+
+    /// The headline is the bold lead, cut clean; a summary with none
+    /// headlines with itself. Every code's section opens with a bold
+    /// lead that fits a terminal line — the shape `--list` and the
+    /// palette rely on, held here.
+    #[test]
+    fn explain_headline_is_the_bold_lead_of_every_code() {
+        assert_eq!(
+            headline_of("**Missing required field.** A required field is absent."),
+            "Missing required field."
+        );
+        assert_eq!(headline_of("no bold lead here"), "no bold lead here");
+        assert!(explain_headline("NML9999").is_none());
+        for (_, code) in codes::ALL {
+            let code = code.to_string();
+            let headline =
+                explain_headline(&code).unwrap_or_else(|| panic!("{code} has no headline"));
+            let summary = explain_summary(&code).unwrap_or_default();
+            assert!(
+                summary.starts_with("**") && headline != summary,
+                "{code}: the section must open with a bold lead: {summary}"
+            );
+            // `nml explain --list` prints `NML0000  <headline>`: the code,
+            // two spaces and the headline share the 80-column line every
+            // page wraps at, so the bound is on the printed LINE.
+            let line = format!("{code}  {headline}");
+            assert!(
+                !headline.is_empty() && !headline.contains("**") && line.chars().count() <= 80,
+                "{code}: `{line}` is {} columns",
+                line.chars().count()
+            );
         }
     }
 

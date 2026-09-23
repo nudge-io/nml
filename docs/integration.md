@@ -340,7 +340,8 @@ value.as_array();  // Option<&[SpannedValue]> -- Array
 
 ## Schema Validation
 
-Define models in `.model.nml` files and validate instances against them:
+Define models in `.model.nml` (or `.schema.nml`) files and validate
+instances against them:
 
 ```nml check
 // schemas/service.model.nml
@@ -375,24 +376,26 @@ nml check --schema schemas/ config.nml
 
 ## Project Configuration
 
-Create an `nml-project.nml` at your workspace root to configure the NML tooling:
+An `nml-project.nml` at or above a file configures the tooling for the
+files below it:
 
 ```nml check
 project MyProject:
-    schema:
-        - "schemas/service.model.nml"
-        - "schemas/database.model.nml"
+    schemaPackages:
+        - acme
     templateNamespaces = ["env", "config", "args"]
     modifiers = ["allow", "deny", "readonly"]
     keywords = ["service", "database", "cache"]
 ```
 
-This file is automatically detected by the NML language server and affects:
-
-- **Schema validation**: Which `.model.nml` files to load
-- **Template namespaces**: Which `{{namespace.key}}` prefixes are valid
-- **Modifier names**: Which `|modifier = value` names are accepted
-- **Keyword completions**: Which block keywords are suggested in the editor
+`schemaPackages`, `autoAssociate` and `provider` choose the schema
+package a file validates under — the CLI and the editor read them, and
+the nearest LIVE config wins; `templateNamespaces`, `modifiers`,
+`keywords`, `memberKeywords`, `builtinRefs` and `userRefPrefix` tune the
+language server's checks and completions. The fields are documented in
+the [language guide](language-guide.md#project-configuration); pins,
+auto-association and liveness in the
+[schema packages guide](guides/schema-packages-and-store.md).
 
 ## Custom Keywords
 
@@ -417,7 +420,7 @@ suggests keywords found in your workspace files.
 
 ## Editor Support
 
-Install the NML VSCode extension for syntax highlighting, diagnostics,
+Install the NML editor extension for syntax highlighting, diagnostics,
 completions, and hover information:
 
 ```bash

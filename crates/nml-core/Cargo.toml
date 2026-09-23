@@ -20,3 +20,6 @@ rowan = { workspace = true }
 [dev-dependencies]
 # Used by the CST→AST lowering's full-AST differential test (span-stripped compare).
 serde_json = { workspace = true }
+# The composition golden's hash (`layers/tests/golden.rs`) — the tree's one
+# content-hash algorithm (nml-validate's package identity uses the same).
+blake3 = "1"

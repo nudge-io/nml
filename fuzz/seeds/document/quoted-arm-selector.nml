@@ -1,0 +1,5 @@
+router r:
+    routes:
+        "GET" -> handler
+        """multi""" -> other
+        else -> fallback

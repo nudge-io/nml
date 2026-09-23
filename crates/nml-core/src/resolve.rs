@@ -38,6 +38,8 @@ type SymbolLookup = Box<dyn Fn(&str) -> Option<Value> + Send + Sync>;
 /// Bounds reference-chain recursion. Const cycles are normally rejected up front
 /// by `SymbolTable::find_const_cycles`; this is defense-in-depth so the resolver
 /// is total even if handed a cyclic lookup directly.
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="64" — reference-resolution depth
 const MAX_RESOLVE_DEPTH: u32 = 64;
 
 pub struct ValueResolver {
@@ -260,24 +262,23 @@ impl ValueResolver {
     }
 
     fn resolve_spanned(&self, sv: &SpannedValue) -> Result<SpannedValue, ResolveError> {
-        Ok(SpannedValue {
-            value: self.resolve(&sv.value)?,
-            span: sv.span,
-        })
+        // The window travels with the value: resolution replaces the text,
+        // never the bytes a content replacement would substitute.
+        Ok(SpannedValue::literal(
+            self.resolve(&sv.value)?,
+            sv.span,
+            sv.spans().content,
+        ))
     }
 
     fn resolve_arm(&self, arm: &Arm) -> Result<Arm, ResolveError> {
-        Ok(Arm {
-            selector: arm.selector.clone(),
-            selector_span: arm.selector_span,
-            target: match &arm.target {
-                ArmTarget::Reference(_) | ArmTarget::Literal { .. } => arm.target.clone(),
-                ArmTarget::Inline { name, body } => ArmTarget::Inline {
-                    name: name.clone(),
-                    body: self.resolve_body(body)?,
-                },
+        Ok(arm.with_target(match &arm.target {
+            ArmTarget::Reference(_) | ArmTarget::Literal(_) => arm.target.clone(),
+            ArmTarget::Inline { name, body } => ArmTarget::Inline {
+                name: name.clone(),
+                body: self.resolve_body(body)?,
             },
-        })
+        }))
     }
 
     fn resolve_list_item(&self, item: &ListItem) -> Result<ListItem, ResolveError> {
@@ -374,14 +375,10 @@ pub fn apply_shared_properties(body: &Body) -> Body {
             }),
             BodyEntryKind::Arm(arm) => {
                 let resolved = match &arm.target {
-                    ArmTarget::Inline { name, body } => Arm {
-                        selector: arm.selector.clone(),
-                        selector_span: arm.selector_span,
-                        target: ArmTarget::Inline {
-                            name: name.clone(),
-                            body: apply_shared_properties(body),
-                        },
-                    },
+                    ArmTarget::Inline { name, body } => arm.with_target(ArmTarget::Inline {
+                        name: name.clone(),
+                        body: apply_shared_properties(body),
+                    }),
                     _ => arm.clone(),
                 };
                 Some(BodyEntry {
@@ -833,6 +830,42 @@ mod tests {
         });
         assert!(matches!(
             r.resolve(&Value::Reference("a".into())),
+            Err(ResolveError::ReferenceCycle)
+        ));
+    }
+
+    /// A reference chain longer than
+    /// [`MAX_RESOLVE_DEPTH`] is refused exactly as a cycle is; a shorter
+    /// one resolves to its literal.
+    #[test]
+    fn reference_chains_are_bounded_by_the_resolve_depth() {
+        let build = |links: u32| {
+            ValueResolver::new(|_| None).with_symbols(move |name: &str| {
+                let i: u32 = name.strip_prefix('r')?.parse().ok()?;
+                Some(if i < links {
+                    Value::Reference(format!("r{}", i + 1))
+                } else {
+                    Value::String("end".into())
+                })
+            })
+        };
+        assert!(matches!(
+            build(MAX_RESOLVE_DEPTH / 2).resolve(&Value::Reference("r0".into())),
+            Ok(Value::String(s)) if s == "end"
+        ));
+        assert!(matches!(
+            build(MAX_RESOLVE_DEPTH + 2).resolve(&Value::Reference("r0".into())),
+            Err(ResolveError::ReferenceCycle)
+        ));
+        // AT the bound, not merely somewhere past it. A chain of `links`
+        // hops lands its literal at depth `links + 1`, so the longest that
+        // resolves has `MAX_RESOLVE_DEPTH - 2` hops and one more is refused.
+        assert!(matches!(
+            build(MAX_RESOLVE_DEPTH - 2).resolve(&Value::Reference("r0".into())),
+            Ok(Value::String(s)) if s == "end"
+        ));
+        assert!(matches!(
+            build(MAX_RESOLVE_DEPTH - 1).resolve(&Value::Reference("r0".into())),
             Err(ResolveError::ReferenceCycle)
         ));
     }

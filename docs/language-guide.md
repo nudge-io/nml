@@ -14,6 +14,13 @@ Comments use `//`:
 service MyService:  // inline comment
 ```
 
+`nml fmt` writes the canonical style and has no options; the style is
+specified in [`spec/style.md`](../spec/style.md). It regenerates layout
+(indentation, the spacing between tokens) and preserves the choices the
+grammar leaves to you — a blank line, an aligned `->` column, whether a
+value sits on its `=`'s line or the next one — so formatting a file never
+rewrites a decision you made. `nml fmt --check` is the CI gate.
+
 ## Declarations
 
 Every `.nml` file contains one or more **declarations**. A declaration has a
@@ -24,8 +31,9 @@ keyword Name:
     body...
 ```
 
-Keywords are either built-in (`model`, `trait`, `enum`, `oneof`, `role`) or
-user-defined via models (e.g. `service`, `resource`).
+Declaration keywords are either built-in (`model`, `trait`, `enum`, `oneof`,
+`const`, `template`) or user-defined via models (e.g. `service`, `resource`).
+(`role` is a *type*, not a declaration keyword — see Types below.)
 
 ### Array Declarations
 
@@ -87,6 +95,15 @@ rootProfile:
     domain = "dev.nudge.io:8000"
     protocol = "https"
 ```
+
+A body declares each name once. A second `key = …` or `key:` — in either
+spelling, a block `files:` beside `files = […]` included — is an error
+(NML2093) at the later entry, with a note at the first; which of the two
+is meant is unknowable, so no fix is offered. A file declares each
+top-level name once the same way (NML1000). Both are parse errors: the
+text is refused wherever it is parsed — `nml fmt` writes nothing, and an
+embedder's `nml_core::parse` returns the error. List items are
+positional and may repeat.
 
 ## Lists
 
@@ -311,7 +328,7 @@ defined elsewhere in the file.
 A single `&` between role references forms one conjunction expression
 (valid in scalar values, inline array elements, and block-list items); see
 [Requiring Several Roles at Once](#requiring-several-roles-at-once-) for
-usage and semantics. RFC 0011 specifies the grammar.
+usage, semantics and the spelling rules. RFC 0014 specifies the grammar.
 
 ## Modeling
 
@@ -615,9 +632,12 @@ service AdminReports:
 
 Each list entry is an independent grant (any entry may match); `&`
 composes conditions *within* an entry — the list is the OR, `&` is the
-AND. Consumers assign the set-intersection semantics. The syntax details
-— canonical `" & "` form, spacing, and the `&&`/dangling-`&` errors —
-live in "Role conjunctions" under Reference Types above.
+AND. Consumers assign the set-intersection semantics. The spelling is
+canonical `" & "` — one space each side, which `nml fmt` writes for you
+from any spacing (`@role/a&@role/b` formats to `@role/a & @role/b`).
+`&&` is refused with a machine-applicable fix (NML0001, "'&' is the
+conjunction operator; '&&' is not needed") and a `&` with nothing after it
+is a parse error (NML0002, "expected a selector after '&'").
 
 ### Inheritance
 
@@ -634,7 +654,8 @@ service NudgeService:
 
     resources:
         - AdminPanel:
-            |allow = [@role/admin]    // narrows: this resource is admins-only```
+            |allow = [@role/admin]    // narrows: this resource is admins-only
+```
 
 ## Reference Assignment
 
@@ -666,27 +687,45 @@ contain `{{...}}` expressions just like any other string.
 
 ## Project Configuration
 
-Create an `nml-project.nml` at your workspace root to configure NML tooling:
+An `nml-project.nml` configures the tooling for the files at or below its
+directory. Three fields decide which schema package a file validates
+under — read by the CLI and the editor alike; the rest tune the language
+server's checks and completions and are read by the editor only:
 
-```
+```nml check
 project MyProject:
-    schema:
-        - "schemas/service.model.nml"
-        - "schemas/database.model.nml"
+    schemaPackages:
+        - acme
+    autoAssociate = false
     templateNamespaces = ["env", "config", "args"]
     modifiers = ["allow", "deny", "readonly"]
     keywords = ["service", "database", "cache"]
 ```
 
-This file is automatically detected by the NML language server and affects
-schema validation, template namespace checking, modifier validation, and
-keyword completions.
+| field | read by | effect |
+|---|---|---|
+| `schemaPackages` | CLI and editor | package NAMES to bind first, in order; a pin is authoritative over auto-association |
+| `autoAssociate` | CLI and editor | `false` opts the files under this config out of auto-association (default `true`) |
+| `provider: tool = "<name>"` | CLI and editor | the schema-provider tool; its name doubles as an implicit `schemaPackages` pin |
+| `templateNamespaces` | editor | the `{{namespace.…}}` prefixes accepted in every document under the config |
+| `modifiers`, `memberKeywords`, `builtinRefs`, `userRefPrefix` | editor | the modifier vocabulary and membership-cycle rules for files no package claims (a package-bound file takes them from its package manifest) |
+| `keywords` | editor | extra block keywords offered by completion |
+
+The config that governs a document is the nearest LIVE one at or above
+its directory — never merged across levels, and never one that sits
+inside content a shallower manifest's binding claims (such a config is
+content, not configuration: NML2080, its pins and `autoAssociate`
+ignored). Pins, auto-association, liveness and `nml binding <file>` are
+described in the
+[schema packages guide](guides/schema-packages-and-store.md); the
+editor's pin and opt-out actions write into that nearest live config
+([editors](reference/editors.md)).
 
 ## File Conventions
 
 | Pattern | Purpose |
 |---------|---------|
-| `*.model.nml` | Model, trait, and enum definitions |
+| `*.model.nml`, `*.schema.nml` | Model, trait, and enum definitions — a schema source, in either spelling |
 | `*.workflow.nml` | Workflow definitions |
 | `*.service.nml` | Service instance declarations |
 | `*.nml` | General configuration |

@@ -38,9 +38,13 @@ jobs:
           toolchain: ${{ matrix.channel }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      # The gate runner — see rust-ci.yml's note. Every gate command lives
+      # in the justfile and nowhere else.
+      - run: cargo install just --version 1.46.0 --locked
+      # THE SAME gate recipes the pinned lanes run, on a floating toolchain:
+      # the canary's value is that it is not a different list of checks.
+      - run: just gate-lint
+      - run: just gate-test
       - name: File or update the tracking issue
         if: failure()
         env:
@@ -48,6 +52,8 @@ jobs:
           CHANNEL: ${{ matrix.channel }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # gate-contract: not-a-gate — files/updates a tracking issue; it
+          # checks nothing and must never block a build.
           title="toolchain canary: ${CHANNEL} is failing"
           body="The weekly toolchain canary failed on \`${CHANNEL}\`: ${RUN_URL}
 

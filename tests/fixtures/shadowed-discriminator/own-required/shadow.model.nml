@@ -1,0 +1,10 @@
+model logEntry:
+    // the entry's kind
+    kind string
+    msg string?
+
+oneof record by kind:
+    "log" -> logEntry
+
+model host:
+    rec record

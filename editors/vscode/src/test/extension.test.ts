@@ -1,6 +1,12 @@
 import * as assert from "node:assert";
 import * as vscode from "vscode";
-import { waitForDiagnostics } from "./util";
+import {
+  assertConfiguredBackend,
+  configuredBackend,
+  diagnosticCode,
+  suiteTimeoutMs,
+  waitForDiagnostics,
+} from "./util";
 
 // End-to-end tests against the real editor + the bundled WASM neutral server
 // (RFC 0035). The headline is the CROSS-FILE FOCUS-HEAL: the whole point of the
@@ -31,20 +37,45 @@ async function setModel(text: string): Promise<void> {
   assert.ok(await vscode.workspace.applyEdit(edit), "schema edit must apply");
 }
 
-suite("nml pull diagnostics (E2E, WASM neutral server)", () => {
+suite(`nml pull diagnostics (E2E, ${configuredBackend()} neutral server)`, function () {
+  // The cross-file heal below holds TWO diagnostics waits; the launch config's
+  // 60 000 ms bounds the whole test, so the second could never reach its own
+  // deadline and say what it was waiting for.
+  this.timeout(suiteTimeoutMs(2));
+
   // Keep the suite order-independent and re-runnable: restore the committed
   // schema after the mutating test (buffer only — disk is never written).
   suiteTeardown(async () => {
     await setModel(MODEL_NUMBER);
   });
 
+  test("the backend under test is the one this launch configured", async () => {
+    // First, and on purpose: every assertion after this one would pass on
+    // EITHER backend, so this is what stops the native lane from being a
+    // second wasm run wearing a different label.
+    const label = await assertConfiguredBackend();
+    assert.ok(label.length > 0, "the extension must name the server it started");
+  });
+
   test("pulls a type-mismatch diagnostic for an instance file", async () => {
     const app = vscode.Uri.joinPath(workspaceUri(), "app.nml");
     await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(app));
     const diags = await waitForDiagnostics(app, (d) => d.length > 0);
-    assert.ok(
-      diags.length > 0,
-      `expected a diagnostic on app.nml (string for number), got: ${JSON.stringify(diags)}`
+    // The CODE, not merely "something arrived". `d.length > 0` is satisfied
+    // by ANY diagnostic this server can produce — a parse error, a schema it
+    // could not read, a universe that came back open — and every one of
+    // those would mean the cross-file type check this test is named for
+    // never ran. NML2008 is what `port = "x"` is against `port number`,
+    // MEASURED against this fixture on both backends.
+    assert.deepStrictEqual(
+      diags.map(diagnosticCode),
+      ["NML2008"],
+      `expected exactly the type mismatch on app.nml, got: ${JSON.stringify(diags)}`
+    );
+    assert.deepStrictEqual(
+      diags.map((d) => d.source),
+      ["nml"],
+      "a diagnostic from somewhere other than the NML server"
     );
   });
 
@@ -75,11 +106,19 @@ suite("nml pull diagnostics (E2E, WASM neutral server)", () => {
 });
 
 // RFC 0010 tier 2, end-to-end in the real editor: the `nml-explain:` content
-// provider fetches the full entry from the running WASM server, and a real
+// provider fetches the full entry from the running server, and a real
 // diagnostic surfaces the negotiated "Explain …" code action wired to
 // `nml.explain`. (The suite above restores the committed schema in its
 // teardown, so `app.nml`'s type mismatch is live again here.)
-suite("nml explanations (E2E, WASM neutral server)", () => {
+//
+// Both tests take the code from the LIVE diagnostic rather than naming one.
+// A hardcoded code made this a round trip to the server and back with the
+// diagnostic left out of it: the fixture produces NML2008 and the test asked
+// for NML0013, so a server that answered the wrong entry — or a code action
+// that carried a code no one could explain — read exactly the same here.
+suite(`nml explanations (E2E, ${configuredBackend()} neutral server)`, function () {
+  this.timeout(suiteTimeoutMs(1));
+
   /** Open app.nml and wait for its diagnostic — activates the extension and
    *  guarantees a coded diagnostic to hang assertions on. */
   async function openAppWithDiagnostic(): Promise<{
@@ -94,19 +133,24 @@ suite("nml explanations (E2E, WASM neutral server)", () => {
     return { app, diags };
   }
 
-  test("the nml-explain provider serves the full entry from the running server", async () => {
-    await openAppWithDiagnostic();
+  test("the nml-explain provider serves the full entry for the diagnostic on screen", async () => {
+    const { diags } = await openAppWithDiagnostic();
+    const code = diagnosticCode(diags[0]);
     const doc = await vscode.workspace.openTextDocument(
-      vscode.Uri.parse("nml-explain:NML0013.md")
+      vscode.Uri.parse(`nml-explain:${code}.md`)
     );
     const text = doc.getText();
     assert.ok(
-      text.startsWith("# NML0013"),
-      `canonical heading expected, got: ${text.slice(0, 120)}`
+      text.startsWith(`# ${code}\n`),
+      `the entry for the code on screen was expected, got: ${text.slice(0, 120)}`
     );
-    assert.ok(
-      text.includes("Invalid number"),
-      `full entry body expected, got: ${text.slice(0, 200)}`
+    // The FULL entry, not the one-line headline the explain INDEX carries
+    // for the same code — which is the other thing this provider could
+    // plausibly have served.
+    assert.match(
+      text,
+      /\*\*Fix:\*\*/,
+      `the full entry body was expected, got: ${text.slice(0, 300)}`
     );
   });
 
@@ -117,16 +161,17 @@ suite("nml explanations (E2E, WASM neutral server)", () => {
       app,
       diags[0].range
     );
+    const expected = diagnosticCode(diags[0]);
     const explain = (actions ?? []).find((a) => a.title.startsWith("Explain NML"));
     assert.ok(
       explain,
       `Explain action expected, got: ${JSON.stringify((actions ?? []).map((a) => a.title))}`
     );
+    assert.strictEqual(explain!.title, `Explain ${expected}`);
     assert.strictEqual(explain!.command?.command, "nml.explain");
-    const code = explain!.command?.arguments?.[0];
-    assert.ok(
-      typeof code === "string" && /^NML\d{4}$/.test(code),
-      `canonical code argument expected, got: ${JSON.stringify(code)}`
-    );
+    // The DIAGNOSTIC's code, not merely a well-shaped one: `/^NML\d{4}$/`
+    // is satisfied by any code the server cares to send, including one that
+    // explains something else entirely.
+    assert.strictEqual(explain!.command?.arguments?.[0], expected);
   });
 });

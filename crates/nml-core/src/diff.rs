@@ -272,6 +272,8 @@ impl FieldChange {
 
 /// Bounds recursion (mirrors the validator/defaulter guards — this walks
 /// schema-validated input, but stays hardened anyway).
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="64" — nesting depth the structural diff will descend
 const MAX_DEPTH: u32 = 64;
 
 /// Diff two multi-file documents for the instance of `root_model`.
@@ -388,6 +390,7 @@ pub fn synthesize_config_root(root_name: &str, fields: &[ConfigRootField]) -> Mo
                 directives: Vec::new(),
                 doc: None,
                 span: nospan,
+                type_span: nospan,
             }
         })
         .collect();
@@ -430,9 +433,11 @@ pub fn wrap_file_as_body(file: &File) -> Body {
                     let refs = b
                         .uses
                         .iter()
-                        .map(|r| crate::types::SpannedValue {
-                            value: crate::types::Value::Reference(r.name.clone()),
-                            span: r.span,
+                        .map(|r| {
+                            crate::types::SpannedValue::new(
+                                crate::types::Value::Reference(r.name.clone()),
+                                r.span,
+                            )
                         })
                         .collect();
                     body.entries.insert(
@@ -444,10 +449,10 @@ pub fn wrap_file_as_body(file: &File) -> Body {
                                     name: USES_DIFF_KEY.to_string(),
                                     span: decl.span,
                                 },
-                                value: crate::types::SpannedValue {
-                                    value: crate::types::Value::Array(refs),
-                                    span: decl.span,
-                                },
+                                value: crate::types::SpannedValue::new(
+                                    crate::types::Value::Array(refs),
+                                    decl.span,
+                                ),
                             }),
                         },
                     );
@@ -760,6 +765,7 @@ fn diff_unmodeled_remainder(
             directives: Vec::new(),
             doc: None,
             span: Span { start: 0, end: 0 },
+            type_span: Span { start: 0, end: 0 },
         };
         let items_field = model
             .fields
@@ -1823,7 +1829,7 @@ fn arm_target_str(a: &crate::ast::Arm) -> String {
     use crate::ast::ArmTarget;
     match &a.target {
         ArmTarget::Reference(id) => id.name.clone(),
-        ArmTarget::Literal { value, .. } => format!("{value:?}"),
+        ArmTarget::Literal(t) => format!("{:?}", t.value),
         ArmTarget::Inline { name, .. } => format!("{}:", name.name),
     }
 }
@@ -1832,7 +1838,7 @@ fn arm_target_eq(a: &crate::ast::ArmTarget, b: &crate::ast::ArmTarget, depth: u3
     use crate::ast::ArmTarget;
     match (a, b) {
         (ArmTarget::Reference(x), ArmTarget::Reference(y)) => x.name == y.name,
-        (ArmTarget::Literal { value: av, .. }, ArmTarget::Literal { value: bv, .. }) => av == bv,
+        (ArmTarget::Literal(a), ArmTarget::Literal(b)) => a.value == b.value,
         (ArmTarget::Inline { name: an, body: ab }, ArmTarget::Inline { name: bn, body: bb }) => {
             an.name == bn.name && body_eq_bounded(ab, bb, depth + 1)
         }
@@ -2174,7 +2180,7 @@ fn arm_target_diff_value(arm: &crate::ast::Arm) -> Value {
     use crate::ast::ArmTarget;
     match &arm.target {
         ArmTarget::Reference(id) => Value::String(id.name.clone()),
-        ArmTarget::Literal { value, .. } => Value::String(value.clone()),
+        ArmTarget::Literal(t) => Value::String(t.value.clone()),
         ArmTarget::Inline { name, .. } => Value::String(format!("{}:", name.name)),
     }
 }
@@ -2895,10 +2901,7 @@ mod tests {
                         name: "v".into(),
                         span: nospan,
                     },
-                    value: SpannedValue {
-                        value: Value::Number(leaf.into()),
-                        span: nospan,
-                    },
+                    value: SpannedValue::new(Value::Number(leaf.into()), nospan),
                 }),
             }]);
             for _ in 0..levels {

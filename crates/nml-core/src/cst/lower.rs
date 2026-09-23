@@ -15,17 +15,11 @@ use crate::error::NmlError;
 use crate::span::Span;
 use crate::types::{SpannedValue, Value};
 
-/// Lower a parsed CST to the semantic AST (resilient: decode errors are swallowed
-/// into placeholder values). Use [`to_ast_with_errors`] to also collect them.
-pub fn to_ast(root: &ast::Root) -> File {
-    to_ast_with_errors(root).0
-}
-
 /// Lower to the semantic AST **and** collect every value-decode (semantic) error
 /// in a single pass. The CST defers value validation to decode, so this is where
 /// those diagnostics surface — once, as the AST is built (no second decode pass).
 /// Powers [`parse_to_ast`](crate::cst::parse_to_ast).
-pub fn to_ast_with_errors(root: &ast::Root) -> (File, Vec<NmlError>, usize) {
+pub(crate) fn to_ast_with_errors(root: &ast::Root) -> (File, Vec<NmlError>, usize) {
     let mut cx = Lower {
         errors: Vec::new(),
         suppressed: 0,
@@ -97,9 +91,25 @@ impl Lower {
                     ast::Entry::SharedProperty(s) => shared_properties.push(self.shared(&s)),
                     ast::Entry::Property(p) => properties.push(self.property(&p)),
                     ast::Entry::ListItem(l) => items.push(self.list_item(&l)),
-                    // Nested blocks / field defs / arms aren't valid in an array
-                    // body (arms belong to a plain `name:` block, e.g. `denial:`).
-                    ast::Entry::NestedBlock(_) | ast::Entry::FieldDef(_) | ast::Entry::Arm(_) => {}
+                    // An array body holds items, properties, modifiers and
+                    // shared properties; a nested block, a field definition or
+                    // a routing arm (arms belong to a plain `name:` block) has
+                    // no place in the lowered value and would vanish — an
+                    // error, never a silent drop: the formatter rewrites from
+                    // the lowered tree, so a dropped entry was content loss (a
+                    // `key:` block pasted at the item column, then `fmt`).
+                    other @ (ast::Entry::NestedBlock(_)
+                    | ast::Entry::FieldDef(_)
+                    | ast::Entry::Arm(_)) => self.misplaced_entry(
+                        &other,
+                        &[
+                            "a list item",
+                            "a property",
+                            "a modifier",
+                            "a shared property",
+                        ],
+                        "in an array body",
+                    ),
                 }
             }
         }
@@ -122,7 +132,12 @@ impl Lower {
             discriminator_type: o.enum_type().map(ident),
             default_discriminator: o.default_value().map(|t| {
                 let s = self.string_token(&t);
-                SpannedValue::new(Value::String(s), token_span(&t))
+                let span = token_span(&t);
+                SpannedValue::literal(
+                    Value::String(s),
+                    span,
+                    crate::cst::string_content_window(t.text(), span.start),
+                )
             }),
             arms: o
                 .arms()
@@ -185,10 +200,11 @@ impl Lower {
                     // recovery attached a body child under the Arm node for the
                     // `-> "name":` mistake (RFC 0007 §6.2).
                     Some(t) if t.kind() == crate::cst::syntax::SyntaxKind::String => {
-                        ArmTarget::Literal {
-                            value: self.string_token(&t),
-                            span: token_span(&t),
-                        }
+                        ArmTarget::Literal(LiteralTarget::from_token(
+                            self.string_token(&t),
+                            token_span(&t),
+                            crate::cst::string_content_window(t.text(), token_span(&t).start),
+                        ))
                     }
                     Some(_) => {
                         if let Some(body) = a.inline_body() {
@@ -208,11 +224,20 @@ impl Lower {
                     }
                     other => ArmTarget::Reference(ident_of(other)),
                 };
-                BodyEntryKind::Arm(Arm {
+                let selector_span = selector_tok.as_ref().map(token_span).unwrap_or(EMPTY_SPAN);
+                // A quoted selector key is a literal like any other: the
+                // window comes from its token, never from its span.
+                let selector_content = selector_tok
+                    .as_ref()
+                    .filter(|t| t.kind() == crate::cst::syntax::SyntaxKind::String)
+                    .map(|t| crate::cst::string_content_window(t.text(), selector_span.start))
+                    .unwrap_or(selector_span);
+                BodyEntryKind::Arm(Arm::from_token(
                     selector,
-                    selector_span: selector_tok.map(|t| token_span(&t)).unwrap_or(EMPTY_SPAN),
+                    selector_span,
+                    selector_content,
                     target,
-                })
+                ))
             }
         };
         BodyEntry { kind, span }
@@ -237,24 +262,7 @@ impl Lower {
             for e in body.entries() {
                 match e {
                     ast::Entry::ListItem(l) => items.push(self.list_item(&l)),
-                    other => {
-                        // Name the offending entry by its kind ("found a
-                        // shared property") and anchor on its content:
-                        // `found: None` renders as "end of file" (false
-                        // mid-file) and the node span starts at the indent.
-                        let node = other.syntax();
-                        self.push_error(NmlError::syntax(
-                            crate::error::ParseErrorKind::Expected {
-                                expected: vec![crate::error::ExpectedItem::Desc("a list item")],
-                                found: Some(crate::error::FoundToken {
-                                    kind: node.kind(),
-                                    text: String::new(),
-                                }),
-                                context: Some("in a modifier block"),
-                            },
-                            content_span(node),
-                        ));
-                    }
+                    other => self.misplaced_entry(&other, &["a list item"], "in a modifier block"),
                 }
             }
             ModifierValue::Block(items)
@@ -267,7 +275,7 @@ impl Lower {
                     .map(|d| crate::types::Directive {
                         name: d.name().map(|t| t.text().to_string()).unwrap_or_default(),
                         arg: d.value().map(|v| self.decode(&v)),
-                        span: super::syntax::node_span(d.syntax()),
+                        span: content_span(d.syntax()),
                     })
                     .collect(),
             }
@@ -292,6 +300,38 @@ impl Lower {
             name: ident_of(s.name()),
             kind,
         }
+    }
+
+    /// An entry the grammar admits in a body but this body's lowered
+    /// shape has no place for (a `.shared` line in a modifier block; a
+    /// `key:` block at an array body's item column): NML0002 naming the
+    /// entry's own kind ("found a nested block") and anchored on its
+    /// content — `found: None` would render "end of file" mid-file, and
+    /// the node span starts at the indent. Never a silent drop: the
+    /// formatter rewrites from the lowered tree, so a dropped entry is
+    /// content loss.
+    fn misplaced_entry(
+        &mut self,
+        entry: &ast::Entry,
+        expected: &[&'static str],
+        context: &'static str,
+    ) {
+        let node = entry.syntax();
+        self.push_error(NmlError::syntax(
+            crate::error::ParseErrorKind::Expected {
+                expected: expected
+                    .iter()
+                    .copied()
+                    .map(crate::error::ExpectedItem::Desc)
+                    .collect(),
+                found: Some(crate::error::FoundToken {
+                    kind: node.kind(),
+                    text: String::new(),
+                }),
+                context: Some(context),
+            },
+            content_span(node),
+        ));
     }
 
     fn list_item(&mut self, l: &ast::ListItem) -> ListItem {
@@ -381,7 +421,7 @@ impl Lower {
                 .map(|d| crate::types::Directive {
                     name: d.name().map(|t| t.text().to_string()).unwrap_or_default(),
                     arg: d.value().map(|v| self.decode(&v)),
-                    span: super::syntax::node_span(d.syntax()),
+                    span: content_span(d.syntax()),
                 })
                 .collect(),
         }
@@ -406,7 +446,7 @@ impl Lower {
     /// Record a semantic error, bounded at `MAX_ERRORS` so a pathological file
     /// cannot grow the list without limit *during* lowering (RFC 0004 §9).
     fn push_error(&mut self, e: NmlError) {
-        if self.errors.len() < super::MAX_ERRORS {
+        if self.errors.len() < crate::diagnostic::MAX_ERRORS {
             self.errors.push(e);
         } else {
             self.suppressed += 1;
@@ -454,7 +494,7 @@ fn facets_of(te: &ast::TypeExpr, errors: &mut Vec<NmlError>) -> Vec<FacetExpr> {
     };
     list.facets()
         .filter_map(|f| {
-            let span = super::syntax::node_span(f.syntax());
+            let span = content_span(f.syntax());
             let key = f.name().map(ident).unwrap_or_else(|| Identifier {
                 name: String::new(),
                 span,
@@ -462,7 +502,7 @@ fn facets_of(te: &ast::TypeExpr, errors: &mut Vec<NmlError>) -> Vec<FacetExpr> {
             let (text, vspan) = if let Some(dl) = f.duration_literal() {
                 let components = dl.components();
                 let first = components.first()?.0.text().to_string();
-                let span = super::syntax::node_span(dl.syntax());
+                let span = content_span(dl.syntax());
                 let text = if f.dash().is_some() {
                     format!("-{}", first)
                 } else {
@@ -818,7 +858,7 @@ mod tests {
     use crate::cst::parse;
 
     fn cst_ast(src: &str) -> File {
-        to_ast(&ast::Root::cast(parse(src).syntax()).unwrap())
+        to_ast_with_errors(&ast::Root::cast(parse(src).syntax()).unwrap()).0
     }
 
     /// A modifier block holds list items only: any other entry is a loud
@@ -867,6 +907,94 @@ mod tests {
             };
             assert_eq!(items.len(), 2, "the items around it survive: {src}");
         }
+    }
+
+    /// An array body holds items, properties, modifiers and shared
+    /// properties: a nested block, a field definition or a routing arm at
+    /// its item column — the shape a `key:` block takes when pasted at the
+    /// indentation a remedy printed it with — is NML0002 naming the
+    /// entry's kind, anchored on the entry; the items around it lower. It
+    /// lowered to nothing, and `fmt` then rewrote the file without it.
+    #[test]
+    fn misplaced_entries_in_an_array_body_are_nml0002_at_their_own_span() {
+        for (line, found) in [
+            (
+                "stray:\n        allowRefs:\n            - \"y\"",
+                "a nested block",
+            ),
+            ("stray string", "a field definition"),
+            ("@role/admin -> Target", "a routing arm"),
+        ] {
+            let src = format!(
+                "[]validator validators:\n    - a:\n        files:\n            - \"x/**\"\n    \
+                 {line}\n    - b:\n        files:\n            - \"z/**\"\n"
+            );
+            let (file, errors) = crate::cst::parse_to_ast_all(&src);
+            assert_eq!(errors.len(), 1, "{src}: {errors:?}");
+            assert_eq!(
+                errors[0].code,
+                Some(crate::diagnostic::codes::UNEXPECTED_TOKEN),
+                "{errors:?}"
+            );
+            assert_eq!(
+                errors[0].message,
+                format!(
+                    "expected a list item, a property, a modifier or a shared property in an \
+                     array body, found {found}"
+                )
+            );
+            let first_line = line.split('\n').next().unwrap();
+            assert_eq!(
+                errors[0].span.map(|s| s.start),
+                src.find(first_line),
+                "anchored on the entry itself: {src}"
+            );
+            let DeclarationKind::Array(a) = &file.declarations[0].kind else {
+                panic!("array: {src}");
+            };
+            assert_eq!(a.body.items.len(), 2, "the items around it survive: {src}");
+        }
+    }
+
+    /// A layout marker is zero-width and sits on no line: the line break
+    /// before a `Dedent` belongs to the token after it. A `|deny:` block
+    /// after an item's body — the item column, the next line — is a
+    /// modifier, never the item's same-line fallback chain (it was
+    /// NML0021, the block consumed as the chain's legs).
+    #[test]
+    fn a_modifier_after_an_item_body_is_a_modifier_not_a_fallback_chain() {
+        let src = "[]validator validators:\n    - a:\n        files:\n            - \"x/**\"\n    \
+                   |deny:\n        - \"q\"\n    - b:\n        files:\n            - \"z/**\"\n";
+        let (file, errors) = crate::cst::parse_to_ast_all(src);
+        assert!(errors.is_empty(), "{errors:?}");
+        let DeclarationKind::Array(a) = &file.declarations[0].kind else {
+            panic!("array");
+        };
+        assert_eq!(a.body.modifiers.len(), 1, "{:?}", a.body);
+        assert_eq!(a.body.modifiers[0].name.name, "deny");
+        assert_eq!(a.body.items.len(), 2, "{:?}", a.body);
+    }
+
+    /// The same marker rule for a field directive: a `#live` on the line
+    /// after an indented value is no directive of the field (a directive
+    /// is same-line) — it is a stray entry, reported, never pulled in.
+    #[test]
+    fn a_next_line_directive_after_an_indented_value_is_not_pulled_in() {
+        let src = "model m:\n    f string =\n        \"v\"\n    #live\n";
+        let (file, errors) = crate::cst::parse_to_ast_all(src);
+        assert!(
+            errors[0]
+                .message
+                .starts_with("expected a block entry in a block body, found `#`"),
+            "{errors:?}"
+        );
+        let DeclarationKind::Block(b) = &file.declarations[0].kind else {
+            panic!("block");
+        };
+        let BodyEntryKind::FieldDefinition(f) = &b.body.entries[0].kind else {
+            panic!("{:?}", b.body.entries);
+        };
+        assert!(f.directives.is_empty(), "{:?}", f.directives);
     }
 
     /// RFC 0030: `- Name:` (trailing colon, no entries) lowers as a Named item
@@ -959,12 +1087,8 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            matches!(lit[0], ArmTarget::Literal { value, .. } if value == "admin.workflow.nml")
-        );
-        assert!(
-            matches!(lit[1], ArmTarget::Literal { value, .. } if value == "default.workflow.nml")
-        );
+        assert!(matches!(lit[0], ArmTarget::Literal(t) if t.value == "admin.workflow.nml"));
+        assert!(matches!(lit[1], ArmTarget::Literal(t) if t.value == "default.workflow.nml"));
 
         // `else` is an arm ONLY when followed by `->`; as a property name it
         // still parses as a property (contextual keyword, not reserved).
@@ -1011,7 +1135,7 @@ mod tests {
         assert!(matches!(&arms[1].selector, ArmSelector::Literal(k) if k == "plan"));
         assert!(matches!(
             &arms[1].target,
-            ArmTarget::Literal { value, .. } if value == "upsell"
+            ArmTarget::Literal(t) if t.value == "upsell"
         ));
     }
 
@@ -1031,7 +1155,7 @@ mod tests {
             "parse should teach the quoted-colon mistake: {:?}",
             parse.errors()
         );
-        let file = to_ast(&ast::Root::cast(parse.syntax()).unwrap());
+        let file = to_ast_with_errors(&ast::Root::cast(parse.syntax()).unwrap()).0;
         let DeclarationKind::Block(block) = &file.declarations[0].kind else {
             panic!("block");
         };
@@ -1050,7 +1174,7 @@ mod tests {
         assert!(
             matches!(
                 &arm.target,
-                ArmTarget::Literal { value, .. } if value == "adminLanding"
+                ArmTarget::Literal(t) if t.value == "adminLanding"
             ),
             "quoted target must lower as Literal, not Inline: {:?}",
             arm.target

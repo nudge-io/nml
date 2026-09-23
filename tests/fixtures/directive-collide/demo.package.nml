@@ -1,0 +1,19 @@
+package demo:
+    version = "0.1.0"
+    formatVersion = 1
+
+[]schema schemas:
+    - core:
+        file = "core.model.nml"
+
+[]validator validators:
+    - core:
+        files:
+            - "apps/*.nml"
+        schemas:
+            - core
+
+[]directive directives:
+    - sealed:
+        arg = "none"
+        doc = "Write-once, under this package's own meaning."

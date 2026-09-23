@@ -24,6 +24,8 @@ use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Invariant: `|coeff| ≤ 10^34 − 1` (≤ 34 significant digits).
+///
+/// LIMIT: reach=content guards=domain surface=kernel shown="10^34 - 1" — the coefficient magnitude of an exact decimal (34 significant digits)
 const COEFF_ABS_MAX: u128 = 9_999_999_999_999_999_999_999_999_999_999_999;
 /// Invariant: `scale ∈ [−6111, 6176]` (⇔ exponent `−scale ∈ [−6176, 6111]`).
 const SCALE_LO: i64 = -6111;
@@ -2015,7 +2017,15 @@ mod tests {
         assert_eq!(co("1e6144").to_f64(), f64::INFINITY);
         assert_eq!(co("-1e6144").to_f64(), f64::NEG_INFINITY);
         assert_eq!(co("1e6144").to_f32(), f32::INFINITY);
+        assert_eq!(co("-1e6144").to_f32(), f32::NEG_INFINITY);
+        // `-0.0 == 0.0` in IEEE, so the equality above cannot see the sign:
+        // the f32 shortcut carries it exactly as the f64 one does.
         assert_eq!(co("-1e-6176").to_f32(), 0.0);
+        assert!(
+            co("-1e-6176").to_f32().is_sign_negative(),
+            "IEEE: rounds to -0.0"
+        );
+        assert!(!co("1e-6176").to_f32().is_sign_negative());
         // Near the cutoffs the format path still runs and agrees with a
         // direct std parse (no misfire inside f64's live range).
         for s in ["1e-340", "1e-300", "9e307", "1e39", "-1e-59"] {

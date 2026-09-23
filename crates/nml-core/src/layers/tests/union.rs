@@ -2182,8 +2182,9 @@ fn shared_only_block_over_an_establishment_is_a_warned_no_op() {
 #[test]
 fn a_union_field_named_like_the_discriminator_composes_beside_it() {
     // The merge strips a oneof's string discriminator before merging
-    // an arm body; a union FIELD named like it (an advisory NML2054
-    // shape) still composes beside the canonical entry — the strip
+    // an arm body; a union FIELD named like it (the NML2054 shape the
+    // loader refuses; the kernel judges the view it is handed) still
+    // composes beside the canonical entry — the strip
     // is by discriminator entries, never the same-named field group.
     const S: &str = "\
 model va:

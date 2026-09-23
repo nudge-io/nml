@@ -21,7 +21,8 @@ experience with one subcommand.
 ## Run standalone
 
 ```bash
-cargo install nml-lsp
+# until the crates.io release:
+cargo install --locked --git https://github.com/nudge-io/nml nml-lsp
 nml-lsp   # speaks LSP over stdio
 ```
 

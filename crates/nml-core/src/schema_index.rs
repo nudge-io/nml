@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{Body, BodyEntryKind};
+use crate::diagnostic::Suggestion;
 use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
 use crate::types::PrimitiveType;
 
@@ -399,7 +400,7 @@ impl SchemaIndex {
             .with_code(codes::UNKNOWN_UNION_VARIANT)
             .with_span(ann.span);
         if let Some(s) = crate::suggest::suggest(&ann.name, nameable.iter().copied()) {
-            diag = diag.with_suggestion(s.to_string(), ann.span);
+            diag = diag.with_suggestion(Suggestion::did_you_mean(s.to_string()).at(ann.span));
         }
         diag
     }
@@ -428,7 +429,7 @@ impl SchemaIndex {
     /// The named type a reference resolves to — a model before a `oneof`
     /// of the same name — the ONE resolution order every pass shares (the
     /// validator, the plan, normalization, the merge, the seal scans): a
-    /// colliding name (NML1000/NML2016 at load, but composition still
+    /// colliding name (NML1000 at parse, NML2016 at load — composition still
     /// runs over the loaded schema) reads the same way everywhere, so no
     /// position is planned under one reading and merged under the other.
     /// Two-variant by construction, so every consumer's match is total.
@@ -514,6 +515,7 @@ mod tests {
             directives: Vec::new(),
             doc: None,
             span: Span::empty(0),
+            type_span: Span::empty(0),
         }
     }
 

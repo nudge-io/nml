@@ -103,9 +103,9 @@ Run it (`cargo run` in `examples/09/`; real output, run in CI):
 
 ```text
 package skylight v0.1.0 — 1 schema(s), 1 validator binding(s)
-content hash blake3:27ff6038e8ab7bbaf17eb72d2cd526d57b1199e7272959b37d0706d5236fad4c (short: 27ff6038)
-published to slot 0.1.0+27ff6038
-store has: skylight v0.1.0 (27ff6038, 1 slot(s))
+content hash blake3:de541008f76adef7f8494994888e749680f46ea7671b0ae6766ba86e1b9e30f2 (short: de541008)
+published to slot 0.1.0+de541008
+store has: skylight v0.1.0 (de541008, 1 slot(s))
 ```
 
 Publishing is idempotent — run it again and you get `Unchanged`. In a real
@@ -131,6 +131,30 @@ and binds your `skylight` schema — strict, as the manifest said. They get:
 When you ship a schema change, you publish a new slot and the pointer
 flips; their next edit validates against it. No plugin marketplace, no
 copy-pasted JSON Schema, no drift.
+
+## Check the binding from the command line
+
+Your users — and your CI — can ask the CLI the question the editor's
+status bar answers: which binding governs `app.nml`, under which root,
+and does the file validate under it. `--root .` pins the universe to the
+project (the [CI guide](../guides/validate-in-ci.md) is the full story):
+
+```text transcript=docs/tutorial/examples/09
+$ nml binding --root . app.nml
+file      app.nml
+root      .  (--root)
+binding   service   skylight blake3:de541008, workspace manifest (skylight.package.nml)
+anchor    .   matched files[0] = "**/app.nml"   (auto-associated)
+layers    none — composition denied (NML2064)
+$ nml check --root . app.nml
+app.nml: ok (6 declaration(s))
+```
+
+The hash on the `binding` line is the content hash the program printed
+— one identity from the manifest on disk to the store slot to the
+editor's status bar. (`layers` is the binding's composition grant: none
+here, so a `uses` stack in `app.nml` is denied — see the
+[binding chapter](../guides/schema-packages-and-store.md#the-layers-grant).)
 
 ## `<your-tool> lsp`
 
@@ -200,8 +224,10 @@ boot validators, its schema sync, and its `lsp` subcommand.
   user's project — including other tools'. Bind what's yours (specific
   filenames or extensions like `*.workflow.nml`).
 - **Skipping the directive declarations.** If your schemas use `#live`
-  but the package doesn't declare `live`, your vocabulary is invisible to
-  tooling — declare each directive with a `doc` so hovers teach it.
+  but the package doesn't declare `live`, every `#live` is an unknown
+  directive — NML5000, an error in `nml check` and in the editor alike
+  (the four merge-policy directives, `#sealed` among them, need no
+  declaration) — declare each directive with a `doc` so hovers teach it.
 
 ## Recap
 

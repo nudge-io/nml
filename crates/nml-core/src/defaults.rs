@@ -24,6 +24,8 @@ use crate::types::{SpannedValue, Value};
 
 /// Recursion bound mirroring the validator's `MAX_VALIDATION_DEPTH`. Bounds the
 /// *depth* of recursion into authored and materialized structure.
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="64" — nesting depth when a model's defaults are materialized
 const MAX_DEFAULT_DEPTH: u32 = 64;
 
 /// Upper bound on the number of nested models materialized from defaults in a
@@ -34,6 +36,8 @@ const MAX_DEFAULT_DEPTH: u32 = 64;
 /// missing-required-field validation error rather than memory exhaustion. The
 /// limit is far above any real config (materialization is rare and shallow in
 /// practice).
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="1024" — models materialized for defaults in one pass
 const MAX_MATERIALIZED_MODELS: u32 = 1024;
 
 /// Inject schema defaults into `body`, dispatching on whether `root` names a
@@ -72,6 +76,8 @@ where
 /// Materialization bound for declaration-reference inlining: far beyond any
 /// real composition depth, so a pathological reference chain degrades to
 /// "reference left in place" (reported by symbols/validation), never a hang.
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="16" — chained default references followed
 const MAX_REFERENCE_DEPTH: u32 = 16;
 
 /// [`from_body_defaulted`] at **document** scope (RFC 0013): properties whose
@@ -1204,6 +1210,73 @@ mod tests {
             nodes <= MAX_MATERIALIZED_MODELS as usize + 8,
             "materialization must stay within budget; synthesized {nodes} nested blocks"
         );
+    }
+
+    /// Materialization stops at
+    /// [`MAX_DEFAULT_DEPTH`] — a fully-defaultable chain longer than the
+    /// bound is synthesized only that deep (well inside the model
+    /// budget).
+    #[test]
+    fn default_materialization_stops_at_the_depth_bound() {
+        let depth = MAX_DEFAULT_DEPTH as usize + 8;
+        let mut src = format!("model l{depth}:\n    v string = \"x\"\n\n");
+        for i in (0..depth).rev() {
+            src.push_str(&format!("model l{i}:\n    a l{}\n\n", i + 1));
+        }
+        let idx = index_from(&src);
+        let out = apply_defaults(
+            &idx,
+            "l0",
+            &body_of("l0 X:\n    a:\n        v = \"keep\"\n"),
+        );
+        let nodes = count_nested(&out);
+        assert!(
+            nodes < depth,
+            "a {depth}-deep chain must not materialize in full: {nodes}"
+        );
+        assert!(nodes <= MAX_DEFAULT_DEPTH as usize && nodes > 8, "{nodes}");
+    }
+
+    /// Array references are inlined only inside
+    /// [`MAX_REFERENCE_DEPTH`] levels of nesting — exactly at the bound a
+    /// reference stays a reference.
+    #[test]
+    fn array_reference_inlining_stops_at_the_reference_depth() {
+        fn nested(levels: usize) -> String {
+            let mut src =
+                String::from("[]thing items:\n    - one:\n        v = \"x\"\n\nthing top:\n");
+            for k in 1..=levels {
+                src.push_str(&format!("{}n{k}:\n", "    ".repeat(k)));
+            }
+            src.push_str(&format!("{}x = items\n", "    ".repeat(levels + 1)));
+            src
+        }
+        fn innermost(body: &Body, levels: usize) -> &BodyEntry {
+            let mut body = body;
+            for _ in 0..levels {
+                body = match &body.entries[0].kind {
+                    BodyEntryKind::NestedBlock(nb) => &nb.body,
+                    other => panic!("expected a nested block, got {other:?}"),
+                };
+            }
+            &body.entries[0]
+        }
+        for (levels, inlined) in [
+            (MAX_REFERENCE_DEPTH as usize - 1, true),
+            (MAX_REFERENCE_DEPTH as usize, false),
+        ] {
+            let src = nested(levels);
+            let file = crate::cst::parse_to_ast(&src).unwrap();
+            let doc = crate::query::Document::new(&file);
+            let block = doc.block_decl("thing", "top").expect("top");
+            let out = inline_layer_array_references(&doc, &block.body);
+            let leaf = innermost(&out, levels);
+            assert_eq!(
+                matches!(leaf.kind, BodyEntryKind::NestedBlock(_)),
+                inlined,
+                "{levels} levels: {leaf:?}"
+            );
+        }
     }
 
     fn count_nested(body: &Body) -> usize {

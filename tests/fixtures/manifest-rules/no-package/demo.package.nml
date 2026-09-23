@@ -1,0 +1,10 @@
+[]schema schemas:
+    - core:
+        file = "core.model.nml"
+
+[]validator validators:
+    - flows:
+        files:
+            - "tenants/**/*.flow.nml"
+        schemas:
+            - core

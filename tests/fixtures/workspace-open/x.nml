@@ -1,0 +1,8 @@
+model thing:
+    v string
+
+thing base:
+    v = "b"
+
+thing t uses base:
+    v = "t"

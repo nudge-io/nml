@@ -71,7 +71,7 @@ service MyService:  // inline comment
 ### Whitespace and Indentation
 
 NML uses indentation to define structure. The canonical indentation unit is **4 spaces**.
-Tabs are not permitted.
+Tabs are not permitted. What the formatter writes, in full, is [Canonical Style](style.md).
 
 The lexer emits synthetic `INDENT` and `DEDENT` tokens based on indentation level changes,
 similar to Python's tokenizer.
@@ -184,7 +184,12 @@ resolved (e.g. an unset environment variable), the next value is tried. The fina
 value in the chain is used if all preceding values fail.
 
 Fallbacks produce a `Fallback(primary, fallback)` node in the AST and can be
-chained to arbitrary depth.
+chained. Each arm is one level of value nesting (`a | b | c` reads as `a`,
+else `b | c`), so a chain is held to the same nesting bound as blocks, values
+and types — 64 arms; past it is `NML0007`. A chain is written on one line: a
+`|` that ends a line has no arm and is an error (NML0002, at the pipe) — the
+next line is the next entry, never the arm — and a `|` that starts a line is
+a modifier block, not a continuation.
 
 ### Number Literals
 
@@ -455,6 +460,18 @@ urlRoutes:
     homeRoute = "/"
     postLoginRoute = "/home"
 ```
+
+Within one body a name is declared at most once across the property
+(`key = …`), nested-block (`key:`) and field-definition (`key type`)
+spellings; a second declaration is an error (NML2093) at the later
+occurrence. At the file scope every declaration — block, array,
+`const`, `template`, `oneof` — shares one namespace, and a second
+declaration under one name is an error (NML1000) at the later name.
+Both are parse-time rules: a text that breaks either is ill-formed and
+is refused as a syntax error is. Names are compared byte-for-byte. The
+`|` and `.` prefixes are separate namespaces (`|allow` is not `allow`),
+and a modifier's type declaration beside its value is declare-then-assign,
+not a repeat. List items are positional and may repeat.
 
 ### Lists
 

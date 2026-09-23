@@ -1,0 +1,14 @@
+trait tagged:
+    kind string?
+
+model logEntry is tagged:
+    msg string?
+
+model note is tagged:
+    text string?
+
+oneof record by kind:
+    "log" -> logEntry
+
+model host:
+    rec record

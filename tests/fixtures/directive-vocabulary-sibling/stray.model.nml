@@ -1,0 +1,3 @@
+model stray:
+    name string #live(3)
+    mode string #live #restart

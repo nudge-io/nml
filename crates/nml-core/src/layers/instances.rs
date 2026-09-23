@@ -62,9 +62,29 @@ impl<'a> InstanceIndex<'a> {
         })
     }
 
-    /// In-scope instance names (did-you-mean candidates for NML2059).
+    /// In-scope instance names (did-you-mean candidates for NML2059 and
+    /// NML2062), in DECLARATION order.
+    ///
+    /// The order is the contract, not an accident of iteration: the
+    /// suggester breaks distance ties toward the EARLIEST candidate
+    /// ([`crate::suggest`]), so a vocabulary handed over in hash order
+    /// makes the hint a different name on each run of the same binary
+    /// over the same file — the composition golden records the hint, the
+    /// `--json` wire carries it, and the editor and `nml check` are
+    /// supposed to say the same thing about the same buffer. Walking the
+    /// declarations and keeping the one [`Self::from_file`] indexed —
+    /// first-wins on a duplicate name, the block every ref composes
+    /// against — yields exactly the map's own names, in the order they
+    /// were written.
     pub fn names(&self) -> impl Iterator<Item = &'a str> + '_ {
-        self.by_name.keys().copied()
+        self.file.declarations.iter().filter_map(|decl| {
+            let crate::ast::DeclarationKind::Block(b) = &decl.kind else {
+                return None;
+            };
+            let name = b.name.name.as_str();
+            let indexed = self.by_name.get(name).copied()?;
+            std::ptr::eq(indexed, b).then_some(name)
+        })
     }
 
     /// The layer's own document — RFC 0013 array refs are file-local, so

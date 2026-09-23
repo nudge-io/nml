@@ -1,10 +1,14 @@
+import { promises as fsp } from "fs";
+import * as path from "path";
 import { Readable, Writable } from "stream";
 import { ExtensionContext, Uri, window, workspace } from "vscode";
 import { Wasm, WasmProcess } from "@vscode/wasm-wasi/v1";
 import { StreamMessageReader, StreamMessageWriter } from "vscode-jsonrpc/node";
 import { MessageTransports } from "vscode-languageclient/node";
 import { NmlLogs } from "./logging";
-import { evaluateNeutralServerPathOverride } from "./pathSecurity";
+import { LaunchSandbox, evaluateNeutralServerPathOverride } from "./pathSecurity";
+import { ExitInfo, ServerProcess, serverProcessOf } from "./serverProcess";
+import { ServerResolution, WASM_LABEL, processServer } from "./serverResolution";
 import {
   buildUriMapping,
   duplicateFolderNames,
@@ -16,9 +20,11 @@ import {
 
 // ─────────────────────────────────────────────────────────────────────────
 // RFC 0035 — neutral-server delivery. The provider path (`<tool> lsp`) is
-// resolved in providerDiscovery.ts; this module owns the *neutral* server: the bundled
-// WASM backend (universal, offline, WASI-sandboxed — the preferred VS Code
-// delivery), with the native binary as the override/fallback.
+// resolved in providerDiscovery.ts and the resolution VOCABULARY both of them
+// speak is serverResolution.ts (pure); this module owns the *neutral* server:
+// the bundled WASM backend (universal, offline, WASI-sandboxed — the preferred
+// VS Code delivery), with the native binary as the override/fallback, and it
+// is the only one of the three that touches the WASI host extension.
 //
 // The WASM bridge deliberately uses the STABLE toolchain — `@vscode/wasm-wasi`
 // (1.x) → Node streams → `vscode-jsonrpc` framing — NOT `@vscode/wasm-wasi-lsp`,
@@ -39,10 +45,6 @@ function defaultNativeCommand(logs: NmlLogs): string {
   return "nml-lsp";
 }
 
-export type NeutralServer =
-  | { kind: "process"; command: string; args: string[]; label: string }
-  | { kind: "wasm"; module: Uri; label: string };
-
 /** Resolve the neutral server, in priority order:
  *  1. `nml.server.path` (machine-scoped user setting) — air-gapped / self-built.
  *  2. The bundled WASM backend, if present (shipped by the build's `bundle:wasm`).
@@ -50,19 +52,21 @@ export type NeutralServer =
  */
 export async function resolveNeutralServer(
   ctx: ExtensionContext,
-  logs: NmlLogs
-): Promise<NeutralServer> {
+  logs: NmlLogs,
+  sandbox: LaunchSandbox
+): Promise<ServerResolution> {
   const roots = (workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
   const override = workspace.getConfiguration("nml").get<string>("server.path", "");
   if (override) {
     const evaluated = await evaluateNeutralServerPathOverride(override, roots);
     if (evaluated.accepted) {
-      return {
-        kind: "process",
-        command: evaluated.command,
-        args: [],
-        label: "neutral (nml.server.path)",
-      };
+      return processServer(
+        evaluated.command,
+        [],
+        "neutral (nml.server.path)",
+        "setting",
+        sandbox
+      );
     }
     if (evaluated.reason === "relative") {
       logs.warn(
@@ -78,14 +82,55 @@ export async function resolveNeutralServer(
   }
   const module = Uri.joinPath(ctx.extensionUri, "server", "nml-lsp.wasm");
   if (await exists(module)) {
-    return { kind: "wasm", module, label: "neutral nml-lsp (wasm)" };
+    return { kind: "wasm", module, label: WASM_LABEL };
   }
-  return {
-    kind: "process",
-    command: defaultNativeCommand(logs),
-    args: [],
-    label: "neutral nml-lsp",
-  };
+  return processServer(defaultNativeCommand(logs), [], "neutral nml-lsp", "default", sandbox);
+}
+
+/** An EMPTY private directory for every process-backed server to start in,
+ *  remade from scratch on each activation.
+ *
+ *  Under the extension's own global storage, not a temp directory: on a
+ *  shared machine every local user reaches `/tmp`, and a working directory an
+ *  attacker can populate is exactly what this is here to prevent. Remade
+ *  rather than reused, so nothing a previous session (or a misbehaving
+ *  server) left behind is in scope for the next one.
+ *
+ *  `undefined` when it cannot be made — a read-only or full profile. The
+ *  caller falls back to [`providerWorkingDir`], which is still never a
+ *  workspace folder. */
+export async function privateWorkingDir(
+  ctx: ExtensionContext,
+  logs: NmlLogs
+): Promise<string | undefined> {
+  const dir = path.join(ctx.globalStorageUri.fsPath, "server-cwd");
+  try {
+    await fsp.rm(dir, { recursive: true, force: true });
+    // The parent may not exist yet (a first activation); the leaf must be
+    // created by THIS call, so it cannot be something that was already
+    // there. `mkdir` with `recursive` is idempotent — it succeeds on an
+    // existing path, a SYMLINK to a directory included — so a link planted
+    // between the `rm` and here would silently become the working
+    // directory, with whatever is inside it (MEASURED: an `lsp` script in
+    // the link's target survives all three calls, and the `chmod` lands on
+    // the target). The leaf therefore goes up without `recursive`, so a
+    // racer's link is `EEXIST`, and is `lstat`ed afterwards so the
+    // directory the server starts in is the one this function made.
+    await fsp.mkdir(path.dirname(dir), { recursive: true, mode: 0o700 });
+    await fsp.mkdir(dir, { mode: 0o700 });
+    await fsp.chmod(dir, 0o700);
+    const made = await fsp.lstat(dir);
+    if (!made.isDirectory()) {
+      throw new Error(`${dir} is not a directory after creating it`);
+    }
+    return dir;
+  } catch (err) {
+    logs.warn(
+      `Could not prepare the private server working directory (${dir}): ${err}. ` +
+        "Falling back to the home directory."
+    );
+    return undefined;
+  }
 }
 
 async function exists(uri: Uri): Promise<boolean> {
@@ -131,13 +176,41 @@ export function wasmUriConverters(): {
   };
 }
 
-/** A running WASM neutral server: the transports the language client speaks over,
- *  plus the process handle so the caller can [`WasmProcess.terminate`] it on
- *  stop/restart (a function `ServerOptions` does not own the process, so the
- *  client won't reap it for us). */
+/** A running WASM neutral server: the transports the language client speaks
+ *  over, plus the server as a [`ServerProcess`] — the SAME shape a native
+ *  launch returns, so the session has one teardown path for both backends
+ *  rather than a `terminateWasm` beside a `stopClient`. */
 export interface WasmServer {
   transports: MessageTransports;
-  process: WasmProcess;
+  server: ServerProcess;
+}
+
+/** The WASM backend as a [`ServerProcess`].
+ *
+ *  It has no host process, so there is no pid to name and no process group to
+ *  signal: `terminate()` is the only lever `@vscode/wasm-wasi` offers, and it
+ *  is what both the polite stage and the forced stage pull. The staged ladder
+ *  still applies unchanged — including the verdict, which is read from the
+ *  run promise actually settling and not from `terminate()` returning. */
+function wasmServerProcess(label: string, proc: WasmProcess, run: Promise<number>): ServerProcess {
+  let exitInfo: ExitInfo | undefined;
+  const exited = run.then(
+    (code): ExitInfo => {
+      exitInfo = { code, signal: null };
+      return exitInfo;
+    },
+    (): ExitInfo => {
+      exitInfo = { code: null, signal: null };
+      return exitInfo;
+    }
+  );
+  return serverProcessOf(label, {
+    pid: undefined,
+    exited,
+    hasExited: () => exitInfo !== undefined,
+    requestExit: () => void proc.terminate().catch(() => undefined),
+    forceExit: () => void proc.terminate().catch(() => undefined),
+  });
 }
 
 /** Instantiate the bundled WASM neutral server and bridge its WASI stdio to the
@@ -167,7 +240,9 @@ export async function createWasmServer(module: Uri, log: NmlLogs): Promise<WasmS
   // Runs until stdin EOF or `terminate()`. Normal exit resolves; an
   // instantiation/trap before stdio is wired rejects — surface it to the log
   // rather than let it become an unhandledRejection in the extension host.
-  proc.run().catch((err) => log.error(`nml-lsp wasm process error: ${err}`));
+  // The promise is ALSO the backend's exit observation, so it is kept.
+  const run = proc.run();
+  run.catch((err) => log.error(`nml-lsp wasm process error: ${err}`));
 
   const wasmOut = proc.stdout;
   const wasmIn = proc.stdin;
@@ -205,6 +280,6 @@ export async function createWasmServer(module: Uri, log: NmlLogs): Promise<WasmS
       reader: new StreamMessageReader(nodeReadable),
       writer: new StreamMessageWriter(nodeWritable),
     },
-    process: proc,
+    server: wasmServerProcess(WASM_LABEL, proc, run),
   };
 }

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::BlockDecl;
-use crate::diagnostic::{Diagnostic, codes};
+use crate::diagnostic::{Diagnostic, Suggestion, codes};
 use crate::span::Span;
 
 use super::grants::*;
@@ -313,7 +313,7 @@ impl<'a, 'p> Linearizer<'a, 'p> {
                         Some(blk.uses[idx].span)
                     });
                     if let Some(s) = sugg {
-                        d = d.with_deletion(s);
+                        d = d.with_suggestion(Suggestion::delete().at(s));
                     }
                     if let Some(ab) = self.instances.get(*a) {
                         d = d.with_related_in(
@@ -428,7 +428,7 @@ impl<'a, 'p> Linearizer<'a, 'p> {
             return Some(Vec::new());
         }
         let site = self.grants.grant_for(id.source_path);
-        if let Some(diag) = deny_diagnostic(&site, id, block) {
+        if let Some(diag) = deny_diagnostic(&site, id, block, &[]) {
             self.diags.push(diag);
             return None;
         }
@@ -516,7 +516,7 @@ pub(in crate::layers) fn schema_def_uses_denial(
     // space, and the colon rule on a bodiless header). The primary span
     // stays the name.
     match block.uses_span {
-        Some(span) => d.with_deletion(span),
+        Some(span) => d.with_suggestion(Suggestion::delete().at(span)),
         None => d,
     }
 }

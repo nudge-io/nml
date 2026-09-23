@@ -18,6 +18,7 @@ type system, model definitions, and composable traits.
 | [types.md](types.md) | Primitive types, compound types, and reference types |
 | [models.md](models.md) | Model, trait, and enum definitions |
 | [access-control.md](access-control.md) | `\|allow` and `\|deny` modifier semantics |
+| [style.md](style.md) | Canonical style: what `nml fmt` writes |
 
 ## Examples
 

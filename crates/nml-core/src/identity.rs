@@ -20,7 +20,7 @@
 
 use crate::ast::{
     Arm, ArmSelector, ArmTarget, Body, BodyEntry, BodyEntryKind, Identifier, ListItem,
-    ListItemKind, NestedBlock, Property,
+    ListItemKind, LiteralTarget, NestedBlock, Property,
 };
 use crate::model::{FieldType, ModelDef, OneOfDef};
 use crate::schema_index::{FieldTarget, SchemaIndex};
@@ -36,6 +36,8 @@ const EMPTY_BODY: Body = Body::fresh(Vec::new());
 
 /// Bounds recursion into nested structure, mirroring the defaulter's
 /// `MAX_DEFAULT_DEPTH`. The pass runs on untrusted instance bodies.
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="64" — nesting depth when a positional identity is derived
 const MAX_POSITIONAL_DEPTH: u32 = 64;
 
 /// Result of [`materialize_item`] / [`materialize_named`]: the enriched body, any
@@ -202,13 +204,10 @@ pub fn map_inline_arm_bodies(
             _ => inline_body.clone(),
         };
         let recursed = recurse(elem, &body_for_recurse, depth + 1);
-        Arm {
-            target: ArmTarget::Inline {
-                name: name.clone(),
-                body: recursed,
-            },
-            ..arm.clone()
-        }
+        arm.with_target(ArmTarget::Inline {
+            name: name.clone(),
+            body: recursed,
+        })
     })
 }
 
@@ -271,9 +270,14 @@ fn arm_fill_target(value: &SpannedValue) -> Option<ArmTarget> {
             name.clone(),
             value.span,
         ))),
-        other => String::try_from(other).ok().map(|s| ArmTarget::Literal {
-            value: s,
-            span: value.span,
+        // A value lifted back into an arm target keeps the window the
+        // literal it came from carried.
+        other => String::try_from(other).ok().map(|s| {
+            ArmTarget::Literal(LiteralTarget::from_token(
+                s,
+                value.span,
+                value.spans().content,
+            ))
         }),
     }
 }
@@ -295,11 +299,7 @@ fn inject_arm(body: &Body, field: &str, target: ArmTarget, span: Span) -> Body {
     }
     let arm = BodyEntry {
         span,
-        kind: BodyEntryKind::Arm(Arm {
-            selector: ArmSelector::Else,
-            selector_span: span,
-            target,
-        }),
+        kind: BodyEntryKind::Arm(Arm::new(ArmSelector::Else, span, target)),
     };
     let block = BodyEntry {
         span,
@@ -628,6 +628,7 @@ mod tests {
             directives: Vec::new(),
             doc: None,
             span: s(),
+            type_span: s(),
         }
     }
 
@@ -767,9 +768,7 @@ mod tests {
         assert!(r.diagnostics.is_empty() && r.validatable);
         let arm = arm_of(&r.body);
         assert!(matches!(arm.selector, ArmSelector::Else));
-        assert!(
-            matches!(arm.target, ArmTarget::Literal { value, .. } if value == "x.workflow.nml")
-        );
+        assert!(matches!(&arm.target, ArmTarget::Literal(t) if t.value == "x.workflow.nml"));
 
         // Bare name → `else -> Fallback` (reference).
         let ref_item = ListItem {
@@ -793,14 +792,14 @@ mod tests {
                         name: Identifier::new("dispatch", s()),
                         body: Body::fresh(vec![BodyEntry {
                             span: s(),
-                            kind: BodyEntryKind::Arm(Arm {
-                                selector: ArmSelector::Else,
-                                selector_span: s(),
-                                target: ArmTarget::Literal {
-                                    value: "kept.workflow.nml".into(),
-                                    span: s(),
-                                },
-                            }),
+                            kind: BodyEntryKind::Arm(Arm::new(
+                                ArmSelector::Else,
+                                s(),
+                                ArmTarget::Literal(LiteralTarget::new(
+                                    "kept.workflow.nml".into(),
+                                    s(),
+                                )),
+                            )),
                         }]),
                     }),
                 }])),
@@ -808,7 +807,7 @@ mod tests {
         };
         let arm = arm_of(&materialize_item(&explicit, &m).body);
         assert!(
-            matches!(arm.target, ArmTarget::Literal { value, .. } if value == "kept.workflow.nml"),
+            matches!(&arm.target, ArmTarget::Literal(t) if t.value == "kept.workflow.nml"),
             "explicit arm block wins over the scalar fill"
         );
 
@@ -912,6 +911,97 @@ mod tests {
             _ => None,
         });
         assert_eq!(name, Some(&Value::String("adminWorker".into())));
+    }
+
+    /// Positional materialization stops at
+    /// [`MAX_POSITIONAL_DEPTH`] — a scalar shorthand under a chain of
+    /// nested model blocks is filled one level short of the bound and
+    /// left alone at it. Built programmatically: the parser's own depth
+    /// cap would refuse the source form.
+    #[test]
+    fn positional_materialization_stops_at_the_depth_bound() {
+        let mut m = model(vec![fd("path", true)]);
+        m.fields.push(FieldDef {
+            name: "child".to_string(),
+            field_type: FieldType::ModelRef("m".to_string()),
+            optional: true,
+            shorthand: false,
+            default_value: None,
+            directives: Vec::new(),
+            doc: None,
+            span: s(),
+            type_span: s(),
+        });
+        m.fields.push(FieldDef {
+            name: "items".to_string(),
+            field_type: FieldType::List(Box::new(FieldType::ModelRef("m".to_string()))),
+            optional: true,
+            shorthand: false,
+            default_value: None,
+            directives: Vec::new(),
+            doc: None,
+            span: s(),
+            type_span: s(),
+        });
+        let index = SchemaIndex::build(vec![m], vec![], vec![]);
+        let chain = |depth: u32| {
+            let leaf = ListItem {
+                span: s(),
+                kind: ListItemKind::Shorthand {
+                    value: SpannedValue::new(Value::String("/api".into()), s()),
+                    body: None,
+                },
+            };
+            let mut body = Body::fresh(vec![BodyEntry {
+                span: s(),
+                kind: BodyEntryKind::NestedBlock(NestedBlock {
+                    name: Identifier::new("items", s()),
+                    body: Body::fresh(vec![BodyEntry {
+                        span: s(),
+                        kind: BodyEntryKind::ListItem(leaf),
+                    }]),
+                }),
+            }]);
+            for _ in 0..depth {
+                body = Body::fresh(vec![BodyEntry {
+                    span: s(),
+                    kind: BodyEntryKind::NestedBlock(NestedBlock {
+                        name: Identifier::new("child", s()),
+                        body,
+                    }),
+                }]);
+            }
+            body
+        };
+        let leaf_is_bare = |out: &Body, depth: u32| {
+            let mut body = out;
+            for _ in 0..depth {
+                body = match &body.entries[0].kind {
+                    BodyEntryKind::NestedBlock(nb) => &nb.body,
+                    other => panic!("expected `child`, got {other:?}"),
+                };
+            }
+            let BodyEntryKind::NestedBlock(items) = &body.entries[0].kind else {
+                panic!("expected `items`");
+            };
+            matches!(
+                &items.body.entries[0].kind,
+                BodyEntryKind::ListItem(ListItem {
+                    kind: ListItemKind::Shorthand { body: None, .. },
+                    ..
+                })
+            )
+        };
+        let filled = apply_positional(&index, "m", &chain(MAX_POSITIONAL_DEPTH - 1));
+        assert!(
+            !leaf_is_bare(&filled, MAX_POSITIONAL_DEPTH - 1),
+            "one short of the bound the shorthand is materialized"
+        );
+        let untouched = apply_positional(&index, "m", &chain(MAX_POSITIONAL_DEPTH));
+        assert!(
+            leaf_is_bare(&untouched, MAX_POSITIONAL_DEPTH),
+            "at the bound the body is left as written"
+        );
     }
 
     #[test]

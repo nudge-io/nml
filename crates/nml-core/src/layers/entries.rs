@@ -3,8 +3,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    Arm, ArmTarget, Body, BodyEntry, BodyEntryKind, Identifier, ListItem, ListItemKind,
-    ModifierValue,
+    ArmTarget, Body, BodyEntry, BodyEntryKind, Identifier, ListItem, ListItemKind, ModifierValue,
 };
 use crate::model::{FieldDef, FieldType, ModelDef, OneOfDef};
 use crate::span::Span;
@@ -278,14 +277,10 @@ pub(in crate::layers) fn deep_arm_entry(entry: BodyEntry) -> BodyEntry {
     };
     BodyEntry {
         span: entry.span,
-        kind: BodyEntryKind::Arm(Arm {
-            selector: arm.selector.clone(),
-            selector_span: arm.selector_span,
-            target: ArmTarget::Inline {
-                name: name.clone(),
-                body: crate::resolve::apply_shared_properties(body),
-            },
-        }),
+        kind: BodyEntryKind::Arm(arm.with_target(ArmTarget::Inline {
+            name: name.clone(),
+            body: crate::resolve::apply_shared_properties(body),
+        })),
     }
 }
 

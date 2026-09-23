@@ -16,13 +16,37 @@ name = "nml"
 path = "src/main.rs"
 
 [dependencies]
-# Adopts the RFC 0004 CST parser (via the shim) — the first consumer on the CST.
+# The language core: the RFC 0004 CST parser, the AST, and the layer engine.
 nml-core = { workspace = true }
 nml-validate = { workspace = true }
 nml-fmt = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# The tree's source RATCHETS (the limits census, the typography-fold
+# glyph ratchet) read Rust sources through the ONE lexer every ratchet
+# shares (`nml_validate::test_support::scan`), as the editor's does.
+nml-validate = { workspace = true, features = ["test-support"] }
+# The DIFFERENTIAL PARITY harness (`tests/integration/parity.rs`) asks
+# BOTH front ends about one file: this binary, and the editor's real
+# resolver in process. It is the only place the two meet, so it is the
+# only place the crate depends on the server — test-only, never shipped.
+nml-lsp = { path = "../crates/nml-lsp" }
+tokio = { workspace = true }
+
 [[test]]
 name = "cli_tests"
 path = "../tests/integration/cli_tests.rs"
+
+# The CLI and the editor over ONE corpus (RFC 0019 item 0, P5): every
+# divergence is a finding or an allow-listed decision, never a silence.
+[[test]]
+name = "parity"
+path = "../tests/integration/parity.rs"
+
+# The link matrix (RFC 0019 item 0, r69b): 318 table-driven rows over the
+# closed and open link trees, a/b byte identity plus reviewed goldens.
+[[test]]
+name = "link_matrix"
+path = "../tests/integration/link_matrix.rs"

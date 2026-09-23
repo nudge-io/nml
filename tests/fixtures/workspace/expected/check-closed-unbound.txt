@@ -1,0 +1,3 @@
+tests/fixtures/workspace/docs/unclaimed.nml:4:7: error[NML2064]: composition not permitted: no binding governs this file in the closed universe (2 manifest(s) discovered) — add a `files` glob that claims it (an operator change), then run `nml binding docs/unclaimed.nml`
+for more information, run: nml explain NML2064
+error: 1 error(s)

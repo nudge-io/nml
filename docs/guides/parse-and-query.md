@@ -12,6 +12,10 @@ service Api:
     host = "0.0.0.0"
     port = 8080
     replicas = 3
+
+service Worker:
+    host = "10.0.0.7"
+    port = 9090
 ```
 
 ```rust source=docs/guides/examples/cookbook/examples/parse_and_query.rs

@@ -17,6 +17,31 @@ use crate::layers::normalize::*;
 use crate::layers::policy::*;
 use crate::layers::seal::*;
 
+#[cfg(test)]
+thread_local! {
+    /// Groups the item gather was handed to compare an item against, summed
+    /// over one composition — the probe-count seam behind the token
+    /// buckets' cost contract.
+    ///
+    /// The bucketing is a DoS defence and, like the displaced-seal memo
+    /// beside it ([`crate::layers::decide::JUDGMENT_MISSES`]), it has no
+    /// behavioural signature: with it an item meets its own token's
+    /// bucket, without it every group gathered so far — the O(items²)
+    /// scan a large list used to pay. A wall-clock bound cannot tell the
+    /// two apart on a fixture small enough to live in a test, so the
+    /// contract is a COUNT, asserted structurally and independent of the
+    /// host's load.
+    pub(in crate::layers) static GROUP_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_group_scan(n: usize) {
+    GROUP_SCANS.with(|c| c.set(c.get() + n));
+}
+
+#[cfg(not(test))]
+fn note_group_scan(_n: usize) {}
+
 /// All sibling items at field `name`, across BOTH list spellings, in
 /// layer-then-document order — the identity-group pool for item scans.
 pub(in crate::layers) fn sibling_items_at<'a, 'b>(
@@ -143,14 +168,6 @@ fn prepared_member_body(
     })
 }
 
-/// RFC 0025 §3 — one layer's list-level `.shared` into one member's
-/// body, ONE level (deeper scopes distribute when the body next
-/// normalizes), yielding to the member's identity-token field: RFC 0005
-/// §10 gives an item's own token the win, and the token materializes
-/// only after the fold — masking here is what keeps the shared write
-/// from claiming the field first. A Named key's `name` is NOT a token
-/// (composition never materializes it), so a list-wide `.name` keeps
-/// reaching a Named item.
 /// The member's token-field mask for `.shared` distribution (RFC 0005
 /// §10): a Shorthand member's `+` field, read from its own model —
 /// the MULTI-member group path's stand-in for the token the post-fold
@@ -171,6 +188,15 @@ fn token_mask(
     }
 }
 
+/// RFC 0025 §3 — one layer's list-level `.shared` into one member's
+/// body, ONE level (deeper scopes distribute when the body next
+/// normalizes), yielding to the member's identity-token field: RFC 0005
+/// §10 gives an item's own token the win. `mask` names that field for
+/// the multi-member path, where the token is injected only after the
+/// fold ([`token_mask`]); a lone member carries its token already and
+/// passes `None` — existing-name-wins does the yielding. A Named key's
+/// `name` is NOT a token (composition never materializes it), so a
+/// list-wide `.name` keeps reaching a Named item.
 fn distribute_shared_level(body: &Body, shared: &[SharedProperty], mask: Option<&str>) -> Body {
     let selected: Vec<&SharedProperty> = shared
         .iter()
@@ -202,6 +228,10 @@ fn prepare_lone_member<'i>(
                 value: value.clone(),
             };
             let materialized = crate::identity::materialize_token(&token, &body, m);
+            // `materialized.diagnostics` (NML2049/2050) are the
+            // validator's to re-emit over the composed artifact; a
+            // non-validatable fill (no `+` field, arm mismatch) keeps the
+            // pre-token body — the shipped singleton behavior, A/B-held.
             if materialized.validatable {
                 materialized.body
             } else {
@@ -441,8 +471,6 @@ impl ItemKey {
     }
 }
 
-// ─────────────────────────────────────────────────────────────── tests ──
-
 impl<'a, 'd> Merger<'a, 'd> {
     /// GATHER-THEN-COMPOSE (RFC 0025 §3): one pass groups items by
     /// identity — layer order, first-seen group order, the token-prehash
@@ -503,9 +531,12 @@ impl<'a, 'd> Merger<'a, 'd> {
     }
 
     /// Compose ONE identity group (RFC 0025 §3), returning the composed
-    /// item and its owning layer. A Reference/Role group and a bodiless
-    /// singleton have nothing to fold — the anchor passes through (an
-    /// identical restatement is a no-op). A SINGLETON with a body
+    /// item and its owning layer. A Reference/Role group, and a bodiless
+    /// singleton whose own reading materializes nothing (dropped-key or
+    /// ambiguous), have nothing to fold — the anchor passes through (an
+    /// identical restatement is a no-op); a bodiless Shorthand singleton
+    /// whose model has a `+` field takes a fresh body and the lone-member
+    /// pipeline. A SINGLETON with a body
     /// deep-normalizes under its own reading — no merge level runs, so
     /// no merge-level records and no annotation synthesis, exactly the
     /// treatment the whole-layer pass gave an unpaired item (its own
@@ -702,6 +733,7 @@ impl<'a, 'd> Merger<'a, 'd> {
                         .get(&prehash)
                         .map(|v| v.as_slice())
                         .unwrap_or(&[]);
+                    note_group_scan(bucket.len());
                     bucket
                         .iter()
                         .copied()

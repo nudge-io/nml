@@ -127,7 +127,18 @@ pub struct FieldDef {
     /// derives no `PartialEq`, and semantic comparison happens on `Value`s
     /// (`Value::semantic_eq`), never on `FieldDef`s wholesale.
     pub doc: Option<String>,
+    /// The declaration's significant content — first to last non-trivia
+    /// token, as [`crate::ast::BodyEntry::span`] is: the span a structural
+    /// suggestion names the entry by (a deletion resolves against it,
+    /// `cst::edit`) and the one every field-anchored finding renders
+    /// from. A synthesized field carries an empty span.
     pub span: Span,
+    /// The type expression's content span; a remedy that edits the type
+    /// (the `?` that makes a required seal the sanctioned optional
+    /// spelling, NML2054) anchors at its end. A synthesized field, or a
+    /// declaration the parser recovered without a type, carries the end
+    /// of `span`.
+    pub type_span: Span,
 }
 
 /// The value domain a facet list ranges over: `number` (RFC 0018) or

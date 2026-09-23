@@ -23,7 +23,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Body, DeclarationKind, File};
-use crate::diagnostic::{Diagnostic, codes};
+use crate::diagnostic::{Diagnostic, DiagnosticSink, codes};
 use crate::diff::Origin;
 use crate::schema_index::SchemaIndex;
 
@@ -37,9 +37,15 @@ mod normalize;
 mod policy;
 mod seal;
 
-pub use grants::{GrantLookup, LayerGrant, LayerGrantProvider, OpenContext, RefDecision};
+pub use grants::{
+    ExternalClass, GrantLookup, LayerGrant, LayerGrantProvider, LayersWire, ManifestHome,
+    OpenContext, RefDecision, UnboundContext,
+};
 pub use instances::{InstanceId, InstanceIndex};
-pub use policy::{MergePolicy, policy_of, validate_merge_policies, validate_merge_policies_over};
+pub use policy::{
+    BUILTIN_DIRECTIVES, BuiltinDirective, MergePolicy, is_builtin_directive, policy_of,
+    validate_merge_policies, validate_merge_policies_over,
+};
 
 use grants::*;
 use linearize::*;
@@ -49,6 +55,8 @@ use merge::*;
 /// linearized stack (the declaring instance included). Bounds merge work in
 /// every context, grants included — the same defensive stance as the
 /// parser's `MAX_DEPTH` and the glob matcher's segment cap.
+///
+/// LIMIT: reach=content guards=work surface=kernel shown="16" — `uses` composition stack depth (a binding grant may lower it, never raise it)
 pub const MAX_STACK_DEPTH: u32 = 16;
 
 // ─────────────────────────────────────────────────────────────── grants ──
@@ -91,9 +99,8 @@ pub fn check_uses_refs(source_path: &str, file: &File) -> Vec<Diagnostic> {
 
 /// Field path → origin: which layer's assignment produced each effective
 /// entry. List items key by the identity pair (kind, token). Consumed
-/// today by the oracle dump (`nml check --dump-compose`, via
-/// `ComposedFile::origins`); the RFC 0019 verbs (`nml resolve
-/// --provenance`) are its next consumers.
+/// today by the composition golden (via `ComposedFile::origins`); the
+/// RFC 0019 verbs (`nml resolve --provenance`) are its next consumers.
 pub type ProvenanceTable = Vec<(String, Origin)>;
 
 #[derive(Debug)]
@@ -156,7 +163,7 @@ pub fn resolve_layers(
     };
     // The declaring clause's own site check + listed-ref resolution.
     let site = grants.grant_for(declaring.source_path);
-    if let Some(d) = deny_diagnostic(&site, declaring, declaring_block) {
+    if let Some(d) = deny_diagnostic(&site, declaring, declaring_block, refs) {
         diags.push(d);
         return (None, diags);
     }
@@ -348,25 +355,80 @@ pub fn resolve_layers(
     (Some(ResolvedInstance { body, origins }), diags)
 }
 
-/// The one-home deduplication key: identical (code, span, message) triples
-/// are the same finding wherever re-encountered — a base defect cloned into
-/// every overlay's resolved body, a shared sub-stack's violation seen by
-/// every descendant's compose. One vocabulary for every deduplicating
-/// consumer (this module's orchestration, the CLI's validator loop, the
-/// LSP's diagnostics pass to come).
+/// The one-home deduplication key: identical (code, span, message, source)
+/// quadruples are the same finding wherever re-encountered — a base defect
+/// cloned into every overlay's resolved body, a shared sub-stack's
+/// violation seen by every descendant's compose. The SOURCE is part of the
+/// key (RFC 0019 item 0, step 0a): a span is an offset into one file, so
+/// the same text at the same offset in two files is two findings with two
+/// homes, never one. One vocabulary for every deduplicating consumer (this
+/// module's orchestration, the CLI's validator loop, `nml fix`'s round
+/// gate, the LSP's diagnostics pass).
 pub type FindingKey = (
     Option<crate::diagnostic::Code>,
     Option<(usize, usize)>,
     String,
+    Option<String>,
 );
 
-/// The [`FindingKey`] of one diagnostic.
+/// The [`FindingKey`] of one diagnostic, its source as stamped.
 pub fn finding_key(diag: &Diagnostic) -> FindingKey {
     (
         diag.code,
         diag.span.map(|sp| (sp.start, sp.end)),
         diag.message.clone(),
+        diag.source.clone(),
     )
+}
+
+/// The [`FindingKey`] of one diagnostic READ FROM `own`: an unstamped
+/// finding (`source == None`) is a finding about the file being checked.
+/// Compose diagnostics arrive stamped with their layer's source; a
+/// validator's instance findings over the composed view do not, and the
+/// two must meet on one key — the merge emits validator-shaped findings
+/// itself (NML2051 at a bogus `as`) that the validator re-derives at the
+/// same span. Every front-end's seeded dedup keys through here.
+pub fn finding_key_in(diag: &Diagnostic, own: &str) -> FindingKey {
+    let mut key = finding_key(diag);
+    if key.3.is_none() {
+        key.3 = Some(own.to_string());
+    }
+    key
+}
+
+/// THE deduplicating sink every front end validates a composed file
+/// through: a validator finding is pushed on to `inner` unless
+/// its [`FindingKey`] — keyed IN `own`, the checked file, since the
+/// validator's findings are unstamped and must meet the merge's stamped
+/// twins on one key — was seen before. `seen` is
+/// [`ComposedFile::dedup_seed`]: the composed findings' keys when the
+/// file COMPOSES, `None` when it does not — then nothing is deduplicated
+/// and no set is held (a set that held a key per finding was most of
+/// the memory a flood cost; a file whose composed view is its authored
+/// one, with no merge finding, reports every validator finding exactly
+/// once by construction — the whole battery ran with a duplicate-key
+/// assertion in `validate` and found none).
+pub struct Deduped<'a, S: ?Sized> {
+    inner: &'a mut S,
+    own: &'a str,
+    seen: Option<HashSet<FindingKey>>,
+}
+
+impl<'a, S: DiagnosticSink + ?Sized> Deduped<'a, S> {
+    pub fn new(inner: &'a mut S, own: &'a str, seen: Option<HashSet<FindingKey>>) -> Self {
+        Self { inner, own, seen }
+    }
+}
+
+impl<S: DiagnosticSink + ?Sized> DiagnosticSink for Deduped<'_, S> {
+    fn push(&mut self, diag: Diagnostic) {
+        if let Some(seen) = &mut self.seen {
+            if !seen.insert(finding_key_in(&diag, self.own)) {
+                return;
+            }
+        }
+        self.inner.push(diag);
+    }
 }
 
 /// A whole file composed: the validation view plus every composition
@@ -379,10 +441,29 @@ pub struct ComposedFile {
     pub validation_file: Option<File>,
     pub diagnostics: Vec<Diagnostic>,
     /// Each successfully composed declaration's provenance table, keyed
-    /// by its declaration index (RFC 0025 Phase 1 — the oracle dumps
-    /// them; `resolve_layers` always computed them and this surface
-    /// used to drop them).
+    /// by its declaration index (RFC 0025 Phase 1 — the composition
+    /// golden pins them; `resolve_layers` always computed them and this
+    /// surface used to drop them).
     pub origins: Vec<(usize, ProvenanceTable)>,
+}
+
+impl ComposedFile {
+    /// The keys a validator pass over this file must be deduplicated
+    /// against (the seed of a [`Deduped`] sink): the composed findings'
+    /// keys — IN `own` — when the file COMPOSES (a merge finding met its
+    /// validator-shaped twin, NML2051 at a bogus `as`; an overlay's
+    /// resolved body carries clones of base entries at their authored
+    /// spans), `None` when nothing composed: deduplication is
+    /// composition's need alone, and a front end that seeded a set for
+    /// every file held a key per finding of a flood.
+    pub fn dedup_seed(&self, own: &str) -> Option<HashSet<FindingKey>> {
+        (self.validation_file.is_some() || !self.diagnostics.is_empty()).then(|| {
+            self.diagnostics
+                .iter()
+                .map(|d| finding_key_in(d, own))
+                .collect()
+        })
+    }
 }
 
 /// Compose every `uses`-carrying block in a file — the one orchestration

@@ -1,6 +1,7 @@
 import { promises as fsp } from "fs";
 import * as os from "os";
 import * as path from "path";
+import { scrubbedEnvOverlay } from "./providerTrust";
 
 /** `fs.realpath`, but never throwing — a racing delete must not crash activation. */
 export async function realPath(p: string): Promise<string> {
@@ -21,6 +22,72 @@ export function expandHomePrefix(p: string, homedir: string): string {
   if (p === "~") return homedir;
   if (p.startsWith("~/")) return path.join(homedir, p.slice(2));
   return p;
+}
+
+/** The working directory every process-backed server is spawned in —
+ *  a project's `<tool> lsp`, an `nml.server.path` override, the native
+ *  default. NEVER a workspace folder: `vscode-languageclient` defaults an
+ *  executable's cwd to the first one, and the tool name a project declares
+ *  may resolve to an interpreter (`sh`, `node`, `python3` all satisfy
+ *  `TOOL_NAME`), for which the fixed argument `lsp` is a SCRIPT PATH
+ *  resolved against the cwd — a repository shipping a file named `lsp`
+ *  beside its `nml-project.nml` would run it the moment the operator
+ *  accepted the prompt. The home directory is the operator's own (a
+ *  terminal's starting point, nothing a repository controls); a homeless
+ *  or relative one falls back to the filesystem root, where nothing
+ *  relative resolves. No server reads its cwd: LSP hands it the roots. */
+export function providerWorkingDir(homedir: string, fsRoot: string): string {
+  return homedir && path.isAbsolute(homedir) ? homedir : fsRoot;
+}
+
+/** A working directory that [`launchSandbox`] minted, and that nothing else
+ *  can spell.
+ *
+ *  The brand is type-level only — `declare const` emits nothing, and the
+ *  property is never written at runtime — and it is what makes the sentence
+ *  `processLaunch.ts` opens with TRUE rather than agreed: `ProcessServer.cwd`
+ *  is this type, so a resolution site cannot hand the launch a bare path.
+ *  Without it the interface was structural and a hand-written
+ *  `{ kind: "process", cwd: someFolder, env: {} }` typechecked — a spawn in a
+ *  workspace folder, where the fixed `lsp` argument is a file an interpreter
+ *  would run, with nothing scrubbed out of the environment. */
+declare const launchSandboxBrand: unique symbol;
+export type SandboxCwd = string & { readonly [launchSandboxBrand]: true };
+
+/** Everything about a spawn that is not the program and its arguments: where
+ *  it starts, and which inherited environment variables are removed first.
+ *  Minted in exactly one place ([`launchSandbox`]) and carried by exactly one
+ *  constructor (`serverAcquisition.processServer`), so no resolution site can
+ *  reach a spawn with half of it. */
+export interface LaunchSandbox {
+  readonly cwd: SandboxCwd;
+  /** Overlaid on the inherited environment; every value is `undefined`,
+   *  which is what REMOVES a variable (see `providerTrust.scrubbedEnvOverlay`). */
+  readonly env: Readonly<Record<string, undefined>>;
+}
+
+/** The sandbox every process-backed server is spawned into.
+ *
+ *  `privateDir` is an empty directory the extension owns
+ *  (`clientManager.privateWorkingDir` creates it under the extension's global
+ *  storage, mode 0700). Empty is the point: the fixed `lsp` argument is a
+ *  SCRIPT PATH for any interpreter a declared tool name resolves to, and on
+ *  Windows the default DLL search order includes the current directory — an
+ *  empty directory has nothing for either to find. Global storage rather than
+ *  a temp directory: on a shared machine `/tmp` is reachable by other local
+ *  users, and the profile directory is not.
+ *
+ *  It falls back to [`providerWorkingDir`] when the private directory cannot
+ *  be made (a read-only or full profile): the operator's home is still never
+ *  a workspace folder, which is the property that matters, and a server that
+ *  cannot start is worse than one starting in a directory with files in it. */
+export function launchSandbox(privateDir: string | undefined): LaunchSandbox {
+  const cwd =
+    privateDir && path.isAbsolute(privateDir)
+      ? privateDir
+      : providerWorkingDir(os.homedir(), path.parse(process.cwd()).root);
+  // The ONE place a [`SandboxCwd`] comes into existence.
+  return { cwd: cwd as SandboxCwd, env: scrubbedEnvOverlay(process.env) };
 }
 
 /** True when `targetReal` lies inside any of `rootReals` (each already realpath'd).

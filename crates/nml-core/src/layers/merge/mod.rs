@@ -7,7 +7,7 @@ use crate::ast::{
     Body, BodyEntry, BodyEntryKind, Identifier, ListItem, Modifier, ModifierValue, NestedBlock,
     SharedProperty,
 };
-use crate::diagnostic::{Diagnostic, codes};
+use crate::diagnostic::{Diagnostic, Suggestion, codes};
 use crate::diff::Origin;
 use crate::model::{FieldDef, FieldType, ModelDef};
 use crate::schema_index::{NameableVariant, SchemaIndex};
@@ -536,7 +536,7 @@ impl<'a, 'd> Merger<'a, 'd> {
                      {by}; restating it would silently decouple if the \
                      base changes — delete this assignment"
                 ))
-                .with_deletion(c.entry.span)
+                .with_suggestion(Suggestion::delete().at(c.entry.span))
             } else {
                 Diagnostic::error(format!(
                     "assignment to `#sealed` field '{path}' — {by} already \

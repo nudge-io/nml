@@ -1,0 +1,26 @@
+package demo:
+    version = "0.1.0"
+    formatVersion = 1
+
+[]schema schemas:
+    - core:
+        file = "core.model.nml"
+
+[]validator validators:
+    - tenantFlows:
+        files:
+            - "tenants/**/*.flow.nml"
+        schemas:
+            - core
+        strict = true
+    - vendorFlows:
+        files:
+            - "vendor/**/*.flow.nml"
+        schemas:
+            - core
+        layers:
+            allowRefs:
+                - "vendor/**"
+            denyRefs:
+                - "vendor/vetoed/**"
+            maxStackDepth = 4

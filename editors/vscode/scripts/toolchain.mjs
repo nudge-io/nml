@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 
 /**
@@ -35,7 +35,7 @@ export function bundleWasm(packageDir) {
     console.error(
       `bundle:wasm: missing ${wasmPath}\n` +
         "  Run: cargo build -p nml-lsp --target wasm32-wasip1 --release\n" +
-        "  Or:  just build-lsp-wasm"
+        "  Or:  just gate-wasm"
     );
     process.exit(1);
   }
@@ -44,8 +44,42 @@ export function bundleWasm(packageDir) {
   copyFileSync(wasmPath, resolve(serverDir, "nml-lsp.wasm"));
 }
 
+/** The name of the launch supervisor, in `src/` and beside every build output. */
+export const SUPERVISOR_FILE = "launchSupervisor.js";
+
+/**
+ * Put the launch supervisor beside the code that runs it.
+ *
+ * `processLaunch.ts` resolves it as `join(__dirname, SUPERVISOR_FILE)`, and
+ * there are two `__dirname`s: `dist/` for the bundled extension the editor
+ * loads, `out/` for the tsc output the real-process tests drive. It is a plain
+ * CommonJS file with no imports beyond `child_process` and `net`, so it is
+ * COPIED rather than bundled — esbuild would rewrite it into a module the
+ * Electron helper cannot run as a script, and the whole point is that
+ * `process.execPath <file>` works with nothing else present.
+ *
+ * @param {string} packageDir
+ * @param {string} outDir directory name under packageDir
+ */
+export function copySupervisor(packageDir, outDir) {
+  const source = resolve(packageDir, "src", SUPERVISOR_FILE);
+  if (!existsSync(source)) {
+    console.error(`copySupervisor: missing ${source}`);
+    process.exit(1);
+  }
+  const target = resolve(packageDir, outDir);
+  mkdirSync(target, { recursive: true });
+  copyFileSync(source, resolve(target, SUPERVISOR_FILE));
+}
+
 /** @param {string} packageDir */
 export function bundleJs(packageDir) {
+  // From scratch. A file left behind by an EARLIER build is a file the VSIX
+  // ships and nothing re-derives — so a packaging check over a directory that
+  // is never cleaned passes on yesterday's output, which is exactly what it
+  // exists to catch. (Proven: with `dist/` reused, deleting the supervisor
+  // copy below left `verifyPackage.mjs` green.)
+  rmSync(resolve(packageDir, "dist"), { recursive: true, force: true });
   pnpmExec(
     packageDir,
     "esbuild",
@@ -58,9 +92,11 @@ export function bundleJs(packageDir) {
     "--minify",
     "--sourcemap"
   );
+  copySupervisor(packageDir, "dist");
 }
 
 /** @param {string} packageDir */
 export function compileTsc(packageDir) {
   pnpmExec(packageDir, "tsc", "-b", "tsconfig.json", "tsconfig.test.json");
+  copySupervisor(packageDir, "out");
 }

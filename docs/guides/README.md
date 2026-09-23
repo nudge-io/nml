@@ -1,10 +1,12 @@
 # NML Cookbook
 
-Task-oriented recipes for embedding NML as a Rust library. Each page solves
-one job, and every recipe is **compiled and executed in CI**: the code
+Task-oriented recipes for embedding NML as a Rust library, plus one CLI page
+(*Validate in CI*). Every Rust listing is **compiled and executed in CI**: the
 listings are excerpts of the example programs in
-[`examples/cookbook/`](examples/cookbook/), which `just docs-test` runs on
-every change — a recipe that stops working fails the build by name.
+[`examples/cookbook/`](examples/cookbook/) and of the test files the CLI page's
+siblings name, which `just gate-docs` runs on every change — a recipe that
+stops working fails the build by name. The CLI page's own blocks are executed
+transcripts of the real binary, checked the same way.
 
 New to the language itself? Start with the [tutorial](../tutorial/README.md).
 Looking up a feature? The [language guide](../language-guide.md) and
@@ -15,7 +17,8 @@ Looking up a feature? The [language guide](../language-guide.md) and
 1. [Parse a file and read values](parse-and-query.md) — the query API
 2. [Deserialize into structs with serde](deserialize-with-serde.md)
 3. [Collect *all* parse errors](collect-all-errors.md) — the editor-grade experience
-4. [Validate in CI](validate-in-ci.md) — strict mode, exit codes, `--schema`
+4. [Validate in CI](validate-in-ci.md) — a workspace manifest, `--root`,
+   strict mode, exit codes, `--schema`, `--json`
 5. [Test your schemas and configs](test-your-schemas.md)
 
 ## Values and defaults
@@ -32,7 +35,9 @@ Looking up a feature? The [language guide](../language-guide.md) and
 ## Shipping to your users
 
 11. [Define a directive vocabulary for your tool](directive-vocabulary.md)
-12. [Build and publish schema packages](schema-packages-and-store.md)
+12. [Build and publish schema packages](schema-packages-and-store.md) — and
+    [how a file finds its binding](schema-packages-and-store.md#how-a-file-finds-its-binding-workspace-resolution):
+    manifests, `files` claims, grants and the closed workspace
 13. [Embed the language server](embed-the-lsp.md) — `<your-tool> lsp` in one line
 
 ## Coming from elsewhere

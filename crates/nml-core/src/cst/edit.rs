@@ -1,10 +1,18 @@
 //! Structural CST editing over the lossless tree — TWO operations with
-//! deliberately different mechanics:
+//! deliberately different mechanics, both reaching every applier as
+//! [`SpliceEdit`]s (the one write primitive; [`splice`] validates every
+//! batch as the last line of defense):
 //!
 //! * **Insertion** (RFC 0030 P2, [`insert_entry_at_path`] — the LSP's pin /
-//!   opt-out writes into `nml-project.nml`) is a **green-tree splice**
+//!   opt-out writes into `nml-project.nml` — and [`SuggestionKind::Insert`],
+//!   the manifest grant a denial asks for, resolved by name span through
+//!   [`resolve_suggestions`]) is a **green-tree splice**
 //!   (`rowan`'s mutable-tree API): the source parses to the lossless CST,
-//!   the new entry parses inside a synthetic wrapper, and the wrapper's
+//!   the new entry parses inside a synthetic wrapper — the parse is the
+//!   snippet's GATE (text that is not one-or-more body entries is refused,
+//!   so new meaning cannot ride an insertion) and its re-indenter (the
+//!   wrapper's body is written at the target body's own indentation and
+//!   nesting unit, its lines ending as the file's do) — and the wrapper's
 //!   parsed elements are moved into the target body with
 //!   [`SyntaxNode::splice_children`]. Every token outside the insertion —
 //!   comments, blank lines, exotic indentation — is carried over
@@ -13,7 +21,9 @@
 //!   factory: hand-assembled green children would re-encode grammar
 //!   knowledge (which trivia goes where) that the parser already owns, so
 //!   parsing a wrapper mints real tokens with exactly the shapes the parser
-//!   itself produces.
+//!   itself produces. The resolver reduces the spliced text to ONE hunk
+//!   ([`single_hunk`]), so an insertion reaches every applier and every
+//!   wire as one exact [`SpliceEdit`], like any other edit.
 //! * **Deletion** (RFC 0023 Part A, [`resolve_suggestions`]) is **range
 //!   computation over the token stream — token walks, never tree
 //!   mutation**. Deletion mints no tokens, and node detachment is wrong
@@ -36,8 +46,10 @@
 //! applier would be an exemption from "every refusal is printed".
 
 use super::ast::{self, AstNode as _};
-use super::syntax::content_span;
-use super::{NmlLanguage, SyntaxKind, SyntaxNode, SyntaxToken, parse};
+use super::syntax::{content_span, significant_tokens};
+use super::{
+    INDENT_UNIT, NmlLanguage, SyntaxKind, SyntaxNode, SyntaxToken, line_terminator, parse,
+};
 use crate::diagnostic::{Suggestion, SuggestionKind};
 use crate::span::Span;
 
@@ -79,13 +91,20 @@ pub enum EntryPosition {
 ///   unreachable because resolution never leaves the addressed parent, and a
 ///   duplicate under the *right* parent refuses rather than picking one and
 ///   silently misdirecting the write.
-/// * `entry_snippet` is written at **zero indentation** (relative indentation
-///   for nested lines): `"- name"`, `"autoAssociate = false"`,
-///   `"schemaPackages:\n    - name"`. The target indentation is derived from
-///   the block's existing entries (verbatim — odd widths included; tabs are
-///   illegal NML indentation, so a tab-indented source is refused via the
-///   parse-error gate below — a safe refusal, not verbatim adoption), or
-///   header indent + four spaces when the body is empty.
+/// * `entry_snippet` is canonical-form NML at **zero indentation** —
+///   [`INDENT_UNIT`] per nesting level: `"- name"`, `"autoAssociate = false"`,
+///   `"schemaPackages:\n    - name"`. The target indentation is the FILE's:
+///   the entry line sits where the block's existing entries sit (verbatim —
+///   odd widths included; an entry at any other column is no entry of that
+///   body), or one unit under the header when the body is empty; each
+///   canonical level of the snippet's own nesting becomes the unit the
+///   block nests by (`nesting_unit`: the block's own step, else the
+///   nearest enclosing block's, else the document's one step, else the
+///   canonical unit — two spaces in a two-space file, and inside a
+///   two-space block of a file that nests two ways), and the minted lines
+///   end as the file's lines do (`\r\n` in a CRLF file). Tabs are illegal
+///   NML indentation, so a tab-indented source is refused via the
+///   parse-error gate below — a safe refusal, not verbatim adoption.
 ///
 /// Everything outside the inserted lines is preserved byte-for-byte.
 pub fn insert_entry_at_path(
@@ -108,20 +127,70 @@ pub fn insert_entry_at_path(
     // read *before* the single splice, so indexing `source` stays valid.
     let root = parsed.syntax().clone_for_update();
     let block = resolve_path(&root, path)?;
+    splice_entries(source, &root, &block, entry_snippet, position)
+}
+
+/// Splice `entry_snippet`'s entries into `block`'s body at `position` —
+/// `block` a node of the MUTABLE tree `root` — and return the whole new
+/// text. The one insertion engine behind [`insert_entry_at_path`] and the
+/// [`SuggestionKind::Insert`] arm of [`resolve_suggestions`].
+fn splice_entries(
+    source: &str,
+    root: &SyntaxNode,
+    block: &SyntaxNode,
+    entry_snippet: &str,
+    position: EntryPosition,
+) -> Option<String> {
     let body = block.children().find(|n| n.kind() == SyntaxKind::Body);
-
-    let indent = entry_indent(source, &block, body.as_ref());
-    let (spare_newline, run) = parse_entry_run(entry_snippet, &indent)?;
-
+    let indent = entry_indent(source, root, block, body.as_ref());
+    let (spare, run) = parse_entry_run(entry_snippet, &indent, line_terminator(source))?;
     match body {
-        Some(body) => insert_into_body(source, &body, run, spare_newline, position)?,
-        // A bare `name:` header parses with **no Body node at all** (the
-        // terminating newline is the block's sibling), so an "empty body"
-        // insert is really an insert next to the block in its parent.
-        None => insert_after_bare_header(&block, run, spare_newline)?,
+        Some(body) => insert_into_body(source, &body, run, spare, position)?,
+        // A bare `name:` header parses with **no Body node at all**, so an
+        // "empty body" insert is really an insert next to the block in its
+        // parent — at the line start after the header line.
+        None => insert_after_bare_header(source, block, run, spare)?,
     }
-
     Some(root.text().to_string())
+}
+
+/// The block whose NAME token occupies exactly `span`: a top-level
+/// declaration (its `Name` node's identifier), a nested block or a named
+/// list item — the anchor a structural insertion names (a manifest
+/// binding's name span, as the kernel locates it). Equality, so a stale
+/// span finds nothing.
+fn block_named_at(root: &SyntaxNode, span: Span) -> Option<SyntaxNode> {
+    root.descendants()
+        .find(|n| block_name(n).is_some_and(|t| super::syntax::token_span(&t) == span))
+}
+
+/// A block-shaped node's name token — a node that owns a body: a
+/// declaration's (a block's or an array's), a nested block's, a named
+/// list item's. `None` for every other node (a property's name names
+/// no body to insert into).
+fn block_name(node: &SyntaxNode) -> Option<SyntaxToken> {
+    match node.kind() {
+        SyntaxKind::BlockDecl | SyntaxKind::ArrayDecl => node
+            .children()
+            .find_map(ast::Name::cast)
+            .and_then(|name| name.ident()),
+        SyntaxKind::NestedBlock => ast::NestedBlock::cast(node.clone())?.name(),
+        SyntaxKind::ListItem => ast::ListItem::cast(node.clone())?.name(),
+        _ => None,
+    }
+}
+
+/// A body entry's name — a property's, a nested block's, a named list
+/// item's — the key a duplicate is judged by. `None` for an unnamed
+/// entry (a modifier, an arm, a scalar list item).
+fn entry_name(node: &SyntaxNode) -> Option<String> {
+    let token = match ast::Entry::cast(node.clone())? {
+        ast::Entry::Property(p) => p.name(),
+        ast::Entry::NestedBlock(b) => b.name(),
+        ast::Entry::ListItem(i) => i.name(),
+        _ => None,
+    }?;
+    Some(token.text().to_string())
 }
 
 /// Resolve `path` (see [`insert_entry_at_path`]'s grammar) to its unique
@@ -162,80 +231,211 @@ fn is_entry(node: &SyntaxNode) -> bool {
     ast::Entry::cast(node.clone()).is_some()
 }
 
-/// The indentation string for a new entry in `block`'s body.
-///
-/// Preference order: the existing first entry's own line indentation
-/// (authoritative — whatever width the file uses; tab indentation never
-/// reaches here, the parse-error gate in `insert_entry_at_path` refuses
-/// it), else the block header's line indentation plus one four-space level
-/// (the house style, matching what the LSP historically wrote).
-fn entry_indent(source: &str, block: &SyntaxNode, body: Option<&SyntaxNode>) -> String {
-    if let Some(entry) = body.and_then(|b| b.children().find(is_entry)) {
-        // The CST attaches each entry line's leading Whitespace *inside* the
-        // entry node, but a leading attached comment may precede it there, so
-        // the reliable sample is the token immediately before the entry's
-        // first significant token (e.g. the `-` of a list item).
-        let first_significant = entry
-            .descendants_with_tokens()
-            .filter_map(|e| e.into_token())
-            .find(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::Indent);
-        if let Some(ws) = first_significant
-            .and_then(|t| t.prev_token())
-            .filter(|t| t.kind() == SyntaxKind::Whitespace)
-        {
-            return ws.text().to_string();
-        }
-    }
-    // Empty body: header indent + one level. The header's own indent is the
-    // whitespace prefix of its line, located via the keyword/name token (the
-    // block node itself may *start* with an attached leading comment, so the
-    // node's start offset is not the header line's start).
-    let header_indent = block
-        .children_with_tokens()
-        .filter_map(|e| e.into_token())
-        .find(|t| t.kind() == SyntaxKind::Ident)
-        .map(|kw| {
-            let start = usize::from(kw.text_range().start());
-            let line_start = source[..start].rfind('\n').map_or(0, |i| i + 1);
-            let prefix = &source[line_start..start];
-            if prefix.chars().all(|c| c == ' ' || c == '\t') {
-                prefix.to_string()
-            } else {
-                String::new()
-            }
-        })
-        .unwrap_or_default();
-    format!("{header_indent}    ")
+/// The indentation a block's body gives a new entry: `indent` for the
+/// entry's own line, `unit` for each level nested inside it.
+struct EntryIndent {
+    indent: String,
+    unit: String,
 }
 
-/// Parse `entry_snippet` (re-indented to `indent`) inside a synthetic wrapper
-/// block and return `(spare_newline, run)`:
+/// The indentation for a new entry in `block`'s body, in the document
+/// `root` is the tree of: the body's existing entries' own line
+/// indentation (authoritative — whatever width the file uses; an entry
+/// at another column would be no entry of this body; tab indentation
+/// never reaches here, the parse-error gate in `insert_entry_at_path`
+/// refuses it), else the header line's indentation plus one unit — the
+/// unit the block nests by ([`nesting_unit`]), for its nested lines too.
+fn entry_indent(
+    source: &str,
+    root: &SyntaxNode,
+    block: &SyntaxNode,
+    body: Option<&SyntaxNode>,
+) -> EntryIndent {
+    let unit = nesting_unit(source, root, block, body);
+    match body.and_then(body_indent) {
+        Some(indent) => EntryIndent { indent, unit },
+        None => EntryIndent {
+            indent: format!("{}{unit}", header_indent(source, block)),
+            unit,
+        },
+    }
+}
+
+/// The unit a line minted under `block` (whose body is `body`, when it
+/// has one) nests by — the NEAREST evidence of the file's own
+/// indentation, the canonical unit when there is none: the block's own
+/// step (what its entries add to its header line), else the step of the
+/// nearest block around it, else the one step every body of the document
+/// nests by ([`document_unit`]), else [`INDENT_UNIT`]. A two-space block
+/// inside a file whose other blocks nest by four keeps nesting by two:
+/// the inserted lines read as the block's own and no width foreign to
+/// the block is introduced — the file is no less consistent than it was,
+/// and `nml fmt` remains one command away for the rest. (rust-analyzer's
+/// `IndentLevel` reads the level from the node it edits under, never
+/// from a whole-file histogram; VS Code's indentation guess is that
+/// histogram over lines — the CST answers exactly, a node away.)
+fn nesting_unit(
+    source: &str,
+    root: &SyntaxNode,
+    block: &SyntaxNode,
+    body: Option<&SyntaxNode>,
+) -> String {
+    body.and_then(|b| body_step(source, b))
+        .or_else(|| {
+            block
+                .ancestors()
+                .skip(1)
+                .filter(|n| n.kind() == SyntaxKind::Body)
+                .find_map(|b| body_step(source, &b))
+        })
+        .or_else(|| document_unit(source, root))
+        .unwrap_or_else(|| INDENT_UNIT.to_string())
+}
+
+/// The leading whitespace of `body`'s first entry's line — `None` for a
+/// body with no entry. The CST attaches each entry line's leading
+/// Whitespace *inside* the entry node, but a leading attached comment
+/// may precede it there, so the reliable sample is the token immediately
+/// before the entry's first significant token (e.g. the `-` of a list
+/// item).
+fn body_indent(body: &SyntaxNode) -> Option<String> {
+    let entry = body.children().find(is_entry)?;
+    significant_tokens(&entry)
+        .next()
+        .and_then(|t| t.prev_token())
+        .filter(|t| t.kind() == SyntaxKind::Whitespace)
+        .map(|ws| ws.text().to_string())
+}
+
+/// What `body`'s entries add to their header line's indentation — the
+/// step the block nests by; `None` for a body with no entry, or one
+/// whose indentation does not extend its header's (a tree with an
+/// offside error: no evidence, never a guess).
+fn body_step(source: &str, body: &SyntaxNode) -> Option<String> {
+    let indent = body_indent(body)?;
+    let header = header_indent(source, &body.parent()?);
+    indent
+        .strip_prefix(header.as_str())
+        .filter(|step| !step.is_empty())
+        .map(str::to_string)
+}
+
+/// The one step every body of the document nests by, or `None`: no body
+/// nests anything (nothing to read), or two bodies nest by different
+/// steps (a two-space file with one four-space block — no one step is
+/// the document's).
+fn document_unit(source: &str, root: &SyntaxNode) -> Option<String> {
+    let mut unit: Option<String> = None;
+    for body in root.descendants().filter(|n| n.kind() == SyntaxKind::Body) {
+        let Some(step) = body_step(source, &body) else {
+            continue;
+        };
+        match &unit {
+            Some(seen) if *seen != step => return None,
+            Some(_) => {}
+            None => unit = Some(step),
+        }
+    }
+    unit
+}
+
+/// The indentation unit a new line after the line holding `offset` nests
+/// by — `nesting_unit` for the entry or declaration that line belongs
+/// to (the body it opens when that already has an entry, else the bodies
+/// around it, the document's one step, the canonical unit): the rule the
+/// structural insertions follow, so the cursor after `key:` lands where
+/// a quick fix would put the nested line. Reads the tree the source
+/// parses to, errors and all — a document mid-edit still has a unit —
+/// and answers the canonical unit past the end of the text.
+pub fn indentation_unit_at(source: &str, offset: usize) -> String {
+    let parsed = parse(source);
+    let root = parsed.syntax();
+    let offset = rowan::TextSize::from(offset.min(source.len()) as u32);
+    // The innermost node at the offset that is an entry of a body or a
+    // top-level declaration: the block a header line opens, the entry a
+    // value line is — its own body (if any) and its ancestors carry the
+    // evidence.
+    let block = root
+        .token_at_offset(offset)
+        .right_biased()
+        .into_iter()
+        .flat_map(|t| t.parent_ancestors())
+        .find(|n| {
+            n.parent()
+                .is_none_or(|p| matches!(p.kind(), SyntaxKind::Body | SyntaxKind::Root))
+        });
+    match block {
+        Some(block) => {
+            let body = block.children().find(|n| n.kind() == SyntaxKind::Body);
+            nesting_unit(source, &root, &block, body.as_ref())
+        }
+        None => document_unit(source, &root).unwrap_or_else(|| INDENT_UNIT.to_string()),
+    }
+}
+
+/// The leading whitespace of the block header's line, located via the
+/// header's first significant token — a declaration's keyword, a list
+/// item's dash (the block node itself may *start* with an attached
+/// leading comment, so the node's start offset is not the header line's
+/// start, and a list item's `- ` is not indentation).
+fn header_indent(source: &str, block: &SyntaxNode) -> String {
+    let Some(first) = significant_tokens(block).next() else {
+        return String::new();
+    };
+    let start = usize::from(first.text_range().start());
+    let line_start = source[..start].rfind('\n').map_or(0, |i| i + 1);
+    let line = &source[line_start..];
+    let width = line.len() - line.trim_start_matches([' ', '\t']).len();
+    source[line_start..line_start + width].to_string()
+}
+
+/// A node's significant tokens in order: neither trivia nor the
+/// zero-width layout markers.
+/// Parse `entry_snippet` (re-indented to `indent`, each of its canonical
+/// [`INDENT_UNIT`] nesting levels as the file's unit, every line ending
+/// in `eol`) inside
+/// a synthetic wrapper block and return `(spare, run)`:
 ///
 /// * `run` — the detached-ready elements forming the entry's complete source
 ///   lines: leading `Whitespace` lives inside each entry node, a property/item
 ///   entry is followed by its terminating `Newline` sibling, and a nested
 ///   block carries its newline inside its own body.
-/// * `spare_newline` — one extra `Newline` token (the wrapper header's), for
-///   callers that must first repair a missing line terminator at the insertion
-///   point (a file ending without `\n`).
+/// * `spare` — one extra line terminator (the wrapper header's: a `\r`
+///   whitespace token and the `Newline` under CRLF, the `Newline` alone
+///   otherwise), for callers that must first repair a missing terminator at
+///   the insertion point (a file ending without one).
 ///
 /// `None` when the snippet does not parse cleanly as one-or-more entries — the
 /// structural analogue of injection safety: text that would change meaning
 /// beyond adding entries cannot come out of this function.
 fn parse_entry_run(
     entry_snippet: &str,
-    indent: &str,
-) -> Option<(SyntaxElement, Vec<SyntaxElement>)> {
+    indent: &EntryIndent,
+    eol: &str,
+) -> Option<(Vec<SyntaxElement>, Vec<SyntaxElement>)> {
     // `w W:` — a top-level block header needs both keyword and name; the
     // snippet's lines become its body.
-    let mut wrapper = String::from("w W:\n");
+    let mut wrapper = format!("w W:{eol}");
     for line in entry_snippet.lines() {
         if line.trim().is_empty() {
-            wrapper.push('\n');
+            wrapper.push_str(eol);
         } else {
-            wrapper.push_str(indent);
-            wrapper.push_str(line);
-            wrapper.push('\n');
+            // The snippet's own nesting is written in canonical levels
+            // (`INDENT_UNIT`, the one spelling every producer uses); each
+            // level is one of the file's units. A level that is no whole
+            // step is refused — re-scaling it would silently change the
+            // snippet's structure.
+            let leading = line.len() - line.trim_start_matches(' ').len();
+            if leading % INDENT_UNIT.len() != 0 {
+                return None;
+            }
+            let levels = leading / INDENT_UNIT.len();
+            wrapper.push_str(&indent.indent);
+            for _ in 0..levels {
+                wrapper.push_str(&indent.unit);
+            }
+            wrapper.push_str(&line[levels * INDENT_UNIT.len()..]);
+            wrapper.push_str(eol);
         }
     }
     let parsed = parse(&wrapper);
@@ -267,11 +467,13 @@ fn parse_entry_run(
     if !run.iter().any(|e| e.as_node().is_some_and(is_entry)) {
         return None;
     }
-    let spare_newline = children
-        .iter()
-        .find(|e| e.kind() == SyntaxKind::Newline)?
-        .clone();
-    Some((spare_newline, run))
+    // The header's terminator: everything before the layout marker —
+    // under CRLF the `\r` (a whitespace token) and the `Newline`, as one.
+    let spare: Vec<SyntaxElement> = children[..first_indent].to_vec();
+    if !spare.iter().any(|e| e.kind() == SyntaxKind::Newline) {
+        return None;
+    }
+    Some((spare, run))
 }
 
 /// Splice `run` into `body` at `position`. All offset reads happen against the
@@ -280,7 +482,7 @@ fn insert_into_body(
     source: &str,
     body: &SyntaxNode,
     run: Vec<SyntaxElement>,
-    spare_newline: SyntaxElement,
+    spare: Vec<SyntaxElement>,
     position: EntryPosition,
 ) -> Option<()> {
     let children: Vec<SyntaxElement> = body.children_with_tokens().collect();
@@ -300,37 +502,32 @@ fn insert_into_body(
             .iter()
             .position(|e| e.as_node().is_some_and(is_entry))
             .unwrap_or_else(before_dedent),
-        // Right after the last entry's line — NOT before the body's closing
+        // Right after the last entry's LINE — NOT before the body's closing
         // Dedent, which would land the new entry below any trailing blank
         // lines/comments that visually separate this block from the next.
+        // Located textually: the entry's last significant token, a
+        // same-line comment, then the terminator (`\r\n` is one). The tree
+        // keeps a following comment line's indentation INSIDE the entry's
+        // own body and a blank line as a sibling, so an element walk
+        // cannot find the line start; the byte offset can, and the splice
+        // lands before whichever element starts there — the tree is read
+        // back as text, so only the byte position matters.
         EntryPosition::Last => match children
             .iter()
             .rposition(|e| e.as_node().is_some_and(is_entry))
         {
-            // A property/list-item entry is terminated by a sibling Newline
-            // (skip past it); a nested-block entry carries its newline inside
-            // its own body, so the entry itself already ends the line. The
-            // terminator is located by skipping trivia first: under CRLF the
-            // `\r` lexes as a Whitespace token sitting between the entry and
-            // its Newline, and `\r`+Newline is ONE terminator — landing
-            // between them would split the pair and spuriously trip the
-            // missing-terminator repair below (the offset before a bare `\r`
-            // does not end with '\n').
             Some(i) => {
-                let mut after = i + 1;
-                while children
-                    .get(after)
-                    .is_some_and(|e| e.kind() == SyntaxKind::Whitespace)
-                {
-                    after += 1;
-                }
-                if children
-                    .get(after)
-                    .is_some_and(|e| e.kind() == SyntaxKind::Newline)
-                {
-                    after + 1
-                } else {
-                    i + 1
+                let entry = children[i].as_node().cloned()?;
+                let content_end = significant_tokens(&entry)
+                    .last()
+                    .map_or(usize::from(entry.text_range().end()), |t| {
+                        usize::from(t.text_range().end())
+                    });
+                match line_end_after(source, content_end) {
+                    Some(offset) => return splice_at_offset(body, offset, run),
+                    // No terminator: the entry ends the file — append,
+                    // and the repair below terminates its line first.
+                    None => before_dedent(),
                 }
             }
             None => before_dedent(),
@@ -347,47 +544,205 @@ fn insert_into_body(
     );
     let mut elements = run;
     if insert_offset > 0 && !source[..insert_offset].ends_with('\n') {
-        elements.insert(0, spare_newline);
+        elements.splice(0..0, spare);
     }
     body.splice_children(index..index, elements);
     Some(())
 }
 
-/// Insert next to a body-less `name:` header. The header's terminating
-/// `Newline` is a sibling of the block node in its parent, so the entry lines
-/// go right after it — producing exactly the text a parse-with-body would
-/// have had, without hand-building a `Body` node (the reparse creates it).
+/// The offset just past the line terminator that ends the line `at`
+/// sits on, when only horizontal whitespace and a `//` comment lie
+/// between `at` and it; `None` when the line runs to the end of the
+/// file unterminated, or something else follows on it.
+fn line_end_after(source: &str, at: usize) -> Option<usize> {
+    let rest = &source[at..];
+    let trimmed = rest.trim_start_matches([' ', '\t']);
+    let trimmed = match trimmed.strip_prefix("//") {
+        Some(comment) => comment.trim_start_matches(|c| c != '\n' && c != '\r'),
+        None => trimmed,
+    };
+    let terminator = trimmed
+        .strip_prefix("\r\n")
+        .map(|_| 2)
+        .or_else(|| trimmed.strip_prefix('\n').map(|_| 1))?;
+    Some(source.len() - trimmed.len() + terminator)
+}
+
+/// Splice `run` into the tree at byte `offset` — before the first
+/// element (in document order) that starts there, in that element's own
+/// parent; at the end of `body` (a body, or a bare header's parent) when
+/// nothing does (the offset is the end of the text).
+fn splice_at_offset(body: &SyntaxNode, offset: usize, run: Vec<SyntaxElement>) -> Option<()> {
+    let root = body.ancestors().last()?;
+    let at = root
+        .descendants_with_tokens()
+        .find(|e| usize::from(e.text_range().start()) == offset && !e.text_range().is_empty());
+    match at {
+        Some(element) => {
+            let parent = element.parent()?;
+            let index = parent.children_with_tokens().position(|c| c == element)?;
+            parent.splice_children(index..index, run);
+        }
+        None => {
+            let end = body.children_with_tokens().count();
+            body.splice_children(end..end, run);
+        }
+    }
+    Some(())
+}
+
+/// Insert next to a body-less `name:` header: the entry lines go at the
+/// line start after the header line — producing exactly the text a
+/// parse-with-body would have had, without hand-building a `Body` node
+/// (the reparse creates it). Located textually, as `EntryPosition::Last`
+/// is (`line_end_after`: horizontal whitespace, an optional same-line
+/// `//` comment, the terminator — `\r\n` as one): the tree keeps the
+/// header's terminator as the block's sibling at top level but as the
+/// NEXT entry's leading trivia for a nested `key:` (RFC 0004 §4.3), and
+/// a token walk that stopped at a comment left the comment below the
+/// inserted entry. `name:` at EOF has no terminator: the header line is
+/// terminated first.
 fn insert_after_bare_header(
+    source: &str,
     block: &SyntaxNode,
     run: Vec<SyntaxElement>,
-    spare_newline: SyntaxElement,
+    spare: Vec<SyntaxElement>,
 ) -> Option<()> {
     // Only a real header (with its colon) is a block we can give a body.
-    block
+    let colon = block
         .children_with_tokens()
         .filter_map(|e| e.into_token())
         .find(|t| t.kind() == SyntaxKind::Colon)?;
     let parent = block.parent()?;
-    let children: Vec<SyntaxElement> = parent.children_with_tokens().collect();
-    let block_index = children.iter().position(|e| e.as_node() == Some(block))?;
-    let after_block = children.get(block_index + 1);
-    let (index, elements) = if after_block.is_some_and(|e| e.kind() == SyntaxKind::Newline) {
-        // `name:\n` — insert after the existing terminator.
-        (block_index + 2, run)
-    } else {
+    match line_end_after(source, usize::from(colon.text_range().end())) {
+        Some(offset) => splice_at_offset(&parent, offset, run),
         // `name:` at EOF (no newline) — terminate the header line first.
-        let mut with_newline = vec![spare_newline];
-        with_newline.extend(run);
-        (block_index + 1, with_newline)
-    };
-    parent.splice_children(index..index, elements);
-    Some(())
+        None => {
+            let index = parent
+                .children_with_tokens()
+                .position(|e| e.as_node() == Some(block))?
+                + 1;
+            let mut with_newline = spare;
+            with_newline.extend(run);
+            parent.splice_children(index..index, with_newline);
+            Some(())
+        }
+    }
+}
+
+/// One [`SuggestionKind::Insert`] resolved alone against the clean tree
+/// `root`: the block named at the suggestion's span receives the
+/// snippet's entries after its last entry — refusing a snippet that is
+/// not entries, a control character in it, a span naming no block, and a
+/// block already holding the head entry — as ONE hunk of `source`.
+fn resolve_insert(
+    source: &str,
+    root: &SyntaxNode,
+    s: &Suggestion,
+) -> Result<PerSuggestion, SuggestionError> {
+    let span = s.span;
+    // Line breaks are the snippet's structure; every OTHER character the
+    // render surfaces escape (`needs_escape`: the controls, the
+    // Trojan-Source bidi set, U+2028/9) is refused before the parse, so
+    // the refusal names the injection, not a parse failure — as for a
+    // verbatim fix.
+    if s.replacement
+        .chars()
+        .any(|c| c != '\n' && crate::diagnostic::needs_escape(c))
+    {
+        return Err(SuggestionError::ControlCharacter { span });
+    }
+    let block = block_named_at(root, span).ok_or(SuggestionError::NoBlockAt { span })?;
+    let into = block_name(&block)
+        .map(|t| t.text().to_string())
+        .ok_or(SuggestionError::NoBlockAt { span })?;
+    let body = block.children().find(|n| n.kind() == SyntaxKind::Body);
+    let indent = entry_indent(source, root, &block, body.as_ref());
+    let (_, run) = parse_entry_run(&s.replacement, &indent, line_terminator(source))
+        .ok_or(SuggestionError::NotAnEntryRun { span })?;
+    let head = run
+        .iter()
+        .filter_map(|e| e.as_node())
+        .find_map(entry_name)
+        .ok_or(SuggestionError::NotAnEntryRun { span })?;
+    let present = body.as_ref().is_some_and(|b| {
+        b.children()
+            .filter_map(|n| entry_name(&n))
+            .any(|n| n == head)
+    });
+    if present {
+        return Err(SuggestionError::AlreadyPresent { span, name: head });
+    }
+    // The splice needs a mutable tree: the clean tree's twin, the block
+    // re-located in it by the same span.
+    let mutable = root.clone_for_update();
+    let target = block_named_at(&mutable, span).ok_or(SuggestionError::NoBlockAt { span })?;
+    let text = splice_entries(
+        source,
+        &mutable,
+        &target,
+        &s.replacement,
+        EntryPosition::Last,
+    )
+    .ok_or(SuggestionError::NotAnEntryRun { span })?;
+    Ok(PerSuggestion::Insertion {
+        edit: single_hunk(source, &text),
+        head,
+        into,
+    })
+}
+
+/// The one replacement turning `old` into `new` — the shortest hunk, on
+/// character boundaries. Texts differing in one contiguous region (a
+/// spliced insertion) yield exactly that region; any other pair yields
+/// the one hunk covering every difference. A pure insertion is placed
+/// at the LINE START it is equivalent at (the shortest diff slides into
+/// the next line's indentation when the inserted text ends the way that
+/// line begins), so an editor receives whole inserted lines.
+pub fn single_hunk(old: &str, new: &str) -> SpliceEdit {
+    let mut prefix = old
+        .bytes()
+        .zip(new.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let room = old.len().min(new.len()) - prefix;
+    let mut suffix = old
+        .bytes()
+        .rev()
+        .zip(new.bytes().rev())
+        .take(room)
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix) {
+        suffix -= 1;
+    }
+    let mut start = prefix;
+    let mut end = new.len() - suffix;
+    if prefix + suffix == old.len() && start < end {
+        // A pure insertion: slide it left, one byte at a time, while
+        // the byte before it equals its last byte (the text is
+        // unchanged), until it starts a line — whole inserted lines.
+        while start > 0
+            && !old[..start].ends_with('\n')
+            && old.as_bytes()[start - 1] == new.as_bytes()[end - 1]
+        {
+            start -= 1;
+            end -= 1;
+        }
+    }
+    SpliceEdit {
+        span: Span::new(start, start + (old.len() - prefix - suffix)),
+        replacement: new[start..end].to_string(),
+    }
 }
 
 // ── Span splicing (RFC 0017 §4.1) ─────────────────────────────────────────
 
 /// One byte-range replacement for [`splice`] — the applier shape of a
-/// machine-applicable [`Suggestion`](crate::diagnostic::Suggestion).
+/// machine-applicable [`Suggestion`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpliceEdit {
     /// The exact byte range the replacement substitutes.
@@ -525,6 +880,21 @@ pub enum SuggestionError {
     /// updated text.
     #[error("overlaps an earlier suggestion's edit (deferred to a later round)")]
     Overlap { span: Span, with: usize },
+    /// No block, list item or declaration has its NAME at exactly this
+    /// span — an insertion's stale anchor fails closed instead of landing
+    /// under whatever now sits at the offset.
+    #[error("no block or list item is named at this span")]
+    NoBlockAt { span: Span },
+    /// The insertion's snippet does not parse as one-or-more body
+    /// entries of the block (the structural-injection gate), or the
+    /// block's shape cannot take one.
+    #[error("the snippet does not parse as entries of the block")]
+    NotAnEntryRun { span: Span },
+    /// The block already holds an entry of the insertion's head name — a
+    /// second `layers:` is a duplicate the loader refuses; an insertion
+    /// never doubles one (a stale or foreign suggestion fails closed).
+    #[error("the block already has a `{name}` entry")]
+    AlreadyPresent { span: Span, name: String },
 }
 
 impl SuggestionError {
@@ -537,7 +907,10 @@ impl SuggestionError {
             | SuggestionError::NotLineExclusive { span }
             | SuggestionError::SharedDistribution { span }
             | SuggestionError::InvalidSpan { span }
-            | SuggestionError::Overlap { span, .. } => *span,
+            | SuggestionError::Overlap { span, .. }
+            | SuggestionError::NoBlockAt { span }
+            | SuggestionError::NotAnEntryRun { span }
+            | SuggestionError::AlreadyPresent { span, .. } => *span,
         }
     }
 }
@@ -573,21 +946,51 @@ impl Deleted {
     }
 }
 
+/// What an accepted suggestion did — closed, so every structural title
+/// exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Applied {
+    /// A verbatim replacement (a did-you-mean, a mechanical fix).
+    Verbatim,
+    /// A structural deletion — of what.
+    Deleted(Deleted),
+    /// A structural insertion: `head` is the inserted entry's name
+    /// (`layers`), `into` the name of the block that received it.
+    Inserted { head: String, into: String },
+}
+
+impl Applied {
+    /// The editor's quick-fix title for a structural outcome; a verbatim
+    /// edit's title names its replacement text and is the editor's own.
+    pub fn title(&self) -> Option<String> {
+        match self {
+            Applied::Verbatim => None,
+            Applied::Deleted(d) => Some(d.title().to_string()),
+            Applied::Inserted { head, into } => Some(format!("Add `{head}` under '{into}'")),
+        }
+    }
+}
+
 /// [`resolve_suggestions`]' result.
 pub struct Resolved {
     /// Sorted, non-overlapping (adjacent allowed) — [`splice`]-ready.
     pub edits: Vec<SpliceEdit>,
-    /// One outcome per input suggestion, in order: a verbatim edit
-    /// (`Ok(None)`), a structural deletion (`Ok(Some(_))` — a target
-    /// subsumed by a containing deletion included, with no edits of its
-    /// own), or a refusal.
-    pub outcomes: Vec<Result<Option<Deleted>, SuggestionError>>,
+    /// One outcome per input suggestion, in order: what it did (a
+    /// deletion subsumed by a containing deletion included, with no
+    /// edits of its own), or a refusal.
+    pub outcomes: Vec<Result<Applied, SuggestionError>>,
 }
 
 /// One suggestion resolved alone — phase 1 of [`resolve_suggestions`],
 /// before any batch rule.
 enum PerSuggestion {
     Verbatim(SpliceEdit),
+    /// A structural insertion resolved to its one hunk.
+    Insertion {
+        edit: SpliceEdit,
+        head: String,
+        into: String,
+    },
     Deletion {
         kind: Deleted,
         edits: Vec<SpliceEdit>,
@@ -614,7 +1017,15 @@ enum PerSuggestion {
 /// the structural-injection refusal, so no applier is exempt — and
 /// structural expansion for [`SuggestionKind::Delete`], computed from
 /// the lossless tree by **token walks, never tree mutation** (see the
-/// module doc for why detachment is wrong here).
+/// module doc for why detachment is wrong here); and structural
+/// insertion for [`SuggestionKind::Insert`] — the block named at the
+/// suggestion's span (a name token, equality) receives the snippet's
+/// entries after its last entry through the green-tree splice, in the
+/// file's own indentation and line terminator, reduced to ONE hunk —
+/// the exact bytes every applier splices and every wire carries; a
+/// block already holding an entry of the snippet's head name refuses
+/// (`AlreadyPresent`). `source` is the text of the file the suggestion
+/// names ([`Suggestion::source`]) — routing is the applier's.
 ///
 /// Suggestions are processed in the given order (the batch applier
 /// sorts by suggestion span, so a containing target precedes what it
@@ -629,11 +1040,12 @@ enum PerSuggestion {
 /// resulting batch are what the applier's [`splice`] validates — the
 /// shared last line of defense.
 pub fn resolve_suggestions(source: &str, suggestions: &[Suggestion]) -> Resolved {
-    // Parsed once, lazily: only a `Delete` needs the tree, and a parse
-    // error must never refuse a verbatim suggestion.
+    // Parsed once, lazily: only a structural suggestion (`Delete`,
+    // `Insert`) needs the tree, and a parse error must never refuse a
+    // verbatim suggestion.
     let tree: Option<Result<SyntaxNode, usize>> = suggestions
         .iter()
-        .any(|s| s.kind == SuggestionKind::Delete)
+        .any(|s| matches!(s.kind, SuggestionKind::Delete | SuggestionKind::Insert))
         .then(|| {
             let parsed = parse(source);
             match parsed.errors().len() {
@@ -653,6 +1065,14 @@ pub fn resolve_suggestions(source: &str, suggestions: &[Suggestion]) -> Resolved
                     errors: *errors,
                 }),
                 None => unreachable!("a Delete forced the parse"),
+            },
+            SuggestionKind::Insert => match &tree {
+                Some(Ok(root)) => resolve_insert(source, root, s),
+                Some(Err(errors)) => Err(SuggestionError::UnparsableSource {
+                    span: s.span,
+                    errors: *errors,
+                }),
+                None => unreachable!("an Insert forced the parse"),
             },
             SuggestionKind::DidYouMean | SuggestionKind::Fix => {
                 // The refusal set IS the render-escape set
@@ -683,7 +1103,7 @@ pub fn resolve_suggestions(source: &str, suggestions: &[Suggestion]) -> Resolved
 
     // Phase 2: batch rules, greedily in the given order — subsumption,
     // the `.shared` distribution refusal, overlap, acceptance.
-    let mut outcomes: Vec<Result<Option<Deleted>, SuggestionError>> = Vec::new();
+    let mut outcomes: Vec<Result<Applied, SuggestionError>> = Vec::new();
     let mut edits: Vec<SpliceEdit> = Vec::new();
     let mut accepted: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, suggestion)
     let mut accepted_nodes: Vec<(usize, usize)> = Vec::new();
@@ -706,9 +1126,22 @@ pub fn resolve_suggestions(source: &str, suggestions: &[Suggestion]) -> Resolved
                 None => {
                     accepted.push((edit.span.start, edit.span.end, i));
                     edits.push(edit);
-                    outcomes.push(Ok(None));
+                    outcomes.push(Ok(Applied::Verbatim));
                 }
             },
+            Ok(PerSuggestion::Insertion { edit, head, into }) => {
+                match overlap(&accepted, edit.span) {
+                    Some(with) => outcomes.push(Err(SuggestionError::Overlap {
+                        span: suggestions[i].span,
+                        with,
+                    })),
+                    None => {
+                        accepted.push((edit.span.start, edit.span.end, i));
+                        edits.push(edit);
+                        outcomes.push(Ok(Applied::Inserted { head, into }));
+                    }
+                }
+            }
             Ok(PerSuggestion::Deletion {
                 kind,
                 edits: own,
@@ -731,7 +1164,7 @@ pub fn resolve_suggestions(source: &str, suggestions: &[Suggestion]) -> Resolved
                     if let Some(u) = uses_of {
                         deleted_uses.push(u);
                     }
-                    outcomes.push(Ok(Some(kind)));
+                    outcomes.push(Ok(Applied::Deleted(kind)));
                     continue;
                 }
                 // A row inside a `.shared` block is distributed into
@@ -763,7 +1196,7 @@ pub fn resolve_suggestions(source: &str, suggestions: &[Suggestion]) -> Resolved
                     deleted_uses.push(u);
                 }
                 edits.extend(own);
-                outcomes.push(Ok(Some(kind)));
+                outcomes.push(Ok(Applied::Deleted(kind)));
             }
         }
     }
@@ -1325,7 +1758,9 @@ project P:
         assert_eq!(out, "project P:\n  schemaPackages:\n    - a\n    - b\n");
         assert_eq!(reparse_pins(&out), ["a", "b"]);
 
-        // Empty nested body in a two-space file: header indent + one level.
+        // A nested block in a two-space file: the snippet's four-space
+        // level becomes the file's two-space one — the block reads as the
+        // file's own, never the house four inside its two.
         let src = "project P:\n  autoAssociate = false\n";
         let out = insert_entry_at_path(
             src,
@@ -1336,7 +1771,18 @@ project P:
         .expect("insert succeeds");
         assert_eq!(
             out,
-            "project P:\n  schemaPackages:\n      - a\n  autoAssociate = false\n"
+            "project P:\n  schemaPackages:\n    - a\n  autoAssociate = false\n"
+        );
+        // A snippet level that is no whole four-space step is refused:
+        // re-scaling it would silently change the snippet's structure.
+        assert_eq!(
+            insert_entry_at_path(
+                src,
+                &["project"],
+                "schemaPackages:\n  - a",
+                EntryPosition::Last
+            ),
+            None
         );
         assert_eq!(reparse_pins(&out), ["a"]);
     }
@@ -1362,10 +1808,205 @@ project P:
         let out = insert_entry_at_path(src, &["project"], "y = 2", EntryPosition::Last)
             .expect("insert succeeds");
         // Exact bytes: existing CRLF lines are untouched; the inserted entry
-        // (minted by the LF-only wrapper parse) lands on its own line after
-        // the intact `\r\n` terminator.
-        assert_eq!(out, "project P:\r\n    x = 1\r\n    y = 2\n");
+        // lands on its own line after the intact `\r\n` terminator and
+        // ends as the file's lines do — never one LF line in a CRLF file.
+        assert_eq!(out, "project P:\r\n    x = 1\r\n    y = 2\r\n");
         reparse_pins(&out);
+        // A CRLF file whose last line lacks its terminator: the repair
+        // terminates it with the file's own `\r\n`, then the entry.
+        let src = "project P:\r\n    x = 1";
+        let out = insert_entry_at_path(src, &["project"], "y = 2", EntryPosition::Last)
+            .expect("insert succeeds");
+        assert_eq!(out, "project P:\r\n    x = 1\r\n    y = 2\r\n");
+        reparse_pins(&out);
+    }
+
+    // ── structural insertion (RFC 0026 B-1: the grant a denial asks for) ──
+
+    /// The demo manifest with two bindings, the second at a name span the
+    /// test locates by text.
+    const TWO_BINDINGS: &str = "package demo:\n    version = \"0.1.0\"\n    formatVersion = 1\n\n[]validator validators:\n    - tenantFlows:\n        files:\n            - \"tenants/**/*.flow.nml\"\n        schemas:\n            - core\n        strict = true\n    - shared:\n        files:\n            - \"shared/**/*.flow.nml\"\n        schemas:\n            - core\n";
+    const X_GRANT: &str = "layers:\n    allowRefs:\n        - \"tenants/cu/x.flow.nml\"";
+
+    fn name_span(text: &str, name: &str) -> Span {
+        let start = text.find(&format!("- {name}:")).expect("the item") + 2;
+        Span::new(start, start + name.len())
+    }
+
+    fn insertion(text: &str, name: &str, entries: &str) -> Suggestion {
+        Suggestion {
+            replacement: entries.to_string(),
+            span: name_span(text, name),
+            kind: SuggestionKind::Insert,
+            source: Some("demo.package.nml".to_string()),
+        }
+    }
+
+    #[test]
+    fn an_insertion_lands_after_the_named_items_last_entry_as_one_hunk() {
+        // The FIRST of two same-keyword items — addressed by its name
+        // span, never by a keyword path that two items would make
+        // ambiguous — receives the block after `strict = true`, nested by
+        // the file's unit, and the edit is one insertion hunk.
+        let r = resolve_suggestions(
+            TWO_BINDINGS,
+            &[insertion(TWO_BINDINGS, "tenantFlows", X_GRANT)],
+        );
+        assert_eq!(
+            r.outcomes,
+            [Ok(Applied::Inserted {
+                head: "layers".to_string(),
+                into: "tenantFlows".to_string(),
+            })]
+        );
+        assert_eq!(r.edits.len(), 1);
+        let edit = &r.edits[0];
+        assert_eq!(
+            edit.span.start, edit.span.end,
+            "an insertion, not a rewrite"
+        );
+        assert_eq!(
+            edit.replacement,
+            "        layers:\n            allowRefs:\n                - \"tenants/cu/x.flow.nml\"\n"
+        );
+        let out = splice(TWO_BINDINGS, &r.edits).expect("splice");
+        assert_eq!(
+            out,
+            TWO_BINDINGS.replace(
+                "        strict = true\n",
+                "        strict = true\n        layers:\n            allowRefs:\n                - \"tenants/cu/x.flow.nml\"\n"
+            )
+        );
+        let (_, errors) = parse_to_ast_all(&out);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            Applied::Inserted {
+                head: "layers".to_string(),
+                into: "tenantFlows".to_string()
+            }
+            .title()
+            .as_deref(),
+            Some("Add `layers` under 'tenantFlows'")
+        );
+        // The second item receives it too, by ITS span.
+        let r = resolve_suggestions(TWO_BINDINGS, &[insertion(TWO_BINDINGS, "shared", X_GRANT)]);
+        let out = splice(TWO_BINDINGS, &r.edits).expect("splice");
+        assert!(out.ends_with(
+            "            - core\n        layers:\n            allowRefs:\n                - \"tenants/cu/x.flow.nml\"\n"
+        ));
+    }
+
+    #[test]
+    fn an_insertion_adopts_the_files_unit_terminator_and_trailing_text() {
+        // Two-space nesting, CRLF lines, a trailing comment and blank line
+        // after the item: the block nests by two, ends its lines with
+        // `\r\n`, and lands after the last ENTRY — the closing comment and
+        // blank line stay below it, byte for byte.
+        let src = "[]validator validators:\r\n  - a:\r\n    files:\r\n      - \"x/**\"\r\n    // end of a\r\n\r\n  - b:\r\n    files:\r\n      - \"y/**\"\r\n";
+        let r = resolve_suggestions(src, &[insertion(src, "a", X_GRANT)]);
+        assert!(
+            matches!(r.outcomes.as_slice(), [Ok(Applied::Inserted { .. })]),
+            "{:?}",
+            r.outcomes
+        );
+        let out = splice(src, &r.edits).expect("splice");
+        assert_eq!(
+            out,
+            "[]validator validators:\r\n  - a:\r\n    files:\r\n      - \"x/**\"\r\n    layers:\r\n      allowRefs:\r\n        - \"tenants/cu/x.flow.nml\"\r\n    // end of a\r\n\r\n  - b:\r\n    files:\r\n      - \"y/**\"\r\n"
+        );
+        let (_, errors) = parse_to_ast_all(&out);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn an_insertion_fails_closed_on_a_stale_span_a_duplicate_and_a_dirty_source() {
+        // A span naming no block (the manifest changed under the
+        // suggestion): nothing is edited.
+        let stale = Suggestion {
+            span: Span::new(0, 7),
+            ..insertion(TWO_BINDINGS, "tenantFlows", X_GRANT)
+        };
+        let r = resolve_suggestions(TWO_BINDINGS, &[stale]);
+        assert!(matches!(
+            r.outcomes.as_slice(),
+            [Err(SuggestionError::NoBlockAt { .. })]
+        ));
+        assert!(r.edits.is_empty());
+        // The block already holds a `layers:` entry: never doubled.
+        let granted = TWO_BINDINGS.replace(
+            "        strict = true\n",
+            "        strict = true\n        layers:\n            allowRefs:\n                - \"tenants/**\"\n",
+        );
+        let r = resolve_suggestions(&granted, &[insertion(&granted, "tenantFlows", X_GRANT)]);
+        assert!(
+            matches!(r.outcomes.as_slice(), [Err(SuggestionError::AlreadyPresent { name, .. })] if name == "layers"),
+            "{:?}",
+            r.outcomes
+        );
+        assert!(r.edits.is_empty());
+        // A source that does not parse: a structural edit refuses.
+        let dirty = TWO_BINDINGS.replace("formatVersion = 1", "formatVersion = = 1");
+        let r = resolve_suggestions(&dirty, &[insertion(&dirty, "tenantFlows", X_GRANT)]);
+        assert!(matches!(
+            r.outcomes.as_slice(),
+            [Err(SuggestionError::UnparsableSource { .. })]
+        ));
+        // Entries that do not parse as entries, and a control character
+        // inside a line: refused before anything is located.
+        let r = resolve_suggestions(
+            TWO_BINDINGS,
+            &[insertion(TWO_BINDINGS, "tenantFlows", "@@@ nonsense")],
+        );
+        assert!(matches!(
+            r.outcomes.as_slice(),
+            [Err(SuggestionError::NotAnEntryRun { .. })]
+        ));
+        let r = resolve_suggestions(
+            TWO_BINDINGS,
+            &[insertion(TWO_BINDINGS, "tenantFlows", "x = \"a\u{2028}b\"")],
+        );
+        assert!(matches!(
+            r.outcomes.as_slice(),
+            [Err(SuggestionError::ControlCharacter { .. })]
+        ));
+    }
+
+    #[test]
+    fn single_hunk_is_the_shortest_boundary_safe_replacement() {
+        let e = single_hunk("abc", "abXYc");
+        assert_eq!(
+            (e.span.start, e.span.end, e.replacement.as_str()),
+            (2, 2, "XY")
+        );
+        let e = single_hunk("abc", "abc");
+        assert_eq!(
+            (e.span.start, e.span.end, e.replacement.as_str()),
+            (3, 3, "")
+        );
+        let e = single_hunk("aXc", "aYc");
+        assert_eq!(
+            (e.span.start, e.span.end, e.replacement.as_str()),
+            (1, 2, "Y")
+        );
+        // `é` (C3 A9) → `è` (C3 A8): the byte prefix would split the
+        // character; the hunk backs off to the boundary.
+        let e = single_hunk("aéb", "aèb");
+        assert_eq!(
+            (e.span.start, e.span.end, e.replacement.as_str()),
+            (1, 3, "è")
+        );
+        let e = single_hunk("", "x");
+        assert_eq!(
+            (e.span.start, e.span.end, e.replacement.as_str()),
+            (0, 0, "x")
+        );
+        // Whole inserted lines land at a line start, not inside the next
+        // line's indentation the shortest diff slides into.
+        let e = single_hunk("a:\n    b\n    c\n", "a:\n    b\n    x\n    c\n");
+        assert_eq!(
+            (e.span.start, e.span.end, e.replacement.as_str()),
+            (9, 9, "    x\n")
+        );
     }
 
     #[test]
@@ -1520,7 +2161,218 @@ project P:
             replacement: String::new(),
             span,
             kind: SuggestionKind::Delete,
+            source: None,
         }
+    }
+
+    /// An insertion anchored on the NAME token `name` inside the first
+    /// occurrence of `needle` — the anchor a producer records.
+    fn ins(src: &str, needle: &str, name: &str, snippet: &str) -> Suggestion {
+        let at = src
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} not in source"));
+        let start = at + needle.rfind(name).expect("the name is inside the needle");
+        Suggestion {
+            replacement: snippet.to_string(),
+            span: Span::new(start, start + name.len()),
+            kind: SuggestionKind::Insert,
+            source: None,
+        }
+    }
+
+    const GRANT: &str = "layers:\n    allowRefs:\n        - \"tenants/cu/member-lookup.flow.nml\"";
+
+    /// The manifest shape NML2064's remedy targets: a named item of a
+    /// `[]validator` list. The insertion lands after the item's last
+    /// entry, at the body's OWN indentation (eight columns here, whatever
+    /// the file uses — never a canonical guess), and the result is one
+    /// exact edit every applier and wire can carry.
+    #[test]
+    fn an_insertion_lands_as_the_last_entry_of_the_named_list_item() {
+        let src = "[]validator validators:\n    - tenantFlows:\n        files:\n            - \"tenants/**\"\n        strict = true\n    - shared:\n        files:\n            - \"shared/**\"\n";
+        let s = ins(src, "- tenantFlows:", "tenantFlows", GRANT);
+        let r = resolve_suggestions(src, &[s]);
+        assert_eq!(
+            r.outcomes,
+            [Ok(Applied::Inserted {
+                head: "layers".to_string(),
+                into: "tenantFlows".to_string(),
+            })]
+        );
+        let at = src.find("    - shared:").unwrap();
+        assert_eq!(
+            r.edits,
+            [SpliceEdit {
+                span: Span::new(at, at),
+                replacement: "        layers:\n            allowRefs:\n                - \"tenants/cu/member-lookup.flow.nml\"\n".to_string(),
+            }]
+        );
+        let out = splice(src, &r.edits).unwrap();
+        assert_eq!(
+            out,
+            "[]validator validators:\n    - tenantFlows:\n        files:\n            - \"tenants/**\"\n        strict = true\n        layers:\n            allowRefs:\n                - \"tenants/cu/member-lookup.flow.nml\"\n    - shared:\n        files:\n            - \"shared/**\"\n"
+        );
+        assert!(parse(&out).errors().is_empty(), "{out}");
+    }
+
+    /// The body's own indentation is adopted verbatim — a two-space
+    /// manifest gets a two-space grant — and every owner shape takes an
+    /// insertion: a nested block, a top-level declaration, a bare
+    /// `name:` header (which gets a body at header indent + four).
+    #[test]
+    fn an_insertion_adopts_the_bodys_indentation_on_every_owner_shape() {
+        let two = "[]validator validators:\n  - tenantFlows:\n    files:\n      - \"tenants/**\"\n";
+        let r = resolve_suggestions(two, &[ins(two, "- tenantFlows:", "tenantFlows", GRANT)]);
+        assert_eq!(
+            splice(two, &r.edits).unwrap(),
+            "[]validator validators:\n  - tenantFlows:\n    files:\n      - \"tenants/**\"\n    layers:\n      allowRefs:\n        - \"tenants/cu/member-lookup.flow.nml\"\n"
+        );
+        let nested = "project p:\n    b:\n        files:\n            - \"x\"\n    c = 1\n";
+        let r = resolve_suggestions(nested, &[ins(nested, "    b:", "b", "strict = true")]);
+        assert_eq!(
+            splice(nested, &r.edits).unwrap(),
+            "project p:\n    b:\n        files:\n            - \"x\"\n        strict = true\n    c = 1\n"
+        );
+        let top = "project p:\n    x = 1\n\nproject q:\n    y = 2\n";
+        let r = resolve_suggestions(top, &[ins(top, "project p:", "p", "z = 3")]);
+        assert_eq!(
+            splice(top, &r.edits).unwrap(),
+            "project p:\n    x = 1\n    z = 3\n\nproject q:\n    y = 2\n"
+        );
+        let bare =
+            "[]validator validators:\n    - tenantFlows:\n    - shared:\n        strict = true\n";
+        let r = resolve_suggestions(
+            bare,
+            &[ins(bare, "- tenantFlows:", "tenantFlows", "strict = false")],
+        );
+        assert_eq!(
+            splice(bare, &r.edits).unwrap(),
+            "[]validator validators:\n    - tenantFlows:\n        strict = false\n    - shared:\n        strict = true\n"
+        );
+        // A bare item's terminator is the next item's leading trivia; under
+        // CRLF the `\r` sits before it — the block lands after the whole
+        // terminator, never inside the pair, never with a blank line, and
+        // its minted line ends as the file's lines do (`\r\n`).
+        let crlf = "[]validator validators:\r\n    - tenantFlows:\r\n    - shared:\r\n        strict = true\r\n";
+        let r = resolve_suggestions(
+            crlf,
+            &[ins(crlf, "- tenantFlows:", "tenantFlows", "strict = false")],
+        );
+        assert_eq!(
+            splice(crlf, &r.edits).unwrap(),
+            "[]validator validators:\r\n    - tenantFlows:\r\n        strict = false\r\n    - shared:\r\n        strict = true\r\n"
+        );
+    }
+
+    /// Stale or wrong anchors fail closed: a span on a property's name
+    /// (no body), on a value, or on nothing at all is `NoBlockAt` — never
+    /// an insertion under whatever now sits at the offset.
+    #[test]
+    fn an_insertion_refuses_a_span_that_names_no_block() {
+        let src = "project p:\n    strict = true\n    files:\n        - \"x\"\n";
+        let on_property = ins(src, "strict = true", "strict", "y = 1");
+        let on_value = ins(src, "- \"x\"", "\"x\"", "y = 1");
+        let mut stale = ins(src, "files:", "files", "y = 1");
+        stale.span = Span::new(stale.span.start + 1, stale.span.end + 1);
+        let wrong = [on_property, on_value, stale];
+        let r = resolve_suggestions(src, &wrong);
+        assert!(r.edits.is_empty(), "{:?}", r.edits);
+        for (o, s) in r.outcomes.iter().zip(&wrong) {
+            assert_eq!(*o, Err(SuggestionError::NoBlockAt { span: s.span }));
+        }
+    }
+
+    /// The two injection gates, named: a control character (the render
+    /// surfaces' escape set, newlines excepted — they are the snippet's
+    /// structure) is refused as such; a snippet that is not body entries
+    /// (a bare `= oops`, an empty snippet) is refused as such; and an
+    /// error-recovered source refuses the structural edit outright.
+    #[test]
+    fn an_insertion_refuses_injection_non_entries_and_unparsable_sources() {
+        let src = "project p:\n    x = 1\n";
+        let esc = ins(src, "project p:", "p", "y = \"\u{1b}[31m\"");
+        let bidi = ins(src, "project p:", "p", "y = \"a\u{202e}b\"");
+        let not_entries = ins(src, "project p:", "p", "= oops");
+        let empty = ins(src, "project p:", "p", "");
+        let r = resolve_suggestions(src, &[esc, bidi, not_entries, empty]);
+        assert!(r.edits.is_empty());
+        let span = Span::new(8, 9);
+        assert_eq!(
+            r.outcomes,
+            [
+                Err(SuggestionError::ControlCharacter { span }),
+                Err(SuggestionError::ControlCharacter { span }),
+                Err(SuggestionError::NotAnEntryRun { span }),
+                Err(SuggestionError::NotAnEntryRun { span }),
+            ]
+        );
+        let dirty = "project p:\n    x = = 1\n";
+        let r = resolve_suggestions(dirty, &[ins(dirty, "project p:", "p", "y = 2")]);
+        assert!(
+            matches!(
+                r.outcomes.as_slice(),
+                [Err(SuggestionError::UnparsableSource { span: s, errors })] if *s == span && *errors > 0
+            ),
+            "{:?}",
+            r.outcomes
+        );
+    }
+
+    /// A last line without its terminator is terminated first (the edit
+    /// carries the newline); a CRLF file's pair is never split, and the
+    /// new line ends as the file's lines do (`\r\n`).
+    #[test]
+    fn an_insertion_repairs_a_missing_terminator_and_keeps_crlf_pairs() {
+        let eof = "project p:\n    x = 1";
+        let r = resolve_suggestions(eof, &[ins(eof, "project p:", "p", "y = 2")]);
+        assert_eq!(
+            r.edits,
+            [SpliceEdit {
+                span: Span::new(eof.len(), eof.len()),
+                replacement: "\n    y = 2\n".to_string(),
+            }]
+        );
+        assert_eq!(
+            splice(eof, &r.edits).unwrap(),
+            "project p:\n    x = 1\n    y = 2\n"
+        );
+        let crlf = "project p:\r\n    x = 1\r\n";
+        let r = resolve_suggestions(crlf, &[ins(crlf, "project p:", "p", "y = 2")]);
+        assert_eq!(
+            splice(crlf, &r.edits).unwrap(),
+            "project p:\r\n    x = 1\r\n    y = 2\r\n"
+        );
+    }
+
+    /// An insertion is one verbatim edit in the batch: it defers to an
+    /// accepted deletion that swallows its anchor's body, and two
+    /// insertions on one block both land (adjacent, not overlapping).
+    #[test]
+    fn insertions_take_part_in_the_batch_rules() {
+        let src = "project p:\n    b:\n        x = 1\n    c = 2\n";
+        let two = [
+            ins(src, "    b:", "b", "y = 2"),
+            ins(src, "    b:", "b", "z = 3"),
+        ];
+        let r = resolve_suggestions(src, &two);
+        assert_eq!(
+            r.outcomes,
+            [
+                Ok(Applied::Inserted {
+                    head: "y".to_string(),
+                    into: "b".to_string(),
+                }),
+                Ok(Applied::Inserted {
+                    head: "z".to_string(),
+                    into: "b".to_string(),
+                }),
+            ]
+        );
+        // Both at the same offset, applied in order: the second lands
+        // after the first (`splice` keeps input order among equal spans).
+        let out = splice(src, &r.edits).unwrap();
+        assert!(parse(&out).errors().is_empty(), "{out}");
+        assert!(out.contains("y = 2") && out.contains("z = 3"), "{out}");
     }
 
     /// Resolve, assert every outcome applied, splice.
@@ -1741,8 +2593,8 @@ project P:
             matches!(
                 r.outcomes.as_slice(),
                 [
-                    Ok(Some(Deleted::SharedProperty)),
-                    Ok(Some(Deleted::Property))
+                    Ok(Applied::Deleted(Deleted::SharedProperty)),
+                    Ok(Applied::Deleted(Deleted::Property))
                 ]
             ),
             "{:?}",
@@ -1772,7 +2624,10 @@ project P:
         assert!(
             matches!(
                 r.outcomes.as_slice(),
-                [Ok(Some(Deleted::NestedBlock)), Ok(Some(Deleted::Property))]
+                [
+                    Ok(Applied::Deleted(Deleted::NestedBlock)),
+                    Ok(Applied::Deleted(Deleted::Property))
+                ]
             ),
             "subsumed, never refused: {:?}",
             r.outcomes
@@ -1796,6 +2651,7 @@ project P:
                 replacement: "1".into(),
                 span: Span::new(inner, inner + 3),
                 kind: SuggestionKind::Fix,
+                source: None,
             },
         ];
         let r = resolve_suggestions(src, &suggestions);
@@ -1803,7 +2659,7 @@ project P:
             matches!(
                 r.outcomes.as_slice(),
                 [
-                    Ok(Some(Deleted::Property)),
+                    Ok(Applied::Deleted(Deleted::Property)),
                     Err(SuggestionError::Overlap { with: 0, .. })
                 ]
             ),
@@ -1839,13 +2695,17 @@ project P:
                 replacement: "->".into(),
                 span: Span::new(arrow, arrow + 2),
                 kind: SuggestionKind::Fix,
+                source: None,
             },
         ];
         let r = resolve_suggestions(src, &suggestions);
         assert!(
             matches!(
                 r.outcomes.as_slice(),
-                [Err(SuggestionError::UnparsableSource { .. }), Ok(None)]
+                [
+                    Err(SuggestionError::UnparsableSource { .. }),
+                    Ok(Applied::Verbatim)
+                ]
             ),
             "{:?}",
             r.outcomes
@@ -1865,6 +2725,7 @@ project P:
                 replacement: "admin\n    evil = 1".into(),
                 span: Span::new(at, at + 1),
                 kind: SuggestionKind::DidYouMean,
+                source: None,
             }],
         );
         assert!(
@@ -1886,6 +2747,7 @@ project P:
                     replacement: format!("a{hostile}b"),
                     span: Span::new(at, at + 1),
                     kind: SuggestionKind::Fix,
+                    source: None,
                 }],
             );
             assert!(
@@ -1966,7 +2828,10 @@ project P:
         let only = "flow t uses a\n";
         let r = resolve_suggestions(only, &[del(ref_span(only, "a"))]);
         assert!(
-            matches!(r.outcomes.as_slice(), [Ok(Some(Deleted::LayerRef))]),
+            matches!(
+                r.outcomes.as_slice(),
+                [Ok(Applied::Deleted(Deleted::LayerRef))]
+            ),
             "{:?}",
             r.outcomes
         );
@@ -1994,6 +2859,7 @@ project P:
                     replacement: "y".into(),
                     span: Span::new(9_999, 10_000),
                     kind: SuggestionKind::DidYouMean,
+                    source: None,
                 },
             ],
         );
@@ -2001,7 +2867,7 @@ project P:
             matches!(
                 r.outcomes.as_slice(),
                 [
-                    Ok(Some(Deleted::Property)),
+                    Ok(Applied::Deleted(Deleted::Property)),
                     Err(SuggestionError::InvalidSpan { .. })
                 ]
             ),
@@ -2016,6 +2882,7 @@ project P:
                 replacement: "y".into(),
                 span: Span::new(5, 3),
                 kind: SuggestionKind::Fix,
+                source: None,
             }],
         );
         assert!(
@@ -2035,6 +2902,7 @@ project P:
                 replacement: "e".into(),
                 span: Span::new(mid, mid + 1),
                 kind: SuggestionKind::Fix,
+                source: None,
             }],
         );
         assert!(
@@ -2057,6 +2925,7 @@ project P:
                     replacement: ";".into(),
                     span: Span::new(colon_at, colon_at + 1),
                     kind: SuggestionKind::Fix,
+                    source: None,
                 },
                 del(span_at(src, "x = 1")),
             ],
@@ -2064,7 +2933,10 @@ project P:
         assert!(
             matches!(
                 r.outcomes.as_slice(),
-                [Ok(None), Ok(Some(Deleted::Property))]
+                [
+                    Ok(Applied::Verbatim),
+                    Ok(Applied::Deleted(Deleted::Property))
+                ]
             ),
             "{:?}",
             r.outcomes
@@ -2088,10 +2960,11 @@ project P:
                 replacement: String::new(),
                 span: Span::new(dot, dot + 1),
                 kind: SuggestionKind::Fix,
+                source: None,
             }],
         );
         assert!(
-            matches!(r.outcomes.as_slice(), [Ok(None)]),
+            matches!(r.outcomes.as_slice(), [Ok(Applied::Verbatim)]),
             "{:?}",
             r.outcomes
         );
@@ -2120,5 +2993,219 @@ project P:
         }
         let unique: std::collections::HashSet<&&str> = titles.iter().collect();
         assert_eq!(unique.len(), titles.len(), "{titles:?}");
+    }
+
+    // ── the unit a minted line nests by (RFC 0026 B-11: the file's own) ──
+
+    #[test]
+    fn the_snippet_convention_is_the_canonical_unit() {
+        // A canonical-form snippet re-indented to the canonical unit is
+        // itself: the level width snippets are written in IS `INDENT_UNIT`
+        // (were the constant to change, every snippet would follow — this
+        // pins that the two cannot drift).
+        let src = "project P:\n";
+        let out = insert_entry_at_path(
+            src,
+            &["project"],
+            "schemaPackages:\n    - a\n    - b",
+            EntryPosition::AfterHeader,
+        )
+        .expect("insert succeeds");
+        assert_eq!(
+            out,
+            format!(
+                "project P:\n{u}schemaPackages:\n{u}{u}- a\n{u}{u}- b\n",
+                u = INDENT_UNIT
+            )
+        );
+        assert_eq!(INDENT_UNIT.len(), 4, "spec/syntax.md: four spaces");
+    }
+
+    #[test]
+    fn a_block_nests_by_its_own_step_inside_a_file_that_nests_two_ways() {
+        // A two-space `project` block beside a four-space `host` block: the
+        // entry line sits where its siblings sit, and the nested line steps
+        // by the BLOCK's own two — never the other block's four, which
+        // would make this block the one that nests two ways.
+        let src = "project P:\n  keywords = [\"k\"]\n\nhost H:\n    slot:\n        kind = \"a\"\n";
+        let out = insert_entry_at_path(
+            src,
+            &["project"],
+            "schemaPackages:\n    - a",
+            EntryPosition::Last,
+        )
+        .expect("insert succeeds");
+        assert_eq!(
+            out,
+            "project P:\n  keywords = [\"k\"]\n  schemaPackages:\n    - a\n\nhost H:\n    slot:\n        kind = \"a\"\n"
+        );
+        assert_eq!(reparse_pins(&out), ["a"]);
+        // The four-space block of the same file nests by four.
+        let out =
+            insert_entry_at_path(src, &["host", "slot"], "x:\n    y = 1", EntryPosition::Last)
+                .expect("insert succeeds");
+        assert_eq!(
+            out,
+            "project P:\n  keywords = [\"k\"]\n\nhost H:\n    slot:\n        kind = \"a\"\n        x:\n            y = 1\n"
+        );
+    }
+
+    #[test]
+    fn an_empty_body_nests_by_the_nearest_step_the_documents_then_the_canonical() {
+        // A bare `schemaPackages:` header inside a two-space `project`
+        // block: the enclosing block's step (two), not the canonical four.
+        let src = "project P:\n  schemaPackages:\n  keywords = [\"k\"]\n";
+        let out = insert_entry_at_path(
+            src,
+            &["project", "schemaPackages"],
+            "- a",
+            EntryPosition::Last,
+        )
+        .expect("insert succeeds");
+        assert_eq!(
+            out,
+            "project P:\n  schemaPackages:\n    - a\n  keywords = [\"k\"]\n"
+        );
+        assert_eq!(reparse_pins(&out), ["a"]);
+        // The same bare header inside a two-space block of a file whose OTHER
+        // block nests by four: the enclosing block's step (two) — not the
+        // canonical unit the document-level census would fall to.
+        let src = "project P:\n  schemaPackages:\n  keywords = [\"k\"]\n\nhost H:\n    x = 1\n";
+        let out = insert_entry_at_path(
+            src,
+            &["project", "schemaPackages"],
+            "- a",
+            EntryPosition::Last,
+        )
+        .expect("insert succeeds");
+        assert_eq!(
+            out,
+            "project P:\n  schemaPackages:\n    - a\n  keywords = [\"k\"]\n\nhost H:\n    x = 1\n"
+        );
+        // A bare top-level header in a file whose other block nests by two:
+        // the document's one step.
+        let src = "host H:\n  x = 1\n\nproject P:\n";
+        let out = insert_entry_at_path(
+            src,
+            &["project"],
+            "schemaPackages:\n    - a",
+            EntryPosition::AfterHeader,
+        )
+        .expect("insert succeeds");
+        assert_eq!(
+            out,
+            "host H:\n  x = 1\n\nproject P:\n  schemaPackages:\n    - a\n"
+        );
+        // The same header in a file that nests two ways, or not at all:
+        // the canonical unit — the only unit that is nobody's guess.
+        let src = "host H:\n  x = 1\n\nsvc S:\n    y = 1\n\nproject P:\n";
+        let out = insert_entry_at_path(
+            src,
+            &["project"],
+            "schemaPackages:\n    - a",
+            EntryPosition::AfterHeader,
+        )
+        .expect("insert succeeds");
+        assert_eq!(
+            out,
+            "host H:\n  x = 1\n\nsvc S:\n    y = 1\n\nproject P:\n    schemaPackages:\n        - a\n"
+        );
+        let out = insert_entry_at_path(
+            "project P:\n",
+            &["project"],
+            "- a",
+            EntryPosition::AfterHeader,
+        )
+        .expect("insert succeeds");
+        assert_eq!(out, "project P:\n    - a\n");
+        // A bare nested header followed by a sibling, a comment line, or the
+        // end of the file: the entry lands on the very next line — never
+        // with a blank line minted between (the header's terminator lives
+        // in the next entry's trivia; the insert is textual).
+        let src = "project P:\n  schemaPackages:\n  // pins\n\n  keywords = [\"k\"]\n";
+        let out = insert_entry_at_path(
+            src,
+            &["project", "schemaPackages"],
+            "- a",
+            EntryPosition::Last,
+        )
+        .expect("insert succeeds");
+        assert_eq!(
+            out,
+            "project P:\n  schemaPackages:\n    - a\n  // pins\n\n  keywords = [\"k\"]\n"
+        );
+        let out = insert_entry_at_path(
+            "project P:\n  schemaPackages: // pins\n  keywords = [\"k\"]\n",
+            &["project", "schemaPackages"],
+            "- a",
+            EntryPosition::Last,
+        )
+        .expect("insert succeeds");
+        assert_eq!(
+            out,
+            "project P:\n  schemaPackages: // pins\n    - a\n  keywords = [\"k\"]\n"
+        );
+        let out = insert_entry_at_path(
+            "project P:\n  schemaPackages:\n",
+            &["project", "schemaPackages"],
+            "- a",
+            EntryPosition::Last,
+        )
+        .expect("insert succeeds");
+        assert_eq!(out, "project P:\n  schemaPackages:\n    - a\n");
+        let out = insert_entry_at_path(
+            "project P:\n  schemaPackages:",
+            &["project", "schemaPackages"],
+            "- a",
+            EntryPosition::Last,
+        )
+        .expect("insert succeeds");
+        assert_eq!(out, "project P:\n  schemaPackages:\n    - a\n");
+        // An odd but consistent width is the file's: adopted verbatim.
+        let src = "project P:\n   schemaPackages:\n";
+        let out = insert_entry_at_path(
+            src,
+            &["project", "schemaPackages"],
+            "- a",
+            EntryPosition::Last,
+        )
+        .expect("insert succeeds");
+        assert_eq!(out, "project P:\n   schemaPackages:\n      - a\n");
+    }
+
+    #[test]
+    fn the_unit_at_an_offset_is_the_one_an_insertion_there_would_use() {
+        // After a nested header whose block already nests: that step.
+        let src = "project P:\n  slot:\n      kind = \"a\"\n  keywords = [\"k\"]\n";
+        let at = |needle: &str| src.find(needle).expect(needle);
+        assert_eq!(indentation_unit_at(src, at("slot:")), "    ");
+        // After a value line: the body it sits in.
+        assert_eq!(indentation_unit_at(src, at("keywords")), "  ");
+        // After the top-level header of a block that already nests: its own
+        // step, whatever the rest of the file does.
+        assert_eq!(indentation_unit_at(src, 0), "  ");
+        // After a bare top-level header: the document's one step when it has
+        // one, else the canonical unit (a file that nests two ways).
+        let two = "project P:\n  keywords = [\"k\"]\n\nhost H:\n";
+        assert_eq!(
+            indentation_unit_at(two, two.find("host").expect("host")),
+            "  "
+        );
+        let mixed = "project P:\n  k = 1\n\nsvc S:\n    y = 1\n\nhost H:\n";
+        assert_eq!(
+            indentation_unit_at(mixed, mixed.find("host").expect("host")),
+            INDENT_UNIT
+        );
+        // Past the end: the document's step; in a file with nothing nested,
+        // and in no file at all: canonical.
+        assert_eq!(indentation_unit_at(two, two.len() + 10), "  ");
+        assert_eq!(indentation_unit_at("project P:\n", 0), INDENT_UNIT);
+        assert_eq!(indentation_unit_at("", 0), INDENT_UNIT);
+        // A CRLF file, and a document mid-edit (a value missing): still a unit.
+        let crlf = "project P:\r\n  slot:\r\n    kind = \r\n";
+        assert_eq!(
+            indentation_unit_at(crlf, crlf.find("slot").expect("slot")),
+            "  "
+        );
     }
 }

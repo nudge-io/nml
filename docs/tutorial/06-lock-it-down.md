@@ -122,7 +122,7 @@ Put a normal property inside an arms body and the validator draws the line
 precisely:
 
 ```text
-app.nml:27:9: error: expected a routing arm ('@selector -> Target' or 'else -> Target'); this field is typed '(role -> …)' and holds only arms
+app.nml:27:9: error[NML2031]: expected a routing arm ('@selector -> Target' or 'else -> Target'); this field is typed '(role -> …)' and holds only arms
 ```
 
 ## Bring it together

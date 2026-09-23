@@ -188,8 +188,11 @@ schema defaults (including the trait-inherited ones — that's where `every
 60s` comes from), reference resolution, then serde. Your structs receive
 finished values; no `unwrap_or` sprinkled through the codebase.
 
-The rest of the program is `println!`. Run it from the chapter directory
-(`cargo run`) and you get the output at the top of the page.
+The rest of the program is `println!`. The crate lives in
+`docs/tutorial/examples/07/app`, so run it from the chapter directory by
+name — `cargo run -p nml-tutorial-07` — and you get the output at the top of
+the page (the program reads `app.nml` from the directory you run it in; that
+is exactly how CI runs it).
 
 ## What about references between declarations?
 

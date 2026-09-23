@@ -1,0 +1,14 @@
+package demo:
+    version = "0.1.0"
+    formatVersion = 1
+
+[]schema schemas:
+    - core:
+        file = "core.model.nml"
+
+[]validator validators:
+    - flows:
+        files:
+            - "tenants/**/*.flow.nml"
+        schemas:
+            - corr

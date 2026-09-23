@@ -23,6 +23,12 @@
 "is "
 "by "
 "as "
+# RFC 0019/0020: the instance-layer header clause and its separator — the
+# corpus held ZERO `uses` clauses across every target (r103-cov), because
+# mutation must rediscover a keyword in declaration-header position one
+# byte at a time and nothing here handed it over.
+"uses "
+", "
 
 # ── type names ──────────────────────────────────────────────────────────
 "string"
@@ -111,6 +117,13 @@
 "// "
 "#live"
 "#restart"
+# The four the LANGUAGE interprets (RFC 0019 merge policies): the corpus
+# held none of them either, so the layer engine's policy arms were never
+# reached from a fuzzed document (r103-cov).
+"#sealed"
+"#identity"
+"#append"
+"#overlay"
 
 # ── hostile characters (source-character policy) ────────────────────────
 # Raw bytes the policy must diagnose, never pass or mangle. U+E0067

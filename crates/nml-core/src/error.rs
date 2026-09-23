@@ -1,5 +1,6 @@
 //! Error types for NML parsing and validation.
 
+use crate::diagnostic::Suggestion;
 use crate::span::Span;
 use thiserror::Error;
 
@@ -97,6 +98,11 @@ pub enum ParseErrorKind {
     /// A deliberate resource bound was hit (`what` names the axis). The
     /// bound is a DoS defense on untrusted input, documented in the index.
     NestingLimit { what: &'static str },
+    /// The source is longer than the token stream can index (`u32`
+    /// bounds — the same 4 GiB ceiling as `rowan::TextSize`). Emitted
+    /// INSTEAD of lexing: the tree is empty and this is its one finding.
+    /// A resource bound like `NestingLimit`, never a panic.
+    SourceTooLarge { len: usize, max: usize },
     /// `set<a, b>` — the map-habit typo; elements are alternatives.
     /// Machine-fixable: the comma becomes `|`.
     SetSeparator,
@@ -107,6 +113,22 @@ pub enum ParseErrorKind {
     UnknownTypeConstructor { found: String },
     /// A `#directive` key repeated on one field.
     DuplicateDirective,
+    /// A body declares one name twice (NML2093): `shown` is the name as its
+    /// sigil spells it (`|allow`, `.retry`), `first` the span of the first
+    /// occurrence's name, `two_spellings` when a block `k:` met an inline
+    /// `k = …` (the message's clarifier). Emitted beside every parse by the
+    /// kernel's name rules (the `entry_names` pass); no repair exists —
+    /// which entry is meant is unknowable.
+    DuplicateEntry {
+        shown: String,
+        first: Span,
+        two_spellings: bool,
+    },
+    /// A file declares one name twice at the top level (NML1000): every
+    /// declaration — block, array, `const`, `template`, `oneof` — shares one
+    /// namespace so references stay unambiguous. `first` spans the first
+    /// declaration's name. The same pass as [`Self::DuplicateEntry`].
+    DuplicateDeclaration { name: String, first: Span },
     /// An unknown (`Some`) or unterminated (`None`) string escape.
     InvalidEscape { escape: Option<char> },
     /// A malformed `\u{…}` escape; the payload names the precise failure so
@@ -196,6 +218,8 @@ pub enum SecretRefIssue {
 
 /// Echoed-source bound: enough to recognize the token, too little to flood
 /// a terminal (long strings render via their kind's description instead).
+///
+/// LIMIT: reach=content guards=output surface=kernel shown="32" — source characters a diagnostic echoes back at you
 pub(crate) const MAX_ECHO: usize = 32;
 
 /// Bound on a machine-fix replacement carried **whole** in an error
@@ -203,6 +227,8 @@ pub(crate) const MAX_ECHO: usize = 32;
 /// be truncated — a partial rewrite would corrupt the file — so past this
 /// bound the fix is omitted rather than clipped. Generous for any literal
 /// a human wrote; a stingy cap on what a hostile file can amplify.
+///
+/// LIMIT: reach=content guards=output surface=kernel shown="64" — bytes of source one machine-applicable fix may capture
 pub(crate) const MAX_FIX_CAPTURE: usize = 64;
 
 /// The separator-strip machine fix, whole-or-none: the replacement
@@ -360,6 +386,9 @@ impl ParseErrorKind {
                 )
             }
             NestingLimit { what } => format!("maximum {what} nesting depth exceeded"),
+            SourceTooLarge { len, max } => format!(
+                "source is {len} bytes; a single NML source is parsed only up to {max} bytes"
+            ),
             SetSeparator => "set elements are alternatives separated by '|', not ','".to_string(),
             ReservedTypeKeyword => {
                 "'map' is reserved for a future map type — only 'set' takes type arguments today"
@@ -371,6 +400,21 @@ impl ParseErrorKind {
             ),
             DuplicateDirective => {
                 "duplicate directive — each directive may appear once per field".to_string()
+            }
+            DuplicateEntry {
+                shown,
+                two_spellings,
+                ..
+            } => {
+                let clarifier = if *two_spellings {
+                    format!(" (`{shown}:` and `{shown} = …` are two spellings of one entry)")
+                } else {
+                    String::new()
+                };
+                format!("duplicate entry '{shown}' — a body declares each name once{clarifier}")
+            }
+            DuplicateDeclaration { name, .. } => {
+                format!("duplicate declaration '{name}' — a file declares each name once")
             }
             InvalidEscape { escape: Some(ch) } => format!(
                 "unknown escape sequence '\\{}' (valid escapes: \\\" \\\\ \\n \\t \\r \\s \\u{{…}})",
@@ -451,10 +495,13 @@ impl ParseErrorKind {
             MultilineClosingMisaligned { .. } => codes::MULTILINE_CLOSING_MISALIGNED,
             BadDedent { .. } => codes::BAD_DEDENT,
             NestingLimit { .. } => codes::NESTING_LIMIT,
+            SourceTooLarge { .. } => codes::SOURCE_TOO_LARGE,
             SetSeparator => codes::SET_SEPARATOR,
             ReservedTypeKeyword => codes::RESERVED_TYPE_KEYWORD,
             UnknownTypeConstructor { .. } => codes::UNKNOWN_TYPE_CONSTRUCTOR,
             DuplicateDirective => codes::DUPLICATE_DIRECTIVE,
+            DuplicateEntry { .. } => codes::DUPLICATE_ENTRY,
+            DuplicateDeclaration { .. } => codes::DUPLICATE_DECLARATION,
             InvalidEscape { .. } => codes::INVALID_ESCAPE,
             InvalidUnicodeEscape { .. } => codes::INVALID_ESCAPE,
             InvalidNumber { .. } => codes::INVALID_NUMBER,
@@ -770,8 +817,9 @@ mod repair_tests {
 
 #[derive(Debug, Clone, Error)]
 pub enum NmlError {
-    /// A syntax error (lexing or parsing — the phase distinction carried no
-    /// information the kind's code doesn't; RFC 0009 merged the variants).
+    /// A syntax or structural error (lexing, parsing, or the name rules over
+    /// the lowered tree — the phase distinction carried no information the
+    /// kind's code doesn't; RFC 0009 merged the variants).
     #[error("{}", kind.message())]
     Syntax { kind: ParseErrorKind, span: Span },
 
@@ -828,7 +876,9 @@ impl NmlError {
                 match kind {
                     crate::money::MoneyErrorKind::UnknownCurrency { code, code_span } => {
                         match crate::suggest::suggest(code, crate::money::currency_codes()) {
-                            Some(s) => diag.with_suggestion(s, *code_span),
+                            Some(s) => {
+                                diag.with_suggestion(Suggestion::did_you_mean(s).at(*code_span))
+                            }
                             None => diag,
                         }
                     }
@@ -847,7 +897,9 @@ impl NmlError {
                             unit,
                             DurationUnit::ALL.iter().map(|u| u.suffix()),
                         ) {
-                            Some(s) => diag.with_suggestion(s, *unit_span),
+                            Some(s) => {
+                                diag.with_suggestion(Suggestion::did_you_mean(s).at(*unit_span))
+                            }
                             None => diag,
                         }
                     }
@@ -858,11 +910,11 @@ impl NmlError {
                     DurationErrorKind::FractionalMagnitude {
                         equivalent: Some(equivalent),
                         ..
-                    } => diag.with_suggestion(equivalent, *span),
+                    } => diag.with_suggestion(Suggestion::did_you_mean(equivalent).at(*span)),
                     // The merged form replaces the whole literal (`1h2h` →
                     // `3h`) — value-preserving by construction.
                     DurationErrorKind::DuplicateUnit { merged } => {
-                        diag.with_suggestion(merged, *span)
+                        diag.with_suggestion(Suggestion::did_you_mean(merged).at(*span))
                     }
                     // No machine fix (completing or deleting the dangling
                     // magnitude would change the value); the related span
@@ -882,21 +934,35 @@ impl NmlError {
                 // no textual heuristic decides fix-vs-did-you-mean.
                 let diag = match kind.repairs(*span) {
                     Repairs::None => diag,
-                    Repairs::DidYouMean(replacement, s) => diag.with_suggestion(replacement, s),
-                    Repairs::Fix(replacement, s) => diag.with_fix(replacement, s),
+                    Repairs::DidYouMean(replacement, s) => {
+                        diag.with_suggestion(Suggestion::did_you_mean(replacement).at(s))
+                    }
+                    Repairs::Fix(replacement, s) => {
+                        diag.with_suggestion(Suggestion::fix(replacement).at(s))
+                    }
                     // Each alternative is a Fix-kind suggestion: the
                     // renderer previews them capped, the editor offers
                     // each as its own action, and the sole-candidate rule
                     // keeps every applier's hands off (N ≥ 2, never one).
-                    Repairs::Alternatives(alts) => alts
-                        .into_iter()
-                        .fold(diag, |d, (replacement, s)| d.with_fix(replacement, s)),
+                    Repairs::Alternatives(alts) => {
+                        alts.into_iter().fold(diag, |d, (replacement, s)| {
+                            d.with_suggestion(Suggestion::fix(replacement).at(s))
+                        })
+                    }
                 };
                 // Related info (RFC 0009): an unterminated string's failure
-                // can surface far from its opening delimiter — label it.
+                // can surface far from its opening delimiter — label it;
+                // a repeated name is judged at the later occurrence and
+                // the first is the note (same file: the note inherits).
                 match kind {
                     ParseErrorKind::UnterminatedString { open, .. } => {
                         diag.with_related(*open, "string opened here")
+                    }
+                    ParseErrorKind::DuplicateEntry { shown, first, .. } => {
+                        diag.with_related(*first, format!("'{shown}' first declared here"))
+                    }
+                    ParseErrorKind::DuplicateDeclaration { name, first } => {
+                        diag.with_related(*first, format!("'{name}' first declared here"))
                     }
                     _ => diag,
                 }
@@ -914,3 +980,27 @@ impl NmlError {
 
 /// Convenience type alias for results with [`NmlError`].
 pub type NmlResult<T> = Result<T, NmlError>;
+
+#[cfg(test)]
+mod bound_tests {
+    use super::{MAX_ECHO, MAX_FIX_CAPTURE, echo, echo_capture, strip_separators_fix};
+
+    /// An echo is clipped at [`MAX_ECHO`]
+    /// characters plus an ellipsis, its capture one past the bound so
+    /// the ellipsis is decidable, and a machine fix is carried whole or
+    /// not at all past [`MAX_FIX_CAPTURE`] bytes.
+    #[test]
+    fn echo_and_fix_capture_are_bounded_by_the_published_constants() {
+        let long = "x".repeat(MAX_ECHO + 9);
+        assert_eq!(echo(&long), format!("{}…", "x".repeat(MAX_ECHO)));
+        assert_eq!(echo(&"x".repeat(MAX_ECHO)), "x".repeat(MAX_ECHO));
+        assert_eq!(echo_capture(&long).chars().count(), MAX_ECHO + 1);
+        let at_bound = "1_".repeat(MAX_FIX_CAPTURE / 2);
+        assert_eq!(at_bound.len(), MAX_FIX_CAPTURE);
+        assert_eq!(
+            strip_separators_fix(&at_bound),
+            Some("1".repeat(MAX_FIX_CAPTURE / 2))
+        );
+        assert_eq!(strip_separators_fix(&"1_".repeat(MAX_FIX_CAPTURE)), None);
+    }
+}

@@ -1,0 +1,9 @@
+model logEntry:
+    kind string #sealed
+    msg string?
+
+oneof record by kind:
+    "log" -> logEntry
+
+model host:
+    rec record

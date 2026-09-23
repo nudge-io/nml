@@ -464,4 +464,3 @@ cfgd l7 uses l6:
                                                                                                                                                             child:
                                                                                                                                                                 child:
                                                                                                                                                                     leaf = "v7"
-

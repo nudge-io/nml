@@ -1,0 +1,3 @@
+tenants/cu/lib/base.flow.nml: error[NML2083]: closed binding rejects `tenants/cu/lib/base.flow.nml`: path component `lib` is a symlink — content reached through a symlinked path is rejected in a closed universe (a link could relocate content into a differently-trusted subtree); replace the link with the content itself, or check the file at its real path
+for more information, run: nml explain NML2083
+error: 1 error(s)

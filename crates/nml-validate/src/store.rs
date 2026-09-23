@@ -15,6 +15,14 @@ use crate::package::{PackageError, SchemaPackage};
 /// Pointer file name inside a package's store directory.
 const CURRENT_POINTER: &str = "current";
 
+/// The bound the `current` pointer is read under: two lines — a slot
+/// name and a `blake3:` digest ([`Store::load_current`]) — so anything
+/// larger is a corrupt or hostile slot, refused as not installed rather
+/// than held. The editor reads this file on the store's load path.
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="4 KiB" — bytes of a schema package's `current` store pointer the loader reads
+const MAX_POINTER_BYTES: usize = 4 * 1024;
+
 /// The store subdirectory under the user data dir.
 const STORE_SUBDIR: &str = "schema-packages";
 
@@ -116,9 +124,16 @@ impl Store {
     /// one read per pass (no guard-vs-load divergence to reason about).
     /// `None` = not installed (including invalid names, which never touch
     /// the filesystem).
+    ///
+    /// Through the crate's ONE reader ([`crate::fs::read_leaf`]) under
+    /// its own bound (`MAX_POINTER_BYTES`, 4 KiB): the pointer is two
+    /// lines, and the by-path
+    /// `read_to_string` this replaces would follow a link, stream a
+    /// device, or block forever on a FIFO named `current` — on the
+    /// editor's per-keystroke store path.
     pub fn pointer_content(&self, name: &str) -> PointerContent {
         let path = self.pointer_path(name)?;
-        std::fs::read_to_string(path).ok()
+        crate::fs::read_leaf(&path, MAX_POINTER_BYTES, "a store pointer").ok()
     }
 
     /// Resolve and load the `current` slot for `name`, verifying the loaded
@@ -146,8 +161,9 @@ impl Store {
             }
         };
         // Slot names are single path components; a pointer must not be able
-        // to walk the filesystem.
-        if slot.contains('/') || slot.contains('\\') || slot.contains("..") {
+        // to walk the filesystem — the ONE rule the write side applies
+        // before it creates a slot (`plain_slot`).
+        if !plain_slot(&slot) {
             return Err(StoreError::Corrupt {
                 detail: "pointer slot name is not a plain directory name".to_string(),
             });
@@ -309,8 +325,37 @@ impl Store {
     /// identical directory and is ignored), and the pointer flip is atomic.
     pub fn publish(&self, package: &SchemaPackage) -> Result<PublishOutcome, StoreError> {
         let name = &package.manifest.name;
+        // An empty `version` spells the slot `+<hash8>`: the read side
+        // follows it, the listing cannot name it (`pointer_identity`
+        // finds no version before the `+`) — refused, so every reader
+        // agrees on every slot the store ever creates.
+        if package.manifest.version.is_empty() {
+            return Err(StoreError::Write {
+                detail: "version is empty: a slot directory name needs one".to_string(),
+            });
+        }
         let hash = package.content_hash();
         let slot = Self::slot_name(&package.manifest.version, &hash);
+        // The slot is a directory name the manifest's `version` spells, and
+        // nothing at parse constrains a version: one bearing a separator or
+        // `..` joined OUT of the store (`<base>/schema-packages/<name>/../../
+        // x+<hash8>` — the staging tree, its files named and bodied by the
+        // manifest, renamed to wherever the version pointed, then a pointer
+        // the read side refuses as corrupt), and a dot-led one is the
+        // temp-artifact shape `gc` deletes once aged. Refused HERE, before
+        // any path is touched, by the rule the read side already holds a
+        // pointer to (`plain_slot`). A control character is the shape
+        // a NAME rule alone let through: `version = "1.0\n"` published a
+        // slot whose pointer spans three lines, and every read of the
+        // package was `Corrupt` from then on.
+        if !plain_slot(&slot) {
+            return Err(StoreError::Write {
+                detail: format!(
+                    "version {:?} does not spell a plain slot directory name",
+                    package.manifest.version
+                ),
+            });
+        }
         let pointer_value = format!("{slot}\n{hash}\n");
         if self.pointer_content(name).as_deref() == Some(pointer_value.as_str()) {
             return Ok(PublishOutcome::Unchanged);
@@ -341,7 +386,8 @@ impl Store {
                 // exactly as every read side does — a manifest must never be
                 // able to write outside its own slot.
                 crate::package::check_plain_file_name(&file).map_err(write_err)?;
-                std::fs::write(staging.join(file), text).map_err(|e| write_err(e.to_string()))?;
+                std::fs::write(staging.join(file), text.as_bytes())
+                    .map_err(|e| write_err(e.to_string()))?;
             }
             if let Err(e) = std::fs::rename(&staging, &slot_dir) {
                 // A same-content racer won the rename: identical slot, fine.
@@ -419,6 +465,24 @@ pub fn hash8(content_hash: &str) -> String {
         .collect()
 }
 
+/// A slot directory name the store will create or follow: a plain entry
+/// name (never empty, `.`, `..` or separator-bearing — the kernel's one
+/// segment rule, `glob::is_plain_name`) that does not begin with `.` —
+/// dot-led names are the store's own temp artifacts (`.staging-*`,
+/// `.pointer-*`), which `gc` removes once aged and `list` never counts —
+/// and carries no control character: the pointer is a LINE-shaped text
+/// file, so a slot holding a newline is one no reader can parse back
+/// (the read side judges the pointer's first LINE, which such a slot
+/// spans), and a NUL is one the OS refuses only after the staging tree
+/// was created. The ONE predicate both the read side (`load_current`)
+/// and the write side (`publish`) apply, so a name one refuses the
+/// other never creates.
+fn plain_slot(slot: &str) -> bool {
+    crate::glob::is_plain_name(slot)
+        && !slot.starts_with('.')
+        && !slot.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +538,60 @@ package demo:
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The `current` pointer is read under [`MAX_POINTER_BYTES`], exactly:
+    /// a pointer padded to the bound still loads, one byte past it reads
+    /// as NOT INSTALLED (the by-path `read_to_string` this replaces held
+    /// whatever the file was, and followed a link to it). The pad is
+    /// blank lines — the pointer's own grammar is its first two lines —
+    /// so the two cases differ in ONE byte and nothing else.
+    #[test]
+    fn the_current_pointer_is_read_under_its_bound() {
+        for (pad_to, installed) in [(MAX_POINTER_BYTES, true), (MAX_POINTER_BYTES + 1, false)] {
+            let base = temp_base(&format!("pointer-{pad_to}"));
+            let hash = write_store(&base);
+            let store = Store::at(&base);
+            let pointer = base.join("schema-packages/demo/current");
+            let head = std::fs::read_to_string(&pointer).unwrap();
+            let padded = format!("{head}{}", "\n".repeat(pad_to - head.len()));
+            assert_eq!(padded.len(), pad_to);
+            std::fs::write(&pointer, &padded).unwrap();
+            assert_eq!(
+                store.pointer_content("demo").is_some(),
+                installed,
+                "{pad_to} bytes"
+            );
+            assert_eq!(
+                store.read_current("demo").is_ok(),
+                installed,
+                "{pad_to} bytes"
+            );
+            if installed {
+                assert_eq!(store.read_current("demo").unwrap().content_hash, hash);
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// A store slot whose `current` is a FIFO, a device or a directory is
+    /// NOT INSTALLED — never a read that blocks forever or streams. The
+    /// editor reads this file on its store path, so a hang here has no
+    /// way out.
+    #[cfg(unix)]
+    #[test]
+    fn a_pointer_that_is_not_a_regular_file_is_not_installed() {
+        let base = temp_base("pointer-fifo");
+        write_store(&base);
+        let store = Store::at(&base);
+        let pointer = base.join("schema-packages/demo/current");
+        std::fs::remove_file(&pointer).unwrap();
+        std::fs::create_dir(&pointer).unwrap();
+        assert!(store.pointer_content("demo").is_none(), "a directory");
+        std::fs::remove_dir(&pointer).unwrap();
+        std::os::unix::fs::symlink("elsewhere", &pointer).unwrap();
+        assert!(store.pointer_content("demo").is_none(), "a dangling link");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -677,6 +795,119 @@ package demo:
             store.read_current("demo"),
             Err(StoreError::Corrupt { .. })
         ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The write side refuses every slot name the read side refuses. A
+    /// manifest `version` bearing a separator or `..` — nothing at parse
+    /// constrains one — used to join OUT of the store: `publish` staged
+    /// the slot under the package directory and `rename`d it to
+    /// `<name>/../../../outside/x+<hash8>`, landing files the manifest
+    /// named and bodied wherever the version pointed, then wrote a pointer
+    /// the read side refuses as corrupt. Refused before any path is
+    /// touched: nothing under the base, nothing beside it. A dot-led
+    /// version is refused too (`gc` deletes dot-led directories as aged
+    /// temp artifacts, which would orphan the pointer), and so is one
+    /// holding a control character: `"1.0\n"` PUBLISHED — the slot was
+    /// created and the pointer flipped — and every `read_current` from
+    /// then on was `Corrupt` ("pointer must hold a slot name and a
+    /// blake3 hash": the slot spans two of the pointer's lines); a NUL
+    /// was refused by the OS only after the staging tree existed. An
+    /// empty version (`+<hash8>`) loads but lists as `?`, so it is
+    /// refused too. Build metadata after `+`, a pre-release tag, a date,
+    /// a `v`-prefix, a space and non-ASCII letters are plain names and
+    /// publish.
+    #[test]
+    fn publish_refuses_a_version_that_spells_no_plain_slot_name() {
+        let base = temp_base("traversing-version");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let store = Store::at(base.join("store"));
+        let mut refused = 0;
+        for version in [
+            "../../../outside/planted",
+            "a/b",
+            "a\\b",
+            "..",
+            ".",
+            ".hidden",
+            "1.0\n",
+            "1.0\r",
+            "1.0\t2",
+            "1.0\u{1}x",
+            "1.0\u{7f}",
+            "",
+        ] {
+            let manifest =
+                MANIFEST.replace("version = \"0.1.0\"", &format!("version = {version:?}"));
+            let package = SchemaPackage::from_parts(&manifest, |_| Ok(CORE.to_string()))
+                .unwrap_or_else(|e| panic!("{version:?} parses (no version charset rule): {e}"));
+            match store.publish(&package) {
+                Err(StoreError::Write { detail }) => {
+                    let expected = if version.is_empty() {
+                        "version is empty"
+                    } else {
+                        "plain slot"
+                    };
+                    assert!(detail.contains(expected), "{version:?}: {detail}");
+                    refused += 1;
+                }
+                other => panic!("{version:?}: expected a Write refusal, got {other:?}"),
+            }
+            assert!(
+                !base.join("store").exists(),
+                "{version:?}: nothing may be created under the base"
+            );
+            assert!(
+                std::fs::read_dir(&outside).unwrap().next().is_none(),
+                "{version:?}: nothing may land outside the store"
+            );
+        }
+        assert_eq!(refused, 12);
+        // A NUL, spelled in the manifest's own escape (`{:?}` writes `\0`,
+        // which NML does not know): refused by the rule, not by the OS
+        // after the staging tree exists.
+        let manifest = MANIFEST.replace("version = \"0.1.0\"", "version = \"1.0\\u{0}x\"");
+        let package = SchemaPackage::from_parts(&manifest, |_| Ok(CORE.to_string())).unwrap();
+        assert_eq!(package.manifest.version, "1.0\u{0}x");
+        match store.publish(&package) {
+            Err(StoreError::Write { detail }) => assert!(detail.contains("plain slot"), "{detail}"),
+            other => panic!("a NUL-bearing version: expected a Write refusal, got {other:?}"),
+        }
+        assert!(
+            !base.join("store").exists(),
+            "nothing may be created under the base"
+        );
+        for version in [
+            "0.1.0+build.7",
+            "1.0.0-rc.1",
+            "2024-01-01",
+            "v1",
+            "1.0 beta",
+            "ünïcode.1",
+            "x..",
+        ] {
+            let manifest =
+                MANIFEST.replace("version = \"0.1.0\"", &format!("version = {version:?}"));
+            let package = SchemaPackage::from_parts(&manifest, |_| Ok(CORE.to_string())).unwrap();
+            assert!(
+                matches!(
+                    store.publish(&package),
+                    Ok(PublishOutcome::Published { .. })
+                ),
+                "{version:?} is a plain slot name and publishes"
+            );
+            let current = store
+                .read_current("demo")
+                .unwrap_or_else(|e| panic!("{version:?} round-trips through the read side: {e:?}"));
+            assert_eq!(current.package.manifest.version, version);
+            let listed = store.list();
+            assert_eq!(
+                (listed.len(), listed[0].version.as_str()),
+                (1, version),
+                "the listing names the version the pointer pins"
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 }

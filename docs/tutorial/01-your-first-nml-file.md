@@ -99,7 +99,7 @@ service Api:
 ```
 
 ```text
-app.nml:2:1: error: tabs are not permitted in indentation; use spaces
+app.nml:2:1: error[NML0005]: tabs are not permitted in indentation; use spaces
 ```
 
 That diagnostic is real — every error message in this tutorial is the actual
@@ -133,8 +133,8 @@ nml parse app.nml
 {
   "kind": {
     "Property": {
-      "name": { "name": "port", "span": { "start": 65, "end": 69 } },
-      "value": { "value": { "Number": 8080 }, "span": { "start": 72, "end": 76 } }
+      "name": { "name": "port", "span": { "start": 140, "end": 144 } },
+      "value": { "value": { "Number": 8080 }, "span": { "start": 147, "end": 151 } }
     }
   }
 }
@@ -146,7 +146,9 @@ it's what you'll consume programmatically in Chapter 7.
 
 `nml fmt app.nml` rewrites the file in canonical style (4-space indents,
 normalized spacing) and preserves your comments. Run it whenever; it's
-idempotent.
+idempotent. One thing it does not preserve: a blank line *inside* a body —
+the blank line above `database:` in the file you just wrote is removed
+(blank lines *between* top-level declarations are kept).
 
 ## Break it
 
@@ -159,7 +161,7 @@ service Api:
 ```
 
 ```text
-app.nml:2:12: error: invalid number: "0.0.0.0"
+app.nml:2:12: error[NML0013]: invalid number: "0.0.0.0"
 ```
 
 An unquoted `0.0.0.0` isn't a string — the parser tries to read it as a

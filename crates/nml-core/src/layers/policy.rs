@@ -21,7 +21,48 @@ pub enum MergePolicy {
     IdentityAppend,
 }
 
-const POLICY_NAMES: [&str; 4] = ["sealed", "identity", "append", "overlay"];
+/// One of the language's merge-policy directives (RFC 0019): known under
+/// every directive vocabulary, and a name no package manifest may
+/// redeclare (NML2082).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinDirective {
+    pub name: &'static str,
+    /// The one sentence every consumption site renders for it (hover,
+    /// completion detail).
+    pub doc: &'static str,
+}
+
+/// The four language-interpreted directives — the base of every directive
+/// vocabulary: a package's declared `[]directive` entries EXTEND this set
+/// and never replace it (`nml_validate::directives::Vocabulary`).
+pub const BUILTIN_DIRECTIVES: [BuiltinDirective; 4] = [
+    BuiltinDirective {
+        name: "sealed",
+        doc: "Write-once from the bottom: the first layer to assign the field fixes it; an \
+              assignment in any higher layer is NML2060 (RFC 0019).",
+    },
+    BuiltinDirective {
+        name: "identity",
+        doc: "List items merge by identity: a matching item merges recursively, an item \
+              matching no base identity is NML2067 unless the field also grants `#append` \
+              (RFC 0019).",
+    },
+    BuiltinDirective {
+        name: "append",
+        doc: "Upper-layer list items are added after the base's; redefining an existing \
+              identity is NML2063 (RFC 0019).",
+    },
+    BuiltinDirective {
+        name: "overlay",
+        doc: "The explicit spelling of the default: a later layer wins on conflict and \
+              nested blocks deep-merge (RFC 0019).",
+    },
+];
+
+/// Whether `name` is one of the language's merge-policy directives.
+pub fn is_builtin_directive(name: &str) -> bool {
+    BUILTIN_DIRECTIVES.iter().any(|b| b.name == name)
+}
 
 /// Derive a field's merge policy from its trailing directives. Invalid
 /// combinations are rejected at schema load (NML2068) — and the engine is
@@ -131,7 +172,7 @@ fn declared_policy_names(field: &FieldDef) -> Vec<&str> {
     field
         .directives
         .iter()
-        .filter(|d| POLICY_NAMES.contains(&d.name.as_str()))
+        .filter(|d| is_builtin_directive(&d.name))
         .map(|d| d.name.as_str())
         .collect()
 }
