@@ -775,6 +775,18 @@ def run_transcript_in(t: Transcript, cwd: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def sample_owns_line(line: str, sample: Path) -> bool:
+    """True when a CLI row attributes a finding to the checked sample file.
+
+    Fences run `nml check` on an absolute temp path, but the CLI prints the
+    file's workspace key (e.g. `example.nml` when the universe root is the
+    temp directory). Match either spelling so code-multiset contracts stay
+    path-scoped without requiring the absolute argv path in output."""
+    if str(sample) in line:
+        return True
+    return line.startswith(f"{sample.name}:")
+
+
 def sample_codes(output: str, sample: Path, severity: str) -> Counter[str]:
     """The `severity[NML####]` codes on the SAMPLE's own output lines, as a
     MULTISET — one count per finding, so an example that regresses from
@@ -785,7 +797,7 @@ def sample_codes(output: str, sample: Path, severity: str) -> Counter[str]:
     return Counter(
         code
         for line in output.splitlines()
-        if str(sample) in line
+        if sample_owns_line(line, sample)
         for code in re.findall(rf"{severity}\[(NML\d{{4}})\]", line)
     )
 

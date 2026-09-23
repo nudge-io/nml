@@ -702,7 +702,7 @@ fn resolve_suggestion<'d>(
 /// resolved edits themselves.
 fn report_insertions<'d>(
     ws: Option<&workspace::Workspace>,
-    path: &Path,
+    _path: &Path,
     source: &str,
     source_map: &nml_core::span::SourceMap,
     own: &str,
@@ -792,7 +792,7 @@ pub(crate) fn sanitized(text: &str) -> String {
 /// TYPED, a foreign one by its key.
 fn note_line<'d>(
     ws: Option<&workspace::Workspace>,
-    path: &Path,
+    _path: &Path,
     source_map: &nml_core::span::SourceMap,
     own: &str,
     foreign: &mut std::collections::HashMap<&'d str, Option<Foreign>>,
