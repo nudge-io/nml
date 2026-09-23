@@ -498,7 +498,7 @@ mod schema_dir_tests {
         let names: Vec<String> = schema_sources_of(listing, dir)
             .expect("listed")
             .iter()
-            .map(|p| p.display().to_string())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
             .collect();
         assert_eq!(
             names,

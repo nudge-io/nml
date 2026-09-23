@@ -318,6 +318,15 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
+    /// Workspace-relative path with `/` separators — matches [`Limit::path`]
+    /// and the census rows on every OS (`file.display()` is `\` on Windows).
+    fn census_file_key(file: &Path, workspace: &Path) -> String {
+        file.strip_prefix(workspace)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
     /// Every `[pub[(..)]] const NAME: TY = RHS;`, `[pub[(..)]] static
     /// NAME: TY = RHS;` and `[pub[(..)]] const fn name(` in a source
     /// (the recognizer contract in the module doc), with the right-hand
@@ -466,7 +475,7 @@ mod tests {
         for file in test_files {
             if let Ok(text) = std::fs::read_to_string(&file) {
                 regions.push((
-                    file.display().to_string(),
+                    census_file_key(&file, &workspace),
                     blank_comments_and_strings(&text),
                 ));
             }
@@ -477,7 +486,7 @@ mod tests {
             };
             let clean = blank_comments_and_strings(&text);
             for block in cfg_test_blocks(&clean) {
-                regions.push((file.display().to_string(), block));
+                regions.push((census_file_key(&file, &workspace), block));
             }
         }
         regions
