@@ -803,6 +803,12 @@ Security group lists every change that made a silent outcome a refusal.
   error and no lint, as `nml check` prints none; a universe row located in
   the document it sits on (NML2081 at its item) sits at that item.
 
+- **public API apiVersion 6, revision 1** — BREAKING: `SchemaPackage::from_parts`
+  no longer carries a type parameter — the resolver returns
+  `Result<String, String>` again (the `Into<Arc<str>>` generic overload is
+  gone from the public surface; workspace discovery shares source text through
+  a crate-private entry point).
+
 - **public API apiVersion 5, revision 1** — BREAKING: the record moved
   with the pinned nightly rustdoc (1.100.0-nightly, 2026-09-22). Auto-trait
   impl lines now carry `&'a mut S` / `&'a F` where-clauses

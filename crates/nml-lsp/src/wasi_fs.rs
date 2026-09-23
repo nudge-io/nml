@@ -66,7 +66,12 @@ impl DirEntryLike for Entry {
 /// entry is created or removed (measured under `wasm-wasi-core`: both move
 /// on a create AND on a delete). Nothing else is read — never the
 /// content, never a second listing.
-type Stamp = (u64, Option<std::time::SystemTime>);
+///
+/// The second component is platform-native time from that one `stat`:
+/// `last_write_time` on Windows (directory `len()` is often zero there, so
+/// the stamp leans on the write time), nanoseconds since the Unix epoch
+/// elsewhere. When the time cannot be read, the memo does not cache.
+type Stamp = (u64, u64);
 
 /// A directory's entries as they were read: names with their kinds, in
 /// `readdir` order. Shared, never mutated — one allocation per directory
@@ -75,7 +80,22 @@ type Held = Arc<Vec<(OsString, EntryKind)>>;
 
 fn stamp_of(dir: &Path) -> Option<Stamp> {
     let meta = std::fs::metadata(dir).ok()?;
-    Some((meta.len(), meta.modified().ok()))
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let t = meta.last_write_time();
+        (t != 0).then_some((meta.len(), t))
+    }
+    #[cfg(not(windows))]
+    {
+        let t = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        Some((meta.len(), t as u64))
+    }
 }
 
 /// The resolver's listing memo: one entry per directory, held while the
@@ -299,7 +319,26 @@ mod lister {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
     use nml_validate::test_support::scan::blank_comments_and_strings;
+
+    /// After a create or delete, some hosts report the directory's stamp
+    /// a tick later than the child write returns. The memo keys on one
+    /// `stat`, so wait briefly rather than flake on that ordering.
+    fn wait_until_stamp_moves(dir: &Path, before: super::Stamp) {
+        if super::stamp_of(dir) != Some(before) {
+            return;
+        }
+        for _ in 0..200 {
+            std::thread::sleep(Duration::from_millis(5));
+            if super::stamp_of(dir) != Some(before) {
+                return;
+            }
+        }
+        panic!("directory stamp did not move after a membership change (still {before:?})");
+    }
 
     /// The lister agrees with the native oracle, entry for entry, over a
     /// tree that has one of every kind — the property the wasm editor's
@@ -332,9 +371,11 @@ mod tests {
 
         let op = memo.snapshot();
         assert_eq!(op(&base).expect("listed").len(), 1);
+        let stamp_after_one = super::stamp_of(&base).expect("directory stamp");
         // Within ONE operation the answer is frozen: a file that appears
         // mid-walk cannot make the walk see two different trees.
         std::fs::write(base.join("two.nml"), b"y").expect("file");
+        wait_until_stamp_moves(&base, stamp_after_one);
         assert_eq!(
             op(&base).expect("listed").len(),
             1,
