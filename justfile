@@ -351,7 +351,9 @@ fmt-check:
 gate-api:
     #!/usr/bin/env bash
     set -euo pipefail
-    rustup toolchain install nightly --profile minimal
+    echo "gate-api: installing nightly (+ rustdoc) for cargo public-api rustdoc JSON"
+    rustup toolchain install nightly --profile minimal --component rustdoc
+    rustup run nightly rustc --version
     cargo install --locked cargo-public-api@0.52.0 cargo-semver-checks@0.50.0
     python3 scripts/api_record.py
     base="${NML_API_BASELINE:-}"
