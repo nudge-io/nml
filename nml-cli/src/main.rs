@@ -544,7 +544,7 @@ fn report(
     // sanitizing `Rendered`).
     out::err(format_args!(
         "{}:{}:{}: {}: {}",
-        sanitized(&path.display().to_string()),
+        sanitized(&workspace::message_path(path)),
         line,
         column,
         out::severity_prefix(diag, true),
@@ -803,7 +803,7 @@ fn note_line<'d>(
     // A same-file note keeps the path AS TYPED beside the finding's own
     // prefix (the key is the wire's spelling, not the terminal's).
     if note.source == own {
-        note.line(&path.display().to_string())
+        note.line(&workspace::message_path(path))
     } else {
         note.line(&note.source)
     }

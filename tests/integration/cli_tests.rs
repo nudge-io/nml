@@ -7955,7 +7955,7 @@ fn a_no_fence_derivation_is_disclosed_on_stderr() {
         format!(
             "note: workspace root {}  (derived: no .git fence found, so the target's own \
              directory is the workspace root — pass --root to pin)\n",
-            bare.display()
+            bare.display().to_string().replace('\\', "/")
         ),
         "{stderr}"
     );
