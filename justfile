@@ -357,9 +357,14 @@ gate-api:
     # Bump with the tool + records in one reviewed change — not rolling `nightly`,
     # which can lack rustdoc on any given day (rustup-components-history).
     rustdoc_nightly="${NML_RUSTDOC_NIGHTLY:-nightly-2025-08-02}"
-    echo "gate-api: installing ${rustdoc_nightly} (+ rustdoc) for cargo public-api rustdoc JSON"
-    rustup toolchain install "$rustdoc_nightly" --profile minimal --component rustdoc
-    rustup run "$rustdoc_nightly" rustc --version
+    echo "gate-api: installing ${rustdoc_nightly} (default profile — rustdoc JSON) for cargo public-api"
+    # Do not use `--profile minimal --component rustdoc`: on many dated nightlies
+    # rustdoc is not a separate downloadable component for that channel (CI fails
+    # with "component rustdoc … is unavailable"), while the default profile still
+    # ships rustdoc as part of its component set.
+    rustup toolchain install "$rustdoc_nightly"
+    rustup run "$rustdoc_nightly" rustdoc --version
+    export RUSTUP_TOOLCHAIN="$rustdoc_nightly"
     cargo install --locked cargo-public-api@0.52.0 cargo-semver-checks@0.50.0
     python3 scripts/api_record.py
     base="${NML_API_BASELINE:-}"

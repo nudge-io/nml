@@ -168,7 +168,7 @@
     "check:toolchain": "node scripts/check-toolchain.mjs",
     "test:engine-policy": "node --test scripts/vscodeEnginePolicy.test.mjs",
     "test:lockfile-policy": "node --test scripts/lockfilePolicy.test.mjs",
-    "test:toolchain-policy": "node --test scripts/toolchainPolicy.test.mjs scripts/toolchainCheck.test.mjs",
+    "test:toolchain-policy": "node --test scripts/toolchainPolicy.test.mjs scripts/toolchainCheck.test.mjs scripts/toolchainSpawn.test.mjs",
     "typecheck": "tsc -b tsconfig.json tsconfig.test.json",
     "compile": "node scripts/compile.mjs",
     "watch": "tsc -b tsconfig.json tsconfig.test.json -w",

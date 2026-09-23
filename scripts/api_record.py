@@ -55,8 +55,10 @@ CRATES = ["nml-core", "nml-validate", "nml-fmt", "nml-lsp"]
 # moves with the toolchain, so the pair (toolchain, tool) is what makes a
 # record reproducible. Bump both in one reviewed change.
 TOOL_VERSION = "0.52.0"
-# Nightly with rustdoc for `cargo public-api` (0.52.x floor). Kept in sync with
-# `just gate-api` / `NML_RUSTDOC_NIGHTLY`; bump with the tool in one change.
+# Dated nightly for `cargo public-api` rustdoc JSON (0.52.x floor). Kept in sync
+# with `just gate-api` / `NML_RUSTDOC_NIGHTLY`; bump with the tool in one change.
+# Installed with the default rustup profile (not `--profile minimal --component
+# rustdoc` — that pair often has no rustdoc artifact for the channel).
 RUSTDOC_NIGHTLY = "nightly-2025-08-02"
 
 HEADER = (

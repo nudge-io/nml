@@ -3,6 +3,24 @@ import { copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 
 /**
+ * `spawn("pnpm")` on Windows resolves the Corepack / npm shim `pnpm.cmd`.
+ * CreateProcess cannot execute a `.cmd` (ENOENT, `status === null`), so a
+ * caller that only checks `status` exits 1 and prints nothing — which is
+ * what `verify:ci` did on `windows-latest` at `test:real`. Node's `shell`
+ * option runs it through `cmd.exe /d /s /c`, and that option joins arguments
+ * with spaces, so an argument that contains a space or a cmd metacharacter
+ * must be refused rather than split.
+ *
+ * @param {NodeJS.Platform} platform
+ * @param {string} cmd
+ */
+export function needsWindowsCmdShell(platform, cmd) {
+  return platform === "win32" && (cmd === "pnpm" || cmd === "pnpm.cmd");
+}
+
+const CMD_META = /[\s"&|<>^%]/;
+
+/**
  * Run a command in the extension package directory; exit non-zero on failure.
  * @param {string} packageDir
  * @param {string} cmd
@@ -10,11 +28,26 @@ import { resolve } from "node:path";
  * @param {{ shell?: boolean }} [opts]
  */
 export function runInPackage(packageDir, cmd, args, opts = {}) {
+  const shell = opts.shell ?? needsWindowsCmdShell(process.platform, cmd);
+  if (shell && process.platform === "win32") {
+    const unsafe = [cmd, ...args].find((arg) => CMD_META.test(arg));
+    if (unsafe !== undefined) {
+      console.error(
+        `refusing to run ${cmd} through cmd.exe: ${JSON.stringify(unsafe)} ` +
+          "contains a space or a cmd metacharacter, and Node joins shell arguments with spaces"
+      );
+      process.exit(1);
+    }
+  }
   const result = spawnSync(cmd, args, {
     cwd: packageDir,
     stdio: "inherit",
-    shell: opts.shell ?? false,
+    shell,
   });
+  if (result.error) {
+    console.error(`failed to run ${cmd} ${args.join(" ")}: ${result.error.message}`);
+    process.exit(1);
+  }
   if (result.status !== 0) {
     process.exit(result.status ?? 1);
   }
@@ -97,6 +130,20 @@ export function bundleJs(packageDir) {
 
 /** @param {string} packageDir */
 export function compileTsc(packageDir) {
-  pnpmExec(packageDir, "tsc", "-b", "tsconfig.json", "tsconfig.test.json");
+  // The typescript bin is a JavaScript file. Running it with this Node
+  // avoids a nested `pnpm exec` — the Windows failure `needsWindowsCmdShell`
+  // exists for. `pnpm exec esbuild` stays, because that bin is a native
+  // executable on Unix and a JS launcher on Windows.
+  const tscBin = resolve(packageDir, "node_modules", "typescript", "bin", "tsc");
+  if (!existsSync(tscBin)) {
+    console.error(`compile: missing typescript at ${tscBin}\n  Run: pnpm install`);
+    process.exit(1);
+  }
+  runInPackage(packageDir, process.execPath, [
+    tscBin,
+    "-b",
+    "tsconfig.json",
+    "tsconfig.test.json",
+  ]);
   copySupervisor(packageDir, "out");
 }

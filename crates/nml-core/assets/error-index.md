@@ -2742,7 +2742,7 @@ this code — named on the command line it would be followed:
 ```text transcript=tests/fixtures/workspace-open link=l.flow.nml:a.flow.nml
 $ nml check --root . .
 l.flow.nml: error[NML2090]: the walk skipped `l.flow.nml`: a symlink — followed only when named on the command line, never by a directory walk — content a runtime could read that no verb judged; name it, or replace the link with the content itself
-./x.nml: ok (3 declaration(s))
+x.nml: ok (3 declaration(s))
 for more information, run: nml explain NML2090
 error: 1 skipped path(s) hold content no verb judged
 ```
