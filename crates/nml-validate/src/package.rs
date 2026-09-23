@@ -421,13 +421,19 @@ impl SchemaPackage {
     /// Load a package from a manifest text plus its source files, resolved by
     /// the caller (embedded `include_str!` bundles, the store, a workspace).
     /// `resolve` maps a declared file name to its contents.
-    /// `resolve` may hand back an owned `String` (the common case: a
-    /// bundle, the store, a test) or an `Arc<str>` a caller is sharing
-    /// across packages (workspace discovery's per-`(directory, file)`
-    /// cache) — the package retains whichever without copying it again.
-    pub fn from_parts<T: Into<Arc<str>>>(
+    pub fn from_parts(
         manifest_text: &str,
-        mut resolve: impl FnMut(&str) -> Result<T, String>,
+        mut resolve: impl FnMut(&str) -> Result<String, String>,
+    ) -> Result<Self, PackageError> {
+        Self::from_parts_arced(manifest_text, |file| resolve(file).map(Arc::from))
+    }
+
+    /// Like [`from_parts`], but the resolver may return a shared [`Arc<str>`]
+    /// (workspace discovery's per-`(directory, file)` cache) without copying
+    /// again.
+    pub(crate) fn from_parts_arced(
+        manifest_text: &str,
+        mut resolve: impl FnMut(&str) -> Result<Arc<str>, String>,
     ) -> Result<Self, PackageError> {
         let manifest = parse_manifest(manifest_text)?;
         let mut sources = Vec::with_capacity(manifest.schemas.len());
@@ -436,7 +442,7 @@ impl SchemaPackage {
                 file: entry.file.clone(),
                 detail,
             })?;
-            sources.push((entry.name.clone(), text.into()));
+            sources.push((entry.name.clone(), text));
         }
         Ok(Self {
             manifest,

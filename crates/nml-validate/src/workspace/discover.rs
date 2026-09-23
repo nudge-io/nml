@@ -961,7 +961,7 @@ fn load_manifest(
     let key_dir = key.dir();
     let mut index = 0usize;
     let mut over_budget: Option<LoadFailure> = None;
-    let package = SchemaPackage::from_parts(&text, |file| {
+    let package = SchemaPackage::from_parts_arced(&text, |file| {
         // `from_parts` resolves `schemas` in declaration order, so the
         // call count is the entry's index.
         let locator = format!("declared source `{file}` (schemas[{index}].file in `{key}`)");
