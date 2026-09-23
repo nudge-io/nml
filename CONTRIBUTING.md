@@ -46,7 +46,7 @@ time, so your machine tells you its numbers on the first full run.
 Three gates change your machine rather than only reading it, and say so:
 `gate-msrv` installs the MSRV toolchain, `gate-wasm` adds the
 `wasm32-wasip1` target, and `gate-api` installs its two pinned classifier
-tools. Everything else only reads.
+tools and the nightly toolchain `cargo public-api` needs. Everything else only reads.
 
 ## The landing gate
 
@@ -76,7 +76,7 @@ Gates that need a tool: `just gate-contract` and `just gate-docs` need
 `python3` (and `gate-contract` needs PyYAML, above), `just gate-supply-chain`
 needs `cargo install cargo-deny`, `just gate-fuzz` needs `cargo install
 cargo-fuzz` and a nightly toolchain, `just gate-api` installs its two pinned
-classifiers itself, and `just gate-ext` runs `pnpm audit` (so it needs the
+classifiers and nightly (for rustdoc JSON), and `just gate-ext` runs `pnpm audit` (so it needs the
 network).
 `just doctor` checks all of them at once.
 

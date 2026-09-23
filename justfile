@@ -82,7 +82,7 @@ doctor:
     if [ "$r" = yes ] && rustup target list --installed 2>/dev/null | grep -q '^wasm32-wasip1$'; then w=yes; else w=no; fi
     check "$w" "wasm32-wasip1 target" "gate-wasm, gate-ext-e2e" "rustup target add wasm32-wasip1" no
     if [ "$r" = yes ] && rustup toolchain list 2>/dev/null | grep -q '^nightly'; then ng=yes; else ng=no; fi
-    check "$ng" "nightly toolchain" "gate-fuzz, gate-minimal-versions" "rustup toolchain install nightly" no
+    check "$ng" "nightly toolchain" "gate-fuzz, gate-minimal-versions, gate-api" "rustup toolchain install nightly" no
     have cargo-deny && cd_=yes || cd_=no
     check "$cd_" "cargo-deny" "gate-supply-chain" "cargo install cargo-deny" no
     have cargo-fuzz && cf=yes || cf=no
@@ -341,7 +341,9 @@ fmt-check:
 # then asks the classifier whether what moved is breaking. Both tools are
 # pinned WITH the toolchain (rustdoc's JSON rendering moves with the
 # compiler; bump all three in one reviewed change) and installed here, so
-# CI and a local run install the same versions. `NML_UPDATE_GOLDEN=1 just
+# CI and a local run install the same versions. `cargo public-api` builds
+# rustdoc JSON with a nightly toolchain (not the active one — the pin file
+# still governs fmt/clippy/check); this recipe installs it. `NML_UPDATE_GOLDEN=1 just
 # gate-api` rewrites the records AFTER the stamp and the CHANGELOG entry
 # moved — never before. The baseline is `NML_API_BASELINE`, else
 # `origin/main` where that ref exists, else `HEAD` (a clone with no
@@ -349,6 +351,7 @@ fmt-check:
 gate-api:
     #!/usr/bin/env bash
     set -euo pipefail
+    rustup toolchain install nightly --profile minimal
     cargo install --locked cargo-public-api@0.52.0 cargo-semver-checks@0.50.0
     python3 scripts/api_record.py
     base="${NML_API_BASELINE:-}"

@@ -19,9 +19,12 @@
 //!    `N` — and every golden line must match one of the documented
 //!    [`SHAPES`], so a new sentence cannot land unreviewed.
 //!
-//! Rows tagged `{ci}` need a lookup-insensitive filesystem and rows
-//! tagged `{locked}` need `chmod 0` to bite (not root); on a platform
-//! where the tag is unmet the row is skipped — its golden line stays
+//! Rows tagged `{ci}` need a lookup-insensitive filesystem, rows
+//! tagged `{locked}` need `chmod 0` to bite (not root), `{pathmax}`
+//! needs listing the five 240-char components under `tenants/cu` to hit
+//! `ENAMETOOLONG` (typical when `PATH_MAX` is ~1024 — not Linux CI),
+//! and `{tmp-link}` needs `/tmp` to be a symlink (macOS — not Linux CI);
+//! on a platform where the tag is unmet the row is skipped — its golden line stays
 //! (generated where it ran), never rewritten to "skipped". Rows tagged
 //! `{ab-free}` are the ones whose a/b identity E26 does NOT promise:
 //! the spelling names the link's target itself (`vendor` exists only in
@@ -149,6 +152,12 @@ struct Tree {
     real: PathBuf,
     locked_bites: bool,
     insensitive: bool,
+    /// Listing the fifth 240-char component under `l/proj/tenants/cu` fails
+    /// (ENAMETOOLONG on macOS); Linux CI paths are short enough to succeed.
+    long_path_bites: bool,
+    /// `/tmp` is a symlink (macOS `/private/tmp`); without it, `/tmp/..`
+    /// + `<real>` does not refuse C25 before the alias-cu fold enters `proj`.
+    tmp_link: bool,
 }
 
 impl Drop for Tree {
@@ -321,16 +330,42 @@ fn build_tree() -> Tree {
         build_base(&typed.join(half).join("p"), half, Variant::Locked);
         build_base(&typed.join(half).join("l"), half, Variant::LongPath);
     }
-    // Self-selection: does `chmod 0` bite (not root), and does the
-    // filesystem find `VENDOR` for `vendor`?
+    // Self-selection: does `chmod 0` bite (not root), does the
+    // filesystem find `VENDOR` for `vendor`, does the long-path base
+    // truncate discovery, and does `/tmp` alias like macOS?
     let locked_bites = std::fs::read_dir(typed.join("a/olocked")).is_err();
     let insensitive = std::fs::symlink_metadata(typed.join("a/proj/VENDOR")).is_ok();
+    let long_path_bites = long_path_enametoolong(&typed);
+    let tmp_link = std::fs::symlink_metadata("/tmp")
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
     Tree {
         typed,
         real,
         locked_bites,
         insensitive,
+        long_path_bites,
+        tmp_link,
     }
+}
+
+/// After [`build_base`]'s five 240-char components: can the kernel's walk
+/// list into the fifth? When `PATH_MAX` is tight the listing fails — the
+/// `{pathmax}` rows' goldens.
+fn long_path_enametoolong(typed: &Path) -> bool {
+    let l = "L".repeat(240);
+    let mut p = typed.join("a/l/proj/tenants/cu");
+    for _ in 0..4 {
+        p = p.join(&l);
+    }
+    let Ok(it) = std::fs::read_dir(&p) else {
+        return true;
+    };
+    for e in it.flatten() {
+        let child = p.join(e.file_name());
+        return std::fs::read_dir(&child).is_err();
+    }
+    false
 }
 
 /// Run one row in one half with a watchdog (a hang is a failure, and the
@@ -450,7 +485,9 @@ fn link_matrix_rows_are_ab_identical_and_match_their_goldens() {
     let mut failures = Vec::new();
     for row in &rows {
         let unmet = (row.label.contains("{ci}") && !tree.insensitive)
-            || (row.label.contains("{locked}") && !tree.locked_bites);
+            || (row.label.contains("{locked}") && !tree.locked_bites)
+            || (row.label.contains("{pathmax}") && !tree.long_path_bites)
+            || (row.label.contains("{tmp-link}") && !tree.tmp_link);
         if unmet {
             skipped.push(row.label.clone());
             if let Some(line) = expected.get(&row.label) {

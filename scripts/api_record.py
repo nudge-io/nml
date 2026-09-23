@@ -28,8 +28,9 @@ is held to the SAME classification, so a regeneration records a decision
 somebody made and can never stand in for making it.
 
 Run: `just gate-api` (or `python3 scripts/api_record.py`). Needs
-`cargo-public-api` on PATH; the CI job installs the pinned version. The
-local fast loop gets the half that needs no tool — `nml-cli`'s
+`cargo-public-api` on PATH (the gate installs the pinned version) and a
+nightly toolchain installed for rustdoc JSON (the gate installs that too).
+The local fast loop gets the half that needs no tool — `nml-cli`'s
 `out.rs`'s `api_contract` module, which holds the records, the stamp and
 the ledger to each other on every `cargo test`.
 """

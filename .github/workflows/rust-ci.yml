@@ -11,8 +11,9 @@ name: Rust CI
 # components included, and every later cargo call resolves to it. The only
 # jobs that name a toolchain are the ones whose PURPOSE is a different
 # toolchain: msrv (the floor from Cargo.toml, forced via RUSTUP_TOOLCHAIN —
-# the env var outranks the pin file) and minimal-versions' nightly resolver
-# step (reached via explicit `cargo +nightly`). New stables land via
+# the env var outranks the pin file), minimal-versions' nightly resolver
+# step (reached via explicit `cargo +nightly`), and gate-api's rustdoc JSON
+# build (nightly installed by the recipe, not the active toolchain). New stables land via
 # canary.yml + a reviewed toolchain-bump PR — never by drift.
 on:
   workflow_call:
