@@ -139,22 +139,6 @@ fn expected_editor(cli: &CliOutcome) -> &'static str {
 /// finding, reported by name. Adding a row is a review decision.
 const ACCEPTED_DIVERGENCES: &[(&str, Axis, &str)] = &[
     (
-        "open-universe-through-a-link",
-        Axis::Oracle,
-        "THE ORACLE GAP, measured here: under an OPEN universe the walk FOLLOWS a symlinked \
-     directory component, and following it needs realpath. The native backend has one and \
-     keys the file at the link's TARGET (`real/a.nml`); the wasm editor's backend has none \
-     (`FsError::NoRealpath`) and keeps the authored spelling (`link/a.nml`). The key is the \
-     name every finding carries and the name every grant glob is matched against, so in a \
-     workspace folder holding a symlinked subdirectory the bundled WASM server can allow \
-     or deny a reference the CLI judges the other way, and publishes its rows under \
-     another name. Both still call the file unbound here, which is why nothing had \
-     noticed. It is an OWNER DECISION, not a settled one: either the wasm host supplies a \
-     realpath (a shim the editor already has for listings), or the kernel keys an \
-     unverifiable link lexically on BOTH backends and says so. Silence is the one option \
-     this row refuses",
-    ),
-    (
         "store-package",
         Axis::Layers,
         "THE STRUCTURAL GAP, on the axis with teeth: `nml check` sees no universe here and \
@@ -756,14 +740,10 @@ fn corpus() -> Vec<Fixture> {
             },
             derived: false,
         },
-        // The one shape on which the two ORACLES can disagree: a
-        // symlinked DIRECTORY component under an OPEN universe, where
-        // the walk follows links. The native backend has realpath and
-        // re-keys the file at the link's target; the wasm backend has
-        // none (`FsError::NoRealpath`) and keeps the authored spelling,
-        // marked unverifiable. Without this fixture the oracle column
-        // would compare two backends on trees that cannot tell them
-        // apart.
+        // A symlinked DIRECTORY component under an OPEN universe, where
+        // the walk follows links and re-keys the file at the link's
+        // target. Pins that the wasm listing shim and the native oracle
+        // agree on the minted key when the host supplies realpath.
         Fixture {
             name: "open-universe-through-a-link",
             build: |root| {

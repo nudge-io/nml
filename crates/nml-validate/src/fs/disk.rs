@@ -190,12 +190,19 @@ fn collect_listing(
     Ok(out)
 }
 
+pub(super) fn resolve_symlink_component(
+    dir: &Path,
+    name: &OsStr,
+) -> Result<Option<PathBuf>, FsError> {
+    match canonicalize(&dir.join(name)) {
+        Ok(target) => Ok(Some(target)),
+        Err(e) => absent_or_error(e).map(|_| None),
+    }
+}
+
 impl PathFs for StdFs {
     fn resolve_symlink(&self, dir: &Path, name: &OsStr) -> Result<Option<PathBuf>, FsError> {
-        match canonicalize(&dir.join(name)) {
-            Ok(target) => Ok(Some(target)),
-            Err(e) => absent_or_error(e).map(|_| None),
-        }
+        resolve_symlink_component(dir, name)
     }
 }
 

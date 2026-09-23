@@ -1,5 +1,8 @@
 //! The wasm editor's oracle ([`WasiFs`]): `lstat` through `std`, listings
 //! through an injected shim, spelling by byte-exact listing membership.
+//! On the wasm target, realpath is unavailable ([`FsError::NoRealpath`]);
+//! on hosts that run this backend in tests and tooling, symlink resolution
+//! uses the same canonicalize as [`StdFs`].
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -7,7 +10,8 @@ use std::path::{Path, PathBuf};
 use super::disk::{DirEntryLike, absent_or_error, kind_of, listing};
 use super::{EntryKind, FsError, Listing, LstatFs, PathFs, Step};
 
-/// The wasm editor's backend: `lstat` works, realpath does not. Listings
+/// The wasm editor's backend: `lstat` works; realpath only on the wasm
+/// target is refused. Listings
 /// come through an injected shim (the LSP's abort-proof `read_dir`
 /// wrapper), and a spelling is proven by BYTE-EXACT membership in the
 /// parent's listing — an insensitive filesystem cannot hold two case
@@ -64,8 +68,16 @@ impl<L> PathFs for WasiFs<L>
 where
     L: Fn(&Path) -> Result<Vec<(OsString, EntryKind)>, FsError>,
 {
-    fn resolve_symlink(&self, _dir: &Path, _name: &OsStr) -> Result<Option<PathBuf>, FsError> {
-        Err(FsError::NoRealpath)
+    fn resolve_symlink(&self, dir: &Path, name: &OsStr) -> Result<Option<PathBuf>, FsError> {
+        #[cfg(target_os = "wasi")]
+        {
+            let _ = (dir, name);
+            Err(FsError::NoRealpath)
+        }
+        #[cfg(not(target_os = "wasi"))]
+        {
+            super::disk::resolve_symlink_component(dir, name)
+        }
     }
 }
 
@@ -210,11 +222,12 @@ mod tests {
         );
     }
 
-    /// No realpath on this backend: `resolve_symlink` is `NoRealpath` for
-    /// every name, so an OPEN walk marks the key unverifiable, and a
+    /// No realpath on the wasm TARGET: `resolve_symlink` is `NoRealpath`
+    /// for every name, so an OPEN walk marks the key unverifiable, and a
     /// CLOSED walk over a respelled lookup is NML2083 form 2 — while an
     /// exact lookup mints a verified key (the wasm editor does not deny
     /// every closed file).
+    #[cfg(target_os = "wasi")]
     #[test]
     fn no_realpath_is_closed_form_two_for_respelled_lookups_only() {
         let dir = scratch("form2");
