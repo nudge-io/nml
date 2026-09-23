@@ -544,7 +544,7 @@ fn report(
     // sanitizing `Rendered`).
     out::err(format_args!(
         "{}:{}:{}: {}: {}",
-        sanitized(&path.display().to_string()),
+        sanitized(own),
         line,
         column,
         out::severity_prefix(diag, true),
@@ -714,7 +714,7 @@ fn report_insertions<'d>(
     // A same-file block keeps the path AS TYPED, as the notes do.
     let spelled = |name: &str| {
         if name == own {
-            path.display().to_string()
+            own.to_string()
         } else {
             name.to_string()
         }
@@ -803,7 +803,7 @@ fn note_line<'d>(
     // A same-file note keeps the path AS TYPED beside the finding's own
     // prefix (the key is the wire's spelling, not the terminal's).
     if note.source == own {
-        note.line(&path.display().to_string())
+        note.line(own)
     } else {
         note.line(&note.source)
     }
@@ -2869,6 +2869,12 @@ pub(crate) fn leaf_under_parent(path: &Path) -> Result<LeafAt, String> {
 /// The spelling's own split: the parent as spelled (`.` for a bare
 /// name) and the final component.
 fn split_typed(path: &Path) -> Result<LeafAt, String> {
+    if path.is_dir() {
+        return Err(format!(
+            "failed to read {}: is a directory",
+            workspace::message_path(path)
+        ));
+    }
     let name = path
         .file_name()
         .and_then(|n| n.to_str())

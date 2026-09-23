@@ -364,8 +364,13 @@ gate-api:
     # ships rustdoc as part of its component set.
     rustup toolchain install "$rustdoc_nightly"
     rustup run "$rustdoc_nightly" rustdoc --version
-    export RUSTUP_TOOLCHAIN="$rustdoc_nightly"
+    # Build the plugins with the workspace pin (rust-toolchain.toml). cargo-semver-checks
+    # 0.50 needs rustc >= 1.93; the rustdoc nightly is 1.90 and is only for JSON at run
+    # time (cargo-public-api's matrix names which nightly *outputs* it reads, not which
+    # compiler must build the `cargo install` artifacts). Installing under the nightly
+    # fails CI with "Failed to install cargo-semver-checks" after public-api succeeds.
     cargo install --locked cargo-public-api@0.52.0 cargo-semver-checks@0.50.0
+    export RUSTUP_TOOLCHAIN="$rustdoc_nightly"
     python3 scripts/api_record.py
     base="${NML_API_BASELINE:-}"
     if [ -z "$base" ]; then

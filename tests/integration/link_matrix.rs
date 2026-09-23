@@ -48,9 +48,8 @@ const SHAPES: &[&str] = &[
     // `fix`'s summary line (dry-run / applied), the only stdout of a fix.
     " edit(s) would apply across ",
     " edit(s) applied across ",
-    // `check`'s success line (the closed universe binds the vendor files
-    // reached through an operator alias, an absent `..`, a `..` after a
-    // file, a case or NFD spelling on an insensitive disk).
+    // `check`'s success line — the workspace key after link resolution (not
+    // the operator's typed spelling), sanitized (A1).
     ": ok (",
     // `binding`'s first row.
     "file      ",

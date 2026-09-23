@@ -631,22 +631,43 @@ pub(crate) fn display_path(path: &Path) -> String {
     forward_slashes(display_path_inner(path))
 }
 
+fn forward_slashes(s: String) -> String {
+    s.replace('\\', "/")
+}
+
+/// Windows extended-path spellings (`\\?\`, `\\?\UNC\`) are for syscalls;
+/// human lines match paths the operator or tempdir APIs spell without them.
+fn path_for_display(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
 fn display_path_inner(path: &Path) -> String {
-    let Ok(cwd) = std::env::current_dir() else {
-        return path.display().to_string();
+    let path = path_for_display(path);
+    let Ok(cwd) = std::env::current_dir().map(|c| path_for_display(&c)) else {
+        return forward_slashes(path.display().to_string());
     };
     if path == cwd {
         return ".".to_string();
     }
     if let Ok(below) = path.strip_prefix(&cwd) {
-        return below.display().to_string();
+        return forward_slashes(below.display().to_string());
     }
-    match cwd.strip_prefix(path) {
+    match cwd.strip_prefix(&path) {
         Ok(above) => {
             let ups: PathBuf = above.components().map(|_| "..").collect();
-            ups.display().to_string()
+            forward_slashes(ups.display().to_string())
         }
-        Err(_) => path.display().to_string(),
+        Err(_) => forward_slashes(path.display().to_string()),
     }
 }
 
@@ -663,10 +684,6 @@ pub(crate) fn wire_root_path(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .display()
         .to_string()
-}
-
-fn forward_slashes(s: String) -> String {
-    s.replace('\\', "/")
 }
 
 /// Absolutize a path against the current directory: the kernel has no

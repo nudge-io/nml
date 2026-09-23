@@ -810,11 +810,11 @@ fn corpus() -> Vec<Fixture> {
 
 /// Undo anything the fixtures made unreadable, so the scratch tree can
 /// be removed whatever the verdict.
-fn reopen(root: &Path) {
+fn reopen(_root: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let shut = root.join("shut");
+        let shut = _root.join("shut");
         if shut.exists() {
             let _ = std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755));
         }
