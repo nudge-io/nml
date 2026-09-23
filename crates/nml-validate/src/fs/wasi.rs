@@ -87,6 +87,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+    #[cfg(target_os = "wasi")]
     use crate::workspace::{PathError, SourceKey, Trust, WorkspaceRoot};
 
     /// A scratch directory that removes itself (the `lstat` half of the
