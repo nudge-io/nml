@@ -46,6 +46,18 @@ fn scratch(tag: &str) -> Scratch {
     Scratch(dir)
 }
 
+/// Match [`StdFs`] realpath spelling (see `fs::disk` — `dunce` on Windows).
+fn canonical(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        dunce::canonicalize(path).unwrap()
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::canonicalize(path).unwrap()
+    }
+}
+
 fn mint(root: &WorkspaceRoot, path: &Path, trust: Trust) -> Result<Keyed, PathError> {
     SourceKey::mint(root, path, &StdFs, trust)
 }
@@ -196,7 +208,7 @@ fn derive_over_real_tree_finds_outermost_manifest_within_git_fence() {
     // stray marker in a shared parent could inflict on every checkout
     // beneath it.
     let root = WorkspaceRoot::derive(&app.join("tenants/cu/x.nml"), &StdFs).unwrap();
-    assert_eq!(root.path(), std::fs::canonicalize(&app).unwrap());
+    assert_eq!(root.path(), canonical(&app));
     assert_eq!(
         *root.origin(),
         nml_validate::workspace::RootOrigin::Derived {
@@ -204,9 +216,7 @@ fn derive_over_real_tree_finds_outermost_manifest_within_git_fence() {
                 kind: nml_validate::fs::EntryKind::Dir
             },
             shadowed: Some(nml_validate::workspace::Shadow::Marker(
-                std::fs::canonicalize(&dir)
-                    .unwrap()
-                    .join("evil.package.nml")
+                canonical(&dir).join("evil.package.nml")
             )),
         }
     );
@@ -218,17 +228,15 @@ fn derive_over_real_tree_finds_outermost_manifest_within_git_fence() {
     assert_eq!(
         err,
         nml_validate::workspace::RootError::Shadowed {
-            marker: std::fs::canonicalize(&dir)
-                .unwrap()
-                .join("evil.package.nml"),
-            fence: std::fs::canonicalize(&app).unwrap().join(".git"),
+            marker: canonical(&dir).join("evil.package.nml"),
+            fence: canonical(&app).join(".git"),
         }
     );
     std::fs::remove_file(app.join(".git")).unwrap();
     std::fs::create_dir_all(app.join(".git")).unwrap();
     std::fs::remove_file(dir.join("evil.package.nml")).unwrap();
     let root = WorkspaceRoot::derive(&app.join("tenants/cu/x.nml"), &StdFs).unwrap();
-    assert_eq!(root.path(), std::fs::canonicalize(&app).unwrap());
+    assert_eq!(root.path(), canonical(&app));
     // The checkout's own `.git` above the scratch shadows it — reported
     // as the entry itself, not refused (no marker sits between).
     if let nml_validate::workspace::RootOrigin::Derived { shadowed, .. } = root.origin() {
