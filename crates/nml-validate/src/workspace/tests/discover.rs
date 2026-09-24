@@ -59,9 +59,7 @@ fn listed(ws: &Ws) -> Vec<String> {
         .probes()
         .into_iter()
         .filter_map(|p| match p {
-            Probe::ListDir(d) => {
-                Some(d.to_string_lossy().replace('\\', "/"))
-            }
+            Probe::ListDir(d) => Some(d.to_string_lossy().replace('\\', "/")),
             _ => None,
         })
         .collect()
