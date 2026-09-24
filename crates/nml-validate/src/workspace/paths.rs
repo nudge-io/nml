@@ -564,8 +564,7 @@ fn windows_drive_relative_tail(rest: &str) -> Vec<OsString> {
     for ch in rest.chars() {
         if ch == '/' || ch == '\\' {
             if !cur.is_empty() {
-                names.push(OsString::from(cur));
-                cur.clear();
+                names.push(OsString::from(std::mem::take(&mut cur)));
             }
         } else {
             cur.push(ch);
@@ -609,12 +608,8 @@ pub(super) fn split_absolute(path: &Path) -> Option<(PathBuf, Vec<OsString>)> {
     // from a plain spelling — split the tail on `/` and `\` instead.
     #[cfg(windows)]
     if !path.has_root() && matches!(path.components().next(), Some(Component::Prefix(_))) {
-        let rest = path
-            .as_os_str()
-            .to_string_lossy()
-            .split(':')
-            .nth(1)
-            .unwrap_or("");
+        let lossy = path.as_os_str().to_string_lossy();
+        let rest = lossy.split(':').nth(1).unwrap_or("");
         return Some((cur, windows_drive_relative_tail(rest)));
     }
     let names = components.map(|c| c.as_os_str().to_os_string()).collect();
