@@ -48,11 +48,7 @@ fn fold_scripted_absolute(names: &[OsString]) -> PathBuf {
             }
         }
     }
-    if depth == 0 {
-        PathBuf::from("/")
-    } else {
-        path
-    }
+    if depth == 0 { PathBuf::from("/") } else { path }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,5 +396,4 @@ mod tests {
             ]
         );
     }
-
 }
