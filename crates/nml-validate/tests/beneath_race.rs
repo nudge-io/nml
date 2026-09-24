@@ -380,7 +380,8 @@ fn leaf_flipped_to_fifo_during_open_never_blocks_for(iters: usize) {
             .success()
     );
     let stop = Arc::new(AtomicBool::new(false));
-    let (r2, s2) = (root.clone(), Arc::clone(&stop));
+    let flips = Arc::new(AtomicUsize::new(0));
+    let (r2, s2, f2) = (root.clone(), Arc::clone(&stop), Arc::clone(&flips));
     let flipper = std::thread::spawn(move || {
         let leaf = r2.join("t/f.nml");
         let fifo = r2.join("t/fifo");
@@ -388,8 +389,11 @@ fn leaf_flipped_to_fifo_during_open_never_blocks_for(iters: usize) {
         while !s2.load(Ordering::Relaxed) {
             let _ = std::fs::rename(&leaf, &real);
             let _ = std::fs::rename(&fifo, &leaf);
+            f2.fetch_add(1, Ordering::Relaxed);
+            std::thread::yield_now();
             let _ = std::fs::rename(&leaf, &fifo);
             let _ = std::fs::rename(&real, &leaf);
+            std::thread::yield_now();
         }
     });
     let started = Instant::now();
@@ -408,14 +412,20 @@ fn leaf_flipped_to_fifo_during_open_never_blocks_for(iters: usize) {
             Err(e) => panic!("unexpected {e}"),
         }
         assert!(started.elapsed().as_secs() < 30, "an open blocked");
+        std::thread::yield_now();
     }
     stop.store(true, Ordering::Relaxed);
     flipper.join().unwrap();
     eprintln!(
-        "shape5 leaf-fifo: iters={iters} ok={ok} not_regular={not_regular} other={other} in {:?}",
+        "shape5 leaf-fifo: iters={iters} ok={ok} not_regular={not_regular} other={other} flips={} in {:?}",
+        flips.load(Ordering::Relaxed),
         started.elapsed()
     );
-    proved(not_regular, "shape5 leaf-fifo", 0);
+    proved(
+        not_regular,
+        "shape5 leaf-fifo",
+        flips.load(Ordering::Relaxed),
+    );
 }
 
 /// Shape 6 (r80-sec): a racer keeps planting a HARD LINK to a victim file
