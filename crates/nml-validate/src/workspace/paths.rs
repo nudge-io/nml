@@ -564,7 +564,8 @@ fn windows_drive_relative_tail(rest: &str) -> Vec<OsString> {
     for ch in rest.chars() {
         if ch == '/' || ch == '\\' {
             if !cur.is_empty() {
-                names.push(OsString::from(std::mem::take(&mut cur)));
+                names.push(OsString::from(cur.clone()));
+                cur.clear();
             }
         } else {
             cur.push(ch);
