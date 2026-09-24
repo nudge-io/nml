@@ -289,7 +289,7 @@ impl RootError {
 
 impl std::fmt::Display for RootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.display_with(&|p: &Path| p.display().to_string()))
+        f.write_str(&self.display_with(&|p: &Path| p.display().to_string().replace('\\', "/")))
     }
 }
 
@@ -558,6 +558,18 @@ fn kind_at(fs: &dyn LstatFs, path: &Path) -> Result<Option<EntryKind>, FsError> 
 /// its head `.` kept). Their `.` clauses are live for exactly those
 /// operator-typed spellings (pinned in `tests/paths.rs`).
 pub(super) fn split_absolute(path: &Path) -> Option<(PathBuf, Vec<OsString>)> {
+    // Windows: `/ws/...` is the operator's POSIX spelling (tests, CLI on
+    // Unix-shaped paths). `is_absolute()` is false and `RootDir` becomes
+    // `\`, which would desync the mock and refuse mint as `NotRelative`.
+    #[cfg(windows)]
+    if !path.is_absolute() && matches!(path.components().next(), Some(Component::RootDir)) {
+        let names = path
+            .components()
+            .skip(1)
+            .map(|c| c.as_os_str().to_os_string())
+            .collect();
+        return Some((PathBuf::from("/"), names));
+    }
     let mut components = path.components().peekable();
     let mut cur = PathBuf::new();
     let mut prefixed = false;
@@ -575,6 +587,13 @@ pub(super) fn split_absolute(path: &Path) -> Option<(PathBuf, Vec<OsString>)> {
     }
     let names = components.map(|c| c.as_os_str().to_os_string()).collect();
     Some((cur, names))
+}
+
+/// Whether `path` is folded from the filesystem root ([`fold_absolute`]),
+/// including POSIX `/…` spellings on Windows (see [`split_absolute`]).
+fn enters_via_fold(path: &Path) -> bool {
+    path.is_absolute()
+        || (cfg!(windows) && matches!(path.components().next(), Some(Component::RootDir)))
 }
 
 /// The invocation target's directory, by the fence-aware walk (E28): the
@@ -1197,7 +1216,7 @@ fn relative_components(
     fs: &dyn PathFs,
     authored: &dyn Fn() -> String,
 ) -> Result<Vec<OsString>, PathError> {
-    let rel: Vec<OsString> = if path.is_absolute() {
+    let rel: Vec<OsString> = if enters_via_fold(path) {
         fold_absolute(path, fs, Some(root.path()))
             .map(|(_, rest)| rest)
             .map_err(|e| match e {

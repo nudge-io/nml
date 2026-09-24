@@ -18,19 +18,32 @@ use crate::fs::{EntryKind, FsError, LstatFs, PathFs, Step};
 /// those spellings are not the `PathBuf` keys `components` hands back, so
 /// the mock normalizes every scripted and oracle path through here.
 fn script_path(path: &Path) -> PathBuf {
-    let Some((mut cur, names)) = super::paths::split_absolute(path) else {
-        return path.to_path_buf();
-    };
+    if let Some((_prefix, names)) = super::paths::split_absolute(path) {
+        fold_scripted_absolute(&names)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Fold absolute path components onto the mock's POSIX `/` tree without
+/// treating `\` inside a name as a separator (legal on Unix; scripted for
+/// unkeyable-name pins).
+fn fold_scripted_absolute(names: &[OsString]) -> PathBuf {
+    let mut parts: Vec<String> = Vec::new();
     for name in names {
         match name.as_os_str() {
             name if name == "." => {}
             name if name == ".." => {
-                cur.pop();
+                parts.pop();
             }
-            name => cur.push(name),
+            name => parts.push(name.to_string_lossy().into_owned()),
         }
     }
-    cur
+    if parts.is_empty() {
+        PathBuf::from("/")
+    } else {
+        PathBuf::from(format!("/{}", parts.join("/")))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -50,11 +50,44 @@ pub(super) fn absent_or_error(e: std::io::Error) -> Result<Option<()>, FsError> 
 fn fs_error(e: std::io::Error) -> FsError {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         FsError::Denied
+    } else if is_access_denied(&e) {
+        FsError::Denied
     } else if is_symlink_loop(&e) {
         FsError::SymlinkLoop
     } else {
         FsError::Io(e.raw_os_error())
     }
+}
+
+/// EACCES / `ERROR_ACCESS_DENIED`: `ErrorKind::PermissionDenied` is not
+/// always set when the raw OS code is the platform's access-denied value.
+fn is_access_denied(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    const EACCES: i32 = 5;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const EACCES: i32 = 13;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    const EACCES: i32 = 13;
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    const EACCES: i32 = 13;
+    e.raw_os_error() == Some(EACCES)
 }
 
 /// ELOOP, by raw OS error: `ErrorKind::FilesystemLoop` is not stable on
@@ -285,7 +318,17 @@ mod tests {
             ]
             .into_iter(),
         );
-        assert_eq!(io.unwrap_err(), FsError::Io(Some(5)));
+        #[cfg(windows)]
+        assert!(
+            matches!(io.unwrap_err(), FsError::Denied),
+            "ERROR_ACCESS_DENIED (5) must refuse the listing on Windows"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            io.unwrap_err(),
+            FsError::Io(Some(5)),
+            "an unrelated raw errno stays Io"
+        );
         let sorted = collect_listing(
             [
                 ok("zeta.package.nml", EntryKind::File),

@@ -3967,6 +3967,7 @@ fn the_hidden_audit_lists_nml_content_and_stops_at_the_bound() {
 /// COUNTED (no key to show as an example), and a directory beneath is
 /// never listed — the audit is incomplete there and the count a lower
 /// bound; a `.txt` so named is no content.
+#[cfg(unix)]
 #[test]
 fn the_hidden_audit_counts_unkeyable_nml_names_and_is_incomplete_at_an_unkeyable_directory() {
     use crate::workspace::discover::{AuditBudget, audit_hidden};
@@ -4017,6 +4018,7 @@ fn the_hidden_audit_counts_unkeyable_nml_names_and_is_incomplete_at_an_unkeyable
 /// directory holding it, with its kind and its name (an unreported one
 /// let the gate certify a directory of content it never entered); a
 /// `.txt` so named is no content and no row.
+#[cfg(unix)]
 #[test]
 fn a_backslash_named_entry_is_skipped_not_joined() {
     use crate::fs::EntryKind;
@@ -4152,6 +4154,7 @@ fn the_walks_files_and_skipped_rows_come_out_in_their_stated_order() {
 /// its `lstat` kind inside the reason (`discover::listed`, the one
 /// classifier); a special entry not so named is no content and no row,
 /// as a plain-named one is not.
+#[cfg(unix)]
 #[test]
 fn an_unkeyable_symlink_and_a_nml_named_special_entry_are_reported_by_kind() {
     use crate::fs::EntryKind;

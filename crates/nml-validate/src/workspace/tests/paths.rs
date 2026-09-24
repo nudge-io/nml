@@ -1726,6 +1726,7 @@ fn fence_facts_spell_a_symlink_and_a_special_entry_fence() {
 /// judged, and only then refused at the open. `SourceKey::under` (the one
 /// lexical keying, the editor's included) answers `None` for it and still
 /// pops `..` for a plain spelling.
+#[cfg(unix)]
 #[test]
 fn a_separator_bearing_component_is_refused_at_mint() {
     let fs = MockFs::new()
