@@ -245,6 +245,9 @@ impl BlockDecl {
     pub fn extends(&self) -> Option<Extends> {
         child(&self.0)
     }
+    pub fn uses(&self) -> Option<Uses> {
+        child(&self.0)
+    }
     pub fn body(&self) -> Option<Body> {
         child(&self.0)
     }
@@ -379,14 +382,27 @@ ast_node!(/// `is Parent (, Parent)*`
 
 impl Extends {
     pub fn parents(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
-        // The `is` keyword is positionally the first `Ident`; the rest are
-        // parents. Skipping by position (not text) is robust even to a parent
-        // literally named `is`.
-        self.0
-            .children_with_tokens()
-            .filter_map(|e| e.into_token())
-            .filter(|t| t.kind() == SyntaxKind::Ident)
-            .skip(1)
+        clause_idents(&self.0)
+    }
+}
+
+/// A header clause's names: the clause keyword (`is` / `uses`) is
+/// positionally the first `Ident`; the rest are the clause's refs. Skipping
+/// by position (not text) is robust even to a ref literally named like the
+/// keyword — and the convention lives HERE, once, for every clause accessor.
+fn clause_idents(node: &SyntaxNode) -> impl Iterator<Item = SyntaxToken> + '_ {
+    node.children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == SyntaxKind::Ident)
+        .skip(1)
+}
+
+ast_node!(/// `uses Ref (, Ref)*` (RFC 0019 layer composition)
+    Uses => Uses);
+
+impl Uses {
+    pub fn refs(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
+        clause_idents(&self.0)
     }
 }
 

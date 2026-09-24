@@ -1,4 +1,4 @@
-use crate::span::Span;
+use crate::span::{Span, ValueSpan};
 use crate::types::SpannedValue;
 use serde::Serialize;
 
@@ -185,9 +185,68 @@ pub struct Arm {
     pub selector: ArmSelector,
     /// Span of the selector token (for diagnostics).
     pub selector_span: Span,
+    /// The bytes a content replacement of the selector substitutes — the
+    /// window inside a quoted key's delimiters, minted at lowering from the
+    /// token ([`crate::cst::string_content_window`]); `selector_span` for a
+    /// role reference and for `else`. Skipped by `Serialize`: it is
+    /// DERIVED from the token, and the AST's JSON shape is a wire
+    /// surface. PRIVATE, like [`SpannedValue`]'s: an arm is minted by
+    /// [`Arm::from_token`] (the lowering, from the selector's token) or
+    /// [`Arm::new`] (a selector with no delimiters to strip) and read
+    /// through [`Arm::selector_spans`], so no code can hold a quoted
+    /// selector's window to its whole span.
+    #[serde(skip)]
+    selector_content: Span,
     /// The arm's target — a reference, string/path literal, or inline block
     /// ([`ArmTarget`]).
     pub target: ArmTarget,
+}
+
+impl Arm {
+    /// An arm whose selector has no delimiters to strip — `else`, a role
+    /// reference, a synthesized arm: the selector's content IS its span.
+    pub fn new(selector: ArmSelector, selector_span: Span, target: ArmTarget) -> Self {
+        Self {
+            selector,
+            selector_span,
+            selector_content: selector_span,
+            target,
+        }
+    }
+
+    /// An arm minted from its selector token (the lowering's door): the
+    /// content window is the token's ([`crate::cst::string_content_window`]).
+    pub fn from_token(
+        selector: ArmSelector,
+        selector_span: Span,
+        selector_content: Span,
+        target: ArmTarget,
+    ) -> Self {
+        Self {
+            selector,
+            selector_span,
+            selector_content,
+            target,
+        }
+    }
+
+    /// Where the selector sits: its whole span and the content window a
+    /// replacement of it substitutes.
+    pub fn selector_spans(&self) -> ValueSpan {
+        ValueSpan::literal(self.selector_span, self.selector_content)
+    }
+
+    /// The same arm with another target — the selector and its spans
+    /// carried over exactly (the resolvers and the layer merge rewrite an
+    /// inline body, never a selector).
+    pub fn with_target(&self, target: ArmTarget) -> Self {
+        Self {
+            selector: self.selector.clone(),
+            selector_span: self.selector_span,
+            selector_content: self.selector_content,
+            target,
+        }
+    }
 }
 
 /// An [`Arm`]'s right-hand side (RFC 0007 §6): a **reference** to a declared
@@ -201,10 +260,7 @@ pub struct Arm {
 #[derive(Debug, Clone, Serialize)]
 pub enum ArmTarget {
     Reference(Identifier),
-    Literal {
-        value: String,
-        span: Span,
-    },
+    Literal(LiteralTarget),
     /// `-> Name:` followed by an indented body — an inline instance of `V`.
     Inline {
         name: Identifier,
@@ -212,12 +268,53 @@ pub enum ArmTarget {
     },
 }
 
+/// A literal arm target (`-> "workflows/pro.workflow.nml"`): its value, its
+/// span, and — private, minted from the token — the content window a
+/// replacement substitutes. Serializes exactly as the struct variant it
+/// replaced (`{"Literal": {"value": …, "span": …}}`): the AST's JSON shape
+/// is a wire surface.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiteralTarget {
+    pub value: String,
+    pub span: Span,
+    /// The bytes a content replacement substitutes — the window inside
+    /// the literal's delimiters, minted at lowering from the token
+    /// ([`crate::cst::string_content_window`]). Skipped by `Serialize`.
+    #[serde(skip)]
+    content: Span,
+}
+
+impl LiteralTarget {
+    /// A literal with no delimiters to strip: its content IS its span.
+    pub fn new(value: String, span: Span) -> Self {
+        Self {
+            value,
+            span,
+            content: span,
+        }
+    }
+
+    /// A literal minted from its token (the lowering's door).
+    pub fn from_token(value: String, span: Span, content: Span) -> Self {
+        Self {
+            value,
+            span,
+            content,
+        }
+    }
+
+    /// Where the literal sits: its whole span and the content window.
+    pub fn spans(&self) -> ValueSpan {
+        ValueSpan::literal(self.span, self.content)
+    }
+}
+
 impl ArmTarget {
     /// The target's source span (for diagnostics / trailing-comment anchors).
     pub fn span(&self) -> Span {
         match self {
             ArmTarget::Reference(id) => id.span,
-            ArmTarget::Literal { span, .. } => *span,
+            ArmTarget::Literal(t) => t.span,
             ArmTarget::Inline { name, .. } => name.span,
         }
     }
@@ -225,7 +322,7 @@ impl ArmTarget {
 
 /// An [`Arm`] selector: a role reference, a string literal key, or the `else`
 /// catch-all.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 pub enum ArmSelector {
     /// A selector token, e.g. `@plan/Pro` — stored verbatim (with the leading
     /// `@`), matching [`ListItemKind::Role`]; the consumer parses its shape.
@@ -257,6 +354,13 @@ pub struct BlockDecl {
     pub keyword: Identifier,
     pub name: Identifier,
     pub extends: Vec<Identifier>,
+    /// RFC 0019: the `uses` clause's layer refs, in authored order (empty
+    /// when the declaration has no clause).
+    pub uses: Vec<Identifier>,
+    /// The clause's own content span (the `uses` keyword through the last
+    /// ref) — the structural deletion target for NML2062's fix.
+    /// Invariant: `uses_span.is_some() == !uses.is_empty()`.
+    pub uses_span: Option<Span>,
     pub body: Body,
 }
 
@@ -444,5 +548,275 @@ impl Identifier {
             name: name.into(),
             span,
         }
+    }
+}
+
+/// Every span the lowered tree carries, in tree order, each named by the
+/// field that holds it — the one enumeration the content-span pin and the
+/// `document` fuzz target walk, so a span field added to the AST is a span
+/// field added here (the fuzz target reads the same list).
+pub fn for_each_span(file: &File, f: &mut impl FnMut(crate::span::SpanSite)) {
+    for decl in &file.declarations {
+        site(f, "Declaration", decl.span);
+        match &decl.kind {
+            DeclarationKind::Block(b) => {
+                ident(f, "BlockDecl.keyword", &b.keyword);
+                ident(f, "BlockDecl.name", &b.name);
+                for e in &b.extends {
+                    ident(f, "BlockDecl.extends", e);
+                }
+                for u in &b.uses {
+                    ident(f, "BlockDecl.uses", u);
+                }
+                if let Some(s) = b.uses_span {
+                    site(f, "BlockDecl.uses_span", s);
+                }
+                body_spans(f, &b.body);
+            }
+            DeclarationKind::Array(a) => {
+                ident(f, "ArrayDecl.item_keyword", &a.item_keyword);
+                ident(f, "ArrayDecl.name", &a.name);
+                for m in &a.body.modifiers {
+                    modifier_spans(f, m);
+                }
+                for s in &a.body.shared_properties {
+                    shared_spans(f, s);
+                }
+                for p in &a.body.properties {
+                    ident(f, "Property.name", &p.name);
+                    value_spans(f, "Property.value", &p.value);
+                }
+                for i in &a.body.items {
+                    item_spans(f, i);
+                }
+            }
+            DeclarationKind::Const(c) => {
+                ident(f, "ConstDecl.name", &c.name);
+                value_spans(f, "ConstDecl.value", &c.value);
+            }
+            DeclarationKind::Template(t) => {
+                ident(f, "TemplateDecl.name", &t.name);
+                value_spans(f, "TemplateDecl.value", &t.value);
+            }
+            DeclarationKind::OneOf(o) => {
+                ident(f, "OneOfDecl.name", &o.name);
+                ident(f, "OneOfDecl.discriminator", &o.discriminator);
+                if let Some(t) = &o.discriminator_type {
+                    ident(f, "OneOfDecl.discriminator_type", t);
+                }
+                if let Some(v) = &o.default_discriminator {
+                    value_spans(f, "OneOfDecl.default_discriminator", v);
+                }
+                for arm in &o.arms {
+                    site(f, "OneOfArm.value_span", arm.value_span);
+                    ident(f, "OneOfArm.model", &arm.model);
+                }
+            }
+        }
+    }
+}
+
+fn site(f: &mut impl FnMut(crate::span::SpanSite), kind: &'static str, span: Span) {
+    f(crate::span::SpanSite::aligned(kind, span));
+}
+
+/// A carrier's whole span and the window inside it, as two sites — the ONE
+/// place that decides which is which. The window is a CONTENT WINDOW (what
+/// a machine-applicable replacement splices) exactly when it differs from
+/// the whole span, which is what a quoted literal's stripped delimiters
+/// leave behind; for everything else — an unquoted arm key, a path, a
+/// number — the content IS the whole span, there are no delimiters to stay
+/// inside of, and the site is a whole span like any other. Read from the
+/// two spans the carrier holds, never from the site's name.
+fn whole_and_window(
+    f: &mut impl FnMut(crate::span::SpanSite),
+    whole_kind: &'static str,
+    window_kind: &'static str,
+    whole: Span,
+    content: Span,
+) {
+    site(f, whole_kind, whole);
+    if content == whole {
+        site(f, window_kind, content);
+    } else {
+        f(crate::span::SpanSite::window(window_kind, content, whole));
+    }
+}
+
+fn ident(f: &mut impl FnMut(crate::span::SpanSite), kind: &'static str, id: &Identifier) {
+    site(f, kind, id.span);
+}
+
+/// A value's span and every span nested in it (template expressions, array
+/// items, fallback arms).
+pub(crate) fn value_spans(
+    f: &mut impl FnMut(crate::span::SpanSite),
+    kind: &'static str,
+    v: &SpannedValue,
+) {
+    let spans = v.spans();
+    whole_and_window(f, kind, "SpannedValue.content", spans.whole, spans.content);
+    match &v.value {
+        crate::types::Value::TemplateString(segments) => {
+            for s in segments {
+                if let crate::types::TemplateSegment::Expression { span, .. } = s {
+                    // Inside the string token that the value's span is.
+                    f(crate::span::SpanSite::expression(
+                        "TemplateSegment::Expression",
+                        *span,
+                        v.span,
+                    ));
+                }
+            }
+        }
+        crate::types::Value::Array(items) => {
+            for item in items {
+                value_spans(f, "Value::Array item", item);
+            }
+        }
+        crate::types::Value::Fallback(a, b) => {
+            value_spans(f, "Value::Fallback lhs", a);
+            value_spans(f, "Value::Fallback rhs", b);
+        }
+        _ => {}
+    }
+}
+
+/// A directive's whole span and its argument's.
+pub(crate) fn directive_spans(
+    f: &mut impl FnMut(crate::span::SpanSite),
+    d: &crate::types::Directive,
+) {
+    site(f, "Directive", d.span);
+    if let Some(arg) = &d.arg {
+        value_spans(f, "Directive.arg", arg);
+    }
+}
+
+fn type_expr_spans(f: &mut impl FnMut(crate::span::SpanSite), t: &FieldTypeExpr) {
+    match t {
+        FieldTypeExpr::Named { name, facets } => {
+            ident(f, "FieldTypeExpr::Named.name", name);
+            for facet in facets {
+                site(f, "FacetExpr", facet.span);
+                ident(f, "FacetExpr.key", &facet.key);
+                value_spans(f, "FacetExpr.value", &facet.value);
+            }
+        }
+        FieldTypeExpr::Array(inner) | FieldTypeExpr::Set(inner) => type_expr_spans(f, inner),
+        FieldTypeExpr::Union(variants) => {
+            for v in variants {
+                type_expr_spans(f, v);
+            }
+        }
+        FieldTypeExpr::Arms { key, target } => {
+            type_expr_spans(f, key);
+            type_expr_spans(f, target);
+        }
+    }
+}
+
+fn body_spans(f: &mut impl FnMut(crate::span::SpanSite), b: &Body) {
+    if let Some(t) = &b.type_annotation {
+        ident(f, "Body.type_annotation", t);
+    }
+    for e in &b.entries {
+        site(f, "BodyEntry", e.span);
+        match &e.kind {
+            BodyEntryKind::Property(p) => {
+                ident(f, "Property.name", &p.name);
+                value_spans(f, "Property.value", &p.value);
+            }
+            BodyEntryKind::NestedBlock(n) => {
+                ident(f, "NestedBlock.name", &n.name);
+                body_spans(f, &n.body);
+            }
+            BodyEntryKind::Modifier(m) => modifier_spans(f, m),
+            BodyEntryKind::SharedProperty(s) => shared_spans(f, s),
+            BodyEntryKind::ListItem(l) => item_spans(f, l),
+            BodyEntryKind::FieldDefinition(fd) => {
+                ident(f, "FieldDefinition.name", &fd.name);
+                type_expr_spans(f, &fd.field_type);
+                if let Some(d) = &fd.default_value {
+                    value_spans(f, "FieldDefinition.default_value", d);
+                }
+                for d in &fd.directives {
+                    directive_spans(f, d);
+                }
+            }
+            BodyEntryKind::Arm(a) => {
+                whole_and_window(
+                    f,
+                    "Arm.selector_span",
+                    "Arm.selector_content",
+                    a.selector_span,
+                    a.selector_content,
+                );
+                match &a.target {
+                    ArmTarget::Reference(id) => ident(f, "ArmTarget::Reference", id),
+                    ArmTarget::Literal(t) => {
+                        whole_and_window(
+                            f,
+                            "ArmTarget::Literal",
+                            "ArmTarget::Literal.content",
+                            t.span,
+                            t.content,
+                        );
+                    }
+                    ArmTarget::Inline { name, body } => {
+                        ident(f, "ArmTarget::Inline.name", name);
+                        body_spans(f, body);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn modifier_spans(f: &mut impl FnMut(crate::span::SpanSite), m: &Modifier) {
+    ident(f, "Modifier.name", &m.name);
+    match &m.value {
+        ModifierValue::Inline(v) => value_spans(f, "Modifier.inline", v),
+        ModifierValue::Block(items) => {
+            for i in items {
+                item_spans(f, i);
+            }
+        }
+        ModifierValue::TypeAnnotation {
+            field_type,
+            directives,
+            ..
+        } => {
+            type_expr_spans(f, field_type);
+            for d in directives {
+                directive_spans(f, d);
+            }
+        }
+    }
+}
+
+fn shared_spans(f: &mut impl FnMut(crate::span::SpanSite), s: &SharedProperty) {
+    ident(f, "SharedProperty.name", &s.name);
+    match &s.kind {
+        SharedPropertyKind::Block(b) => body_spans(f, b),
+        SharedPropertyKind::Scalar(v) => value_spans(f, "SharedProperty.scalar", v),
+    }
+}
+
+fn item_spans(f: &mut impl FnMut(crate::span::SpanSite), l: &ListItem) {
+    site(f, "ListItem", l.span);
+    match &l.kind {
+        ListItemKind::Named { name, body } => {
+            ident(f, "ListItem::Named.name", name);
+            body_spans(f, body);
+        }
+        ListItemKind::Shorthand { value, body } => {
+            value_spans(f, "ListItem::Shorthand.value", value);
+            if let Some(b) = body {
+                body_spans(f, b);
+            }
+        }
+        ListItemKind::Reference(id) => ident(f, "ListItem::Reference", id),
+        ListItemKind::Role(_) => {}
     }
 }

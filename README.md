@@ -160,17 +160,20 @@ serde = { version = "1", features = ["derive"] }
 ## CLI
 
 ```bash
-# installs the `nml` binary (until the crates.io release, use:
-#   cargo install --locked --git https://github.com/nudge-io/nml nml-cli)
-# --locked: build with the exact dependency set CI verified
-cargo install --locked nml-cli
+# installs the `nml` binary. `nml-cli` is not on crates.io yet, so install
+# from git; --locked builds with the exact dependency set CI verified.
+cargo install --locked --git https://github.com/nudge-io/nml nml-cli
 
 nml parse <file>                  # dump the AST as JSON (reports ALL errors)
 nml validate <file>               # duplicates + unresolved references
-nml fmt <file>                    # canonical formatting, comment-preserving
+nml fmt [--check] <path>...       # canonical formatting (spec/style.md); --check for CI
 nml check --schema <dir> <file>   # full validation; non-zero exit for CI
+nml check --root . tenants/       # every .nml file under tenants/, under its manifest binding
 nml fix [--dry-run] <path>...     # apply machine-applicable fixes in bulk
+nml binding <file>                # which manifest binding governs a file
 nml explain NML2007               # the full error-index entry, offline
+nml limits                        # every published bound, and who can reach it
+nml <command> --help              # a command's options (--root, --json, …)
 ```
 
 **MSRV: Rust 1.86** — measured, CI-enforced on all three platforms, and
@@ -199,20 +202,22 @@ editor quick-fixes apply what can be applied mechanically).
 | Start here | |
 |---|---|
 | [Tutorial](docs/tutorial/README.md) | Nine chapters, one growing config — from first file to shipped schemas |
-| [Cookbook](docs/guides/README.md) | Fourteen library recipes, every one compiled and run in CI |
+| [Cookbook](docs/guides/README.md) | Thirteen library recipes compiled and run in CI, plus the CLI's CI guide |
 | [Case Study](docs/case-study.md) | How a production workflow platform embeds NML |
 | [Footprint & Performance](docs/footprint.md) | Dependency counts, binary size, parse throughput — measured, reproducible |
 | [Language Guide](docs/language-guide.md) | Writing NML — syntax and features |
 | [Integration Guide](docs/integration.md) | Embedding NML in a Rust project |
 | [Language Specification](spec/README.md) | Formal grammar and semantics, for implementers |
-| [Error Index](docs/errors/README.md) | Every `NML0000` diagnostic code, with verified examples and fixes |
+| [Error Index](docs/errors/README.md) | Every diagnostic code (`NML0001` … `NML5003`), with verified examples and fixes |
 | [Editor Integration](docs/reference/editors.md) | LSP + VS Code surfaces: diagnostics, quick fixes, hover explanations, completion |
 | [Stability Policy](docs/stability.md) | What pre-1.0 means here; breaking changes ship with fixers |
+| Glossary (`docs/glossary.md`) | One word per concept — universe, claim, govern, binding, grant, bound — and where each surface prints it |
 
 Docs examples are executable: tagged ```` ```nml ```` blocks run through the
-real CLI in CI (`just docs-test`), every tutorial chapter's finished config
+real CLI in CI (`just gate-docs`), every tutorial chapter's finished config
 is a validated fixture, and the tutorial's Rust programs compile and run in
-CI with their printed output asserted — so what you read is what the tools do.
+CI with a line of their printed output asserted — so what you read is what
+the tools do.
 
 ## Project structure
 
@@ -224,23 +229,30 @@ crates/
   nml-lsp/        Language server (native + wasm32-wasip1)
 nml-cli/          The `nml` binary
 editors/vscode/   VS Code extension (bundles the WASM language server)
-spec/             Language specification
+spec/             Language specification (including style.md, what `nml fmt` writes)
 docs/             Guides, integration docs, RFCs
+docs/api/         The library crates' public-API record — the contract a
+                  downstream embedder reads (docs/stability.md explains it)
 ```
 
 ## Building
 
 ```bash
 corepack enable && pnpm install   # once per clone
-just test        # cargo test --workspace
-just lint        # Rust fmt + clippy + doc
-just lint-ext    # extension typecheck
-just install     # build + install the LSP and VS Code extension locally
-just verify-ext  # extension gate (no E2E)
+just doctor           # what this machine is missing, before anything runs
+just gate fast        # ~20s:  the CI/local contract + fmt, clippy, rustdoc
+just gate fast core   # ~3min: + tests, docs examples, the extension
+just gate             # everything CI runs that one machine can run
+just gate-test        # one gate alone: cargo test --workspace
+just lint-ext         # extension typecheck (the inner loop, not a gate)
+just install          # build + install the LSP and VS Code extension locally
 ```
 
-Minimum supported Rust: see `rust-version` in [Cargo.toml](Cargo.toml).
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and landing changes.
+Every check that can fail a pull request is a `just gate-*` recipe, and a
+CI workflow may not run a gate any other way — so "green locally" and
+"green in CI" are the same sentence. Minimum supported Rust: see
+`rust-version` in [Cargo.toml](Cargo.toml). See
+[CONTRIBUTING.md](CONTRIBUTING.md) for development setup and landing changes.
 
 ## License
 

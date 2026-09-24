@@ -1,0 +1,2 @@
+model note:
+    text string

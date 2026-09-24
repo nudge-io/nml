@@ -1,8 +1,9 @@
 //! Exact duration values (RFC 0017, amended for compound literals).
 //!
 //! Storage is **canonical integer segments** (coarse→fine, no zeros, no
-//! duplicates) with the total nanoseconds cached at construction, so
-//! comparison is a field read and [`Duration::as_std`] is infallible.
+//! duplicates); the total nanoseconds is derived on read from at most six
+//! segments, and [`Duration::as_std`] is infallible because the gate
+//! bounded that total at construction.
 //! Comparison is **semantic** (`30s == 30000ms == 0h30s`-less spellings);
 //! rendering is [`Display`](std::fmt::Display), the one spelling
 //! normalizer (`1h30m`, attached, coarse→fine).
@@ -138,12 +139,16 @@ impl DurationUnit {
 
 /// The segment capacity IS the unit count: a canonical duration holds at
 /// most one segment per unit, so the bound is structural, not chosen.
+///
+/// LIMIT: reach=content guards=domain surface=kernel shown="6" — segments in one compound duration literal (`1h30m`)
 pub(crate) const MAX_SEGMENTS: usize = 6;
 const _: () = assert!(MAX_SEGMENTS == DurationUnit::ALL.len());
 
 /// `std::time::Duration::MAX` in nanoseconds — the value-domain ceiling.
 /// (`u64::MAX` seconds + 999,999,999 ns; far inside `u128`, so total
 /// arithmetic can never overflow.)
+///
+/// LIMIT: reach=content guards=domain surface=kernel shown="~1.8e28 ns" — the largest duration representable as a `std::time::Duration`
 const STD_MAX_NANOS: u128 = u64::MAX as u128 * 1_000_000_000 + 999_999_999;
 
 /// One integer magnitude paired with a unit — a single component of a
@@ -154,10 +159,15 @@ pub struct DurationSegment {
     pub unit: DurationUnit,
 }
 
-/// Exact duration: canonical integer segments (coarse→fine) with the
-/// total nanoseconds cached at the construction gate.
+/// Exact duration: canonical integer segments (coarse→fine). The total
+/// nanoseconds is derived on read ([`Duration::total_nanos`]: six
+/// multiply-adds), not cached: a cached `u128` made this type 128 bytes
+/// and 16-aligned, and as an inline [`Value`](crate::types::Value)
+/// variant it set the size of EVERY value in every AST — the largest
+/// single term of the parser's memory per input byte. Without
+/// it the type is 104 bytes, 8-aligned, still `Copy`, same API.
 ///
-/// `PartialEq`/`Eq`/`Hash`/`Ord` are **manual, over the cached total** —
+/// `PartialEq`/`Eq`/`Hash`/`Ord` are **manual, over the total** —
 /// deliberately not derived. A derived equality would compare segments,
 /// making `90m != 1h30m`; the reload differ would then report a spurious
 /// change — the exact defect this type exists to close (RFC 0017 §2).
@@ -167,7 +177,6 @@ pub struct DurationSegment {
 pub struct Duration {
     segments: [DurationSegment; MAX_SEGMENTS],
     len: u8,
-    nanos: u128,
 }
 
 impl Duration {
@@ -232,7 +241,6 @@ impl Duration {
         Some(Duration {
             segments: storage,
             len: segments.len() as u8,
-            nanos,
         })
     }
 
@@ -241,18 +249,24 @@ impl Duration {
         &self.segments[..self.len as usize]
     }
 
-    /// The total in nanoseconds — the semantic comparison basis. A field
-    /// read: the gate computed it once.
+    /// The total in nanoseconds — the semantic comparison basis. Derived
+    /// from the segments (at most six multiply-adds; the gate proved the
+    /// sum in-domain, so it cannot overflow) rather than cached — see the
+    /// type-level doc for why the cache was dropped.
     pub fn total_nanos(&self) -> u128 {
-        self.nanos
+        self.segments()
+            .iter()
+            .map(|s| s.magnitude as u128 * s.unit.nanos() as u128)
+            .sum()
     }
 
     /// Convert to [`std::time::Duration`] — **infallible by
     /// construction**: the gate bounds the total (RFC 0017 §6).
     pub fn as_std(&self) -> std::time::Duration {
+        let nanos = self.total_nanos();
         std::time::Duration::new(
-            (self.nanos / 1_000_000_000) as u64,
-            (self.nanos % 1_000_000_000) as u32,
+            (nanos / 1_000_000_000) as u64,
+            (nanos % 1_000_000_000) as u32,
         )
     }
 
@@ -356,18 +370,18 @@ impl fmt::Display for Duration {
     }
 }
 
-// Semantic equality/ordering/hashing over the cached nanosecond total —
-// see the type-level doc for why these are hand-written.
+// Semantic equality/ordering/hashing over the nanosecond total — see the
+// type-level doc for why these are hand-written.
 impl PartialEq for Duration {
     fn eq(&self, other: &Self) -> bool {
-        self.nanos == other.nanos
+        self.total_nanos() == other.total_nanos()
     }
 }
 impl Eq for Duration {}
 
 impl Ord for Duration {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.nanos.cmp(&other.nanos)
+        self.total_nanos().cmp(&other.total_nanos())
     }
 }
 impl PartialOrd for Duration {
@@ -380,7 +394,7 @@ impl PartialOrd for Duration {
 /// `Duration` a valid map key.
 impl Hash for Duration {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.nanos.hash(state);
+        self.total_nanos().hash(state);
     }
 }
 
@@ -514,6 +528,20 @@ mod tests {
 
     fn seg(magnitude: u64, unit: DurationUnit) -> DurationSegment {
         DurationSegment { magnitude, unit }
+    }
+
+    /// No cached total — six segments plus a length, eight-
+    /// aligned. The total is derived and agrees with the gate's sum at
+    /// every unit's domain boundary (the `as_std` pin covers the ceiling).
+    #[test]
+    fn duration_is_segments_only_and_the_total_is_derived() {
+        assert_eq!(std::mem::size_of::<Duration>(), 104);
+        assert_eq!(std::mem::align_of::<Duration>(), 8);
+        let d = Duration::parse_text("1h30m45s500ms250us100ns").unwrap();
+        assert_eq!(
+            d.total_nanos(),
+            3_600_000_000_000 + 30 * 60_000_000_000 + 45_000_000_000 + 500_000_000 + 250_000 + 100
+        );
     }
 
     #[test]

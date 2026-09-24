@@ -23,23 +23,75 @@
 //!
 //! The lexer is *resilient*: malformed input (bad escape, tab indentation, …)
 //! yields a diagnostic and a token, never an abort — diagnostics are bounded
-//! (`super::MAX_ERRORS`).
+//! (`crate::diagnostic::MAX_ERRORS`).
 
 use crate::cst::syntax::SyntaxKind;
-use crate::error::NmlError;
+use crate::error::{NmlError, ParseErrorKind};
 use crate::span::Span;
 
-/// A lexed token: its kind and the exact source slice it covers (empty for the
-/// zero-width markers `Indent`/`Dedent`).
-pub(super) struct LexToken<'a> {
+/// A lexed token: its kind and the source range it covers (empty for the
+/// zero-width markers `Indent`/`Dedent`). Twelve bytes — kind plus two
+/// `u32` bounds — rather than a fat `&str` + `usize` offset: the token
+/// stream is the largest transient of a parse (≈0.7 tokens per source byte
+/// on dense input), so its per-token size is a direct term of the parser's
+/// bytes-per-input-byte. Text is sliced from the source on demand via
+/// [`LexToken::text`]; `u32` bounds mirror `rowan::TextSize`, which already
+/// caps a tree's text at 4 GiB.
+#[derive(Clone, Copy)]
+pub(super) struct LexToken {
     pub kind: SyntaxKind,
-    pub text: &'a str,
-    pub offset: usize,
+    /// Byte offset of the token's first byte in the source.
+    pub offset: u32,
+    /// Byte length; zero for `Indent`/`Dedent`.
+    pub len: u32,
+}
+
+impl LexToken {
+    /// The exact source slice this token covers.
+    pub fn text<'a>(&self, src: &'a str) -> &'a str {
+        &src[self.start()..self.end()]
+    }
+
+    pub fn start(&self) -> usize {
+        self.offset as usize
+    }
+
+    pub fn end(&self) -> usize {
+        self.start() + self.len as usize
+    }
+}
+
+/// The largest source the token stream can index: bounds are `u32`, the
+/// same ceiling as `rowan::TextSize` (a larger input could not form a
+/// green tree either), stated once, here. A source past it lexes to NO
+/// tokens and exactly one typed error — [`ParseErrorKind::SourceTooLarge`]
+/// — so the lexer's never-panics contract holds literally at the bound
+/// (`bound` below is total by this guard, not by an `expect`).
+///
+/// LIMIT: reach=content guards=domain surface=kernel shown="4294967295 bytes" — the bytes one source document may hold (the span index is 32-bit)
+pub(super) const MAX_SOURCE_LEN: usize = u32::MAX as usize;
+
+/// A source position as a token bound. Total: every position the lexer
+/// visits is `<= src.len() <= MAX_SOURCE_LEN` by [`lex_bounded`]'s guard.
+///
+/// The guard is spelled as "does this fit the 32-bit span index", not as
+/// `at <= MAX_SOURCE_LEN`: on a 32-bit target (`wasm32-wasip1`, the default
+/// editor backend) `usize` IS `u32`, so that comparison is a tautology the
+/// compiler proves away — the assertion meant nothing on exactly the arm the
+/// bundled server runs on, while saying so on the native one.
+fn bound(at: usize) -> u32 {
+    debug_assert!(
+        u32::try_from(at).is_ok(),
+        "positions are guarded at lex_bounded"
+    );
+    at as u32
 }
 
 /// The full lossless token stream plus any lexical diagnostics.
 pub(super) struct Lexed<'a> {
-    pub tokens: Vec<LexToken<'a>>,
+    /// The source the tokens index into.
+    pub src: &'a str,
+    pub tokens: Vec<LexToken>,
     pub errors: Vec<NmlError>,
     /// Errors dropped at the `MAX_ERRORS` cap — counted, never silent
     /// (RFC 0009: exact suppression accounting).
@@ -47,13 +99,37 @@ pub(super) struct Lexed<'a> {
 }
 
 pub(super) fn lex(src: &str) -> Lexed<'_> {
+    lex_bounded(src, MAX_SOURCE_LEN)
+}
+
+/// [`lex`] under an explicit ceiling — the seam the bound's pin fakes (a
+/// 4 GiB allocation is not a unit test). Over the ceiling: no tokens, no
+/// scan, one [`ParseErrorKind::SourceTooLarge`] at offset 0.
+pub(super) fn lex_bounded(src: &str, max_len: usize) -> Lexed<'_> {
+    if src.len() > max_len {
+        return Lexed {
+            src,
+            tokens: Vec::new(),
+            errors: vec![NmlError::syntax(
+                ParseErrorKind::SourceTooLarge {
+                    len: src.len(),
+                    max: max_len,
+                },
+                Span::empty(0),
+            )],
+            suppressed: 0,
+        };
+    }
     Lexer {
         src,
         bytes: src.as_bytes(),
         pos: 0,
         indent: vec![0],
         at_line_start: true,
-        tokens: Vec::new(),
+        // Dense input lexes to ~0.7 tokens per byte; reserving an eighth of
+        // that keeps the doubling slack small without over-reserving for
+        // token-sparse (long-string) input. Trimmed after the run.
+        tokens: Vec::with_capacity(src.len() / 8 + 16),
         errors: Vec::new(),
         suppressed: 0,
     }
@@ -67,7 +143,7 @@ struct Lexer<'a> {
     /// Offside indent stack (column widths). Always non-empty (`[0, …]`).
     indent: Vec<usize>,
     at_line_start: bool,
-    tokens: Vec<LexToken<'a>>,
+    tokens: Vec<LexToken>,
     errors: Vec<NmlError>,
     suppressed: usize,
 }
@@ -95,7 +171,9 @@ impl<'a> Lexer<'a> {
             self.indent.pop();
             self.push_empty(SyntaxKind::Dedent);
         }
+        self.tokens.shrink_to_fit();
         Lexed {
+            src: self.src,
             tokens: self.tokens,
             errors: self.errors,
             suppressed: self.suppressed,
@@ -422,8 +500,8 @@ impl<'a> Lexer<'a> {
     fn push(&mut self, kind: SyntaxKind, start: usize, end: usize) {
         self.tokens.push(LexToken {
             kind,
-            text: &self.src[start..end],
-            offset: start,
+            offset: bound(start),
+            len: bound(end - start),
         });
     }
 
@@ -434,19 +512,19 @@ impl<'a> Lexer<'a> {
     fn push_empty_at(&mut self, kind: SyntaxKind, at: usize) {
         self.tokens.push(LexToken {
             kind,
-            text: &self.src[at..at],
-            offset: at,
+            offset: bound(at),
+            len: 0,
         });
     }
 
-    /// Record a diagnostic, capped at [`MAX_ERRORS`](super::MAX_ERRORS) so a
+    /// Record a diagnostic, capped at [`MAX_ERRORS`](crate::diagnostic::MAX_ERRORS) so a
     /// pathological file cannot grow the error list without bound *during*
     /// lexing (RFC 0004 §9, "bounded output"). Tokens are still emitted, so
     /// losslessness is unaffected by the cap.
     /// Classified emission (RFC 0009) — the lexer half of the single
     /// channel; message, code, and fix all derive from the kind.
     fn push_error_kind(&mut self, kind: crate::error::ParseErrorKind, span: Span) {
-        if self.errors.len() < super::MAX_ERRORS {
+        if self.errors.len() < crate::diagnostic::MAX_ERRORS {
             self.errors.push(NmlError::syntax(kind, span));
         } else {
             self.suppressed += 1;
@@ -509,7 +587,7 @@ mod tests {
 
     /// Foundational invariant: token texts concatenate back to the source.
     fn assert_lossless(src: &str) {
-        let joined: String = lex(src).tokens.iter().map(|t| t.text).collect();
+        let joined: String = lex(src).tokens.iter().map(|t| t.text(src)).collect();
         assert_eq!(joined, src, "token texts must reconstruct the source");
     }
 
@@ -594,7 +672,7 @@ mod tests {
             vec![SyntaxKind::Dash, SyntaxKind::Role, SyntaxKind::Colon]
         );
         let toks = lex("@public:\n");
-        assert_eq!(toks.tokens[0].text, "@public");
+        assert_eq!(toks.tokens[0].text(toks.src), "@public");
     }
 
     #[test]
@@ -606,7 +684,7 @@ mod tests {
             .iter()
             .find(|t| t.kind == SyntaxKind::Secret)
             .unwrap();
-        assert_eq!(secret.text, "$ENV.MY_VAR");
+        assert_eq!(secret.text(toks.src), "$ENV.MY_VAR");
         // Even an unknown namespace lexes losslessly (value layer flags it).
         assert_lossless("k = $NOPE.X\n");
     }
@@ -620,7 +698,7 @@ mod tests {
             .iter()
             .find(|t| t.kind == SyntaxKind::String)
             .unwrap();
-        assert_eq!(s.text, "\"a\\nb\"");
+        assert_eq!(s.text(toks.src), "\"a\\nb\"");
         let ml = "s = \"\"\"\n  raw\n\"\"\"\n";
         assert_lossless(ml);
         assert_eq!(
@@ -682,7 +760,7 @@ mod tests {
         assert_eq!(
             nontrivia
                 .iter()
-                .map(|t| (t.kind, t.text))
+                .map(|t| (t.kind, t.text(toks.src)))
                 .collect::<Vec<_>>(),
             vec![
                 (Ident, "x"),
@@ -706,9 +784,9 @@ mod tests {
         let usd = lexed
             .tokens
             .iter()
-            .find(|t| t.kind == SyntaxKind::Ident && t.text == "USD")
+            .find(|t| t.kind == SyntaxKind::Ident && t.text(lexed.src) == "USD")
             .expect("USD ident");
-        assert_eq!(usd.text, "USD");
+        assert_eq!(usd.text(lexed.src), "USD");
         assert_lossless("x = 19.99USD\n");
     }
 
@@ -720,7 +798,7 @@ mod tests {
             .tokens
             .iter()
             .filter(|t| t.kind == SyntaxKind::Ident)
-            .map(|t| t.text)
+            .map(|t| t.text(src))
             .collect();
         assert_eq!(idents, vec!["count", "s"]);
         assert_lossless(src);
@@ -760,5 +838,45 @@ mod tests {
             lexed.errors
         );
         assert_lossless("s = \"\"\"abc\\\"\"\"");
+    }
+
+    /// A token is twelve bytes (kind + two `u32` bounds), not
+    /// a fat `&str` + `usize`. The token stream is the parse's largest
+    /// transient, so this size IS a term of bytes-per-input-byte.
+    #[test]
+    fn lex_token_is_twelve_bytes() {
+        assert_eq!(std::mem::size_of::<LexToken>(), 12);
+    }
+
+    /// The 4 GiB bound is a typed finding, never a panic: past the
+    /// ceiling the lexer scans nothing and reports exactly one
+    /// `SourceTooLarge` at offset 0; at the ceiling it lexes normally.
+    /// The bound is faked — a 4 GiB allocation is not a unit test.
+    #[test]
+    fn a_source_past_the_bound_lexes_to_one_typed_error_and_no_tokens() {
+        let src = "x = 1\n";
+        let over = lex_bounded(src, src.len() - 1);
+        assert!(over.tokens.is_empty(), "nothing is lexed past the bound");
+        assert_eq!(over.suppressed, 0);
+        assert_eq!(over.errors.len(), 1);
+        match &over.errors[0] {
+            NmlError::Syntax {
+                kind: ParseErrorKind::SourceTooLarge { len, max },
+                span,
+            } => {
+                assert_eq!((*len, *max), (src.len(), src.len() - 1));
+                assert_eq!(*span, Span::empty(0));
+            }
+            other => panic!("expected SourceTooLarge, got {other:?}"),
+        }
+        let at = lex_bounded(src, src.len());
+        assert!(at.errors.is_empty(), "the bound is inclusive");
+        let joined: String = at.tokens.iter().map(|t| t.text(at.src)).collect();
+        assert_eq!(joined, src);
+        assert_eq!(
+            MAX_SOURCE_LEN,
+            u32::MAX as usize,
+            "rowan's TextSize ceiling"
+        );
     }
 }

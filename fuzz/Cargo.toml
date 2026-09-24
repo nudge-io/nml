@@ -15,9 +15,13 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# `format` compares span-erased lowered trees; `compose` compares the
+# composed view of one file against itself.
+serde_json = "1"
 nml-core = { path = "../crates/nml-core" }
 nml-fmt = { path = "../crates/nml-fmt" }
-nml-validate = { path = "../crates/nml-validate" }
+# `test-support` for the scripted `MockFs` the `paths` target drives.
+nml-validate = { path = "../crates/nml-validate", features = ["test-support"] }
 
 [[bin]]
 name = "number"
@@ -57,6 +61,41 @@ bench = false
 [[bin]]
 name = "validate"
 path = "fuzz_targets/validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compose"
+path = "fuzz_targets/compose.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "paths"
+path = "fuzz_targets/paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "paths_oracle"
+path = "fuzz_targets/paths_oracle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "walk"
+path = "fuzz_targets/walk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
 test = false
 doc = false
 bench = false

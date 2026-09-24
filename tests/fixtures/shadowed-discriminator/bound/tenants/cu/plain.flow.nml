@@ -1,0 +1,4 @@
+host H:
+    rec:
+        kind = "log"
+        msg = "hi"

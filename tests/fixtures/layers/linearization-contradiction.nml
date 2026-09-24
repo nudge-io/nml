@@ -1,0 +1,12 @@
+// NML2077: `uses mid, base` lists base above its dependent mid.
+model thing:
+    v string
+
+thing base:
+    v = "b"
+
+thing mid uses base:
+    v = "m"
+
+thing top uses mid, base:
+    v = "t"

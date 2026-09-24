@@ -156,7 +156,7 @@ maintenanceContact = ["oncall@skylight.dev", "ops@skylight.dev"]
 Both validate; a number doesn't:
 
 ```text
-app.nml:25:26: error: type mismatch for 'maintenanceContact': expected one of string, []string; got number
+app.nml:25:26: error[NML2032]: type mismatch for 'maintenanceContact': expected one of string, []string; got number
 ```
 
 Rule of thumb: `oneof` when the variants are *named alternatives with their

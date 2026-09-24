@@ -1,0 +1,3 @@
+// NML2059 fires even with no schema universe: structural, not schema-bound.
+flow tenant uses missingBase:
+    x = 1

@@ -38,6 +38,8 @@ type SymbolLookup = Box<dyn Fn(&str) -> Option<Value> + Send + Sync>;
 /// Bounds reference-chain recursion. Const cycles are normally rejected up front
 /// by `SymbolTable::find_const_cycles`; this is defense-in-depth so the resolver
 /// is total even if handed a cyclic lookup directly.
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="64" — reference-resolution depth
 const MAX_RESOLVE_DEPTH: u32 = 64;
 
 pub struct ValueResolver {
@@ -260,24 +262,23 @@ impl ValueResolver {
     }
 
     fn resolve_spanned(&self, sv: &SpannedValue) -> Result<SpannedValue, ResolveError> {
-        Ok(SpannedValue {
-            value: self.resolve(&sv.value)?,
-            span: sv.span,
-        })
+        // The window travels with the value: resolution replaces the text,
+        // never the bytes a content replacement would substitute.
+        Ok(SpannedValue::literal(
+            self.resolve(&sv.value)?,
+            sv.span,
+            sv.spans().content,
+        ))
     }
 
     fn resolve_arm(&self, arm: &Arm) -> Result<Arm, ResolveError> {
-        Ok(Arm {
-            selector: arm.selector.clone(),
-            selector_span: arm.selector_span,
-            target: match &arm.target {
-                ArmTarget::Reference(_) | ArmTarget::Literal { .. } => arm.target.clone(),
-                ArmTarget::Inline { name, body } => ArmTarget::Inline {
-                    name: name.clone(),
-                    body: self.resolve_body(body)?,
-                },
+        Ok(arm.with_target(match &arm.target {
+            ArmTarget::Reference(_) | ArmTarget::Literal(_) => arm.target.clone(),
+            ArmTarget::Inline { name, body } => ArmTarget::Inline {
+                name: name.clone(),
+                body: self.resolve_body(body)?,
             },
-        })
+        }))
     }
 
     fn resolve_list_item(&self, item: &ListItem) -> Result<ListItem, ResolveError> {
@@ -374,14 +375,10 @@ pub fn apply_shared_properties(body: &Body) -> Body {
             }),
             BodyEntryKind::Arm(arm) => {
                 let resolved = match &arm.target {
-                    ArmTarget::Inline { name, body } => Arm {
-                        selector: arm.selector.clone(),
-                        selector_span: arm.selector_span,
-                        target: ArmTarget::Inline {
-                            name: name.clone(),
-                            body: apply_shared_properties(body),
-                        },
-                    },
+                    ArmTarget::Inline { name, body } => arm.with_target(ArmTarget::Inline {
+                        name: name.clone(),
+                        body: apply_shared_properties(body),
+                    }),
                     _ => arm.clone(),
                 };
                 Some(BodyEntry {
@@ -389,6 +386,26 @@ pub fn apply_shared_properties(body: &Body) -> Body {
                     span: entry.span,
                 })
             }
+            // A block-form modifier is a list like any other spelling
+            // (RFC 0019's spelling-equivalence doctrine): its items' own
+            // bodies are scopes too, or a `.shared` inside a `|deny:`
+            // item survives as a raw SharedProperty into composed output
+            // while the block spelling merges it.
+            BodyEntryKind::Modifier(m) => match &m.value {
+                ModifierValue::Block(items) => Some(BodyEntry {
+                    kind: BodyEntryKind::Modifier(Modifier {
+                        name: m.name.clone(),
+                        value: ModifierValue::Block(
+                            items
+                                .iter()
+                                .map(|item| apply_shared_in_item(item.clone()))
+                                .collect(),
+                        ),
+                    }),
+                    span: entry.span,
+                }),
+                _ => Some(entry.clone()),
+            },
             _ => Some(entry.clone()),
         })
         .collect();
@@ -398,7 +415,9 @@ pub fn apply_shared_properties(body: &Body) -> Body {
 
 /// Recurse into a (just-merged) item's own body so ITS scopes apply their
 /// own shared properties. Bodyless scalars and references have no scopes.
-fn apply_shared_in_item(item: ListItem) -> ListItem {
+/// `pub(crate)`: the merge's deep pass runs it over passthrough and
+/// modifier-block items (RFC 0025 §2).
+pub(crate) fn apply_shared_in_item(item: ListItem) -> ListItem {
     let span = item.span;
     match item.kind {
         ListItemKind::Named { name, body } => ListItem {
@@ -445,7 +464,9 @@ pub fn apply_array_shared_properties(array_body: &ArrayBody) -> Vec<ListItem> {
         .collect()
 }
 
-fn merge_shared_into_item(item: &ListItem, shared: &[&SharedProperty]) -> ListItem {
+/// `pub(crate)`: layer composition's ThisLevel distributes a body's own
+/// `.shared` lines one level into its direct items (RFC 0025 §1).
+pub(crate) fn merge_shared_into_item(item: &ListItem, shared: &[&SharedProperty]) -> ListItem {
     match &item.kind {
         ListItemKind::Named { name, body } => ListItem {
             kind: ListItemKind::Named {
@@ -472,7 +493,10 @@ fn merge_shared_into_item(item: &ListItem, shared: &[&SharedProperty]) -> ListIt
     }
 }
 
-fn merge_shared_into_body(body: &Body, shared: &[&SharedProperty]) -> Body {
+/// `pub(crate)`: layer composition's item gather distributes a layer's
+/// list-level `.shared` into that layer's members before the group fold
+/// (RFC 0025 §3).
+pub(crate) fn merge_shared_into_body(body: &Body, shared: &[&SharedProperty]) -> Body {
     let existing_names: Vec<&str> = body
         .entries
         .iter()
@@ -806,6 +830,42 @@ mod tests {
         });
         assert!(matches!(
             r.resolve(&Value::Reference("a".into())),
+            Err(ResolveError::ReferenceCycle)
+        ));
+    }
+
+    /// A reference chain longer than
+    /// [`MAX_RESOLVE_DEPTH`] is refused exactly as a cycle is; a shorter
+    /// one resolves to its literal.
+    #[test]
+    fn reference_chains_are_bounded_by_the_resolve_depth() {
+        let build = |links: u32| {
+            ValueResolver::new(|_| None).with_symbols(move |name: &str| {
+                let i: u32 = name.strip_prefix('r')?.parse().ok()?;
+                Some(if i < links {
+                    Value::Reference(format!("r{}", i + 1))
+                } else {
+                    Value::String("end".into())
+                })
+            })
+        };
+        assert!(matches!(
+            build(MAX_RESOLVE_DEPTH / 2).resolve(&Value::Reference("r0".into())),
+            Ok(Value::String(s)) if s == "end"
+        ));
+        assert!(matches!(
+            build(MAX_RESOLVE_DEPTH + 2).resolve(&Value::Reference("r0".into())),
+            Err(ResolveError::ReferenceCycle)
+        ));
+        // AT the bound, not merely somewhere past it. A chain of `links`
+        // hops lands its literal at depth `links + 1`, so the longest that
+        // resolves has `MAX_RESOLVE_DEPTH - 2` hops and one more is refused.
+        assert!(matches!(
+            build(MAX_RESOLVE_DEPTH - 2).resolve(&Value::Reference("r0".into())),
+            Ok(Value::String(s)) if s == "end"
+        ));
+        assert!(matches!(
+            build(MAX_RESOLVE_DEPTH - 1).resolve(&Value::Reference("r0".into())),
             Err(ResolveError::ReferenceCycle)
         ));
     }

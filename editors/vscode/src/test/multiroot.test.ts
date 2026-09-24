@@ -1,6 +1,12 @@
 import * as assert from "node:assert";
 import * as vscode from "vscode";
-import { waitForDiagnostics } from "./util";
+import {
+  assertConfiguredBackend,
+  configuredBackend,
+  diagnosticCode,
+  suiteTimeoutMs,
+  waitForDiagnostics,
+} from "./util";
 
 // Multi-root E2E (RFC 0035): proves the WASM backend's per-folder WASI mount +
 // `wasmUriConverters` are correct across MORE THAN ONE folder — the case that
@@ -15,7 +21,13 @@ function folderByName(name: string): vscode.WorkspaceFolder {
   return f;
 }
 
-suite("nml pull diagnostics (E2E, WASM neutral server, MULTI-ROOT)", () => {
+suite(`nml pull diagnostics (E2E, ${configuredBackend()} neutral server, MULTI-ROOT)`, function () {
+  this.timeout(suiteTimeoutMs(1));
+
+  test("the backend under test is the one this launch configured", async () => {
+    await assertConfiguredBackend();
+  });
+
   test("resolves a cross-folder schema (per-folder /workspaces/<name> mount)", async () => {
     // The whole point — confirm this really opened as a multi-root workspace.
     assert.strictEqual(
@@ -29,9 +41,13 @@ suite("nml pull diagnostics (E2E, WASM neutral server, MULTI-ROOT)", () => {
     const app = vscode.Uri.joinPath(folderByName("multi-b").uri, "app.nml");
     await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(app));
     const diags = await waitForDiagnostics(app, (d) => d.length > 0);
-    assert.ok(
-      diags.length > 0,
-      `expected a cross-folder type diagnostic on app.nml, got: ${JSON.stringify(diags)}`
+    // Which diagnostic: a folder that was NOT mounted produces one too (the
+    // model is simply unknown), and it would satisfy `length > 0` while
+    // proving the opposite of what this test is named for.
+    assert.deepStrictEqual(
+      diags.map(diagnosticCode),
+      ["NML2008"],
+      `expected exactly the cross-folder type mismatch on app.nml, got: ${JSON.stringify(diags)}`
     );
   });
 });

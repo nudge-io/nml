@@ -8,8 +8,9 @@ system whose schemas ship to your users' editors.
 Each chapter takes 10–15 minutes and ends with a working file you can check
 with the real tooling. Every code block on these pages runs against the real
 `nml` CLI in CI, every chapter's finished config is a fixture the test suite
-validates, and the Rust programs in chapters 7–9 compile and run in CI with
-their printed output asserted — what you see here is tested, not transcribed.
+validates, and the Rust programs in chapters 7–9 compile and run in CI with a
+line of their printed output asserted — what you see here is tested, not
+transcribed.
 
 ## Chapters
 

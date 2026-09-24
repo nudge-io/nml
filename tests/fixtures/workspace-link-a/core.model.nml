@@ -1,0 +1,2 @@
+model thing:
+    v string

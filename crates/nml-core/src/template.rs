@@ -5,55 +5,89 @@ use crate::types::TemplateSegment;
 ///
 /// The `string_start` byte offset is the position of the opening quote in the
 /// source file, used to compute accurate spans for each expression.
-pub fn parse_template_string(s: &str, string_start: usize) -> Vec<TemplateSegment> {
+pub(crate) fn parse_template_string(s: &str, string_start: usize) -> Vec<TemplateSegment> {
+    scan(s, string_start, |literal, _| {
+        TemplateSegment::Literal(literal.to_string())
+    })
+}
+
+/// The one `{{…}}` scanner. `base` is the source offset of `s`'s first byte;
+/// every expression's span is its `{{` through its `}}` in those
+/// coordinates, so a caller that hands the RAW string body with the body's
+/// own offset gets exact source spans. `literal` builds each literal
+/// segment from its raw slice and that slice's source offset — the string
+/// decoder decodes escapes there; the decoded-text path keeps the text. An
+/// unclosed `{{` is literal text to the end.
+pub fn scan(
+    s: &str,
+    base: usize,
+    mut literal: impl FnMut(&str, usize) -> TemplateSegment,
+) -> Vec<TemplateSegment> {
     let mut segments = Vec::new();
     let mut remaining = s;
     let mut offset = 0;
 
     while let Some(start) = remaining.find("{{") {
         if start > 0 {
-            segments.push(TemplateSegment::Literal(remaining[..start].to_string()));
+            segments.push(literal(&remaining[..start], base + offset));
         }
 
         let after_open = &remaining[start + 2..];
         if let Some(end) = after_open.find("}}") {
             let raw = &after_open[..end];
-            let expr = raw.trim();
-            let expr_byte_start = string_start + offset + start;
-            let expr_byte_end = expr_byte_start + 2 + end + 2;
-            let span = Span::new(expr_byte_start, expr_byte_end);
-
-            let parts: Vec<&str> = expr.splitn(2, '.').collect();
-            let (namespace, path) = if parts.len() == 2 {
-                (
-                    parts[0].to_string(),
-                    parts[1].split('.').map(|s| s.to_string()).collect(),
-                )
-            } else {
-                (expr.to_string(), Vec::new())
-            };
-
-            segments.push(TemplateSegment::Expression {
-                namespace,
-                path,
-                raw: raw.to_string(),
-                span,
-            });
+            let expr_start = base + offset + start;
+            segments.push(expression(
+                raw,
+                Span::new(expr_start, expr_start + 2 + end + 2),
+            ));
 
             let consumed = start + 2 + end + 2;
             offset += consumed;
             remaining = &remaining[consumed..];
         } else {
-            segments.push(TemplateSegment::Literal(remaining[start..].to_string()));
+            segments.push(literal(&remaining[start..], base + offset + start));
             return segments;
         }
     }
 
     if !remaining.is_empty() {
-        segments.push(TemplateSegment::Literal(remaining.to_string()));
+        segments.push(literal(remaining, base + offset));
     }
 
     segments
+}
+
+/// One expression from its raw inner text (between the braces, padding
+/// kept) and its whole span.
+fn expression(raw: &str, span: Span) -> TemplateSegment {
+    let expr = raw.trim();
+    let parts: Vec<&str> = expr.splitn(2, '.').collect();
+    let (namespace, path) = if parts.len() == 2 {
+        (
+            parts[0].to_string(),
+            parts[1].split('.').map(|s| s.to_string()).collect(),
+        )
+    } else {
+        (expr.to_string(), Vec::new())
+    };
+    TemplateSegment::Expression {
+        namespace,
+        path,
+        raw: raw.to_string(),
+        span,
+    }
+}
+
+/// The namespace token's own span inside an expression whose whole span is
+/// `span` (`{{` through `}}`) and whose raw inner text is `raw`: the first
+/// identifier after the opening braces and any padding — where a
+/// did-you-mean on the namespace must land, so applying it replaces the
+/// namespace and nothing else.
+pub fn namespace_span(raw: &str, span: Span) -> Span {
+    let pad = raw.len() - raw.trim_start().len();
+    let name = raw.trim().split('.').next().unwrap_or("").len();
+    let start = span.start + 2 + pad;
+    Span::new(start, (start + name).min(span.end))
 }
 
 /// Reconstruct the original string from template segments (for formatting/round-tripping).

@@ -117,16 +117,54 @@ impl Serialize for ResolvedText {
     }
 }
 
-/// A value with its source location.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// A value with its source location — and, for a quoted literal, the
+/// window INSIDE its delimiters that a content replacement substitutes
+/// ([`Self::spans`]).
+#[derive(Debug, Clone, Serialize)]
 pub struct SpannedValue {
     pub value: Value,
     pub span: Span,
+    /// DERIVED at decode from the token's own text, never authored: the
+    /// decoder is the only reader that can tell a terminated literal from
+    /// an unterminated one, and a span alone cannot. Private, skipped by
+    /// `Serialize` (the AST's JSON shape is a wire surface) and excluded
+    /// from equality — it carries no identity, so two values equal in
+    /// value and span are equal.
+    #[serde(skip)]
+    content: Span,
+}
+
+impl PartialEq for SpannedValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value && self.span == other.span
+    }
 }
 
 impl SpannedValue {
+    /// A value whose content IS its span — every value that is not a
+    /// quoted literal, and every value synthesized outside a decode.
     pub fn new(value: Value, span: Span) -> Self {
-        Self { value, span }
+        Self {
+            value,
+            span,
+            content: span,
+        }
+    }
+
+    /// A quoted literal: `span` covers the delimiters, `content` the
+    /// bytes between them ([`crate::cst::string_content_window`]).
+    pub fn literal(value: Value, span: Span, content: Span) -> Self {
+        Self {
+            value,
+            span,
+            content,
+        }
+    }
+
+    /// Where this value sits: the whole span, and the bytes a content
+    /// replacement substitutes.
+    pub fn spans(&self) -> crate::span::ValueSpan {
+        crate::span::ValueSpan::literal(self.span, self.content)
     }
 }
 
@@ -160,7 +198,7 @@ impl Value {
     /// same thing, regardless of where (or in which file) they were written.
     ///
     /// The derived `PartialEq` is *span-sensitive* (`Array(Vec<SpannedValue>)`
-    /// and `Fallback` recurse through `SpannedValue`, whose derived eq compares
+    /// and `Fallback` recurse through `SpannedValue`, whose eq compares
     /// `Span`; a `TemplateString` expression segment carries a `span` and its
     /// `raw` source text), so `==` flags a value merely *moved to another line*
     /// as different — exactly the cosmetic false-positive a semantic diff or a
@@ -509,6 +547,30 @@ impl TryFrom<&Value> for Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The AST's per-property footprint, pinned. `Value` was
+    /// 128 bytes because the inline `Duration` variant cached a `u128`;
+    /// every property in every AST paid for it. A regression (a cached
+    /// total, a fat variant) shows here before it shows in RSS. These
+    /// are the sizes on 64-bit targets; the wasm32 lane checks, it does
+    /// not run tests.
+    #[test]
+    fn ast_value_footprint_is_pinned() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<Duration>(), 104, "Duration");
+        assert_eq!(size_of::<Value>(), 112, "Value");
+        // +16 since RFC 0026 decision 2: a value carries the window a
+        // machine-applicable replacement of its CONTENT substitutes, so no
+        // consumer has to guess it from the span — the guess assumed a
+        // closing quote and cut multi-byte characters in half on
+        // unterminated literals. `Value` is 16-byte aligned (an exact
+        // decimal's coefficient is a `u128`), so a `(u8, u8)` delimiter
+        // pair would have cost the same 16 bytes as the span it encodes:
+        // the honest spelling is the span.
+        assert_eq!(size_of::<SpannedValue>(), 144, "SpannedValue");
+        assert_eq!(size_of::<crate::ast::Property>(), 192, "Property");
+        assert_eq!(size_of::<crate::ast::BodyEntry>(), 304, "BodyEntry");
+    }
 
     // ── Value::Resolved / ResolvedText contract pins ────────────────
 

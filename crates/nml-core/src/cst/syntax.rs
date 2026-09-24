@@ -82,6 +82,9 @@ pub enum SyntaxKind {
     OneOfArm,
     Name,
     Extends,
+    /// RFC 0019: the `uses <LayerRef> (, <LayerRef>)*` header clause on an
+    /// instance declaration — layer composition refs, sibling of `Extends`.
+    Uses,
     // bodies & entries
     Body,
     Property,
@@ -165,6 +168,7 @@ impl SyntaxKind {
             OneOfArm => "a oneof arm",
             Name => "a name",
             Extends => "an `is` clause",
+            Uses => "a `uses` clause",
             Body => "a block body",
             Property => "a property",
             NestedBlock => "a nested block",
@@ -192,6 +196,19 @@ impl SyntaxKind {
             self,
             SyntaxKind::Whitespace | SyntaxKind::Newline | SyntaxKind::Comment
         )
+    }
+
+    /// Offside layout markers (RFC 0004 §4.2.1): zero-width, consumed by the
+    /// parser, never source content — a span must begin and end on neither.
+    pub fn is_layout(self) -> bool {
+        matches!(self, SyntaxKind::Indent | SyntaxKind::Dedent)
+    }
+
+    /// A token that IS source content: neither trivia nor a layout marker.
+    /// The one predicate every content-span computation and every
+    /// significant-token walk reads.
+    pub fn is_significant(self) -> bool {
+        !self.is_trivia() && !self.is_layout()
     }
 }
 
@@ -232,8 +249,10 @@ pub(super) fn text_offset(offset: rowan::TextSize) -> usize {
     u32::from(offset) as usize
 }
 
-/// The full byte span of a node (the single home for `TextRange → Span`).
-pub(super) fn node_span(node: &SyntaxNode) -> crate::span::Span {
+/// The full extent of a node — trivia and layout markers included: a TREE
+/// query key (range pruning), never a span an AST node carries (those are
+/// [`content_span`]s).
+pub(super) fn node_extent(node: &SyntaxNode) -> crate::span::Span {
     let r = node.text_range();
     crate::span::Span::new(text_offset(r.start()), text_offset(r.end()))
 }
@@ -270,24 +289,34 @@ pub(super) fn duration_component_tokens<'a>(
         .collect()
 }
 
-/// The span of a node's **significant** content — first to last non-trivia token
-/// in its subtree. Unlike [`node_span`], this excludes leading/trailing attached
-/// trivia (comments, whitespace) — important wherever spans drive behaviour
-/// (template offsets, comment placement) rather than just diagnostics.
+/// The significant tokens of a node's subtree, in source order — every
+/// token that is content ([`SyntaxKind::is_significant`]): no trivia, no
+/// layout marker.
+pub(super) fn significant_tokens(node: &SyntaxNode) -> impl Iterator<Item = SyntaxToken> {
+    node.descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind().is_significant())
+}
+
+/// The span of a node's **content** — its first through its last significant
+/// token — and THE span every AST and schema node carries. The content-span
+/// invariant ([`crate::span::Span::is_content_in`]): a non-empty span begins
+/// and ends on content, never on indentation, a line break, a comment or a
+/// layout marker — so a diagnostic anchored on a node lands on the node
+/// (`FieldDef` rows used to render at column 1 from the indentation; block
+/// spans used to run past their last line to the zero-width `Dedent`), and
+/// an edit resolved by span touches exactly the node. A node with no
+/// significant token (an empty recovery) is the empty span at its start.
 pub(super) fn content_span(node: &SyntaxNode) -> crate::span::Span {
     let mut first = None;
     let mut last = None;
-    for tok in node
-        .descendants_with_tokens()
-        .filter_map(|e| e.into_token())
-        .filter(|t| !t.kind().is_trivia())
-    {
+    for tok in significant_tokens(node) {
         let r = tok.text_range();
         first.get_or_insert(text_offset(r.start()));
         last = Some(text_offset(r.end()));
     }
     match (first, last) {
         (Some(s), Some(e)) => crate::span::Span::new(s, e),
-        _ => node_span(node),
+        _ => crate::span::Span::empty(text_offset(node.text_range().start())),
     }
 }

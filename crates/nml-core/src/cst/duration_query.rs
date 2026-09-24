@@ -3,7 +3,9 @@
 
 use crate::cst::Parse;
 use crate::cst::ast::{self, AstNode};
-use crate::cst::syntax::{SyntaxKind, SyntaxNode, SyntaxToken, node_span, token_span};
+use crate::cst::syntax::{
+    SyntaxKind, SyntaxNode, SyntaxToken, content_span, node_extent, token_span,
+};
 use crate::span::Span;
 use rowan::TextSize;
 
@@ -65,7 +67,7 @@ pub fn duration_literals_in(parse: &Parse, range: Span) -> Vec<DurationLiteralAt
 }
 
 fn collect_duration_literals(node: &SyntaxNode, range: Span, out: &mut Vec<DurationLiteralAt>) {
-    let span = node_span(node);
+    let span = node_extent(node);
     // Prune subtrees outside the range: keeps range requests O(range), not
     // O(document).
     if !spans_intersect(span, range) {
@@ -82,7 +84,7 @@ fn collect_duration_literals(node: &SyntaxNode, range: Span, out: &mut Vec<Durat
 }
 
 fn build_literal_at(literal: ast::DurationLiteral, offset: usize) -> DurationLiteralAt {
-    let span = node_span(literal.syntax());
+    let span = content_span(literal.syntax());
     let raw = literal.components();
     let components: Vec<(Span, Option<Span>)> = raw
         .iter()

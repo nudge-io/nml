@@ -33,11 +33,12 @@ jobs:
       # architecture note.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-      - run: cargo build -p nml-cli --locked
-      # Pre-build the cookbook so the harness's per-example runs (and their
-      # per-run timeouts) never pay the crate's cold compile.
-      - run: cargo build -p nml-cookbook --examples --tests --locked
-      - run: python3 scripts/docs_test.py
+      # The gate runner — see rust-ci.yml's note. Every gate command lives
+      # in the justfile and nowhere else.
+      - run: cargo install just --version 1.46.0 --locked
+      # Builds the CLI and pre-builds the cookbook (so the harness's per-example
+      # runs never pay the crate's cold compile), then runs the suite.
+      - run: just gate-docs
 
   extension:
     name: VS Code extension

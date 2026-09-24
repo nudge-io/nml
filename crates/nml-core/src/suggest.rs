@@ -20,6 +20,8 @@
 /// Inputs longer than this are never considered: they cannot be a near-miss
 /// of any sane name under the length-proportional cutoff, so this is purely a
 /// robustness guard against quadratic distance work on pathological values.
+///
+/// LIMIT: reach=content guards=work surface=kernel shown="256" — name length the did-you-mean engine will consider
 const MAX_INPUT_LEN: usize = 256;
 
 /// The best near-miss for `input` among `candidates`, or `None` when nothing
@@ -39,8 +41,17 @@ where
     let input_chars: Vec<char> = input.chars().collect();
     let mut best: Option<(usize, &str)> = None;
     for &cand in &candidates {
+        // Length window: an edit distance is at least the length
+        // difference, so a candidate whose length differs by more than
+        // the cutoff can never be suggested — skip the O(n·m) distance
+        // (a char count is O(n)). Result-preserving by that bound.
+        let cand_len = cand.chars().count();
+        let cutoff = (input_chars.len().max(cand_len) / 3).max(1);
+        if input_chars.len().abs_diff(cand_len) > cutoff {
+            continue;
+        }
+        note_comparison();
         let cand_chars: Vec<char> = cand.chars().collect();
-        let cutoff = (input_chars.len().max(cand_chars.len()) / 3).max(1);
         let dist = osa_distance(&input_chars, &cand_chars);
         // Strict `<` keeps the earliest candidate on a tie.
         if dist <= cutoff && best.is_none_or(|(b, _)| dist < b) {
@@ -49,6 +60,28 @@ where
     }
     best.map(|(_, cand)| cand)
 }
+
+#[cfg(test)]
+thread_local! {
+    static COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Edit-distance computations performed on this thread — the probe-count
+/// seam behind the suggester's cost pins (the length window here, the
+/// per-file budget in `symbols`): a bound on WORK, asserted structurally,
+/// never a wall-clock assertion.
+#[cfg(test)]
+pub(crate) fn comparisons_on_this_thread() -> usize {
+    COMPARISONS.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn note_comparison() {
+    COMPARISONS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_comparison() {}
 
 /// Optimal string alignment (restricted Damerau-Levenshtein) distance:
 /// insertions, deletions, substitutions, and adjacent transpositions, each
@@ -87,6 +120,23 @@ mod tests {
 
     fn s<'a>(input: &str, candidates: &'a [&'a str]) -> Option<&'a str> {
         suggest(input, candidates.iter().copied())
+    }
+
+    /// A candidate whose length differs from the input by
+    /// more than the cutoff can never be within it (an edit distance is
+    /// at least the length difference), so it is pruned BEFORE the
+    /// O(n·m) distance. The probe-count seam sees only the in-window
+    /// candidate; the result is what the unpruned scan would return.
+    #[test]
+    fn length_window_prunes_before_the_distance() {
+        let before = comparisons_on_this_thread();
+        let got = s("abcdefghij", &["x", "abcdefghijklmnopq", "abcdefghik"]);
+        assert_eq!(got, Some("abcdefghik"));
+        assert_eq!(
+            comparisons_on_this_thread() - before,
+            1,
+            "10 vs 1 (cutoff 3) and 10 vs 17 (cutoff 5) are pruned; 10 vs 10 is compared"
+        );
     }
 
     #[test]
@@ -140,8 +190,15 @@ mod tests {
     #[test]
     fn empty_and_pathological_inputs_are_guarded() {
         assert_eq!(s("", &["warn"]), None);
+        // The guard is inclusive: an input AT the bound is still considered
+        // (the candidate here is a one-edit near-miss of it), one byte past
+        // it is not.
+        let at = "x".repeat(MAX_INPUT_LEN);
+        let near = format!("{}y", "x".repeat(MAX_INPUT_LEN - 1));
+        assert_eq!(suggest(&at, [near.as_str()]), Some(near.as_str()));
         let huge = "x".repeat(MAX_INPUT_LEN + 1);
         assert_eq!(suggest(&huge, ["warn"]), None);
+        assert_eq!(suggest(&huge, [near.as_str()]), None);
         assert_eq!(s("warn", &[]), None);
     }
 

@@ -1,0 +1,3 @@
+model core:
+    action string #sealed
+    rateLimit number #lvie

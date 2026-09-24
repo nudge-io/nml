@@ -1,0 +1,9 @@
+tenants/cu/nml-project.nml: warning[NML2080]: project config `tenants/cu/nml-project.nml` is inert: it sits inside content claimed by binding 'tenantFlows' of demo.package.nml (files[0] = "tenants/**/*.flow.nml") — content, not configuration; its pins, autoAssociate, bindings and anchoring are ignored
+tests/fixtures/workspace/tenants/cu/member-lookup.flow.nml:4:7: error[NML2064]: composition not permitted: binding 'tenantFlows' (demo.package.nml) carries no `layers:` grant — an operator change, not fixable from a content file; run `nml binding tenants/cu/member-lookup.flow.nml` to see the effective grant
+demo.package.nml:10:7: note: to permit it, give this binding a `layers:` grant whose `allowRefs` admits "tenants/cu/member-lookup.flow.nml"
+help: the block to add after line 15 of demo.package.nml — paste it as printed:
+        layers:
+            allowRefs:
+                - "tenants/cu/member-lookup.flow.nml"
+for more information, run: nml explain NML2064
+error: 1 error(s)

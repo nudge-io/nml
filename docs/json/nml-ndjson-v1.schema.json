@@ -1,0 +1,415 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nudge-io/nml/blob/main/docs/json/nml-ndjson-v1.schema.json",
+  "title": "nml --json row, formatVersion 1",
+  "$comment": "The `$defs/revision` const is THIS FILE's revision, stated once (the `contract` row's and the `summary` row's `revision` reference it): a stream written at another revision fails validation on its first row, before any finding. Every addition to this file (a key, a row type, an enumerated value) moves the const by one, with one CHANGELOG entry (`--json formatVersion F, revision R`) naming the additions; scripts/docs_test.py holds the const to the writer's (`nml version --json`, row one), refuses a shape change at an unchanged revision (docs/json/nml-ndjson-v1.shape.txt is the generated shape record) and a revision without one. A rename, a removal, a type change or a narrowed vocabulary moves `$defs/formatVersion` and this file's name.",
+  "description": "One line of the line-delimited JSON every nml verb writes to stdout under --json: a `type`-discriminated object. This document IS the wire contract for formatVersion 1 (docs/stability.md), at the revision the `contract` row names: a field may be added to a row without bumping the version (the revision moves); renaming or removing one, or narrowing a vocabulary, must bump the version. Every row is closed (`additionalProperties: false`): a consumer validates strictly only against the schema at the revision the stream's FIRST row (`contract`) names, and otherwise ignores keys it does not know. The `contract` row opens every run and the closing `summary` row carries the same `formatVersion`, `revision` and `nmlVersion`. Columns (`col`, `endCol`) are 1-based BYTE columns of the line as the run read it. scripts/docs_test.py validates every executed transcript's rows against this file and that every stream opens with `contract` and closes with `summary`.",
+  "oneOf": [
+    { "$ref": "#/$defs/contract" },
+    { "$ref": "#/$defs/diagnostic" },
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/result" },
+    { "$ref": "#/$defs/summary" },
+    { "$ref": "#/$defs/binding" },
+    { "$ref": "#/$defs/fix" },
+    { "$ref": "#/$defs/parse" },
+    { "$ref": "#/$defs/fmt" },
+    { "$ref": "#/$defs/explain" },
+    { "$ref": "#/$defs/limit" },
+    { "$ref": "#/$defs/version" }
+  ],
+  "$defs": {
+    "formatVersion": {
+      "description": "The contract's number — THIS FILE's, stated once: moved by a rename, a removal, a type change or a narrowed vocabulary, never by an addition, and with it this file's name.",
+      "const": 1
+    },
+    "revision": {
+      "description": "The additions axis within the format — THIS FILE's revision, stated once (the `contract` and `summary` rows reference it): every addition moves it by one, with one CHANGELOG entry naming the additions. The writer (`nml-cli/src/out.rs` REVISION) is the source; scripts/docs_test.py holds this const, the generated shape record and the CHANGELOG ledger to it.",
+      "const": 3
+    },
+    "contract": {
+      "description": "The stream's FIRST row, on every path that emits a row at all: the format's number, its revision (the additions axis; this file's own revision, as a const) and the binary that wrote the stream. The closing `summary` row repeats the three.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "formatVersion", "revision", "nmlVersion"],
+      "properties": {
+        "type": { "const": "contract" },
+        "formatVersion": { "$ref": "#/$defs/formatVersion" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "nmlVersion": { "type": "string" }
+      }
+    },
+    "count": { "type": "integer", "minimum": 0 },
+    "nullableCount": { "type": ["integer", "null"], "minimum": 0 },
+    "code": {
+      "description": "A stable diagnostic code, or null for an uncoded finding.",
+      "type": ["string", "null"],
+      "pattern": "^NML[0-9]{4}$"
+    },
+    "severity": { "enum": ["error", "warning", "info"] },
+    "verb": {
+      "description": "The verb the run executed, as typed.",
+      "enum": ["parse", "validate", "fmt", "check", "fix", "binding", "explain", "limits", "version"]
+    },
+    "universe": { "enum": ["closed", "open"] },
+    "closure": {
+      "description": "The kernel's word on the whole universe: every manifest enumerated and loaded (`complete`), the walk cut short (`truncated`), or a live input that failed to load (`unloadable`).",
+      "enum": ["complete", "truncated", "unloadable"]
+    },
+    "skipReason": {
+      "description": "Why the walk left an entry out of its enumeration, by policy. `unkeyableName`: the entry's name is no key (not UTF-8, or bearing a path separator) — its row's `key` is the holding directory's and `entry` carries the name. `componentBound`: a directory at the 64-component bound, never listed.",
+      "enum": ["symlink", "fifo", "dotDirectory", "dotFile", "policyDirectory", "unkeyableName", "componentBound"]
+    },
+    "related": {
+      "description": "A secondary location that explains the primary one, in its own file.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "line", "col", "message"],
+      "properties": {
+        "source": { "type": "string" },
+        "line": { "$ref": "#/$defs/nullableCount" },
+        "col": { "$ref": "#/$defs/nullableCount" },
+        "message": { "type": "string" }
+      }
+    },
+    "cause": {
+      "description": "The finding whose refusal a row reports, on a row that wraps another finding under a code of its own — NML2088 over a manifest's first finding (a repeated entry NML2093, a repeated declaration NML1000, an unknown property NML2001, a parse finding, a rule of the loader's own NML2094–NML2104), NML2091 over a declared source's first finding: its code (never null — a codeless finding hides no fact the row does not state, and a row reported under the inner finding's own code, NML2081, wraps nothing), its sentence, and its place in its own file (`line`/`col` null when the finding has no place or its file could not be read). One level: the innermost finding, the one to act on. Absent from every other row, so a consumer reads `cause?.code ?? code`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "source", "line", "col", "message"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^NML[0-9]{4}$" },
+        "source": { "type": "string" },
+        "line": { "$ref": "#/$defs/nullableCount" },
+        "col": { "$ref": "#/$defs/nullableCount" },
+        "message": { "type": "string" }
+      }
+    },
+    "edit": {
+      "description": "One byte-exact edit of a suggestion, resolved against the file as this run read it: the text from `line`:`col` up to `endLine`:`endCol` (1-based; columns are BYTE columns of the line; the end exclusive; equal for an insertion) is replaced by `lines` joined with a newline. Every element is one line and never hosts a control character, so a consumer prints or applies a line as a line.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["line", "col", "endLine", "endCol", "lines"],
+      "properties": {
+        "line": { "$ref": "#/$defs/count" },
+        "col": { "$ref": "#/$defs/count" },
+        "endLine": { "$ref": "#/$defs/count" },
+        "endCol": { "$ref": "#/$defs/count" },
+        "lines": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "suggestion": {
+      "description": "A machine-applicable edit set the finding carries (rustc's structured suggestion) in the file `source` names — the finding's own, or another (NML2064's `layers:` grant goes in the manifest that lacks it). `kind` is the exclusivity: `didYouMean` a singular correction, `fix` one of several mutually exclusive alternatives (never auto-applied while siblings exist), `delete` a structural removal, `insert` a block added as the last entry of a named block. Every kind is exact by construction (the kernel never guesses); only edits the run resolved are here, at least one `edits` entry each, and a consumer applying them later first verifies the file is as the run read it (rerun `nml check`). `nml fix` applies a finding's edits to the file it was given only.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "source", "edits"],
+      "properties": {
+        "kind": { "enum": ["didYouMean", "fix", "delete", "insert"] },
+        "source": { "type": "string" },
+        "edits": { "type": "array", "items": { "$ref": "#/$defs/edit" } }
+      }
+    },
+    "diagnostic": {
+      "description": "One finding. `source` is the workspace KEY of the file it is in (the path as typed for a workspace-free verb); `line`/`col` are 1-based (`col` a byte column) and null for a locationless finding (a universe note, a kernel rejection, a fixer's own note); `suggestions` are its machine-applicable edits, resolved (empty when it carries none); `cause` rides only a row that reports another finding's refusal (revision 2).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "source", "line", "col", "severity", "code", "message", "related", "suggestions"],
+      "properties": {
+        "type": { "const": "diagnostic" },
+        "source": { "type": "string" },
+        "line": { "$ref": "#/$defs/nullableCount" },
+        "col": { "$ref": "#/$defs/nullableCount" },
+        "severity": { "$ref": "#/$defs/severity" },
+        "code": { "$ref": "#/$defs/code" },
+        "message": { "type": "string" },
+        "related": { "type": "array", "items": { "$ref": "#/$defs/related" } },
+        "suggestions": { "type": "array", "items": { "$ref": "#/$defs/suggestion" } },
+        "cause": { "$ref": "#/$defs/cause" }
+      }
+    },
+    "error": {
+      "description": "A failure line. `kind` says what failed: the invocation itself (`usage`, exit 2), one target of a many-target run that continued (`target`), or the run's closing verdict when no `result`/`summary` row carries it (`run`).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "kind", "message", "exit"],
+      "properties": {
+        "type": { "const": "error" },
+        "kind": { "enum": ["usage", "target", "run"] },
+        "message": { "type": "string" },
+        "exit": { "enum": [1, 2] }
+      }
+    },
+    "result": {
+      "description": "One target's verdict — always the last row for that target. `declarations` is null for `validate` (symbols only).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "verb", "target", "key", "ok", "errors", "warnings", "declarations"],
+      "properties": {
+        "type": { "const": "result" },
+        "verb": { "enum": ["check", "validate"] },
+        "target": { "type": "string" },
+        "key": { "type": "string" },
+        "ok": { "type": "boolean" },
+        "errors": { "$ref": "#/$defs/count" },
+        "warnings": { "$ref": "#/$defs/count" },
+        "declarations": { "$ref": "#/$defs/nullableCount" }
+      }
+    },
+    "root": {
+      "description": "The workspace root the run resolved in: the canonical path, how it was fixed, the fence entry's kind when derived within a VCS fence, and the entry above the fence that shadows the derived universe (another `.git`, or a root marker above a directory fence).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "origin", "fence", "shadowed"],
+      "properties": {
+        "path": { "type": "string" },
+        "origin": { "enum": ["explicit", "editor", "derivedVcsFence", "derivedTargetDir"] },
+        "fence": { "enum": ["dir", "file", "symlink", "other", null] },
+        "shadowed": { "type": ["string", "null"] }
+      }
+    },
+    "truncatedUnit": {
+      "description": "A budget unit the walk stopped inside: every file under `unit` is denied while the rest of the universe stands.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "stop", "why"],
+      "properties": {
+        "unit": { "type": "string" },
+        "stop": { "type": "string" },
+        "why": { "enum": ["entries", "liveInputBytes", "unreadable"] }
+      }
+    },
+    "skipped": {
+      "description": "What the walk left out of its enumeration by policy: `byWhy` the EXACT count per reason; `rows` the first `--max-findings` entries by depth then key (`0` lifts the bound); `hidden` how many rows that budget held back.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["byWhy", "rows", "shown", "hidden"],
+      "properties": {
+        "byWhy": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/skipReason" },
+          "additionalProperties": { "$ref": "#/$defs/count" }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["key", "why"],
+            "properties": {
+              "key": { "type": "string" },
+              "why": { "$ref": "#/$defs/skipReason" },
+              "entry": { "type": "string", "description": "The entry's own name where `key` cannot carry it (`unkeyableName`), spelled lossily." }
+            }
+          }
+        },
+        "shown": { "$ref": "#/$defs/count" },
+        "hidden": { "$ref": "#/$defs/count" }
+      }
+    },
+    "withheld": {
+      "description": "What the finding-PRINTING budget held back (`--max-findings`); the counts on the row stay exact. `byCode` keys are codes, or `(uncoded)`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shown", "hidden", "byCode"],
+      "properties": {
+        "shown": { "$ref": "#/$defs/count" },
+        "hidden": { "$ref": "#/$defs/count" },
+        "byCode": { "type": "object", "additionalProperties": { "$ref": "#/$defs/count" } }
+      }
+    },
+    "summary": {
+      "description": "The run's ONE closing row, emitted last on every path — a clean run, a failing one, a parse error, an absent target, a usage error. It carries the `contract` row's three facts again. `exit` is the process's own exit code. The universe fields are null for a verb with no universe. `fix` carries its own counters in the same row, on every path — `routed` among them: the distinct edits its findings carry that lie in another file, refused and pending there. `schemaSources` is how many schema sources a `--schema <dir>` invocation contributed, null when none was given: `0` says the directory held none, so every target was validated against its own definitions alone.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "formatVersion", "revision", "nmlVersion", "verb", "exit", "targets", "errors", "warnings", "root", "universe", "closure", "manifests", "truncatedUnits", "skipped", "withheld", "schemaSources"],
+      "properties": {
+        "type": { "const": "summary" },
+        "formatVersion": { "$ref": "#/$defs/formatVersion" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "nmlVersion": { "type": "string" },
+        "verb": { "$ref": "#/$defs/verb" },
+        "exit": { "enum": [0, 1, 2] },
+        "targets": { "$ref": "#/$defs/count" },
+        "errors": { "$ref": "#/$defs/count" },
+        "warnings": { "$ref": "#/$defs/count" },
+        "root": { "oneOf": [{ "$ref": "#/$defs/root" }, { "type": "null" }] },
+        "universe": { "oneOf": [{ "$ref": "#/$defs/universe" }, { "type": "null" }] },
+        "closure": { "oneOf": [{ "$ref": "#/$defs/closure" }, { "type": "null" }] },
+        "manifests": { "$ref": "#/$defs/nullableCount" },
+        "truncatedUnits": {
+          "oneOf": [{ "type": "array", "items": { "$ref": "#/$defs/truncatedUnit" } }, { "type": "null" }]
+        },
+        "skipped": { "oneOf": [{ "$ref": "#/$defs/skipped" }, { "type": "null" }] },
+        "withheld": { "oneOf": [{ "$ref": "#/$defs/withheld" }, { "type": "null" }] },
+        "schemaSources": { "$ref": "#/$defs/nullableCount" },
+        "dryRun": { "type": "boolean" },
+        "edits": { "$ref": "#/$defs/count" },
+        "filesFixed": { "$ref": "#/$defs/count" },
+        "files": { "$ref": "#/$defs/count" },
+        "remaining": { "$ref": "#/$defs/count" },
+        "routed": { "$ref": "#/$defs/count" },
+        "suppressed": { "$ref": "#/$defs/count" },
+        "budgetExhausted": { "$ref": "#/$defs/count" },
+        "failed": { "$ref": "#/$defs/count" }
+      }
+    },
+    "claimant": {
+      "description": "A binding that claims the file: its package, the claim's class, the manifest it came from, the anchor directory and the `files` glob that matched.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "package", "contentHash", "class", "manifest", "anchor", "glob"],
+      "properties": {
+        "name": { "type": "string" },
+        "package": { "type": "string" },
+        "contentHash": { "type": "string" },
+        "class": { "enum": ["workspace", "injected", "store", "builtin"] },
+        "manifest": { "type": "string" },
+        "anchor": { "type": "string" },
+        "glob": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["index", "pattern"],
+          "properties": {
+            "index": { "$ref": "#/$defs/count" },
+            "pattern": { "type": "string" }
+          }
+        }
+      }
+    },
+    "governingBinding": {
+      "description": "The claimant that governs the file, with the step that selected it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "package", "contentHash", "class", "manifest", "anchor", "glob", "step"],
+      "properties": {
+        "name": { "type": "string" },
+        "package": { "type": "string" },
+        "contentHash": { "type": "string" },
+        "class": { "enum": ["workspace", "injected", "store", "builtin"] },
+        "manifest": { "type": "string" },
+        "anchor": { "type": "string" },
+        "glob": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["index", "pattern"],
+          "properties": {
+            "index": { "$ref": "#/$defs/count" },
+            "pattern": { "type": "string" }
+          }
+        },
+        "step": { "enum": ["pinned", "autoAssociated"] }
+      }
+    },
+    "layers": {
+      "description": "The composition grant: `granted` alone when composition is denied or the open context permits it; the grant's own fields when a binding carries one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["granted"],
+      "properties": {
+        "granted": { "type": "boolean" },
+        "allowRefs": { "type": "array", "items": { "type": "string" } },
+        "denyRefs": { "type": "array", "items": { "type": "string" } },
+        "maxStackDepth": { "$ref": "#/$defs/nullableCount" }
+      }
+    },
+    "binding": {
+      "description": "`nml binding`'s answer for one file: the key, whether the file is absent (the binding shown is what WOULD govern the path), the root and universe facts the `summary` carries too, the governing verdict, the binding or the claimants, the grant, and the notes (diagnostic rows; under `--quiet` the errors among them).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "file", "absent", "root", "universe", "closure", "manifests", "truncatedUnits", "governing", "binding", "layers", "claimants", "notes"],
+      "properties": {
+        "type": { "const": "binding" },
+        "file": { "type": "string" },
+        "absent": { "type": "boolean" },
+        "root": { "$ref": "#/$defs/root" },
+        "universe": { "$ref": "#/$defs/universe" },
+        "closure": { "$ref": "#/$defs/closure" },
+        "manifests": { "$ref": "#/$defs/count" },
+        "truncatedUnits": { "type": "array", "items": { "$ref": "#/$defs/truncatedUnit" } },
+        "governing": { "enum": ["bound", "unbound", "ambiguous"] },
+        "binding": { "oneOf": [{ "$ref": "#/$defs/governingBinding" }, { "type": "null" }] },
+        "layers": { "$ref": "#/$defs/layers" },
+        "claimants": {
+          "oneOf": [{ "type": "array", "items": { "$ref": "#/$defs/claimant" } }, { "type": "null" }]
+        },
+        "notes": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } }
+      }
+    },
+    "fix": {
+      "description": "One file `nml fix` changed (or, dry-run, would change): `diff` is the unified diff on a dry run, else null; `routed` the distinct edits standing in this file's findings that lie in ANOTHER file (refused here, applied there — an operator's change pending in a manifest), a part of `remaining`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "file", "applied", "remaining", "routed", "dryRun", "diff"],
+      "properties": {
+        "type": { "const": "fix" },
+        "file": { "type": "string" },
+        "applied": { "$ref": "#/$defs/count" },
+        "remaining": { "$ref": "#/$defs/count" },
+        "routed": { "$ref": "#/$defs/count" },
+        "dryRun": { "type": "boolean" },
+        "diff": { "type": ["string", "null"] }
+      }
+    },
+    "parse": {
+      "description": "`nml parse`'s AST as data (its shape is the AST's own, not this contract's).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "file", "ast"],
+      "properties": {
+        "type": { "const": "parse" },
+        "file": { "type": "string" },
+        "ast": {}
+      }
+    },
+    "fmt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "file", "changed"],
+      "properties": {
+        "type": { "const": "fmt" },
+        "file": { "type": "string" },
+        "changed": { "type": "boolean" }
+      }
+    },
+    "explain": {
+      "description": "One diagnostic code's summary and full document (`--list` emits one row per code).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "code", "summary", "document"],
+      "properties": {
+        "type": { "const": "explain" },
+        "code": { "type": "string", "pattern": "^NML[0-9]{4}$" },
+        "summary": { "type": ["string", "null"] },
+        "document": { "type": ["string", "null"] }
+      }
+    },
+    "version": {
+      "description": "`nml version --json`: the binary's version (the `contract` and `summary` rows carry the same string as `nmlVersion`).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "version"],
+      "properties": {
+        "type": { "const": "version" },
+        "version": { "type": "string" }
+      }
+    },
+    "limit": {
+      "description": "One published bound (`published: true`, with its value and classification), or one bound the census deliberately does not publish (`published: false`, with the reason in `what`).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "name", "reach", "what", "declaredIn", "published"],
+      "properties": {
+        "type": { "const": "limit" },
+        "name": { "type": "string" },
+        "value": { "type": "string" },
+        "reach": { "enum": ["content", "peer", "operator", "internal"] },
+        "guards": { "enum": ["work", "memory", "output", "domain"] },
+        "surface": { "enum": ["kernel", "cli", "editor"] },
+        "what": { "type": "string" },
+        "declaredIn": { "type": "string" },
+        "declaration": { "type": "string" },
+        "published": { "type": "boolean" }
+      }
+    }
+  }
+}

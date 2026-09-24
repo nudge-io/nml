@@ -98,7 +98,7 @@ meaning, and duplicates are errors —
 ```
 
 ```text
-app.nml:4:31: error: duplicate set element for 'regions' 'us-east' — set elements must be unique
+app.nml:4:31: error[NML2030]: duplicate set element for 'regions' 'us-east' — set elements must be unique
 ```
 
 Use `set<T>` whenever "the same element twice" is a config bug — regions,

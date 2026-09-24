@@ -120,8 +120,10 @@ You never wrote a redaction list, and there's no list to forget to update —
 the schema already knows which fields are secrets.
 
 The rest of the program loads the schema and both files exactly like
-Chapter 7 and prints the plan; run `cargo run` in `examples/08/` to see the
-output from the top of the page. Wire the same loop to SIGHUP or a file
+Chapter 7 and prints the plan; run `cargo run -p nml-tutorial-08` from
+`docs/tutorial/examples/08` (the crate is in its `app/` subdirectory; the
+program reads the chapter directory's files) to see the output from the top
+of the page. Wire the same loop to SIGHUP or a file
 watcher and you have live reload with a truthful report — the architecture
 behind NML-based platforms' `reload --check`, at tutorial scale.
 

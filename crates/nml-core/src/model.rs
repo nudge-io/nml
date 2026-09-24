@@ -127,7 +127,18 @@ pub struct FieldDef {
     /// derives no `PartialEq`, and semantic comparison happens on `Value`s
     /// (`Value::semantic_eq`), never on `FieldDef`s wholesale.
     pub doc: Option<String>,
+    /// The declaration's significant content — first to last non-trivia
+    /// token, as [`crate::ast::BodyEntry::span`] is: the span a structural
+    /// suggestion names the entry by (a deletion resolves against it,
+    /// `cst::edit`) and the one every field-anchored finding renders
+    /// from. A synthesized field carries an empty span.
     pub span: Span,
+    /// The type expression's content span; a remedy that edits the type
+    /// (the `?` that makes a required seal the sanctioned optional
+    /// spelling, NML2054) anchors at its end. A synthesized field, or a
+    /// declaration the parser recovered without a type, carries the end
+    /// of `span`.
+    pub type_span: Span,
 }
 
 /// The value domain a facet list ranges over: `number` (RFC 0018) or
@@ -191,8 +202,6 @@ pub struct Facets<T> {
 
 /// The RFC 0018 numeric bound — [`FacetBoundOf`] over [`Number`](crate::types::Number).
 pub type FacetBound = FacetBoundOf<crate::types::Number>;
-/// The RFC 0018 numeric `multipleOf` — [`FacetMultipleOf`] over `Number`.
-pub type FacetMultiple = FacetMultipleOf<crate::types::Number>;
 /// Facets on a `number` field.
 pub type NumberFacets = Facets<crate::types::Number>;
 /// Facets on a `duration` field.
@@ -488,6 +497,9 @@ impl std::fmt::Display for FieldType {
 
 #[cfg(test)]
 mod facet_tests {
+    /// The RFC 0018 numeric `multipleOf` — [`FacetMultipleOf`] over `Number`.
+    type FacetMultiple = FacetMultipleOf<crate::types::Number>;
+
     use super::*;
     use crate::types::Number;
 

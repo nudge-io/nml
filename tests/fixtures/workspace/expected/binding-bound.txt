@@ -1,0 +1,6 @@
+file      tenants/cu/member-lookup.flow.nml
+root      tests/fixtures/workspace  (--root)
+binding   tenantFlows   demo blake3:be06ba4b, workspace manifest (demo.package.nml)
+anchor    .   matched files[0] = "tenants/**/*.flow.nml"   (auto-associated)
+layers    none — composition denied (NML2064)
+notes     tenants/cu/nml-project.nml: warning[NML2080]: project config `tenants/cu/nml-project.nml` is inert: it sits inside content claimed by binding 'tenantFlows' of demo.package.nml (files[0] = "tenants/**/*.flow.nml") — content, not configuration; its pins, autoAssociate, bindings and anchoring are ignored

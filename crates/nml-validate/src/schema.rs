@@ -5,12 +5,31 @@ use nml_core::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef, Primitiv
 use nml_core::resolve::ValueResolver;
 use nml_core::schema::{ExtractedSchema, report_graph_cycles};
 use nml_core::schema_index::{BodyShape, FieldTarget, SchemaIndex};
-use nml_core::span::Span;
+use nml_core::span::{Span, ValueSpan};
 use nml_core::types::{PrimitiveType, Value};
 
-use nml_core::diagnostic::{Diagnostic, codes};
+use nml_core::diagnostic::{Diagnostic, DiagnosticSink, Suggestion, codes};
 
+/// Nesting depth of instance validation against a model: bounds the
+/// recursion an adversarial instance body can drive.
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="64" — nesting depth of instance validation against a model
 const MAX_VALIDATION_DEPTH: u32 = 64;
+
+/// Mutually exclusive fixes offered for one ambiguous-union finding —
+/// one per candidate variant, capped: an adversarial 1000-variant union
+/// must not mint 1000 actions (the editor's `MAX_SUGGESTION_ACTIONS`
+/// mirrors it on the wire).
+///
+/// LIMIT: reach=content guards=output surface=kernel shown="8" — mutually exclusive fix alternatives offered for one finding
+const MAX_FIX_ALTERNATIVES: usize = 8;
+
+/// Echoed-value bound for a schema diagnostic: a string value is the
+/// one unbounded kind, so it truncates like nml-core's `echo` (32 chars
+/// + `…`) — a multi-KB literal cannot balloon a diagnostic.
+///
+/// LIMIT: reach=content guards=output surface=kernel shown="32" — source characters a schema diagnostic echoes back at you
+const MAX_ECHO: usize = 32;
 
 /// Diagnostic for a scalar shorthand item on a union-typed list — out of scope
 /// (RFC 0005 §10), flagged here in both the top-level and nested list paths.
@@ -20,7 +39,7 @@ const UNION_SHORTHAND_MSG: &str =
 /// Validates instance declarations against model definitions.
 ///
 /// In default mode, unknown properties are reported as warnings and blocks
-/// with no matching model are silently skipped.  Call [`Self::strict`] to
+/// with no matching model are silently skipped.  Call [`SchemaValidator::strict`] to
 /// promote unknown-property diagnostics to errors and to detect blocks /
 /// arrays whose keyword has no model definition.
 ///
@@ -178,7 +197,7 @@ impl SchemaValidator {
 
     /// Mark this validator's schema set as a closed vocabulary (RFC 0012) —
     /// see the field docs. Called by the package layer only.
-    pub fn closed_vocabulary(mut self) -> Self {
+    pub(crate) fn closed_vocabulary(mut self) -> Self {
         self.closed_vocabulary = true;
         self
     }
@@ -266,7 +285,7 @@ impl SchemaValidator {
         &self,
         keyword: &str,
         span: Span,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) -> bool {
         let Some(model) = self.find_model(keyword) else {
             return false;
@@ -286,7 +305,7 @@ impl SchemaValidator {
     }
 
     /// An "unknown property" diagnostic (warning by default, error under
-    /// [`Self::strict`]) with a near-miss suggestion against the model's
+    /// [`SchemaValidator::strict`]) with a near-miss suggestion against the model's
     /// declared fields when one is close enough. The suggestion span is the
     /// property-name token, so the quick-fix is machine-applicable.
     fn unknown_property_diagnostic(&self, name: &str, model: &ModelDef, span: Span) -> Diagnostic {
@@ -315,7 +334,7 @@ impl SchemaValidator {
         .with_code(codes::UNKNOWN_PROPERTY)
         .with_span(span);
         match nml_core::suggest::suggest(name, model.fields.iter().map(|f| f.name.as_str())) {
-            Some(s) => diag.with_suggestion(s, span),
+            Some(s) => diag.with_suggestion(Suggestion::did_you_mean(s).at(span)),
             None => diag,
         }
     }
@@ -328,7 +347,7 @@ impl SchemaValidator {
         body: &Body,
         inner: &FieldType,
         depth: u32,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         let shared: Vec<&SharedProperty> = body
             .entries
@@ -377,7 +396,7 @@ impl SchemaValidator {
         shared: &[&SharedProperty],
         models: &[&ModelDef],
         depth: u32,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         for sp in shared {
             let name = sp.name.name.as_str();
@@ -408,7 +427,7 @@ impl SchemaValidator {
                 candidates.sort_unstable();
                 candidates.dedup();
                 if let Some(s) = nml_core::suggest::suggest(name, candidates) {
-                    diag = diag.with_suggestion(s, sp.name.span);
+                    diag = diag.with_suggestion(Suggestion::did_you_mean(s).at(sp.name.span));
                 }
                 diags.push(diag);
                 continue;
@@ -421,7 +440,7 @@ impl SchemaValidator {
                             &only.field_type,
                             name,
                             "for shared property",
-                            sv.span,
+                            sv.spans(),
                             diags,
                         );
                     } else {
@@ -433,7 +452,7 @@ impl SchemaValidator {
                             &union,
                             name,
                             "for shared property",
-                            sv.span,
+                            sv.spans(),
                             diags,
                         );
                     }
@@ -466,7 +485,7 @@ impl SchemaValidator {
                             block_capable = true;
                             break;
                         }
-                        let mut local = Vec::new();
+                        let mut local: Vec<Diagnostic> = Vec::new();
                         if self.validate_target_instance(
                             &target,
                             body,
@@ -496,7 +515,7 @@ impl SchemaValidator {
                         );
                     } else if !ok {
                         if let Some(local) = first {
-                            diags.extend(local);
+                            diags.absorb(local);
                         }
                     }
                 }
@@ -517,7 +536,7 @@ impl SchemaValidator {
         shared: &[&SharedProperty],
         elem: &FieldTarget<'_>,
         depth: u32,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         for sp in shared {
             let name = sp.name.name.as_str();
@@ -539,7 +558,7 @@ impl SchemaValidator {
                                 &field.field_type,
                                 name,
                                 "for shared property",
-                                sv.span,
+                                sv.spans(),
                                 diags,
                             );
                         }
@@ -589,7 +608,7 @@ impl SchemaValidator {
         self.index.model(name)
     }
 
-    pub fn find_enum(&self, name: &str) -> Option<&EnumDef> {
+    pub(crate) fn find_enum(&self, name: &str) -> Option<&EnumDef> {
         self.index.enum_def(name)
     }
 
@@ -659,11 +678,21 @@ impl SchemaValidator {
     /// again. Instance typing stays exclusively in [`Self::validate`].
     pub fn validate_definitions(&self, file: &File) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
+        self.validate_definitions_into(file, &mut diagnostics);
+        diagnostics
+    }
+
+    /// [`Self::validate_definitions`], streamed into `diagnostics`.
+    pub(crate) fn validate_definitions_into(
+        &self,
+        file: &File,
+        diagnostics: &mut dyn DiagnosticSink,
+    ) {
         for decl in &file.declarations {
             if let DeclarationKind::Block(block) = &decl.kind {
                 let keyword = block.keyword.name.as_str();
-                if matches!(keyword, "model" | "trait" | "enum") {
-                    self.validate_body(&block.body, true, keyword, &mut diagnostics);
+                if nml_core::symbols::is_schema_keyword(keyword) {
+                    self.validate_body(&block.body, true, keyword, diagnostics);
                     if matches!(keyword, "model" | "trait") {
                         // Declared defaults are NOT checked here. Both
                         // their facet rules (NML2058, via
@@ -676,13 +705,19 @@ impl SchemaValidator {
                 }
             }
         }
-        diagnostics
     }
 
     /// Validate a parsed NML file against the loaded models.
     pub fn validate(&self, file: &File) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
+        self.validate_into(file, &mut diagnostics);
+        diagnostics
+    }
 
+    /// [`Self::validate`], streamed: every finding is PUSHED into
+    /// `diagnostics` as it is derived — a front end that reports as it
+    /// goes never holds a flood.
+    pub fn validate_into(&self, file: &File, diagnostics: &mut dyn DiagnosticSink) {
         // Schema names the *file itself* declares, split by composability.
         // In-file schema definitions are validated when a schema set is
         // loaded, not here — so in-file checks (the `is`-target twin below)
@@ -716,10 +751,10 @@ impl SchemaValidator {
         for decl in &file.declarations {
             match &decl.kind {
                 DeclarationKind::Block(block) => {
-                    self.validate_block(block, &file_locals, &mut diagnostics);
+                    self.validate_block(block, &file_locals, diagnostics);
                 }
                 DeclarationKind::Array(arr) => {
-                    self.validate_array(arr, &mut diagnostics);
+                    self.validate_array(arr, diagnostics);
                 }
                 // `oneof` declarations are schema definitions, validated when
                 // the schema is loaded; they carry no instance data here —
@@ -733,19 +768,17 @@ impl SchemaValidator {
             }
         }
 
-        self.validate_member_cycles(file, &mut diagnostics);
-
-        diagnostics
+        self.validate_member_cycles(file, diagnostics);
     }
 
     fn validate_block(
         &self,
         block: &BlockDecl,
         file_locals: &FileLocalSchema<'_>,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         let keyword = &block.keyword.name;
-        let is_schema_def = matches!(keyword.as_str(), "model" | "enum" | "trait");
+        let is_schema_def = nml_core::symbols::is_schema_keyword(keyword.as_str());
 
         if is_schema_def && self.closed_vocabulary {
             diags.push(self.ineffective_definition(keyword, block.keyword.span));
@@ -800,7 +833,8 @@ impl SchemaValidator {
                                 .map(|m| m.name.as_str())
                                 .chain(file_locals.composables.iter().copied()),
                         ) {
-                            diag = diag.with_suggestion(s, parent.span);
+                            diag =
+                                diag.with_suggestion(Suggestion::did_you_mean(s).at(parent.span));
                         }
                         diag
                     }
@@ -846,14 +880,14 @@ impl SchemaValidator {
                         .with_code(codes::UNKNOWN_BLOCK_KEYWORD)
                         .with_span(block.keyword.span);
                 if let Some(s) = nml_core::suggest::suggest(keyword, self.keyword_candidates()) {
-                    diag = diag.with_suggestion(s, block.keyword.span);
+                    diag = diag.with_suggestion(Suggestion::did_you_mean(s).at(block.keyword.span));
                 }
                 diags.push(diag);
             }
         }
     }
 
-    fn validate_array(&self, arr: &ArrayDecl, diags: &mut Vec<Diagnostic>) {
+    fn validate_array(&self, arr: &ArrayDecl, diags: &mut dyn DiagnosticSink) {
         // Array-level modifiers cover the items, so the *element* model's
         // modifier fields are the vocabulary.
         let elem_governing = self
@@ -865,7 +899,7 @@ impl SchemaValidator {
         }
 
         let keyword = &arr.item_keyword.name;
-        let is_schema_def = matches!(keyword.as_str(), "model" | "enum" | "trait");
+        let is_schema_def = nml_core::symbols::is_schema_keyword(keyword.as_str());
         // Traits are never element types either (RFC 0011): report once at
         // the keyword and skip item validation — the declaration is already
         // in error, and its items have no model to validate against.
@@ -900,7 +934,7 @@ impl SchemaValidator {
             .with_code(codes::UNKNOWN_ARRAY_KEYWORD)
             .with_span(arr.item_keyword.span);
             if let Some(s) = nml_core::suggest::suggest(keyword, self.keyword_candidates()) {
-                diag = diag.with_suggestion(s, arr.item_keyword.span);
+                diag = diag.with_suggestion(Suggestion::did_you_mean(s).at(arr.item_keyword.span));
             }
             diags.push(diag);
         }
@@ -960,7 +994,7 @@ impl SchemaValidator {
         elem: &FieldTarget,
         label: ElemLabel<'_>,
         depth: u32,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         use ListItemKind as K;
         let header = match &item.kind {
@@ -974,15 +1008,15 @@ impl SchemaValidator {
         // diagnostics, did-you-mean suggestions, fallback-leg recursion, all
         // of it (the spelling-parity property test pins this).
         let check_value = |value: &Value,
-                           span: Span,
+                           at: ValueSpan,
                            ty: &FieldType,
-                           diags: &mut Vec<Diagnostic>| {
-            self.validate_value_against_type(value, ty, label.field, label.container, span, diags);
+                           diags: &mut dyn DiagnosticSink| {
+            self.validate_value_against_type(value, ty, label.field, label.container, at, diags);
         };
         // Tier-2: content with nowhere to go is an error, never a silent
         // drop — NML2055, the body-side mirror of NML2049's dropped key.
         let dropped_body =
-            |body: &Body, ty: &FieldType, span: Span, diags: &mut Vec<Diagnostic>| {
+            |body: &Body, ty: &FieldType, span: Span, diags: &mut dyn DiagnosticSink| {
                 if !body.entries.is_empty() {
                     diags.push(
                         Diagnostic::error(format!(
@@ -1045,14 +1079,19 @@ impl SchemaValidator {
             // Leaf/Union: value items type-check; bodies have nowhere to go.
             FieldTarget::Leaf(ty) | FieldTarget::Union(ty) => match &item.kind {
                 K::Shorthand { value, body } => {
-                    check_value(&value.value, value.span, ty, diags);
+                    check_value(&value.value, value.spans(), ty, diags);
                     if let Some(b) = body {
                         dropped_body(b, ty, value.span, diags);
                     }
                 }
                 K::Named { name, body } => dropped_body(body, ty, name.span, diags),
                 K::Role(r) => {
-                    check_value(&Value::Role(r.clone()), item.span, ty, diags);
+                    check_value(
+                        &Value::Role(r.clone()),
+                        ValueSpan::whole(item.span),
+                        ty,
+                        diags,
+                    );
                 }
                 // References resolve later (a name may become the element's
                 // value downstream) — accepted anywhere, like `$ENV` refs.
@@ -1066,7 +1105,7 @@ impl SchemaValidator {
             // scalar gets the type mismatch).
             FieldTarget::ListOf(ty, _) | FieldTarget::SetOf(ty, _) => match &item.kind {
                 K::Shorthand { value, body } => {
-                    check_value(&value.value, value.span, ty, diags);
+                    check_value(&value.value, value.spans(), ty, diags);
                     if let Some(b) = body {
                         self.validate_target_instance(elem, b, depth, header, label, diags);
                     }
@@ -1074,7 +1113,12 @@ impl SchemaValidator {
                 K::Named { body, .. } => {
                     self.validate_target_instance(elem, body, depth, header, label, diags);
                 }
-                K::Role(r) => check_value(&Value::Role(r.clone()), item.span, ty, diags),
+                K::Role(r) => check_value(
+                    &Value::Role(r.clone()),
+                    ValueSpan::whole(item.span),
+                    ty,
+                    diags,
+                ),
                 K::Reference(_) => {}
             },
             // Free-form: accepts every shape by definition.
@@ -1103,9 +1147,9 @@ impl SchemaValidator {
         model: &ModelDef,
         depth: u32,
         header: Option<Span>,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
-        diags.extend(result.diagnostics);
+        diags.absorb(result.diagnostics);
         if result.validatable {
             self.validate_instance_against_model(&result.body, model, depth, header, diags);
         }
@@ -1121,7 +1165,7 @@ impl SchemaValidator {
         body: &Body,
         is_schema_def: bool,
         keyword: &str,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         // The governing model (concrete only) supplies the modifier
         // vocabulary when it declares modifier fields.
@@ -1183,7 +1227,7 @@ impl SchemaValidator {
         &self,
         m: &Modifier,
         governing: Option<&ModelDef>,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         // A model that declares modifier *fields* (`|allow []role?`) is the
         // vocabulary for its blocks — per-block precision the global list
@@ -1217,7 +1261,7 @@ impl SchemaValidator {
                     if let Some(sugg) =
                         nml_core::suggest::suggest(&m.name.name, declared.iter().copied())
                     {
-                        diag = diag.with_suggestion(sugg, m.name.span);
+                        diag = diag.with_suggestion(Suggestion::did_you_mean(sugg).at(m.name.span));
                     }
                     diags.push(diag);
                 }
@@ -1243,7 +1287,7 @@ impl SchemaValidator {
                 &m.name.name,
                 self.valid_modifiers.iter().map(String::as_str),
             ) {
-                diag = diag.with_suggestion(s, m.name.span);
+                diag = diag.with_suggestion(Suggestion::did_you_mean(s).at(m.name.span));
             }
             diags.push(diag);
         }
@@ -1263,7 +1307,7 @@ impl SchemaValidator {
         body: &Body,
         depth: u32,
         header_span: Option<Span>,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) -> bool {
         let Some(target) = self.index.resolve_ref(ref_name) else {
             // Unknown/enum name: a leaf reference with no instance shape to
@@ -1311,7 +1355,7 @@ impl SchemaValidator {
         body: &Body,
         union_span: Span,
         fix_anchor: Option<(&str, Span)>,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) -> bool {
         if let Some(ann) = &body.type_annotation {
             if self
@@ -1319,15 +1363,7 @@ impl SchemaValidator {
                 .select_variant_by_type_name(variants, &ann.name)
                 .is_none()
             {
-                let nameable = self.index.nameable_variant_names(variants);
-                let mut diag =
-                    Diagnostic::error(format!("`{}` is not a variant of this union", ann.name))
-                        .with_code(codes::UNKNOWN_UNION_VARIANT)
-                        .with_span(ann.span);
-                if let Some(s) = nml_core::suggest::suggest(&ann.name, nameable.iter().copied()) {
-                    diag = diag.with_suggestion(s.to_string(), ann.span);
-                }
-                diags.push(diag);
+                diags.push(self.index.unknown_union_variant(variants, ann));
                 return false;
             }
             return true;
@@ -1386,12 +1422,14 @@ impl SchemaValidator {
             .with_span(union_span);
             // One mutually exclusive Fix per candidate, ONLY where the
             // annotation is grammatical and meaning-preserving (a field header
-            // or a Named item — an anchored name token to extend). Capped: an
-            // adversarial 1000-variant union must not mint 1000 actions.
-            const MAX_FIX_ALTERNATIVES: usize = 8;
+            // or a Named item — an anchored name token to extend). Capped
+            // (`MAX_FIX_ALTERNATIVES`): an adversarial 1000-variant union must
+            // not mint 1000 actions.
             if let Some((anchor_name, anchor_span)) = fix_anchor {
                 for c in candidates.iter().take(MAX_FIX_ALTERNATIVES) {
-                    diag = diag.with_fix(format!("{anchor_name} as {}", c.name()), anchor_span);
+                    diag = diag.with_suggestion(
+                        Suggestion::fix(format!("{anchor_name} as {}", c.name())).at(anchor_span),
+                    );
                 }
             }
             diags.push(diag);
@@ -1409,7 +1447,7 @@ impl SchemaValidator {
         inner: &'a FieldType,
         item: &ListItem,
         probe: &Body,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) -> Option<FieldTarget<'a>> {
         if let FieldType::Union(variants) = inner {
             // A pure VALUE item (bare scalar / role) carries no body, so
@@ -1449,7 +1487,7 @@ impl SchemaValidator {
     /// complement of [`Self::check_union_annotation`]: together they make every
     /// annotated body either meaningful (union) or flagged (non-union), never
     /// silently ignored — the same single-source discipline everywhere.
-    fn flag_stray_annotation(&self, body: &Body, diags: &mut Vec<Diagnostic>) {
+    fn flag_stray_annotation(&self, body: &Body, diags: &mut dyn DiagnosticSink) {
         if let Some(ann) = &body.type_annotation {
             diags.push(
                 Diagnostic::error(format!(
@@ -1469,7 +1507,7 @@ impl SchemaValidator {
         depth: u32,
         header_span: Option<Span>,
         label: ElemLabel<'_>,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) -> bool {
         match target {
             FieldTarget::Model(m) => {
@@ -1534,7 +1572,7 @@ impl SchemaValidator {
         key: &FieldType,
         target: &FieldType,
         depth: u32,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         if depth >= MAX_VALIDATION_DEPTH {
             diags.push(truncation_advisory(body, None));
@@ -1621,7 +1659,7 @@ impl SchemaValidator {
                             &Value::String(selector.clone()),
                             enum_def,
                             "arm key",
-                            arm.selector_span,
+                            arm.selector_spans(),
                             diags,
                         );
                     } else if !self.index.arm_literal_key_admits(key, selector) {
@@ -1649,7 +1687,7 @@ impl SchemaValidator {
 
     /// Validate an inline instance body against a resolved target — shared by
     /// list items and inline arm targets so both spellings agree by construction.
-    fn validate_inline_body(&self, ctx: InlineBodyValidation<'_>, diags: &mut Vec<Diagnostic>) {
+    fn validate_inline_body(&self, ctx: InlineBodyValidation<'_>, diags: &mut dyn DiagnosticSink) {
         match ctx.elem {
             FieldTarget::Model(m) => {
                 let result = match ctx.name {
@@ -1662,15 +1700,48 @@ impl SchemaValidator {
                 };
                 self.validate_materialized(result, m, ctx.depth, ctx.header_span, diags);
             }
-            FieldTarget::OneOf(_) => {
-                self.validate_target_instance(
-                    ctx.elem,
-                    ctx.body,
-                    ctx.depth,
-                    ctx.header_span,
-                    ctx.label,
-                    diags,
-                );
+            FieldTarget::OneOf(oneof) => {
+                // A NAMED item under a oneof element materializes its
+                // name into the arm's `+` field exactly like a model
+                // element's item (the arm the body states, else the
+                // schema default — the same consult composition makes),
+                // or the arm's required positional field reads as
+                // missing on every raw block.
+                let arm = ctx.name.and_then(|_| {
+                    let stated = ctx.body.entries.iter().find_map(|e| match &e.kind {
+                        BodyEntryKind::Property(p) if p.name.name == oneof.discriminator => {
+                            p.value.value.as_str().map(str::to_string)
+                        }
+                        _ => None,
+                    });
+                    let disc = stated.or_else(|| oneof.default_discriminator.clone())?;
+                    oneof
+                        .variants
+                        .iter()
+                        .find(|(v, _)| *v == disc)
+                        .and_then(|(_, m)| self.find_model(m))
+                });
+                let materialized = match (ctx.name, arm) {
+                    (Some(name), Some(arm)) => {
+                        nml_core::identity::materialize_arm_inline(name, ctx.body, arm)
+                    }
+                    _ => nml_core::identity::Materialized {
+                        body: ctx.body.clone(),
+                        diagnostics: Vec::new(),
+                        validatable: true,
+                    },
+                };
+                diags.absorb(materialized.diagnostics);
+                if materialized.validatable {
+                    self.validate_target_instance(
+                        ctx.elem,
+                        &materialized.body,
+                        ctx.depth,
+                        ctx.header_span,
+                        ctx.label,
+                        diags,
+                    );
+                }
             }
             FieldTarget::Leaf(ty) | FieldTarget::Union(ty) => {
                 if !ctx.body.entries.is_empty() {
@@ -1711,18 +1782,18 @@ impl SchemaValidator {
         arm_target: &ArmTarget,
         v: &FieldType,
         depth: u32,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         match arm_target {
             ArmTarget::Reference(_) => {}
-            ArmTarget::Literal { value, span } => {
+            ArmTarget::Literal(literal) => {
                 if self.index.field_type_admits_a_literal(v) {
                     self.validate_value_against_type(
-                        &Value::String(value.clone()),
+                        &Value::String(literal.value.clone()),
                         v,
                         "arm target",
                         "for",
-                        *span,
+                        literal.spans(),
                         diags,
                     );
                 } else {
@@ -1733,7 +1804,7 @@ impl SchemaValidator {
                              inline block ('-> Name:')"
                         ))
                         .with_code(codes::ARM_TARGET_MISMATCH)
-                        .with_span(*span),
+                        .with_span(literal.span),
                     );
                 }
             }
@@ -1778,7 +1849,7 @@ impl SchemaValidator {
         model: &ModelDef,
         depth: u32,
         header_span: Option<Span>,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         if depth >= MAX_VALIDATION_DEPTH {
             diags.push(truncation_advisory(body, header_span));
@@ -1799,7 +1870,7 @@ impl SchemaValidator {
                             &field_def.field_type,
                             &field_def.name,
                             "for",
-                            prop.value.span,
+                            prop.value.spans(),
                             diags,
                         );
                     } else {
@@ -1951,7 +2022,12 @@ impl SchemaValidator {
                     }
                 }
                 BodyEntryKind::Modifier(m) => {
-                    seen_fields.push(&m.name.name);
+                    // A type-annotation modifier (`|slot (a | b)`) is a
+                    // declaration, never a value (RFC 0019 errata E12):
+                    // it satisfies no required field.
+                    if !matches!(m.value, ModifierValue::TypeAnnotation { .. }) {
+                        seen_fields.push(&m.name.name);
+                    }
 
                     if let Some(field_def) = model.fields.iter().find(|f| f.name == m.name.name) {
                         self.validate_modifier_value(m, field_def, diags);
@@ -2043,7 +2119,7 @@ impl SchemaValidator {
         oneof: &OneOfDef,
         depth: u32,
         header_span: Option<Span>,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         if depth >= MAX_VALIDATION_DEPTH {
             diags.push(truncation_advisory(body, header_span));
@@ -2069,6 +2145,34 @@ impl SchemaValidator {
             BodyEntryKind::Property(prop) if prop.name.name == oneof.discriminator => Some(prop),
             _ => None,
         });
+        // EVERY later entry of that name must be a string too: composition
+        // re-adds the effective string discriminator ahead of a dependent's
+        // `kind = 5`, so a first-only check laundered the dependent's type
+        // error through the composed view (NML2042 raw, silence composed).
+        for prop in body
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                BodyEntryKind::Property(prop) if prop.name.name == oneof.discriminator => {
+                    Some(prop)
+                }
+                _ => None,
+            })
+            .skip(1)
+        {
+            if !matches!(prop.value.value, Value::String(_)) {
+                diags.push(
+                    Diagnostic::error(format!(
+                        "discriminator '{}' for oneof '{}' must be a string (one of: {})",
+                        oneof.discriminator,
+                        oneof.name,
+                        valid_values(),
+                    ))
+                    .with_code(codes::INVALID_DISCRIMINATOR)
+                    .with_span(prop.value.span),
+                );
+            }
+        }
 
         let Some(discriminator) = discriminator else {
             // An omitted discriminator is valid when the union declares a default —
@@ -2131,7 +2235,9 @@ impl SchemaValidator {
             {
                 // The discriminator is a string literal (guarded above); the
                 // fix replaces its content, not its quotes.
-                diag = diag.with_suggestion(v, string_content_span(discriminator.value.span));
+                diag = diag.with_suggestion(
+                    Suggestion::did_you_mean(v).at(discriminator.value.spans().content),
+                );
             }
             diags.push(diag);
             return;
@@ -2171,7 +2277,12 @@ impl SchemaValidator {
 
     /// Validate a modifier's value against the type declared in the model
     /// (e.g. `|allow []string?`).
-    fn validate_modifier_value(&self, m: &Modifier, field: &FieldDef, diags: &mut Vec<Diagnostic>) {
+    fn validate_modifier_value(
+        &self,
+        m: &Modifier,
+        field: &FieldDef,
+        diags: &mut dyn DiagnosticSink,
+    ) {
         let FieldType::Modifier(declared) = &field.field_type else {
             return;
         };
@@ -2183,7 +2294,7 @@ impl SchemaValidator {
                     declared,
                     &field.name,
                     "for",
-                    sv.span,
+                    sv.spans(),
                     diags,
                 );
             }
@@ -2214,7 +2325,7 @@ impl SchemaValidator {
                                 inner,
                                 &field.name,
                                 "in array",
-                                sv.span,
+                                sv.spans(),
                                 diags,
                             );
                         }
@@ -2224,7 +2335,7 @@ impl SchemaValidator {
                                 inner,
                                 &field.name,
                                 "in array",
-                                item.span,
+                                ValueSpan::whole(item.span),
                                 diags,
                             );
                         }
@@ -2267,9 +2378,10 @@ impl SchemaValidator {
         field_type: &FieldType,
         field_name: &str,
         context: &str,
-        span: Span,
-        diags: &mut Vec<Diagnostic>,
+        at: ValueSpan,
+        diags: &mut dyn DiagnosticSink,
     ) {
+        let span = at.whole;
         // The RFC 0047 resolved lane runs exactly ONCE per declared value,
         // here — before the fallback split below. Resolution
         // short-circuits on the first leg that succeeds, so resolving the
@@ -2301,7 +2413,7 @@ impl SchemaValidator {
             }
         }
 
-        self.validate_value_type_only(value, field_type, field_name, context, span, diags);
+        self.validate_value_type_only(value, field_type, field_name, context, at, diags);
     }
 
     /// The TYPE/shape half, with the resolved lane already run once for
@@ -2318,8 +2430,8 @@ impl SchemaValidator {
         field_type: &FieldType,
         field_name: &str,
         context: &str,
-        span: Span,
-        diags: &mut Vec<Diagnostic>,
+        at: ValueSpan,
+        diags: &mut dyn DiagnosticSink,
     ) {
         if let Value::Fallback(primary, fallback) = value {
             self.validate_value_type_only(
@@ -2327,7 +2439,7 @@ impl SchemaValidator {
                 field_type,
                 field_name,
                 context,
-                primary.span,
+                primary.spans(),
                 diags,
             );
             self.validate_value_type_only(
@@ -2335,12 +2447,12 @@ impl SchemaValidator {
                 field_type,
                 field_name,
                 context,
-                fallback.span,
+                fallback.spans(),
                 diags,
             );
             return;
         }
-        self.validate_non_fallback_value(value, field_type, field_name, context, span, diags);
+        self.validate_non_fallback_value(value, field_type, field_name, context, at, diags);
     }
 
     /// The type/shape half of [`Self::validate_value_against_type`], with
@@ -2353,9 +2465,10 @@ impl SchemaValidator {
         field_type: &FieldType,
         field_name: &str,
         context: &str,
-        span: Span,
-        diags: &mut Vec<Diagnostic>,
+        at: ValueSpan,
+        diags: &mut dyn DiagnosticSink,
     ) {
+        let span = at.whole;
         match field_type {
             FieldType::Primitive { ty: prim, facets } => {
                 self.validate_primitive_value(value, prim, field_name, context, span, diags);
@@ -2383,7 +2496,7 @@ impl SchemaValidator {
             }
             FieldType::ModelRef(ref_name) => {
                 if let Some(enum_def) = self.find_enum(ref_name) {
-                    self.validate_enum_value(value, enum_def, field_name, span, diags);
+                    self.validate_enum_value(value, enum_def, field_name, at, diags);
                 } else {
                     self.validate_model_ref_value(value, ref_name, field_name, span, diags);
                 }
@@ -2396,7 +2509,7 @@ impl SchemaValidator {
                             inner,
                             field_name,
                             "in array",
-                            item.span,
+                            item.spans(),
                             diags,
                         );
                     }
@@ -2422,7 +2535,7 @@ impl SchemaValidator {
                             inner,
                             field_name,
                             "in set",
-                            item.span,
+                            item.spans(),
                             diags,
                         );
                     }
@@ -2526,13 +2639,13 @@ impl SchemaValidator {
                         // the resolved lane once per candidate variant
                         // — resolving an `$ENV` repeatedly to judge one
                         // declared value.
-                        let mut scratch = Vec::new();
+                        let mut scratch: Vec<Diagnostic> = Vec::new();
                         self.validate_value_type_only(
                             value,
                             v,
                             field_name,
                             context,
-                            span,
+                            at,
                             &mut scratch,
                         );
                         if scratch.is_empty() {
@@ -2545,7 +2658,7 @@ impl SchemaValidator {
                     }
                     if !admitted {
                         if let Some(d) = first_rejection {
-                            diags.extend(d);
+                            diags.absorb(d);
                         }
                     }
                 }
@@ -2554,7 +2667,7 @@ impl SchemaValidator {
                 // Type-only re-entry: this is the SAME value one layer
                 // down, not a nested one, and the public door already ran
                 // its resolved-lane check through this wrapper.
-                self.validate_value_type_only(value, declared, field_name, context, span, diags);
+                self.validate_value_type_only(value, declared, field_name, context, at, diags);
             }
             FieldType::Arms { .. } => {
                 // An arm set is a block of arms, never a scalar value.
@@ -2627,7 +2740,7 @@ impl SchemaValidator {
         field_name: &str,
         context: &str,
         span: Span,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         if value_matches_primitive(value, prim) {
             return;
@@ -2662,7 +2775,7 @@ impl SchemaValidator {
                         ))
                         .with_code(codes::REPLACED_SYNTAX)
                         .with_span(span)
-                        .with_suggestion(canonical, span),
+                        .with_suggestion(Suggestion::did_you_mean(canonical).at(span)),
                     );
                     return;
                 }
@@ -2695,7 +2808,7 @@ impl SchemaValidator {
                         ))
                         .with_code(codes::REPLACED_SYNTAX)
                         .with_span(span)
-                        .with_suggestion(canonical, span),
+                        .with_suggestion(Suggestion::did_you_mean(canonical).at(span)),
                     );
                     return;
                 }
@@ -2711,7 +2824,7 @@ impl SchemaValidator {
                         ))
                         .with_code(codes::REPLACED_SYNTAX)
                         .with_span(span)
-                        .with_suggestion(text.clone(), span),
+                        .with_suggestion(Suggestion::did_you_mean(text.clone()).at(span)),
                     );
                     return;
                 }
@@ -2761,7 +2874,7 @@ impl SchemaValidator {
                     Diagnostic::warning(msg)
                         .with_code(codes::ROLE_LITERAL)
                         .with_span(span)
-                        .with_suggestion(replacement, span),
+                        .with_suggestion(Suggestion::did_you_mean(replacement).at(span)),
                 );
                 return;
             }
@@ -2791,9 +2904,10 @@ impl SchemaValidator {
         value: &Value,
         enum_def: &EnumDef,
         field_name: &str,
-        span: Span,
-        diags: &mut Vec<Diagnostic>,
+        at: ValueSpan,
+        diags: &mut dyn DiagnosticSink,
     ) {
+        let span = at.whole;
         let variants = || {
             enum_def
                 .variants
@@ -2819,14 +2933,12 @@ impl SchemaValidator {
                         nml_core::suggest::suggest(s, enum_def.variants.iter().map(String::as_str))
                     {
                         // Machine-applicable fix (RFC 0030): replace the value
-                        // *content* with the canonical variant. A string
-                        // literal's span includes its quotes, so the content
-                        // span excludes them; a bare reference has none.
-                        let content_span = match value {
-                            Value::String(_) => string_content_span(span),
-                            _ => span,
-                        };
-                        diag = diag.with_suggestion(v, content_span);
+                        // *content* with the canonical variant. The window is
+                        // the one the AST carries from the token (a bare
+                        // reference's is its whole span) — never re-derived
+                        // from the span, which cannot tell a terminated
+                        // literal from an unterminated one.
+                        diag = diag.with_suggestion(Suggestion::did_you_mean(v).at(at.content));
                     }
                     diags.push(diag);
                 }
@@ -2853,7 +2965,7 @@ impl SchemaValidator {
         ref_name: &str,
         field_name: &str,
         span: Span,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         match value {
             Value::Reference(_)
@@ -2875,7 +2987,7 @@ impl SchemaValidator {
         }
     }
 
-    fn validate_modifier_content(&self, m: &Modifier, diags: &mut Vec<Diagnostic>) {
+    fn validate_modifier_content(&self, m: &Modifier, diags: &mut dyn DiagnosticSink) {
         let prefix = match &self.membership.user_ref_prefix {
             Some(p) => p,
             None => return,
@@ -2908,7 +3020,7 @@ impl SchemaValidator {
         value: &Value,
         span: Span,
         prefix: &str,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         match value {
             Value::Role(r) if r.starts_with(prefix) => {
@@ -2933,7 +3045,7 @@ impl SchemaValidator {
         &self,
         body: &Body,
         keyword: &str,
-        diags: &mut Vec<Diagnostic>,
+        diags: &mut dyn DiagnosticSink,
     ) {
         if self.membership.member_keywords.is_empty()
             || !self.membership.member_keywords.iter().any(|k| k == keyword)
@@ -2947,7 +3059,7 @@ impl SchemaValidator {
         }
     }
 
-    fn check_builtin_in_nested_members(&self, body: &Body, diags: &mut Vec<Diagnostic>) {
+    fn check_builtin_in_nested_members(&self, body: &Body, diags: &mut dyn DiagnosticSink) {
         if self.membership.builtin_refs.is_empty() {
             return;
         }
@@ -2974,7 +3086,7 @@ impl SchemaValidator {
         }
     }
 
-    fn validate_member_cycles(&self, file: &File, diags: &mut Vec<Diagnostic>) {
+    fn validate_member_cycles(&self, file: &File, diags: &mut dyn DiagnosticSink) {
         if self.membership.member_keywords.is_empty() {
             return;
         }
@@ -3087,7 +3199,7 @@ fn truncation_advisory(body: &Body, header_span: Option<Span>) -> Diagnostic {
 /// RFC 0032 set uniqueness over list items — the one emitter for every
 /// item-set surface: error at the second occurrence, span-blind value
 /// identity for scalars, name identity for named items.
-fn push_duplicate_set_items(items: &[&ListItem], diags: &mut Vec<Diagnostic>) {
+fn push_duplicate_set_items(items: &[&ListItem], diags: &mut dyn DiagnosticSink) {
     for (i, item) in items.iter().enumerate() {
         if let Some(earlier) = items[..i].iter().find(|p| set_items_equal(p, item)) {
             let clarifier = match (&earlier.kind, &item.kind) {
@@ -3151,7 +3263,7 @@ fn field_type_shape_errors(
     field_type: &FieldTypeExpr,
     forbidden_context: Option<&'static str>,
     span: Span,
-    diags: &mut Vec<Diagnostic>,
+    diags: &mut dyn DiagnosticSink,
 ) {
     match field_type {
         FieldTypeExpr::Named { .. } => {}
@@ -3267,7 +3379,7 @@ fn type_has_facets(t: &FieldType) -> bool {
 /// double-report. Safe on a PARTIAL schema view (the LSP's open-buffer
 /// registry): an unresolvable model or enum reference degrades to a
 /// value-shape check, never a false "unknown definition".
-pub fn default_diagnostics(schema: &ExtractedSchema) -> Vec<Diagnostic> {
+pub(crate) fn default_diagnostics(schema: &ExtractedSchema) -> Vec<Diagnostic> {
     // The clone is deliberate. `SchemaValidator` owns its definitions,
     // and threading a borrowed one through would widen its API for a
     // measured 46 µs on a real 85-model schema set — a quarter of one
@@ -3285,13 +3397,13 @@ pub fn default_diagnostics(schema: &ExtractedSchema) -> Vec<Diagnostic> {
             let Some(default) = &field.default_value else {
                 continue;
             };
-            let mut scratch = Vec::new();
+            let mut scratch: Vec<Diagnostic> = Vec::new();
             validator.validate_value_against_type(
                 &default.value,
                 &field.field_type,
                 &field.name,
                 "as the default for",
-                default.span,
+                default.spans(),
                 &mut scratch,
             );
             scratch.retain(|d| d.code != Some(codes::FACET_VIOLATION));
@@ -3316,7 +3428,7 @@ fn validate_facets<T: nml_core::model::FacetDomain>(
     value: &T,
     field_name: &str,
     span: Span,
-    diags: &mut Vec<Diagnostic>,
+    diags: &mut dyn DiagnosticSink,
 ) {
     for tail in facets.violations(value) {
         diags.push(
@@ -3346,7 +3458,7 @@ fn check_resolved_facets(
     value: &Value,
     field_name: &str,
     span: Span,
-    diags: &mut Vec<Diagnostic>,
+    diags: &mut dyn DiagnosticSink,
 ) {
     // A value that needs no resolution was already judged by the literal
     // facet arm; re-checking it here would double-report.
@@ -3407,7 +3519,7 @@ fn validate_facets_resolved<T: nml_core::model::FacetDomain>(
     var: &str,
     field_name: &str,
     span: Span,
-    diags: &mut Vec<Diagnostic>,
+    diags: &mut dyn DiagnosticSink,
 ) {
     for desc in facets.violation_descriptions(value) {
         diags.push(
@@ -3466,7 +3578,6 @@ fn duplicate_clarifier(earlier: &Value, current: &Value) -> String {
 fn value_label(value: &Value) -> String {
     match value {
         Value::String(s) | Value::Role(s) => {
-            const MAX_ECHO: usize = 32;
             if s.chars().count() > MAX_ECHO {
                 let head: String = s.chars().take(MAX_ECHO).collect();
                 format!(" '{head}…'")
@@ -3502,17 +3613,6 @@ fn value_type_name(value: &Value) -> &'static str {
     }
 }
 
-/// The content span of a string literal: the literal's span includes its
-/// quotes, so a machine-applicable replacement targets the inside. Degenerate
-/// spans (too short to contain quotes) are returned unchanged.
-fn string_content_span(span: Span) -> Span {
-    if span.end > span.start + 1 {
-        Span::new(span.start + 1, span.end - 1)
-    } else {
-        span
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -3532,6 +3632,77 @@ mod tests {
 
     fn diags(schema: &str, source: &str) -> Vec<Diagnostic> {
         let file = nml_core::cst::parse_to_ast(source).unwrap();
+        make_validator(schema).validate(&file)
+    }
+
+    /// RFC 0026 decision 2: a did-you-mean over an UNTERMINATED string
+    /// literal targets the literal's real content. The token has no closing
+    /// quote, and the producer used to strip one anyway — which cut the last
+    /// character in half when it was multi-byte, so the span fell inside a
+    /// character. Both appliers refuse such a span, so the defect cost the
+    /// fix rather than corrupting a file; an embedder splicing by byte
+    /// offset would have corrupted one. (`\u{85}` is the shape the
+    /// `validate` fuzz target crashed on.)
+    #[test]
+    fn a_did_you_mean_over_an_unterminated_literal_targets_a_whole_character() {
+        let schema = "enum httpMethod:\n    - \"GET\"\n    - \"POST\"\n\
+                      model record:\n    method httpMethod\n";
+        for tail in ["GE\u{85}", "caf\u{e9}", "GE\u{1f600}", "GE", ""] {
+            let source = format!("record r:\n    method = \"{tail}");
+            let found = diags_best_effort(schema, &source);
+            for d in &found {
+                for s in &d.suggestions {
+                    assert!(
+                        s.span.end <= source.len()
+                            && source.is_char_boundary(s.span.start)
+                            && source.is_char_boundary(s.span.end),
+                        "{tail:?}: suggestion span {:?} is not on character boundaries",
+                        s.span
+                    );
+                    // The window is the literal's real content: everything
+                    // after the opening quote, nothing stripped from an end
+                    // that has no delimiter.
+                    assert_eq!(&source[s.span.start..s.span.end], tail, "{tail:?}");
+                }
+            }
+        }
+    }
+
+    /// The validator over a BEST-EFFORT tree — the editor's path, where a
+    /// body naming an entry twice has already drawn the parse band's
+    /// NML2093 and the typed walk still judges every entry as authored.
+    /// RFC 0026 decision 2 at its THIRD carrier, the ARM SELECTOR.
+    /// `Arm::selector_content` is the window the AST carries from the
+    /// selector's token, and the arm-key check splices a did-you-mean at it.
+    /// The corpus pin
+    /// (`an_unterminated_literal_carries_a_character_boundary_content_window`)
+    /// judges every `*.content` site by the BYTE rule — in bounds, on
+    /// character boundaries — which the WHOLE token span also satisfies, so
+    /// nothing pinned that the window excludes the delimiters. Carrying the
+    /// token span here rewrites `"GE" -> h` as `GET -> h`: an unquoted
+    /// selector, a corrupt fix, and every other pin green.
+    #[test]
+    fn a_did_you_mean_over_an_arm_selector_targets_the_selectors_content() {
+        let schema = "enum httpMethod:\n    - \"GET\"\n    - \"POST\"\n\
+                      model handler:\n    name string\n\
+                      model router:\n    routes (httpMethod -> handler)\n";
+        let source =
+            "handler h:\n    name = \"x\"\n\nrouter r:\n    routes:\n        \"GE\" -> h\n";
+        let spans: Vec<_> = diags_best_effort(schema, source)
+            .iter()
+            .flat_map(|d| d.suggestions.clone())
+            .map(|s| s.span)
+            .collect();
+        assert_eq!(spans.len(), 1, "one did-you-mean over the arm selector");
+        assert_eq!(
+            &source[spans[0].start..spans[0].end],
+            "GE",
+            "the window is the selector's CONTENT — its delimiters excluded"
+        );
+    }
+
+    fn diags_best_effort(schema: &str, source: &str) -> Vec<Diagnostic> {
+        let file = nml_core::cst::parse_best_effort(source);
         make_validator(schema).validate(&file)
     }
 
@@ -5121,6 +5292,123 @@ workflow W:
     }
 
     #[test]
+    fn a_type_annotation_modifier_satisfies_no_required_field() {
+        // RFC 0019 errata E12: `|deny []string` inside an instance body
+        // is a declaration, never a value — the required field stays
+        // missing until a real value is written.
+        let schema = "model m:\n    |deny []string\n    name string\n";
+        let decl_only = diags(schema, "m a:\n    |deny []string\n    name = \"n\"\n");
+        assert!(
+            decl_only
+                .iter()
+                .any(|d| d.code == Some(codes::MISSING_REQUIRED_FIELD)
+                    && d.message.contains("'deny'")),
+            "{decl_only:?}"
+        );
+        let with_value = diags(
+            schema,
+            "m b:\n    |deny []string\n    |deny = [\"a\"]\n    name = \"n\"\n",
+        );
+        assert!(
+            with_value.is_empty(),
+            "a real value satisfies it: {with_value:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_item_under_a_oneof_element_credits_the_arms_positional_field() {
+        // `- a: kind = "a"` under `steps []oo` where the arm declares
+        // `name string+`: the name is the `+` field, exactly as under a
+        // model element — no phantom NML2007 on the raw block.
+        let schema = "model arma:\n    name string+\n    kind string?\n\n\
+                      model armb:\n    name string+\n    kind string?\n    z string\n\n\
+                      oneof oo by kind = \"a\":\n    \"a\" -> arma\n    \"b\" -> armb\n\n\
+                      model flow:\n    steps []oo\n";
+        let d = diags(
+            schema,
+            "flow f:\n    steps:\n        - a:\n            kind = \"a\"\n        - b:\n            kind = \"b\"\n            z = \"1\"\n        - c:\n",
+        );
+        assert!(d.is_empty(), "{d:?}");
+        // The arm's other required field is still required.
+        let d = diags(
+            schema,
+            "flow g:\n    steps:\n        - b:\n            kind = \"b\"\n",
+        );
+        assert_eq!(
+            d.iter()
+                .filter(|d| d.code == Some(codes::MISSING_REQUIRED_FIELD))
+                .count(),
+            1,
+            "{d:?}"
+        );
+        assert!(d[0].message.contains("'z'"), "{}", d[0].message);
+    }
+
+    #[test]
+    fn every_discriminator_entry_must_be_a_string() {
+        // A first-only check laundered a dependent's `kind = 5` through the
+        // composed view (the effective string discriminator is re-added
+        // ahead of it): every entry of that name is checked — over the
+        // best-effort tree the editor validates (the repeat itself is the
+        // parse's NML2093; `parse_to_ast` refuses such text).
+        let schema = "model arma:\n    kind string\n    a string\n\n\
+                      oneof oo by kind:\n    \"a\" -> arma\n\nmodel h:\n    cfg oo\n";
+        let d = diags_best_effort(
+            schema,
+            "h x:\n    cfg:\n        kind = \"a\"\n        a = \"1\"\n        kind = 5\n",
+        );
+        assert_eq!(
+            d.iter()
+                .filter(|d| d.code == Some(codes::INVALID_DISCRIMINATOR))
+                .count(),
+            1,
+            "{d:?}"
+        );
+        // The count contract: every non-string entry, first or later,
+        // exactly once; a duplicate STRING is not this finding.
+        for (body, want) in [
+            ("kind = \"a\"\n        kind = 5\n        kind = true\n", 2),
+            ("kind = \"a\"\n        kind = \"a\"\n", 0),
+            ("kind = 5\n        kind = \"a\"\n", 1),
+            ("kind = 5\n        kind = 6\n", 2),
+        ] {
+            let d = diags_best_effort(
+                schema,
+                &format!("h x:\n    cfg:\n        {body}        a = \"1\"\n"),
+            );
+            assert_eq!(
+                d.iter()
+                    .filter(|d| d.code == Some(codes::INVALID_DISCRIMINATOR))
+                    .count(),
+                want,
+                "{body:?}: {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_variant_naming_a_list_element_gets_the_honest_form() {
+        // `as ub` where `ub` is only a list variant's ELEMENT: not a
+        // nameable variant, and "did you mean ua" would mislead — the
+        // shared builder says so, with no suggestion (one message, one
+        // home, byte-identical with the compose engine's).
+        let diags = diags_for(
+            "model ua:\n    x string\n\nmodel ub:\n    k string\n\n\
+             model host:\n    slot (ua | []ub)\n",
+            "host H:\n    slot as ub:\n        x = \"1\"\n",
+        );
+        let d = diags
+            .iter()
+            .find(|d| d.code == Some(codes::UNKNOWN_UNION_VARIANT))
+            .expect("unknown-variant error");
+        assert!(
+            d.message.contains("names a list variant's element") && d.suggestions.is_empty(),
+            "honest form, no did-you-mean: {d:?}"
+        );
+        assert_eq!(diags.len(), 1, "no guessed-variant noise: {diags:?}");
+    }
+
+    #[test]
     fn unknown_variant_annotation_errors_with_did_you_mean() {
         let diags = diags_for(
             SAME_CLASS_SCHEMA,
@@ -5411,6 +5699,50 @@ workflow W:
             d2.message.contains("block form"),
             "the message steers to the block form: {}",
             d2.message
+        );
+    }
+
+    /// The alternative bound, exactly — a union
+    /// of [`MAX_FIX_ALTERNATIVES`] + 4 same-class variants mints
+    /// [`MAX_FIX_ALTERNATIVES`] fixes, not one per variant.
+    #[test]
+    fn d2_fix_alternatives_are_capped_at_the_bound() {
+        use nml_core::diagnostic::SuggestionKind;
+        let names: Vec<String> = (0..MAX_FIX_ALTERNATIVES + 4)
+            .map(|i| format!("v{i:02}"))
+            .collect();
+        let mut schema = String::new();
+        for n in &names {
+            schema.push_str(&format!("model {n}:\n    a string?\n"));
+        }
+        schema.push_str(&format!("model host:\n    slot ({})?\n", names.join(" | ")));
+        let diags = diags_for(&schema, "host H:\n    slot:\n        a = \"x\"\n");
+        let d2 = diags
+            .iter()
+            .find(|d| d.code == Some(codes::AMBIGUOUS_UNION_INSTANCE))
+            .expect("D2");
+        let fixes = d2
+            .suggestions
+            .iter()
+            .filter(|s| s.kind == SuggestionKind::Fix)
+            .count();
+        assert_eq!(fixes, MAX_FIX_ALTERNATIVES, "{d2:?}");
+    }
+
+    /// A schema diagnostic echoes a string value
+    /// up to [`MAX_ECHO`] characters and an ellipsis; at the bound it
+    /// echoes whole.
+    #[test]
+    fn value_label_echoes_at_most_max_echo_characters() {
+        let long = "q".repeat(MAX_ECHO + 9);
+        assert_eq!(
+            value_label(&Value::String(long)),
+            format!(" '{}…'", "q".repeat(MAX_ECHO))
+        );
+        let exact = "q".repeat(MAX_ECHO);
+        assert_eq!(
+            value_label(&Value::String(exact.clone())),
+            format!(" '{exact}'")
         );
     }
 
@@ -6654,6 +6986,8 @@ workflow W:
                     keyword: Identifier::new("tree", span),
                     name: Identifier::new("Root", span),
                     extends: vec![],
+                    uses: vec![],
+                    uses_span: None,
                     body,
                 }),
                 span,
@@ -8010,14 +8344,15 @@ mod resolved_facet_tests {
     fn fallback_to_violating_literal_reports_once() {
         let schema = "model svc:\n    port number(min = 4000)\n";
         let body = "svc A:\n    port = 3000 | $ENV.P\n";
-        for env in [
-            &[][..],
-            &[("P", "9000")][..], // primary literal wins regardless
-        ] {
-            let diags = diags_with_env(schema, body, unsafe {
-                // The helper takes &'static; these literals are static.
-                std::mem::transmute::<&[(&str, &str)], &'static [(&'static str, &'static str)]>(env)
-            });
+        // The helper takes `&'static` slices; a `const` array of them is
+        // `'static` by construction (no `unsafe` lifetime laundering — the
+        // crate forbids `unsafe_code`).
+        const ENVS: [&[(&str, &str)]; 2] = [
+            &[],
+            &[("P", "9000")], // primary literal wins regardless
+        ];
+        for env in ENVS {
+            let diags = diags_with_env(schema, body, env);
             assert_eq!(
                 facet_errors(&diags).len(),
                 1,

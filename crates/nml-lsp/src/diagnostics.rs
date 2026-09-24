@@ -1,5 +1,5 @@
 use nml_core::ast::*;
-use nml_core::diagnostic::{Severity, codes};
+use nml_core::diagnostic::{Severity, Suggestion, codes};
 use nml_core::model::{EnumDef, ModelDef, OneOfDef};
 use nml_core::types::{TemplateSegment, Value};
 use nml_validate::schema::{MembershipSemantics, SchemaValidator};
@@ -28,6 +28,22 @@ pub struct DiagnosticConfig {
     /// judging composition would report false "unknown `is` target" errors
     /// for parents the registry validator resolves fine.
     pub load_pass_owns_composition: bool,
+    /// The universe's composition grant for this document (step 0e: the
+    /// kernel's `Grant`, the CLI's own verdict), `None` for the open
+    /// developer context — a file outside every root, a buffer the
+    /// server resolves through no universe.
+    pub grant: Option<nml_validate::workspace::Grant>,
+}
+
+impl DiagnosticConfig {
+    /// The provider `compose_file` asks: the universe's grant, else the
+    /// open context.
+    fn grant_provider(&self) -> &dyn nml_core::layers::LayerGrantProvider {
+        match &self.grant {
+            Some(grant) => grant,
+            None => &nml_core::layers::OpenContext,
+        }
+    }
 }
 
 /// Where schema validation for a document comes from (RFC 0030).
@@ -51,14 +67,185 @@ pub enum SchemaMode<'a> {
 }
 
 /// Compute diagnostics for an NML source document.
-pub fn compute(
+/// Compose the buffer's same-file `uses` stacks and validate the
+/// RESOLVED view — the editor and `nml check` must agree on every
+/// uses-bearing file: validating a raw overlay body reports phantom
+/// missing-required errors on files `check` accepts, and misses every
+/// compose finding (NML2059–NML2084). Mirrors `cmd_check` exactly:
+/// compose diagnostics first, then the validator STREAMED over the
+/// substituted validation view through the kernel's one deduplicating
+/// sink (`layers::Deduped`, seeded by `ComposedFile::dedup_seed` — a
+/// base defect cloned into every overlay's resolved body is one
+/// finding, not one per overlay) into a `Bounded` tranche of
+/// [`MAX_DIAGNOSTICS`]: the editor holds no more validator
+/// findings than it publishes, and returns how many it counted past the
+/// cap — exact, for the summary row. `keep` is the front end's own
+/// suppression (the load pass's composition verdicts), applied AHEAD of
+/// the tranche through `Filtered`, so a suppressed finding neither fills
+/// the tranche nor rides the count. Grants: the universe's verdict for
+/// this file (`provider`, the same lookup `nml check` composes under —
+/// NML2064 for an unbound file in a closed universe, NML2065 for a
+/// reference a binding's grant refuses), the open context only where no
+/// universe applies.
+fn composed_validate(
+    validator: &SchemaValidator,
+    file: &nml_core::ast::File,
+    source_name: &str,
+    provider: &dyn nml_core::layers::LayerGrantProvider,
+    keep: &dyn Fn(&nml_core::diagnostic::Diagnostic) -> bool,
+) -> Validated {
+    never_dark(
+        || {
+            let composed =
+                nml_core::layers::compose_file(validator.index(), source_name, file, provider);
+            let seed = composed.dedup_seed(source_name);
+            let mut out: Vec<_> = composed
+                .diagnostics
+                .into_iter()
+                .filter(|diag| keep(diag))
+                .collect();
+            let mut bounded = nml_core::diagnostic::Bounded::new(&mut out, MAX_DIAGNOSTICS);
+            let mut deduped = nml_core::layers::Deduped::new(&mut bounded, source_name, seed);
+            let mut sink = nml_core::diagnostic::Filtered::new(&mut deduped, keep);
+            validator.validate_into(composed.validation_file.as_ref().unwrap_or(file), &mut sink);
+            let elided = bounded.elided;
+            Validated {
+                diagnostics: out,
+                elided,
+            }
+        },
+        || {
+            let mut out = Vec::new();
+            let mut bounded = nml_core::diagnostic::Bounded::new(&mut out, MAX_DIAGNOSTICS);
+            let mut sink = nml_core::diagnostic::Filtered::new(&mut bounded, keep);
+            validator.validate_into(file, &mut sink);
+            let elided = bounded.elided;
+            Validated {
+                diagnostics: out,
+                elided,
+            }
+        },
+    )
+}
+
+/// A composition verdict — an `is` target the validator could not resolve
+/// (`UNKNOWN_MIXIN`) or resolved to the wrong kind (`INVALID_MIXIN_KIND`).
+/// The one predicate the two passes share: the schema load pass drops
+/// these when its universe is partial, the validator pass when the load
+/// pass owns composition — never both, so every verdict has one home.
+fn is_composition_verdict(diag: &nml_core::diagnostic::Diagnostic) -> bool {
+    matches!(
+        diag.code,
+        Some(codes::UNKNOWN_MIXIN | codes::INVALID_MIXIN_KIND)
+    )
+}
+
+/// The validator pass's result: the bounded tranche it holds, and how
+/// many findings it counted past the tranche (exact; the summary row's).
+#[derive(Default)]
+struct Validated {
+    diagnostics: Vec<nml_core::diagnostic::Diagnostic>,
+    elided: usize,
+}
+
+impl nml_core::diagnostic::DiagnosticSink for Validated {
+    fn push(&mut self, diag: nml_core::diagnostic::Diagnostic) {
+        self.diagnostics.push(diag);
+    }
+}
+
+/// The editor must never go dark: a panic inside compose+validate (an
+/// engine invariant, an `expect`) would otherwise unwind through
+/// tower-lsp's inline handler future and take the whole server down into
+/// a crash-restart loop. Degrade instead: `raw` (guarded too — a second
+/// panic would be the same loop) plus one NML2086 anchored at the buffer
+/// start, so the degradation is visible, never silent. The debug
+/// assertion at the compose boundary stays loud in nml-core's tests. (On
+/// `wasm32-wasip1` panics abort — the guard is inert there by
+/// construction; the CLI's own process posture applies.)
+fn never_dark<T: Default + nml_core::diagnostic::DiagnosticSink>(
+    attempt: impl FnOnce() -> T,
+    raw: impl FnOnce() -> T,
+) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt)) {
+        Ok(out) => out,
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown panic".to_string());
+            let mut out =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(raw)).unwrap_or_default();
+            out.push(compose_guard_diag(&what));
+            out
+        }
+    }
+}
+
+/// The guard's own finding — anchored at the buffer start: a span-less
+/// diagnostic never reaches the editor (`push_diagnostic` drops it), and
+/// a silent degradation would defeat the guard's purpose.
+fn compose_guard_diag(what: &str) -> nml_core::diagnostic::Diagnostic {
+    nml_core::diagnostic::Diagnostic::error(format!(
+        "internal error while composing this file — showing findings for the raw \
+         text only; please report the input ({what})"
+    ))
+    .with_code(nml_core::diagnostic::codes::INTERNAL_COMPOSE_INVARIANT)
+    .with_span(nml_core::span::Span::empty(0))
+}
+
+/// One buffer's parse, every view: the semantic AST, the
+/// buffer's own extracted definitions and the full parse findings
+/// (lower pass + RFC 0018 facet rules) — from ONE `parse_and_extract`.
+/// The server parses once per publish and hands this to
+/// [`compute_parsed`]; a `.model.nml` buffer's schema passes reuse the
+/// same extraction (cloned definitions, never a re-parse of the text).
+pub struct ParsedBuffer {
+    pub file: nml_core::ast::File,
+    pub own_defs: nml_core::schema::ExtractedSchema,
+    pub parse_errors: Vec<nml_core::diagnostic::Diagnostic>,
+}
+
+impl ParsedBuffer {
+    pub fn parse(source: &str) -> Self {
+        let (file, own_defs, parse_errors) = nml_core::cst::parse_and_extract(source);
+        Self {
+            file,
+            own_defs,
+            parse_errors,
+        }
+    }
+}
+
+/// The instance-side diagnostics of an already-parsed buffer. Parses
+/// nothing itself — the one-parse-per-publish pin reads
+/// `nml_core::cst::parses_on_this_thread` across this call. `source_name`
+/// is the buffer's name on every finding it composes and every dedup key
+/// (its workspace KEY under a root — the CLI's vocabulary, step 0f — its
+/// path outside every root); a same-file `Related.source` equals it, a
+/// foreign one goes through `locate`.
+pub fn compute_parsed(
     source: &str,
+    parsed: ParsedBuffer,
     mode: &SchemaMode<'_>,
     config: &DiagnosticConfig,
     uri: Option<&tower_lsp::lsp_types::Url>,
+    source_name: &str,
+    locate: &dyn Fn(&str) -> Option<(tower_lsp::lsp_types::Url, String)>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
+    // Validator findings counted past the bounded tranche: the
+    // cap row's count is exact across every pass.
+    let mut elided = 0usize;
     let line_index = LineIndex::new(source);
+    let push_diagnostic = |diag: nml_core::diagnostic::Diagnostic,
+                           identity: Option<&str>,
+                           uri: Option<&tower_lsp::lsp_types::Url>,
+                           line_index: &LineIndex,
+                           out: &mut Vec<Diagnostic>| {
+        push_diagnostic_located(diag, identity, uri, line_index, source_name, locate, out);
+    };
 
     // Resilient parse: always yields a best-effort AST plus the full set of
     // syntactic + semantic errors (position-sorted, bounded). Reporting every
@@ -72,7 +259,11 @@ pub fn compute(
     // parse band carries them for every document with no separate walk.
     // (Previously this fn parsed the same text up to three times per
     // keystroke: parse, facet re-extraction, merge re-extraction.)
-    let (file, own_defs, parse_errors) = nml_core::cst::parse_and_extract(source);
+    let ParsedBuffer {
+        file,
+        own_defs,
+        parse_errors,
+    } = parsed;
 
     for diag in parse_errors {
         push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
@@ -87,10 +278,6 @@ pub fn compute(
 
     let mut symbols = nml_core::symbols::SymbolTable::new();
     symbols.register_file(&file);
-
-    for diag in symbols.find_duplicates() {
-        push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
-    }
 
     for diag in symbols.find_unresolved_references(&file) {
         push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
@@ -122,101 +309,104 @@ pub fn compute(
             let doc_is_registry_source = config.uri_is_registry_source;
             if !doc_is_registry_source {
                 let own = own_defs;
-                for m in own.models {
-                    if models.iter().any(|k| k.name == m.name) {
-                        // CLI parity (RFC 0012): the same collision `nml
-                        // check` reports — never a silent shadow.
-                        push_diagnostic(
-                            nml_core::diagnostic::Diagnostic::error(format!(
-                                "duplicate {} definition '{}' — the workspace schema \
-                                 registry already defines it",
-                                m.kind.label(),
-                                m.name
-                            ))
-                            .with_code(nml_core::diagnostic::codes::DUPLICATE_DEFINITION)
-                            .with_span(m.span),
-                            None,
-                            uri,
-                            &line_index,
-                            &mut diagnostics,
-                        );
-                    } else {
-                        models.push(m);
-                    }
-                }
-                for e in own.enums {
-                    if enums.iter().any(|k| k.name == e.name) {
-                        push_diagnostic(
-                            nml_core::diagnostic::Diagnostic::error(format!(
-                                "duplicate enum definition '{}' — the workspace schema \
-                                 registry already defines it",
-                                e.name
-                            ))
-                            .with_code(nml_core::diagnostic::codes::DUPLICATE_DEFINITION)
-                            .with_span(e.span),
-                            None,
-                            uri,
-                            &line_index,
-                            &mut diagnostics,
-                        );
-                    } else {
-                        enums.push(e);
-                    }
-                }
-                for o in own.oneofs {
-                    if oneofs.iter().any(|k| k.name == o.name) {
-                        push_diagnostic(
-                            nml_core::diagnostic::Diagnostic::error(format!(
-                                "duplicate oneof definition '{}' — the workspace schema \
-                                 registry already defines it",
-                                o.name
-                            ))
-                            .with_code(nml_core::diagnostic::codes::DUPLICATE_DEFINITION)
-                            .with_span(o.span),
-                            None,
-                            uri,
-                            &line_index,
-                            &mut diagnostics,
-                        );
-                    } else {
-                        oneofs.push(o);
-                    }
+                let mut collisions = join_own_definitions(
+                    own.models,
+                    &mut models,
+                    |m| &m.name,
+                    |m| m.span,
+                    |m| m.kind.label(),
+                );
+                collisions.extend(join_own_definitions(
+                    own.enums,
+                    &mut enums,
+                    |e| &e.name,
+                    |e| e.span,
+                    |_| "enum",
+                ));
+                collisions.extend(join_own_definitions(
+                    own.oneofs,
+                    &mut oneofs,
+                    |o| &o.name,
+                    |o| o.span,
+                    |_| "oneof",
+                ));
+                for diag in collisions {
+                    push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
                 }
             }
-            if !models.is_empty() || !enums.is_empty() || !oneofs.is_empty() {
+            if models.is_empty() && enums.is_empty() && oneofs.is_empty() {
+                // No schema anywhere — but `check` still composes
+                // STRUCTURALLY (NML2059/2061/2062/2077 need no schema),
+                // so the editor must too or a schema-less buffer goes
+                // dark on a typo'd `uses` ref the CLI catches.
+                let empty = nml_core::schema_index::SchemaIndex::build(vec![], vec![], vec![]);
+                // Same never-go-dark guard as the schema-bearing path.
+                let composed = never_dark(
+                    || {
+                        nml_core::layers::compose_file(
+                            &empty,
+                            source_name,
+                            &file,
+                            config.grant_provider(),
+                        )
+                        .diagnostics
+                    },
+                    Vec::new,
+                );
+                for diag in composed {
+                    push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
+                }
+            } else {
                 let mut schema = nml_core::schema::ExtractedSchema {
                     models,
                     enums,
                     oneofs,
                 };
                 nml_core::schema::resolve_model_inheritance(&mut schema);
+                // Mixed `.nml` buffers get their schema-load lints
+                // (NML2068 is an ERROR) here — the load pass only covers
+                // `.model.nml` URIs, so without this the documented
+                // error-index repros squiggle nowhere in the editor.
+                if !config.uri_is_registry_source {
+                    for diag in nml_core::layers::validate_merge_policies_over(
+                        &schema.models,
+                        &schema.oneofs,
+                    ) {
+                        push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
+                    }
+                }
                 let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs)
                     .with_modifiers(config.modifiers.clone())
                     .with_membership_semantics(config.membership.clone());
-                for diag in validator.validate(&file) {
-                    // A `.model.nml` buffer's mixin (`is`) targets are judged
-                    // by the SCHEMA LOAD PASS against the buffer's TRUE
-                    // universe — its covering package's sources (workspace,
-                    // store, or in-binary snapshot). The validator resolves
-                    // them against the WORKSPACE REGISTRY, which cannot see
-                    // snapshot sources: for a store-covered buffer this arm
-                    // reported `unknown \`is\` target` for parents the
-                    // package genuinely defines (caught by the provenance
-                    // matrix e2e). Same-code findings from the load pass
-                    // carry the same did-you-mean, so nothing is lost.
-                    // Suppression is gated on the load pass actually OWNING
-                    // composition: when its universe is truncated (registry
-                    // cap) or single-source (non-file buffer), this arm's
-                    // uncapped registry is the only correct judge and its
-                    // verdicts must stand.
-                    if config.load_pass_owns_composition
-                        && matches!(
-                            diag.code,
-                            Some(codes::UNKNOWN_MIXIN | codes::INVALID_MIXIN_KIND)
-                        )
-                    {
-                        continue;
-                    }
+                // A `.model.nml` buffer's mixin (`is`) targets are judged
+                // by the SCHEMA LOAD PASS against the buffer's TRUE
+                // universe — its covering package's sources (workspace,
+                // store, or in-binary snapshot). The validator resolves
+                // them against the WORKSPACE REGISTRY, which cannot see
+                // snapshot sources: for a store-covered buffer this arm
+                // reported `unknown \`is\` target` for parents the
+                // package genuinely defines (caught by the provenance
+                // matrix e2e). Same-code findings from the load pass
+                // carry the same did-you-mean, so nothing is lost.
+                // Suppression is gated on the load pass actually OWNING
+                // composition: when its universe is truncated (registry
+                // cap) or single-source (non-file buffer), this arm's
+                // uncapped registry is the only correct judge and its
+                // verdicts must stand. The rule is applied AT THE SOURCE,
+                // ahead of the bounded tranche: a suppressed verdict never
+                // fills the tranche or rides the cap row's count.
+                let keep = |diag: &nml_core::diagnostic::Diagnostic| {
+                    !(config.load_pass_owns_composition && is_composition_verdict(diag))
+                };
+                let validated = composed_validate(
+                    &validator,
+                    &file,
+                    source_name,
+                    config.grant_provider(),
+                    &keep,
+                );
+                elided += validated.elided;
+                for diag in validated.diagnostics {
                     push_diagnostic(diag, None, uri, &line_index, &mut diagnostics);
                 }
             }
@@ -225,7 +415,15 @@ pub fn compute(
             validator,
             identity,
         } => {
-            for diag in validator.validate(&file) {
+            let validated = composed_validate(
+                validator,
+                &file,
+                source_name,
+                config.grant_provider(),
+                &|_| true,
+            );
+            elided += validated.elided;
+            for diag in validated.diagnostics {
                 push_diagnostic(diag, Some(identity), uri, &line_index, &mut diagnostics);
             }
         }
@@ -238,7 +436,113 @@ pub fn compute(
         .collect();
     validate_templates(&file, &ns, uri, &line_index, &mut diagnostics);
 
+    cap_diagnostics(&mut diagnostics, elided);
+
     diagnostics
+}
+
+/// Open mode is one namespace (RFC 0012): a buffer's own definitions join
+/// its validation set, except where the workspace registry already defines
+/// the name — the registry's stays authoritative (the loader's first-wins
+/// rule) and the buffer's is NML2009, the collision `nml check` reports:
+/// never a silent shadow. ONE rule for models, enums and oneofs; the
+/// collisions come back in declaration order for the caller to place.
+fn join_own_definitions<T>(
+    own: Vec<T>,
+    registry: &mut Vec<T>,
+    name: impl Fn(&T) -> &str,
+    span: impl Fn(&T) -> nml_core::span::Span,
+    what: impl Fn(&T) -> &'static str,
+) -> Vec<nml_core::diagnostic::Diagnostic> {
+    let mut collisions = Vec::new();
+    for def in own {
+        if registry.iter().any(|k| name(k) == name(&def)) {
+            collisions.push(
+                nml_core::diagnostic::Diagnostic::error(format!(
+                    "duplicate {} definition '{}' — the workspace schema registry already \
+                     defines it",
+                    what(&def),
+                    name(&def)
+                ))
+                .with_code(codes::DUPLICATE_DEFINITION)
+                .with_span(span(&def)),
+            );
+        } else {
+            registry.push(def);
+        }
+    }
+    collisions
+}
+
+/// Editor flood cap: a hostile or badly broken buffer can yield tens of
+/// thousands of findings (one per unmatched list item), and serializing
+/// them all on EVERY keystroke is a client-side DoS. The first
+/// [`MAX_DIAGNOSTICS`] tell the story; the tail is summarized in one row.
+/// The CLI prints 512 per run by default and `--max-findings 0` lifts
+/// it — a one-shot terminal run is still the place for the
+/// full list. The validator pass is bounded AT THE SOURCE (a
+/// `Bounded` sink keeps its first tranche and counts the rest, so a
+/// flood is never held whole — after the load pass's suppression, so
+/// the count holds only findings that would have published); the
+/// other passes and the union are
+/// truncated here, and `prior` — what the validator counted past its
+/// tranche — rides the summary row, so the count is exact. Bounds
+/// memory and SERIALIZATION, not compute: the analysis still runs over
+/// everything (fine while it stays linear).
+///
+/// LIMIT: reach=content guards=output surface=editor shown="500" — diagnostics published per document; the tail is summarized in one row
+const MAX_DIAGNOSTICS: usize = 500;
+
+fn cap_diagnostics(diagnostics: &mut Vec<Diagnostic>, prior: usize) {
+    let over = diagnostics.len().saturating_sub(MAX_DIAGNOSTICS);
+    if over + prior > 0 {
+        let elided = over + prior;
+        diagnostics.truncate(MAX_DIAGNOSTICS);
+        diagnostics.push(Diagnostic {
+            severity: Some(DiagnosticSeverity::INFORMATION),
+            message: format!(
+                "{elided} further finding(s) not shown — resolve the above, \
+                 or run `nml check` for the full list"
+            ),
+            ..Default::default()
+        });
+    }
+}
+
+/// The `data.suggestions[]` a row carries for the code-action handler —
+/// each edit's kind, payload and anchor, and the file it lands in when
+/// that is not `own_source` (`file_of`: for a finding the inheritance
+/// `Diagnostic::suggestion_source` settles; a degraded note's carried
+/// edit names its file itself) — so the action is minted on that
+/// document, never resolved against this one's text. `None` with
+/// nothing to offer: the key is then absent. ONE builder for a located
+/// finding's row and a universe note's row alike.
+pub(crate) fn suggestion_data<'s>(
+    suggestions: &'s [nml_core::diagnostic::Suggestion],
+    file_of: impl Fn(&'s nml_core::diagnostic::Suggestion) -> Option<&'s str>,
+    own_source: &str,
+) -> Option<serde_json::Value> {
+    (!suggestions.is_empty()).then(|| {
+        serde_json::json!({
+            "suggestions": suggestions
+                .iter()
+                .map(|s| {
+                    let mut entry = serde_json::json!({
+                        "replacement": s.replacement,
+                        "start": s.span.start,
+                        "end": s.span.end,
+                        // The names live with the kind (`wire_name`),
+                        // where a new variant cannot compile unnamed.
+                        "kind": s.kind.wire_name(),
+                    });
+                    if let Some(src) = file_of(s).filter(|src| *src != own_source) {
+                        entry["source"] = serde_json::Value::String(src.to_string());
+                    }
+                    entry
+                })
+                .collect::<Vec<_>>(),
+        })
+    })
 }
 
 /// Lower one core diagnostic to LSP form — **the** converter (RFC 0008):
@@ -248,11 +552,29 @@ pub fn compute(
 /// onto package-mode errors, and rides the structured suggestion in
 /// `Diagnostic.data` so the code-action handler offers a one-keystroke fix
 /// without re-deriving (or worse, message-parsing) it.
+/// [`push_diagnostic_located`] for the passes with no compose notes to
+/// locate (templates, model-source checks): same-file notes behave
+/// identically, and a foreign-source note falls back to the
+/// diagnostic's own location with the file named — never a foreign span
+/// through this document's index.
 fn push_diagnostic(
     diag: nml_core::diagnostic::Diagnostic,
     identity: Option<&str>,
     uri: Option<&tower_lsp::lsp_types::Url>,
     line_index: &LineIndex,
+    out: &mut Vec<Diagnostic>,
+) {
+    let own = uri.map(|u| u.path().to_string()).unwrap_or_default();
+    push_diagnostic_located(diag, identity, uri, line_index, &own, &|_| None, out);
+}
+
+fn push_diagnostic_located(
+    diag: nml_core::diagnostic::Diagnostic,
+    identity: Option<&str>,
+    uri: Option<&tower_lsp::lsp_types::Url>,
+    line_index: &LineIndex,
+    own_source: &str,
+    locate: &dyn Fn(&str) -> Option<(tower_lsp::lsp_types::Url, String)>,
     out: &mut Vec<Diagnostic>,
 ) {
     let Some(span) = diag.span else {
@@ -269,25 +591,7 @@ fn push_diagnostic(
         Some(id) if is_error => format!("{} (schema: {id})", diag.rendered_message()),
         _ => diag.rendered_message(),
     };
-    let data = (!diag.suggestions.is_empty()).then(|| {
-        serde_json::json!({
-            "suggestions": diag
-                .suggestions
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "replacement": s.replacement,
-                        "start": s.span.start,
-                        "end": s.span.end,
-                        "kind": match s.kind {
-                            nml_core::diagnostic::SuggestionKind::DidYouMean => "didYouMean",
-                            nml_core::diagnostic::SuggestionKind::Fix => "fix",
-                        },
-                    })
-                })
-                .collect::<Vec<_>>(),
-        })
-    });
+    let data = suggestion_data(&diag.suggestions, |s| diag.suggestion_source(s), own_source);
     out.push(Diagnostic {
         range: line_index.range(span),
         severity: Some(match diag.severity {
@@ -304,22 +608,74 @@ fn push_diagnostic(
         message,
         source: Some("nml".to_string()),
         data,
-        // Secondary locations (RFC 0009), spec-native. Same-document by
-        // construction; the uri is required by the LSP `Location` shape.
         related_information: uri.map(|uri| {
-            diag.related
-                .iter()
-                .map(|rel| tower_lsp::lsp_types::DiagnosticRelatedInformation {
+            related_information(
+                diag.source.as_deref(),
+                &diag.related,
+                diag.span,
+                uri,
+                line_index,
+                own_source,
+                locate,
+            )
+        }),
+        ..Default::default()
+    });
+}
+
+/// Secondary locations (RFC 0009), spec-native — each located in ITS
+/// OWN file (`Related.source`, RFC 0019 plan item 2): the current
+/// document's index for a same-file note, a located foreign file's own
+/// index otherwise, and the diagnostic's own location (`diag_span`, or
+/// the document start) with the file named in the message when the file
+/// cannot be located — never the right file with a wrong range. ONE
+/// mapping for a located finding's notes and a kernel row's (a degraded
+/// note at the top of the file: NML2091's first failing source line).
+pub fn related_information(
+    diag_source: Option<&str>,
+    related: &[nml_core::diagnostic::Related],
+    diag_span: Option<nml_core::span::Span>,
+    uri: &tower_lsp::lsp_types::Url,
+    line_index: &LineIndex,
+    own_source: &str,
+    locate: &dyn Fn(&str) -> Option<(tower_lsp::lsp_types::Url, String)>,
+) -> Vec<tower_lsp::lsp_types::DiagnosticRelatedInformation> {
+    related
+        .iter()
+        .map(|rel| {
+            let foreign = rel
+                .source
+                .as_deref()
+                .or(diag_source)
+                .filter(|s| *s != own_source)
+                .map(|s| (s, locate(s)));
+            match foreign {
+                None => tower_lsp::lsp_types::DiagnosticRelatedInformation {
                     location: tower_lsp::lsp_types::Location {
                         uri: uri.clone(),
                         range: line_index.range(rel.span),
                     },
                     message: rel.message.clone(),
-                })
-                .collect()
-        }),
-        ..Default::default()
-    });
+                },
+                Some((_, Some((furl, text)))) => {
+                    tower_lsp::lsp_types::DiagnosticRelatedInformation {
+                        location: tower_lsp::lsp_types::Location {
+                            uri: furl,
+                            range: LineIndex::new(&text).range(rel.span),
+                        },
+                        message: rel.message.clone(),
+                    }
+                }
+                Some((s, None)) => tower_lsp::lsp_types::DiagnosticRelatedInformation {
+                    location: tower_lsp::lsp_types::Location {
+                        uri: uri.clone(),
+                        range: diag_span.map(|sp| line_index.range(sp)).unwrap_or_default(),
+                    },
+                    message: format!("{} (in {s})", rel.message),
+                },
+            }
+        })
+        .collect()
 }
 
 /// Cross-definition schema validation for a `.model.nml` buffer — the
@@ -343,11 +699,21 @@ fn push_diagnostic(
 /// single-source non-file buffer), so this pass's `UNKNOWN_MIXIN`/
 /// `INVALID_MIXIN_KIND` findings are truncation artifacts and are dropped —
 /// the registry validator's unsuppressed verdicts own composition instead.
+///
+/// `own` is the buffer's OWN extraction (definitions + parse findings),
+/// already derived by the publish's one parse: the buffer's slot in the
+/// universe takes it in place of its text, so the pass never re-parses
+/// the buffer; every other source is extracted one at a time,
+/// exactly as `load_schema` would.
 pub fn schema_load_pass(
     own_name: &str,
     sources: &[(String, String)],
     uri: Option<&tower_lsp::lsp_types::Url>,
     owns_composition: bool,
+    own: (
+        nml_core::schema::ExtractedSchema,
+        Vec<nml_core::diagnostic::Diagnostic>,
+    ),
 ) -> Vec<Diagnostic> {
     let own_text = match sources.iter().find(|(n, _)| n == own_name) {
         Some((_, text)) => text,
@@ -356,25 +722,38 @@ pub fn schema_load_pass(
         None => return Vec::new(),
     };
     let line_index = LineIndex::new(own_text);
-    let refs: Vec<(&str, &str)> = sources
-        .iter()
-        .map(|(n, t)| (n.as_str(), t.as_str()))
-        .collect();
-    let (_schema, findings) = nml_validate::loader::load_schema(&refs);
+    let mut own = Some(own);
+    let parts = sources.iter().map(|(n, t)| {
+        if n == own_name {
+            if let Some((schema, diags)) = own.take() {
+                return (n.as_str(), schema, diags);
+            }
+        }
+        let (extracted, errors) = nml_core::cst::extract_schema(t);
+        (n.as_str(), extracted, errors)
+    });
+    let (_schema, findings) = nml_validate::loader::load_schema_parts(parts);
+    // The note locator speaks the UNIVERSE's name vocabulary — the same
+    // names the loader stamps — and serves from the in-hand sources
+    // (read buffer-first), so a same-file note never degrades on a
+    // canonicalized-vs-`uri.path()` spelling mismatch and a sibling's
+    // note locates in the sibling's own text with zero I/O. A
+    // non-path universe name (an untitled buffer) yields no Url and
+    // falls back loudly, named in the message.
+    let locate = |src: &str| -> Option<(tower_lsp::lsp_types::Url, String)> {
+        let (name, text) = sources.iter().find(|(n, _)| n == src)?;
+        let url = tower_lsp::lsp_types::Url::from_file_path(std::path::Path::new(name)).ok()?;
+        Some((url, text.clone()))
+    };
     let mut out = Vec::new();
     for diag in findings
         .into_iter()
         .filter(|d| d.source.as_deref() == Some(own_name))
     {
-        if !owns_composition
-            && matches!(
-                diag.code,
-                Some(codes::UNKNOWN_MIXIN | codes::INVALID_MIXIN_KIND)
-            )
-        {
+        if !owns_composition && is_composition_verdict(&diag) {
             continue;
         }
-        push_diagnostic(diag, None, uri, &line_index, &mut out);
+        push_diagnostic_located(diag, None, uri, &line_index, own_name, &locate, &mut out);
     }
     out
 }
@@ -388,190 +767,47 @@ pub fn schema_load_pass(
 /// - extraction errors: `rebuild_schema_registry` silently discards them, so
 ///   without this pass a broken schema source only ever manifests as missing
 ///   completions elsewhere;
-/// - directive validation against the covering package's vocabulary: unknown
-///   name (with a machine-applicable did-you-mean) and arity per the declared
-///   argument kind;
-/// - the undeclared-sibling info — the forgot-the-manifest trap.
+/// - the covering vocabulary's verdicts (`VocabularyMatch::judge` — the
+///   kernel's one judge, the rows `nml check` and `nml validate` report
+///   for the same file): unknown name with a did-you-mean, arity, the
+///   `#live`/`#restart` contradiction, and the undeclared-sibling note.
+///
+/// `schema`/`errors` are the buffer's own extraction — the publish's one
+/// parse, shared with the load pass; this pass parses nothing.
+/// The kernel's note on a schema source judged under no vocabulary for a
+/// reason the author can act on ([`crate::packages::VocabularyOutcome::note`]:
+/// the truncated
+/// universe, an ambiguous coverage) — one info row at the top of the file,
+/// through the one converter; nothing for a covered or opaque file.
+pub fn coverage_note(
+    source: &str,
+    outcome: &crate::packages::VocabularyOutcome,
+    uri: Option<&tower_lsp::lsp_types::Url>,
+) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    if let Some(note) = outcome.note() {
+        push_diagnostic(note, None, uri, &LineIndex::new(source), &mut out);
+    }
+    out
+}
+
 pub fn schema_source_pass(
     source: &str,
+    schema: &nml_core::schema::ExtractedSchema,
+    errors: &[nml_core::diagnostic::Diagnostic],
     vocab: &crate::packages::VocabularyMatch,
     uri: Option<&tower_lsp::lsp_types::Url>,
 ) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     let line_index = LineIndex::new(source);
-    let (schema, errors) = nml_core::cst::extract_schema(source);
-    for diag in errors {
+    for diag in errors.iter().cloned() {
         push_diagnostic(diag, None, uri, &line_index, &mut out);
     }
 
-    let vocab_names: Vec<String> = vocab.directives.iter().map(|d| d.name.clone()).collect();
-    let vocab_has = |name: &str| vocab_names.iter().any(|n| n == name);
-    for model in &schema.models {
-        for field in &model.fields {
-            for directive in &field.directives {
-                check_directive(
-                    directive,
-                    source,
-                    vocab,
-                    &vocab_names,
-                    uri,
-                    &line_index,
-                    &mut out,
-                );
-            }
-            // Parity with nudge's boot gate (`verify_directive_vocabulary`):
-            // `#live` and `#restart` on the SAME field is an error. Only when
-            // the vocabulary declares both — in other vocabularies the names
-            // carry no reload semantics (and undeclared ones already error as
-            // unknown directives above).
-            if vocab_has("live") && vocab_has("restart") {
-                let live = field.directives.iter().find(|d| d.name == "live");
-                let restart = field.directives.iter().find(|d| d.name == "restart");
-                if let (Some(live), Some(restart)) = (live, restart) {
-                    // Squiggle the later of the two — the addition that
-                    // created the contradiction.
-                    let span = if restart.span.start > live.span.start {
-                        restart.span
-                    } else {
-                        live.span
-                    };
-                    push_diagnostic(
-                        nml_core::diagnostic::Diagnostic::error(
-                            "'#live' and '#restart' contradict — pick one",
-                        )
-                        .with_code(codes::DIRECTIVE_CONFLICT)
-                        .with_span(span),
-                        None,
-                        uri,
-                        &line_index,
-                        &mut out,
-                    );
-                }
-            }
-        }
-    }
-    if vocab.undeclared_sibling {
-        // `Severity::Info` (RFC 0008): advisory, expressible in the unified
-        // model — the last producer that needed a hand-built LSP diagnostic.
-        push_diagnostic(
-            nml_core::diagnostic::Diagnostic::info(format!(
-                "not part of package '{}'; add a []schema entry to participate",
-                vocab.package_name
-            ))
-            .with_code(codes::UNDECLARED_SIBLING)
-            .with_span(nml_core::span::Span::empty(0)),
-            None,
-            uri,
-            &line_index,
-            &mut out,
-        );
+    for diag in vocab.judge(&schema.models, source) {
+        push_diagnostic(diag, None, uri, &line_index, &mut out);
     }
     out
-}
-
-/// The byte span of a directive's *name* token. `Directive.span` covers the
-/// whole construct (`#` through the close); the did-you-mean quick-fix spans
-/// from the `#` **through this name span's end** (sigil-inclusive replacement
-/// `#name`, never touching any argument), so the precise question here is
-/// where the name *ends*. Located by searching the directive's own slice
-/// rather than assuming `start + 1` — the parser tolerates trivia between
-/// `#` and the name, and a wrong end would make the quick-fix mangle the
-/// argument.
-fn directive_name_span(
-    directive: &nml_core::types::Directive,
-    source: &str,
-) -> nml_core::span::Span {
-    let span = directive.span;
-    let fallback = nml_core::span::Span::new(
-        span.start + 1,
-        (span.start + 1 + directive.name.len()).min(span.end),
-    );
-    let Some(slice) = source.get(span.start..span.end) else {
-        return fallback;
-    };
-    // Skip the `#` itself, then take the first occurrence of the name — that
-    // IS the name token (an argument can only follow it). `get` rather than
-    // indexing: the parser's invariant is that the span starts at `#` and
-    // covers a non-empty name, but a degenerate span from a parser
-    // regression must degrade to the fallback, not panic the request path.
-    let Some(rest) = slice.get(1..) else {
-        return fallback;
-    };
-    match rest.find(&directive.name) {
-        Some(rel) => {
-            let start = span.start + 1 + rel;
-            nml_core::span::Span::new(start, start + directive.name.len())
-        }
-        None => fallback,
-    }
-}
-
-/// Vocabulary checks for one parsed directive: unknown name (error, with a
-/// structured suggestion when a near-miss exists) and arity per the declared
-/// [`DirectiveArg`](nml_validate::package::DirectiveArg).
-fn check_directive(
-    directive: &nml_core::types::Directive,
-    source: &str,
-    vocab: &crate::packages::VocabularyMatch,
-    vocab_names: &[String],
-    uri: Option<&tower_lsp::lsp_types::Url>,
-    line_index: &LineIndex,
-    out: &mut Vec<Diagnostic>,
-) {
-    use nml_validate::package::DirectiveArg;
-    // An empty name means the parser already reported "expected a directive
-    // name" on this token — stacking an "unknown directive '#'" on top of
-    // that error helps no one.
-    if directive.name.is_empty() {
-        return;
-    }
-    let decl = vocab.directives.iter().find(|d| d.name == directive.name);
-    let Some(decl) = decl else {
-        // Built as a validator-style diagnostic and lowered by the shared
-        // converter, so the hint prose and the quick-fix wire shape are the
-        // same as every other suggestion in the system.
-        let mut vdiag = nml_core::diagnostic::Diagnostic::error(format!(
-            "unknown directive '#{}' (package '{}')",
-            directive.name, vocab.package_name
-        ))
-        .with_code(codes::UNKNOWN_DIRECTIVE)
-        .with_span(directive.span);
-        if let Some(suggested) =
-            nml_core::suggest::suggest(&directive.name, vocab_names.iter().map(String::as_str))
-        {
-            // The fix replaces from the `#` through the name with the
-            // sigil-inclusive form, so the hint reads exactly what the user
-            // types (`did you mean "#live"?`) — and applying it normalizes
-            // any stray trivia between `#` and the name.
-            let fix_span = nml_core::span::Span::new(
-                directive.span.start,
-                directive_name_span(directive, source).end,
-            );
-            vdiag = vdiag.with_suggestion(format!("#{suggested}"), fix_span);
-        }
-        push_diagnostic(vdiag, None, uri, line_index, out);
-        return;
-    };
-    // Wording matches nudge's boot gate (`verify_directive_vocabulary` in
-    // reload_semantics.rs) byte-for-byte, so a schema author sees ONE message
-    // per mistake regardless of which surface caught it first.
-    let arity_error = match (decl.arg, directive.arg.is_some()) {
-        (DirectiveArg::None, true) => Some(format!("'#{}' takes no argument", directive.name)),
-        (DirectiveArg::None, false) => None,
-        (_, false) => Some(format!("'#{}' requires an argument", directive.name)),
-        (_, true) => None,
-    };
-    if let Some(message) = arity_error {
-        push_diagnostic(
-            nml_core::diagnostic::Diagnostic::error(message)
-                .with_code(codes::DIRECTIVE_BAD_ARITY)
-                .with_span(directive.span),
-            None,
-            uri,
-            line_index,
-            out,
-        );
-    }
 }
 
 fn validate_shared_property_templates(
@@ -684,7 +920,10 @@ fn validate_value_templates(
     if let Value::TemplateString(segments) = value {
         for seg in segments {
             if let TemplateSegment::Expression {
-                namespace, span, ..
+                namespace,
+                raw,
+                span,
+                ..
             } = seg
             {
                 if !valid_ns.is_empty() && !valid_ns.contains(&namespace.as_str()) {
@@ -695,7 +934,12 @@ fn validate_value_templates(
                     .with_span(*span);
                     if let Some(s) = nml_core::suggest::suggest(namespace, valid_ns.iter().copied())
                     {
-                        diag = diag.with_suggestion(s, *span);
+                        // The fix replaces the NAMESPACE, not the whole
+                        // `{{…}}` the row squiggles.
+                        diag = diag.with_suggestion(
+                            Suggestion::did_you_mean(s)
+                                .at(nml_core::template::namespace_span(raw, *span)),
+                        );
                     }
                     push_diagnostic(diag, None, uri, line_index, diags);
                 }
@@ -709,8 +953,899 @@ mod tests {
 
     use super::*;
 
+    /// Parse `source` and run [`compute_parsed`] over it — the tests' one-call
+    /// path; the server parses once per publish and calls `compute_parsed`.
+    fn compute(
+        source: &str,
+        mode: &SchemaMode<'_>,
+        config: &DiagnosticConfig,
+        uri: Option<&tower_lsp::lsp_types::Url>,
+        source_name: &str,
+        locate: &dyn Fn(&str) -> Option<(tower_lsp::lsp_types::Url, String)>,
+    ) -> Vec<Diagnostic> {
+        compute_parsed(
+            source,
+            ParsedBuffer::parse(source),
+            mode,
+            config,
+            uri,
+            source_name,
+            locate,
+        )
+    }
+
+    /// [`schema_source_pass`] over a freshly extracted source.
+    fn source_pass(source: &str, vocab: &crate::packages::VocabularyMatch) -> Vec<Diagnostic> {
+        let (schema, errors) = nml_core::cst::extract_schema(source);
+        schema_source_pass(source, &schema, &errors, vocab, None)
+    }
+
+    /// The editor's double parse, closed: a publish parses its
+    /// buffer ONCE. `compute_parsed` parses nothing; the load pass takes
+    /// the buffer's own extraction and parses only the OTHER sources of
+    /// the universe; the source pass parses nothing. Read at the parse
+    /// counter — structural, never timed.
+    #[test]
+    fn the_editor_passes_never_reparse_the_buffer() {
+        use nml_core::cst::parses_on_this_thread;
+        let text = "model m:\n    name string\n";
+        let parsed = ParsedBuffer::parse(text);
+        let before = parses_on_this_thread();
+        let _ = compute_parsed(
+            text,
+            parsed,
+            &SchemaMode::Registry {
+                models: &[],
+                enums: &[],
+                oneofs: &[],
+            },
+            &DiagnosticConfig::default(),
+            None,
+            "",
+            &|_| None,
+        );
+        assert_eq!(
+            parses_on_this_thread() - before,
+            0,
+            "compute_parsed parses nothing"
+        );
+
+        let own = "/ws/m.model.nml";
+        let sources = vec![
+            (own.to_string(), text.to_string()),
+            (
+                "/ws/a.model.nml".to_string(),
+                "model a:\n    x string\n".to_string(),
+            ),
+            (
+                "/ws/b.model.nml".to_string(),
+                "model b:\n    y string\n".to_string(),
+            ),
+        ];
+        let own_part = nml_core::cst::extract_schema(text);
+        let before = parses_on_this_thread();
+        let _ = schema_load_pass(own, &sources, None, true, own_part);
+        assert_eq!(
+            parses_on_this_thread() - before,
+            2,
+            "the load pass parses the two OTHER sources, never the buffer"
+        );
+
+        let (schema, errors) = nml_core::cst::extract_schema(text);
+        // The demo vocabulary is built from a package text (its own
+        // parse) — settled before the counter is read.
+        let vocab = demo_vocab(false);
+        let before = parses_on_this_thread();
+        let _ = schema_source_pass(text, &schema, &errors, &vocab, None);
+        assert_eq!(
+            parses_on_this_thread() - before,
+            0,
+            "the source pass parses nothing"
+        );
+    }
+
     fn default_config() -> DiagnosticConfig {
         DiagnosticConfig::default()
+    }
+
+    /// Step 0e: the editor composes under the UNIVERSE's grant. An
+    /// unbound file's `uses` in a closed universe is NML2064 in the CLI's
+    /// own sentence (the root and the claim count named); the open
+    /// developer context permits it. `OpenContext` used to be the
+    /// editor's only context, so the CI gate and the editor disagreed on
+    /// every uses-bearing file a closed universe left unbound.
+    #[test]
+    fn composition_is_judged_under_the_universes_grant_not_the_open_context() {
+        let text = "thing base:\n    v = \"b\"\n\nthing t uses base:\n    v = \"t\"\n";
+        let url = tower_lsp::lsp_types::Url::parse("file:///ws/docs/unclaimed.nml").unwrap();
+        let registry = SchemaMode::Registry {
+            models: &[],
+            enums: &[],
+            oneofs: &[],
+        };
+        let code = |d: &Diagnostic| match &d.code {
+            Some(tower_lsp::lsp_types::NumberOrString::String(c)) => c.clone(),
+            _ => String::new(),
+        };
+        let mut closed = default_config();
+        closed.grant = Some(nml_validate::workspace::Grant::Unbound { closed: Some(2) });
+        let out = compute(
+            text,
+            &registry,
+            &closed,
+            Some(&url),
+            "docs/unclaimed.nml",
+            &|_| None,
+        );
+        let denied: Vec<&Diagnostic> = out.iter().filter(|d| code(d) == "NML2064").collect();
+        assert_eq!(denied.len(), 1, "{out:?}");
+        assert!(
+            denied[0].message.contains(
+                "no binding governs this file in the closed universe (2 manifest(s) discovered)"
+            ),
+            "{}",
+            denied[0].message
+        );
+        assert_eq!(
+            denied[0].severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        );
+        let open = compute(
+            text,
+            &registry,
+            &default_config(),
+            Some(&url),
+            "docs/unclaimed.nml",
+            &|_| None,
+        );
+        assert!(open.iter().all(|d| code(d) != "NML2064"), "{open:?}");
+        // A binding without a grant denies too (NML2064's no-grant form
+        // names the binding and its manifest); under the store's copy of
+        // the package the sentence says so and names the change it needs.
+        let mut no_grant = default_config();
+        no_grant.grant = Some(nml_validate::workspace::Grant::NoGrant {
+            binding: "tenantFlows".to_string(),
+            manifest: "<store current>".to_string(),
+            package: "demo".to_string(),
+            home: nml_core::layers::ManifestHome::External(nml_core::layers::ExternalClass::Store),
+        });
+        let out = compute(
+            text,
+            &registry,
+            &no_grant,
+            Some(&url),
+            "tenants/cu/x.flow.nml",
+            &|_| None,
+        );
+        let denied: Vec<&Diagnostic> = out.iter().filter(|d| code(d) == "NML2064").collect();
+        assert_eq!(denied.len(), 1, "{out:?}");
+        assert!(
+            denied[0].message.contains("tenantFlows")
+                && denied[0].message.contains("(<store current>)")
+                && denied[0].message.contains(
+                    "the store's current copy of package `demo`, never edited in place: add the \
+                     grant in the package's source and republish it"
+                ),
+            "{}",
+            denied[0].message
+        );
+        assert!(denied[0].data.is_none(), "no editable manifest: no edit");
+        assert!(
+            denied[0]
+                .related_information
+                .as_ref()
+                .is_none_or(|notes| notes.is_empty()),
+            "no editable manifest: no located note: {:?}",
+            denied[0].related_information
+        );
+        // With the binding's span in an editable manifest, the wire
+        // carries the remedy as a structured insertion IN THAT
+        // DOCUMENT: the entry names the manifest (`source`), the
+        // binding's name span (the anchor the resolver relocates) and
+        // the zero-indent block — the manifest-document quick-fix's
+        // whole input: the code action routes to that document.
+        let mut editable = default_config();
+        editable.grant = Some(nml_validate::workspace::Grant::NoGrant {
+            binding: "tenantFlows".to_string(),
+            manifest: "demo.package.nml".to_string(),
+            package: "demo".to_string(),
+            home: nml_core::layers::ManifestHome::Workspace {
+                at: nml_core::span::Span::new(152, 163),
+            },
+        });
+        let out = compute(
+            text,
+            &registry,
+            &editable,
+            Some(&url),
+            "tenants/cu/x.flow.nml",
+            &|_| None,
+        );
+        let denied = out
+            .iter()
+            .find(|d| code(d) == "NML2064")
+            .unwrap_or_else(|| panic!("{out:?}"));
+        let entry = denied
+            .data
+            .as_ref()
+            .and_then(|d| d.get("suggestions"))
+            .and_then(|s| s.as_array())
+            .and_then(|s| s.first())
+            .unwrap_or_else(|| panic!("{denied:?}"));
+        assert_eq!(
+            *entry,
+            serde_json::json!({
+                "kind": "insert",
+                "source": "demo.package.nml",
+                "start": 152,
+                "end": 163,
+                "replacement": "layers:\n    allowRefs:\n        - \"tenants/cu/x.flow.nml\"",
+            })
+        );
+    }
+
+    /// `Related.source` at the LSP wire (RFC 0019 plan item 2), pinned
+    /// with a synthetic diagnostic because both consumers compose
+    /// single-file today: a located foreign note gets ITS OWN file's
+    /// uri and line index; an un-locatable one falls back to the
+    /// diagnostic's own location with the file named in the message —
+    /// never a foreign span through this document's index.
+    #[test]
+    fn related_notes_locate_in_their_own_files() {
+        use nml_core::span::Span;
+        let own_url = tower_lsp::lsp_types::Url::parse("file:///ws/main.nml").unwrap();
+        let foreign_url = tower_lsp::lsp_types::Url::parse("file:///ws/b.nml").unwrap();
+        let foreign_text = "x = 1\ny = 2\n";
+        let locate = |src: &str| -> Option<(tower_lsp::lsp_types::Url, String)> {
+            (src == "/ws/b.nml").then(|| (foreign_url.clone(), foreign_text.to_string()))
+        };
+        let diag = nml_core::diagnostic::Diagnostic::error("sealed")
+            .with_code(nml_core::diagnostic::codes::SEALED_FIELD_VIOLATION)
+            .with_span(Span::new(0, 1))
+            .with_related_in(Span::new(0, 1), "sealed here", None)
+            .with_related_in(Span::new(6, 7), "sealed here", Some("/ws/b.nml".into()))
+            .with_related_in(Span::new(3, 4), "sealed here", Some("/ws/gone.nml".into()));
+        let mut out = Vec::new();
+        let line_index = LineIndex::new("a = 1\n");
+        push_diagnostic_located(
+            diag,
+            None,
+            Some(&own_url),
+            &line_index,
+            "/ws/main.nml",
+            &locate,
+            &mut out,
+        );
+        let related = out[0].related_information.as_ref().expect("notes");
+        assert_eq!(related.len(), 3);
+        assert_eq!(related[0].location.uri, own_url, "same-file note");
+        assert_eq!(related[1].location.uri, foreign_url, "its own file");
+        assert_eq!(
+            related[1].location.range.start.line, 1,
+            "byte 6 is LINE 2 of b.nml, through b.nml's OWN index"
+        );
+        assert_eq!(
+            related[2].location.uri, own_url,
+            "un-locatable: the diagnostic's own location"
+        );
+        assert!(
+            related[2].message.contains("(in /ws/gone.nml)"),
+            "{related:?}"
+        );
+    }
+
+    /// A tag character (U+E0067, 4 UTF-8 bytes / 2 UTF-16 units) maps
+    /// to editor coordinates through the astral math: the NML0018 range
+    /// must cover exactly the two surrogate units, and text AFTER the
+    /// character must not be shifted — a byte-counted range here would
+    /// select the wrong columns in every editor.
+    #[test]
+    fn a_tag_character_diagnostic_spans_two_utf16_units() {
+        let text = "x = \"a\u{E0067}b\"\n";
+        let url = tower_lsp::lsp_types::Url::parse("file:///ws/tag.nml").unwrap();
+        let out = compute(
+            text,
+            &SchemaMode::Registry {
+                models: &[],
+                enums: &[],
+                oneofs: &[],
+            },
+            &default_config(),
+            Some(&url),
+            "",
+            &|_| None,
+        );
+        let tag = out
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "NML0018".into(),
+                    ))
+            })
+            .expect("the policy fires on the raw tag character");
+        assert_eq!(tag.range.start.line, 0);
+        assert_eq!(tag.range.start.character, 6, "after `x = \"a`");
+        assert_eq!(
+            tag.range.end.character, 8,
+            "one astral scalar = two UTF-16 units"
+        );
+    }
+
+    /// RFC 0019: the editor composes same-file `uses` stacks exactly as
+    /// `nml check` does — an overlay whose base supplies a required field
+    /// gets no phantom missing-required error, and compose findings
+    /// (here a sealed-field violation) surface in the buffer.
+    #[test]
+    fn editor_composes_uses_stacks_like_check() {
+        let schema = nml_core::cst::extract_schema(
+            "model flow:\n    entrypoint string #sealed\n    label string\n",
+        )
+        .0;
+        let clean = compute(
+            "flow base:\n    entrypoint = \"search\"\n    label = \"x\"\n\n\
+             flow t uses base:\n    label = \"y\"\n",
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            None,
+            "",
+            &|_| None,
+        );
+        assert!(
+            clean.is_empty(),
+            "the overlay validates through its RESOLVED body: {clean:?}"
+        );
+        let sealed = compute(
+            "flow base:\n    entrypoint = \"search\"\n    label = \"x\"\n\n\
+             flow t uses base:\n    entrypoint = \"admin\"\n",
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            None,
+            "",
+            &|_| None,
+        );
+        assert!(
+            sealed.iter().any(|d| d.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "NML2060".to_string()
+                ))),
+            "compose findings reach the buffer: {sealed:?}"
+        );
+    }
+
+    /// Editor parity for the union compose family: a discarded
+    /// contribution (NML2085) and its "established here" related note
+    /// reach the buffer through the composed path, in-buffer.
+    #[test]
+    fn editor_surfaces_union_discards_like_check() {
+        let schema = nml_core::cst::extract_schema(
+            "model ua:\n    x string\n\nmodel h:\n    slot (ua | string)\n",
+        )
+        .0;
+        let uri = tower_lsp::lsp_types::Url::parse("file:///h.nml").unwrap();
+        let diags = compute(
+            "h base:\n    slot as ua:\n        x = \"1\"\n\nh t uses base:\n    slot = \"v\"\n",
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            Some(&uri),
+            "",
+            &|_| None,
+        );
+        let discard = diags
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "NML2085".to_string(),
+                    ))
+            })
+            .unwrap_or_else(|| panic!("the discard reaches the buffer: {diags:?}"));
+        assert_eq!(discard.range.start.line, 5, "on the discarded entry");
+        let related = discard
+            .related_information
+            .as_ref()
+            .expect("related note present when a uri is known");
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].message, "established here");
+        assert_eq!(
+            related[0].location.range.start.line, 1,
+            "the establishing entry"
+        );
+    }
+
+    /// Why the guard's finding carries a span: `push_diagnostic` drops a
+    /// span-less finding (a validator defect the parity suite polices),
+    /// so an un-anchored guard diagnostic would degrade SILENTLY.
+    #[test]
+    fn push_diagnostic_drops_a_spanless_finding_and_keeps_the_anchored_guard() {
+        let line_index = LineIndex::new("flow t uses base:\n");
+        let mut out = Vec::new();
+        push_diagnostic(
+            nml_core::diagnostic::Diagnostic::error("no span"),
+            None,
+            None,
+            &line_index,
+            &mut out,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        push_diagnostic(
+            compose_guard_diag("boom"),
+            None,
+            None,
+            &line_index,
+            &mut out,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            (out[0].range.start.line, out[0].range.start.character),
+            (0, 0)
+        );
+        assert!(out[0].message.contains("boom"));
+    }
+
+    /// A non-item line in a modifier block reaches the editor at its own
+    /// range (the entry, not the indent).
+    #[test]
+    fn the_editor_surfaces_a_modifier_block_non_item_at_its_range() {
+        let schema = nml_core::cst::extract_schema("model policy:\n    |deny []string\n").0;
+        let diags = compute(
+            "policy p:\n    |deny:\n        - \"a\"\n        .note = \"x\"\n",
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            None,
+            "",
+            &|_| None,
+        );
+        let d = diags
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "NML0002".to_string(),
+                    ))
+            })
+            .unwrap_or_else(|| panic!("{diags:?}"));
+        assert!(
+            d.message.contains("found a shared property"),
+            "{}",
+            d.message
+        );
+        assert_eq!((d.range.start.line, d.range.start.character), (3, 8));
+        assert_eq!((d.range.end.line, d.range.end.character), (3, 19));
+    }
+
+    /// The never-go-dark guard: a panicking compose pass degrades to the
+    /// raw findings plus one NML2086 that names the panic and carries a
+    /// span (a span-less finding is dropped before the editor sees it);
+    /// a panicking fallback is guarded too.
+    #[test]
+    fn a_compose_panic_degrades_to_raw_findings_plus_nml2086() {
+        let raw = || {
+            vec![
+                nml_core::diagnostic::Diagnostic::warning("raw")
+                    .with_span(nml_core::span::Span::empty(3)),
+            ]
+        };
+        let out = never_dark(|| panic!("boom"), raw);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0].message, "raw");
+        assert_eq!(
+            out[1].code,
+            Some(nml_core::diagnostic::codes::INTERNAL_COMPOSE_INVARIANT)
+        );
+        assert!(out[1].message.contains("boom"), "{}", out[1].message);
+        assert!(out[1].span.is_some(), "anchored, so it reaches the editor");
+        let out: Vec<nml_core::diagnostic::Diagnostic> =
+            never_dark(|| panic!("boom"), || panic!("again"));
+        assert_eq!(out.len(), 1, "{out:?}");
+    }
+
+    /// The zero-item warning at a union position reaches the editor in
+    /// its union wording (a scalar/list variant is not "the list").
+    #[test]
+    fn editor_surfaces_union_zero_item_warnings() {
+        let schema = nml_core::cst::extract_schema(
+            "model ua:\n    x string\n\nmodel ub:\n    kind string\n\nmodel h:\n    slot (ua | []ub)\n",
+        )
+        .0;
+        let diags = compute(
+            "h base:\n    slot:\n        - w:\n            kind = \"k\"\n\nh t uses base:\n    slot = []\n",
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            None,
+            "",
+            &|_| None,
+        );
+        let warn = diags
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "NML2079".to_string(),
+                    ))
+            })
+            .unwrap_or_else(|| panic!("the zero-item warning reaches the buffer: {diags:?}"));
+        assert_eq!(warn.range.start.line, 6);
+        assert!(
+            warn.message.contains("never establishes a variant"),
+            "{}",
+            warn.message
+        );
+    }
+
+    /// Editor parity with `check`'s structural compose: a buffer with NO
+    /// schema anywhere still composes structurally, so a typo'd `uses`
+    /// ref squiggles instead of going dark.
+    #[test]
+    fn schemaless_buffers_compose_structurally() {
+        let diags = compute(
+            "flow memberLookup:\n    entrypoint = \"x\"\n\nflow t uses memberLookop:\n    entrypoint = \"y\"\n",
+            &SchemaMode::Registry {
+                models: &[],
+                enums: &[],
+                oneofs: &[],
+            },
+            &default_config(),
+            None,
+            "",
+            &|_| None,
+        );
+        assert!(
+            diags.iter().any(|d| d.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "NML2059".to_string()
+                ))
+                && d.message.contains("did you mean 'memberLookup'")),
+            "structural NML2059 with hint reaches the buffer: {diags:?}"
+        );
+    }
+
+    /// Mixed `.nml` buffers get schema-load merge-policy lints — NML2068
+    /// is an ERROR the CLI reports; the load pass covers only
+    /// `.model.nml` URIs, so this arm must carry it.
+    #[test]
+    fn mixed_buffers_get_merge_policy_lints() {
+        let schema = nml_core::cst::extract_schema("model m:\n    xs []string\n").0;
+        let diags = compute(
+            "model bad:\n    xs []string #sealed #append\n\nm i:\n    xs = [\"a\"]\n",
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            None,
+            "",
+            &|_| None,
+        );
+        assert!(
+            diags.iter().any(|d| d.code
+                == Some(tower_lsp::lsp_types::NumberOrString::String(
+                    "NML2068".to_string()
+                ))),
+            "the incoherent-policy ERROR squiggles in the editor: {diags:?}"
+        );
+    }
+
+    /// The cap boundary is exact: AT the cap nothing changes (no phantom
+    /// summary row); one past it truncates and appends the summary with
+    /// an accurate count.
+    #[test]
+    fn diagnostic_cap_boundary_is_exact() {
+        let row = |i: usize| Diagnostic {
+            message: format!("finding {i}"),
+            ..Default::default()
+        };
+        let mut at_cap: Vec<Diagnostic> = (0..MAX_DIAGNOSTICS).map(row).collect();
+        cap_diagnostics(&mut at_cap, 0);
+        assert_eq!(at_cap.len(), MAX_DIAGNOSTICS, "at the cap: untouched");
+        assert!(
+            !at_cap.last().unwrap().message.contains("not shown"),
+            "no phantom summary at the boundary"
+        );
+        let mut over: Vec<Diagnostic> = (0..MAX_DIAGNOSTICS + 1).map(row).collect();
+        cap_diagnostics(&mut over, 0);
+        assert_eq!(over.len(), MAX_DIAGNOSTICS + 1, "tranche plus summary");
+        assert!(
+            over.last()
+                .unwrap()
+                .message
+                .starts_with("1 further finding"),
+            "accurate elided count: {}",
+            over.last().unwrap().message
+        );
+        // What the validator counted past its own tranche rides the row
+        // even when the union sits at the cap.
+        let mut at_cap: Vec<Diagnostic> = (0..MAX_DIAGNOSTICS).map(row).collect();
+        cap_diagnostics(&mut at_cap, 7);
+        assert_eq!(at_cap.len(), MAX_DIAGNOSTICS + 1);
+        assert!(
+            at_cap
+                .last()
+                .unwrap()
+                .message
+                .starts_with("7 further finding"),
+            "{}",
+            at_cap.last().unwrap().message
+        );
+    }
+
+    /// r89 (P7): the validator pass HOLDS only its tranche — `Validated`
+    /// carries [`MAX_DIAGNOSTICS`] findings and the exact count past
+    /// them — so a flood is bounded at the source, not truncated after
+    /// being held whole (the cap row alone would read the same either
+    /// way; this pins the memory shape).
+    #[test]
+    fn the_validator_pass_holds_only_its_tranche() {
+        let (schema, diags) =
+            nml_validate::loader::load_schema(&[("m.model.nml", "model thing:\n    v string\n")]);
+        assert!(diags.is_empty(), "{diags:?}");
+        let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs).strict();
+        let mut text = String::from("thing t:\n    v = \"x\"\n");
+        for i in 0..1200 {
+            text.push_str(&format!("    f{i} = 1\n"));
+        }
+        let file = nml_core::cst::parse_to_ast(&text).expect("parses");
+        let validated = composed_validate(
+            &validator,
+            &file,
+            "flood.nml",
+            &nml_core::layers::OpenContext,
+            &|_| true,
+        );
+        assert_eq!(validated.diagnostics.len(), MAX_DIAGNOSTICS);
+        assert_eq!(validated.elided, 700);
+    }
+
+    /// The front end's suppression is applied AT THE SOURCE, ahead of
+    /// the bounded tranche: 600 composition verdicts the load pass owns
+    /// and three unknown-field errors publish exactly the three, with
+    /// nothing counted past the tranche. Filtering after the tranche
+    /// kept 500 of the 603, dropped the suppressed ones among them, and
+    /// counted the 103 it never saw — a phantom `103 further`.
+    #[test]
+    fn suppressed_findings_never_fill_the_tranche_or_the_count() {
+        let (schema, diags) =
+            nml_validate::loader::load_schema(&[("m.model.nml", "model thing:\n    v string\n")]);
+        assert!(diags.is_empty(), "{diags:?}");
+        let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs).strict();
+        let mut text = String::new();
+        for i in 0..600 {
+            text.push_str(&format!("model m{i} is nonexistent:\n    v string\n"));
+        }
+        for i in 0..3 {
+            text.push_str(&format!("thing t{i}:\n    v = \"x\"\n    bogus = 1\n"));
+        }
+        let file = nml_core::cst::parse_to_ast(&text).expect("parses");
+        // The ground truth, unbounded: the verdicts and the rest.
+        let truth = validator.validate(&file);
+        let verdicts = truth.iter().filter(|d| is_composition_verdict(d)).count();
+        let rest = truth.len() - verdicts;
+        assert!(
+            verdicts >= 600 && rest < MAX_DIAGNOSTICS,
+            "{verdicts} verdicts, {rest} others"
+        );
+        let all = composed_validate(
+            &validator,
+            &file,
+            "mixed.nml",
+            &nml_core::layers::OpenContext,
+            &|_| true,
+        );
+        assert_eq!(all.diagnostics.len(), MAX_DIAGNOSTICS);
+        assert_eq!(all.elided, truth.len() - MAX_DIAGNOSTICS);
+        let kept = composed_validate(
+            &validator,
+            &file,
+            "mixed.nml",
+            &nml_core::layers::OpenContext,
+            &|d| !is_composition_verdict(d),
+        );
+        assert_eq!(kept.elided, 0, "{:?}", kept.diagnostics);
+        assert_eq!(kept.diagnostics.len(), rest, "{:?}", kept.diagnostics);
+        assert!(kept.diagnostics.iter().all(|d| !is_composition_verdict(d)));
+    }
+
+    /// The same, as the editor publishes it: a registry-mode buffer
+    /// whose load pass owns composition publishes its three type errors
+    /// and NO summary row — the 600 suppressed verdicts are neither
+    /// shown nor counted as `further`.
+    #[test]
+    fn a_suppressed_flood_publishes_no_phantom_summary_row() {
+        let (schema, diags) =
+            nml_validate::loader::load_schema(&[("m.model.nml", "model thing:\n    v string\n")]);
+        assert!(diags.is_empty(), "{diags:?}");
+        let mut text = String::new();
+        for i in 0..600 {
+            text.push_str(&format!("model m{i} is nonexistent:\n    v string\n"));
+        }
+        for i in 0..3 {
+            text.push_str(&format!("thing t{i}:\n    v = 1\n"));
+        }
+        let url = tower_lsp::lsp_types::Url::parse("file:///ws/mixed.nml").unwrap();
+        let registry = SchemaMode::Registry {
+            models: &schema.models,
+            enums: &schema.enums,
+            oneofs: &schema.oneofs,
+        };
+        let mut owned = default_config();
+        owned.load_pass_owns_composition = true;
+        let out = compute(&text, &registry, &owned, Some(&url), "mixed.nml", &|_| None);
+        assert!(
+            !out.iter().any(|d| d.message.contains("further finding")),
+            "phantom summary row: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|d| d.message.contains("unknown `is` target")),
+            "a suppressed verdict published: {out:?}"
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|d| d.message.contains("expected"))
+                .count(),
+            3,
+            "{out:?}"
+        );
+        // Not owning composition, the same buffer floods: the tranche and
+        // an exact row.
+        let out = compute(
+            &text,
+            &registry,
+            &default_config(),
+            Some(&url),
+            "mixed.nml",
+            &|_| None,
+        );
+        assert!(
+            out.iter().any(|d| d.message.contains("further finding")),
+            "{}",
+            out.len()
+        );
+    }
+
+    /// r89 (P7): the validator's flood is bounded AT THE SOURCE — a
+    /// buffer yielding 1,200 unknown-field errors under a strict binding
+    /// publishes the first [`MAX_DIAGNOSTICS`] and one summary row whose
+    /// count is exact — through the kernel's `Bounded` sink, never a
+    /// 1,200-entry list truncated afterwards.
+    #[test]
+    fn the_validator_flood_is_bounded_at_the_source_with_an_exact_count() {
+        let (schema, diags) =
+            nml_validate::loader::load_schema(&[("m.model.nml", "model thing:\n    v string\n")]);
+        assert!(diags.is_empty(), "{diags:?}");
+        let validator = SchemaValidator::new(schema.models, schema.enums, schema.oneofs).strict();
+        let mut text = String::from("thing t:\n    v = \"x\"\n");
+        for i in 0..1200 {
+            text.push_str(&format!("    f{i} = 1\n"));
+        }
+        let url = tower_lsp::lsp_types::Url::parse("file:///ws/flood.nml").unwrap();
+        let mode = SchemaMode::Package {
+            validator: &validator,
+            identity: "t".to_string(),
+        };
+        let out = compute(
+            &text,
+            &mode,
+            &default_config(),
+            Some(&url),
+            "flood.nml",
+            &|_| None,
+        );
+        assert_eq!(
+            out.len(),
+            MAX_DIAGNOSTICS + 1,
+            "the tranche plus the summary row"
+        );
+        assert!(
+            out.last()
+                .unwrap()
+                .message
+                .starts_with("700 further finding(s) not shown"),
+            "{}",
+            out.last().unwrap().message
+        );
+    }
+
+    /// A hostile or badly broken buffer must not stream tens of
+    /// thousands of diagnostics to the client per keystroke: the cap
+    /// keeps the first tranche and summarizes the tail.
+    #[test]
+    fn diagnostic_flood_is_capped_with_a_summary_row() {
+        let schema = nml_core::cst::extract_schema(
+            "model item:\n    name string+\n    v string\n\nmodel flow:\n    items []item #identity\n",
+        )
+        .0;
+        let mut src = String::from(
+            "flow base:\n    items:\n        - b0:\n            v = \"x\"\n\nflow t uses base:\n    items:\n",
+        );
+        for i in 0..1200 {
+            src.push_str(&format!("        - g{i}:\n            v = \"y\"\n"));
+        }
+        let diags = compute(
+            &src,
+            &SchemaMode::Registry {
+                models: &schema.models,
+                enums: &schema.enums,
+                oneofs: &schema.oneofs,
+            },
+            &default_config(),
+            None,
+            "",
+            &|_| None,
+        );
+        assert!(
+            diags.len() <= 501,
+            "capped at the tranche plus one summary: {}",
+            diags.len()
+        );
+        let last = diags.last().expect("non-empty");
+        assert!(
+            last.message.contains("not shown"),
+            "the tail is summarized: {}",
+            last.message
+        );
+    }
+
+    /// The wire's `data.suggestions[]` names a file only for an edit that
+    /// lands in ANOTHER document: an own-file edit carries no `source`
+    /// (the code action is offered on this document, its title unqualified,
+    /// and two twins of one edit collapse), a foreign one always carries it
+    /// (the action is minted on that document and titled with it). Nothing
+    /// to offer is no key at all.
+    #[test]
+    fn suggestion_data_names_a_file_only_when_the_edit_is_foreign() {
+        use nml_core::diagnostic::Suggestion;
+        use nml_core::span::Span;
+        let span = Span::new(4, 10);
+        let own = Suggestion::did_you_mean("version").at(span);
+        let foreign = Suggestion::delete().at(span).in_file("core.model.nml");
+        let data = suggestion_data(
+            std::slice::from_ref(&own),
+            |s: &Suggestion| s.source.as_deref().or(Some("demo.nml")),
+            "demo.nml",
+        )
+        .expect("an own-file edit is still offered");
+        let rows = data["suggestions"].as_array().expect("suggestions");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].get("source").is_none(),
+            "own file, unnamed: {rows:?}"
+        );
+        assert_eq!(rows[0]["kind"], "didYouMean", "{rows:?}");
+        let data = suggestion_data(
+            &[own, foreign],
+            |s: &Suggestion| s.source.as_deref().or(Some("demo.nml")),
+            "demo.nml",
+        )
+        .expect("data");
+        let rows = data["suggestions"].as_array().expect("suggestions");
+        assert!(rows[0].get("source").is_none(), "{rows:?}");
+        assert_eq!(rows[1]["source"], "core.model.nml", "{rows:?}");
+        assert!(
+            suggestion_data(&[], |s: &Suggestion| s.source.as_deref(), "demo.nml").is_none(),
+            "nothing to offer is no key"
+        );
     }
 
     /// RFC 0030: package-bound documents validate through the package's
@@ -750,6 +1885,8 @@ package demo:
             },
             &default_config(),
             None,
+            "",
+            &|_| None,
         );
         let dym = diags
             .iter()
@@ -788,10 +1925,12 @@ package demo:
     /// `live`/`restart`/`key(ident)` directives.
     fn demo_vocab(undeclared_sibling: bool) -> crate::packages::VocabularyMatch {
         crate::packages::VocabularyMatch {
-            package_name: "demo".to_string(),
-            directives: nml_validate::test_support::demo_package_with_directives()
-                .manifest
-                .directives,
+            vocabulary: nml_validate::directives::Vocabulary::new(
+                "demo",
+                nml_validate::test_support::demo_package_with_directives()
+                    .manifest
+                    .directives,
+            ),
             undeclared_sibling,
             universe: crate::packages::SchemaUniverse::None,
         }
@@ -804,7 +1943,7 @@ package demo:
     #[test]
     fn unknown_directive_suggestion_applies() {
         let source = "model core:\n    name string #lvie\n";
-        let diags = schema_source_pass(source, &demo_vocab(false), None);
+        let diags = source_pass(source, &demo_vocab(false));
         let diag = diags
             .iter()
             .find(|d| d.message.contains("unknown directive '#lvie'"))
@@ -827,10 +1966,26 @@ package demo:
             s.get("end").unwrap().as_u64().unwrap() as usize,
         );
         let fixed = format!("{}{}{}", &source[..start], replacement, &source[end..]);
-        let rediags = schema_source_pass(&fixed, &demo_vocab(false), None);
+        let rediags = source_pass(&fixed, &demo_vocab(false));
         assert!(
             rediags.is_empty(),
             "applying the suggestion must yield a clean directive: {rediags:?}"
+        );
+    }
+
+    /// The language's merge-policy directives are known under a declared
+    /// vocabulary (RFC 0019: merged into every vocabulary outcome), and a
+    /// near-miss of one is suggested like any declared name.
+    #[test]
+    fn builtin_directives_are_known_under_a_declared_vocabulary() {
+        let clean = "model core:\n    name string #sealed\n    steps []core #identity #append\n";
+        assert!(source_pass(clean, &demo_vocab(false)).is_empty());
+        let diags = source_pass("model core:\n    name string #seled\n", &demo_vocab(false));
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert!(
+            diags[0].message.contains("did you mean \"#sealed\""),
+            "{}",
+            diags[0].message
         );
     }
 
@@ -839,7 +1994,7 @@ package demo:
     #[test]
     fn directive_arity_both_directions() {
         let source = "model core:\n    name string #live(3)\n    mode string? #key\n";
-        let diags = schema_source_pass(source, &demo_vocab(false), None);
+        let diags = source_pass(source, &demo_vocab(false));
         assert!(
             diags
                 .iter()
@@ -854,7 +2009,7 @@ package demo:
         );
         // The satisfied shapes are clean.
         let ok = "model core:\n    name string #live\n    mode string? #key(host)\n";
-        assert!(schema_source_pass(ok, &demo_vocab(false), None).is_empty());
+        assert!(source_pass(ok, &demo_vocab(false)).is_empty());
     }
 
     /// Parity with nudge's boot gate (`verify_directive_vocabulary`):
@@ -863,7 +2018,7 @@ package demo:
     #[test]
     fn live_restart_conflict_on_same_field() {
         let source = "model core:\n    name string #live #restart\n    mode string? #live\n";
-        let diags = schema_source_pass(source, &demo_vocab(false), None);
+        let diags = source_pass(source, &demo_vocab(false));
         let conflicts: Vec<_> = diags
             .iter()
             .filter(|d| d.message == "'#live' and '#restart' contradict — pick one")
@@ -885,7 +2040,7 @@ package demo:
     #[test]
     fn bare_hash_is_not_double_reported() {
         let source = "model core:\n    name string #\n";
-        let diags = schema_source_pass(source, &demo_vocab(false), None);
+        let diags = source_pass(source, &demo_vocab(false));
         assert!(
             !diags
                 .iter()
@@ -900,7 +2055,7 @@ package demo:
     #[test]
     fn extraction_error_surfaces() {
         let source = "model core:\n    name strin g+ @@@\n";
-        let diags = schema_source_pass(source, &demo_vocab(false), None);
+        let diags = source_pass(source, &demo_vocab(false));
         assert!(
             diags
                 .iter()
@@ -914,7 +2069,7 @@ package demo:
     #[test]
     fn undeclared_sibling_info() {
         let source = "model extra:\n    name string+\n";
-        let diags = schema_source_pass(source, &demo_vocab(true), None);
+        let diags = source_pass(source, &demo_vocab(true));
         let info = diags
             .iter()
             .find(|d| d.severity == Some(DiagnosticSeverity::INFORMATION))
@@ -924,7 +2079,7 @@ package demo:
             "not part of package 'demo'; add a []schema entry to participate"
         );
         // Declared / non-sibling coverage carries no info note.
-        assert!(schema_source_pass(source, &demo_vocab(false), None).is_empty());
+        assert!(source_pass(source, &demo_vocab(false)).is_empty());
     }
 
     /// Registry-mode shim keeping the existing test bodies terse.
@@ -944,6 +2099,8 @@ package demo:
             },
             config,
             None,
+            "",
+            &|_| None,
         )
     }
 
@@ -971,7 +2128,7 @@ package demo:
         let mut cfg = default_config();
         cfg.uri_is_registry_source = true;
         let from_compute = compute_registry(source, &[], &[], &[], &cfg);
-        let from_schema_pass = schema_source_pass(source, &demo_vocab(false), None);
+        let from_schema_pass = source_pass(source, &demo_vocab(false));
 
         let facet_of = |v: &[Diagnostic]| -> Vec<Diagnostic> {
             v.iter()
@@ -1006,7 +2163,58 @@ package demo:
             .iter()
             .map(|(n, t)| (n.to_string(), t.to_string()))
             .collect();
-        schema_load_pass(own, &owned, None, true)
+        let own_text = sources
+            .iter()
+            .find(|(n, _)| *n == own)
+            .map_or("", |(_, t)| *t);
+        schema_load_pass(
+            own,
+            &owned,
+            None,
+            true,
+            nml_core::cst::extract_schema(own_text),
+        )
+    }
+
+    /// The certification probe, pinned: the load pass locates notes in
+    /// the UNIVERSE'S name vocabulary — the names the loader stamps —
+    /// never `uri.path()`, so a canonicalized `own_name` (macOS
+    /// `/private/tmp`) beside a `/tmp` uri still renders a same-file
+    /// note at its OWN span with a clean message, in the buffer's uri.
+    #[test]
+    fn load_pass_notes_survive_a_uri_spelling_mismatch() {
+        let own_name = "/private/tmp/probe-ws/m.model.nml";
+        let uri = tower_lsp::lsp_types::Url::parse("file:///tmp/probe-ws/m.model.nml").unwrap();
+        // An unterminated string: the finding carries a same-file
+        // "string opened here" note at the opening quote.
+        let text = "model m:\n    name string = \"oops\n";
+        let sources = vec![(own_name.to_string(), text.to_string())];
+        let out = schema_load_pass(
+            own_name,
+            &sources,
+            Some(&uri),
+            true,
+            nml_core::cst::extract_schema(text),
+        );
+        let with_note = out
+            .iter()
+            .find(|d| {
+                d.related_information
+                    .as_ref()
+                    .is_some_and(|r| !r.is_empty())
+            })
+            .unwrap_or_else(|| panic!("no noted finding: {out:?}"));
+        let note = &with_note.related_information.as_ref().unwrap()[0];
+        assert_eq!(
+            note.message, "string opened here",
+            "clean message — no `(in …)` fallback: {note:?}"
+        );
+        assert_eq!(note.location.uri, uri, "the buffer's own uri");
+        let quote_line = 1u32; // the opening quote sits on line 2 (0-based 1)
+        assert_eq!(
+            note.location.range.start.line, quote_line,
+            "the note's OWN span, not the diagnostic's: {note:?}"
+        );
     }
 
     /// Another file's findings must NOT paint onto this buffer. The
@@ -1300,15 +2508,31 @@ package demo:
         );
     }
 
+    /// A repeated declaration name is the parse band's row (NML1000) at
+    /// the later NAME (the note rides `relatedInformation` where a uri
+    /// gives it a Location — the harness pins that on the document).
     #[test]
     fn duplicate_decl_produces_diagnostic() {
         let source =
             "service Svc:\n    localMount = \"/\"\n\nservice Svc:\n    localMount = \"/other\"\n";
         let diags = compute_registry(source, &[], &[], &[], &default_config());
+        let rows: Vec<_> = diags
+            .iter()
+            .filter(|d| {
+                matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == "NML1000")
+            })
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "duplicate declarations should be flagged: {diags:?}"
+        );
+        assert_eq!(rows[0].range.start.line, 3, "{:?}", rows[0]);
+        assert_eq!(rows[0].range.start.character, 8, "{:?}", rows[0]);
         assert!(
-            diags.iter().any(|d| d.message.contains("duplicate")),
-            "duplicate declarations should be flagged: {:?}",
-            diags
+            rows[0].message.starts_with("duplicate declaration 'Svc'"),
+            "{:?}",
+            rows[0]
         );
     }
 
@@ -1336,6 +2560,29 @@ package demo:
             "acyclic const chains should not be flagged: {:?}",
             diags
         );
+    }
+
+    /// The NML5004 did-you-mean replaces exactly the namespace of an
+    /// expression whose row spans the whole `{{…}}` — applied at its byte
+    /// span it yields the corrected expression, nothing else touched.
+    #[test]
+    fn unknown_template_namespace_fix_replaces_only_the_namespace() {
+        let source = "service Svc:\n    val = \"ab {{ arg.name }} x\"\n";
+        let config = config_with_namespaces(&["args"]);
+        let diag = compute_registry(source, &[], &[], &[], &config)
+            .into_iter()
+            .find(|d| d.message.contains("unknown template namespace 'arg'"))
+            .expect("namespace diagnostic expected");
+        let data = diag.data.expect("suggestion data");
+        let s = &data["suggestions"][0];
+        let (start, end) = (
+            s["start"].as_u64().expect("start") as usize,
+            s["end"].as_u64().expect("end") as usize,
+        );
+        assert_eq!(&source[start..end], "arg", "{data}");
+        let mut fixed = source.to_string();
+        fixed.replace_range(start..end, s["replacement"].as_str().expect("replacement"));
+        assert_eq!(fixed, "service Svc:\n    val = \"ab {{ args.name }} x\"\n");
     }
 
     #[test]
@@ -1473,6 +2720,8 @@ package demo:
             },
             &DiagnosticConfig::default(),
             Some(&uri),
+            "",
+            &|_| None,
         );
         let unterminated = diags
             .iter()
@@ -1501,6 +2750,8 @@ package demo:
             },
             &DiagnosticConfig::default(),
             None,
+            "",
+            &|_| None,
         );
         assert!(
             diags
@@ -1525,6 +2776,8 @@ package demo:
             },
             &DiagnosticConfig::default(),
             None,
+            "",
+            &|_| None,
         );
         assert!(
             diags.iter().any(|d| d.code
@@ -1533,6 +2786,77 @@ package demo:
                 ))
                 && d.message.contains("duplicate model definition 'cache'")),
             "{diags:?}"
+        );
+    }
+
+    /// ONE registry-first rule for every definition kind: a buffer
+    /// redefining a registry model, enum AND oneof gets three NML2009 rows,
+    /// each naming its kind, and the REGISTRY's definition keeps typing the
+    /// buffer's instances (the buffer's `cache` has no `maxEntries`; the
+    /// registry's requires it) — a shadow would type them by the buffer's.
+    /// The buffer's definition does not reach the DEFINITION-level passes
+    /// either: its `#append` on a scalar would mint NML2068 against
+    /// `cache.other` — a field the REGISTRY's `cache` has not got, a
+    /// buffer minting a schema lint against a model it does not own.
+    #[test]
+    fn registry_first_join_is_one_rule_for_models_enums_and_oneofs() {
+        let registry = nml_core::cst::extract_schema(concat!(
+            "model cache:\n    maxEntries number\n\nenum level:\n    - \"a\"\n\n",
+            "oneof shape by kind:\n    \"c\" -> cache\n"
+        ))
+        .0;
+        let source = concat!(
+            "model cache:\n    other string? #append\n\nenum level:\n    - \"b\"\n\n",
+            "oneof shape by kind:\n    \"d\" -> cache\n\ncache Hot:\n    other = \"x\"\n"
+        );
+        let diags = compute(
+            source,
+            &SchemaMode::Registry {
+                models: &registry.models,
+                enums: &registry.enums,
+                oneofs: &registry.oneofs,
+            },
+            &DiagnosticConfig::default(),
+            None,
+            "",
+            &|_| None,
+        );
+        let nml2009: Vec<&str> = diags
+            .iter()
+            .filter(|d| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "NML2009".into(),
+                    ))
+            })
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            nml2009,
+            [
+                "duplicate model definition 'cache' — the workspace schema registry already \
+                 defines it",
+                "duplicate enum definition 'level' — the workspace schema registry already \
+                 defines it",
+                "duplicate oneof definition 'shape' — the workspace schema registry already \
+                 defines it",
+            ],
+            "{diags:?}"
+        );
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("missing required field 'maxEntries'")),
+            "the registry's `cache` types the buffer's instance: {diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| {
+                d.code
+                    == Some(tower_lsp::lsp_types::NumberOrString::String(
+                        "NML2068".into(),
+                    ))
+            }),
+            "the shadowed definition reached the policy pass: {diags:?}"
         );
     }
 
@@ -1555,6 +2879,8 @@ package demo:
             },
             &config,
             None,
+            "",
+            &|_| None,
         );
         assert!(
             diags.iter().all(|d| d.code
@@ -1563,5 +2889,23 @@ package demo:
                 ))),
             "{diags:?}"
         );
+    }
+
+    /// The ONE predicate the two passes share names both composition
+    /// verdicts — an `is` target the validator could not resolve
+    /// (`UNKNOWN_MIXIN`) and one of the wrong kind (`INVALID_MIXIN_KIND`)
+    /// — and nothing else:
+    /// a predicate that knew one of the two would let the other be
+    /// reported twice (the load pass's and the validator's), or dropped
+    /// by neither.
+    #[test]
+    fn the_composition_verdict_predicate_covers_both_codes_and_no_other() {
+        let with = |code| nml_core::diagnostic::Diagnostic::error("x").with_code(code);
+        assert!(is_composition_verdict(&with(codes::UNKNOWN_MIXIN)));
+        assert!(is_composition_verdict(&with(codes::INVALID_MIXIN_KIND)));
+        assert!(!is_composition_verdict(&with(codes::UNKNOWN_PROPERTY)));
+        assert!(!is_composition_verdict(
+            &nml_core::diagnostic::Diagnostic::error("uncoded")
+        ));
     }
 }

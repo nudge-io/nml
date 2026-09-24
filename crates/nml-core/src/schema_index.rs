@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{Body, BodyEntryKind};
+use crate::diagnostic::Suggestion;
 use crate::model::{EnumDef, FieldDef, FieldType, ModelDef, OneOfDef};
 use crate::types::PrimitiveType;
 
@@ -367,6 +368,43 @@ impl SchemaIndex {
         (candidates.len() >= 2).then_some(candidates)
     }
 
+    /// The one NML2051 builder — an `as` annotation naming no nameable
+    /// variant — shared by the validator (raw bodies) and the compose
+    /// engine (a dependent layer's annotation the composed view replaces
+    /// before validation): identical message + span, so a non-`uses`
+    /// base declaration's finding and the merge's collapse to one home.
+    /// A name that is a LIST variant's element gets the honest form
+    /// (list variants are selected by shape, never named) and no
+    /// did-you-mean; anything else gets the closest nameable variant.
+    pub fn unknown_union_variant(
+        &self,
+        variants: &[FieldType],
+        ann: &crate::ast::Identifier,
+    ) -> crate::diagnostic::Diagnostic {
+        use crate::diagnostic::{Diagnostic, codes};
+        let list_element = variants.iter().any(|v| {
+            matches!(v, FieldType::List(inner) | FieldType::Set(inner)
+                if matches!(inner.as_ref(), FieldType::ModelRef(n) if *n == ann.name))
+        });
+        if list_element {
+            return Diagnostic::error(format!(
+                "`{}` names a list variant's element, not a nameable variant — \
+                 list variants are selected by shape; drop the `as`",
+                ann.name
+            ))
+            .with_code(codes::UNKNOWN_UNION_VARIANT)
+            .with_span(ann.span);
+        }
+        let nameable = self.nameable_variant_names(variants);
+        let mut diag = Diagnostic::error(format!("`{}` is not a variant of this union", ann.name))
+            .with_code(codes::UNKNOWN_UNION_VARIANT)
+            .with_span(ann.span);
+        if let Some(s) = crate::suggest::suggest(&ann.name, nameable.iter().copied()) {
+            diag = diag.with_suggestion(Suggestion::did_you_mean(s.to_string()).at(ann.span));
+        }
+        diag
+    }
+
     /// The declared type names of a union's **nameable** variants (model/`oneof`
     /// refs) — the one candidate set powering `as`-position completion and the
     /// did-you-mean on an unknown annotation. Source order, so completion and
@@ -388,16 +426,32 @@ impl SchemaIndex {
             .collect()
     }
 
-    /// Resolve a named type reference (`someModel`) to its **recursible**
-    /// definition — a model or a `oneof` — or `None` (an enum or unknown
-    /// name: a leaf, whose declared type lives at the reference site, not
-    /// here). The single definition of name→definition dispatch, shared by
-    /// schema validation, defaulting, and the LSP.
-    pub fn resolve_ref(&self, name: &str) -> Option<FieldTarget<'_>> {
+    /// The named type a reference resolves to — a model before a `oneof`
+    /// of the same name — the ONE resolution order every pass shares (the
+    /// validator, the plan, normalization, the merge, the seal scans): a
+    /// colliding name (NML1000 at parse, NML2016 at load — composition still
+    /// runs over the loaded schema) reads the same way everywhere, so no
+    /// position is planned under one reading and merged under the other.
+    /// Two-variant by construction, so every consumer's match is total.
+    ///
+    /// Only **recursible** definitions are nameable — an enum or unknown
+    /// name is `None` (a leaf, whose declared type lives at the reference
+    /// site, not here). The single definition of name→definition
+    /// dispatch, shared by schema validation, defaulting, and the LSP.
+    pub fn nameable(&self, name: &str) -> Option<NameableVariant<'_>> {
         if let Some(m) = self.model(name) {
-            return Some(FieldTarget::Model(m));
+            return Some(NameableVariant::Model(m));
         }
-        self.oneof(name).map(FieldTarget::OneOf)
+        self.oneof(name).map(NameableVariant::OneOf)
+    }
+
+    /// [`Self::nameable`] as a [`FieldTarget`], for the type-resolution
+    /// walk.
+    pub fn resolve_ref(&self, name: &str) -> Option<FieldTarget<'_>> {
+        self.nameable(name).map(|named| match named {
+            NameableVariant::Model(m) => FieldTarget::Model(m),
+            NameableVariant::OneOf(o) => FieldTarget::OneOf(o),
+        })
     }
 
     fn resolve_type<'a>(&'a self, ty: &'a FieldType) -> FieldTarget<'a> {
@@ -461,6 +515,7 @@ mod tests {
             directives: Vec::new(),
             doc: None,
             span: Span::empty(0),
+            type_span: Span::empty(0),
         }
     }
 

@@ -11,8 +11,9 @@ name: Rust CI
 # components included, and every later cargo call resolves to it. The only
 # jobs that name a toolchain are the ones whose PURPOSE is a different
 # toolchain: msrv (the floor from Cargo.toml, forced via RUSTUP_TOOLCHAIN —
-# the env var outranks the pin file) and minimal-versions' nightly resolver
-# step (reached via explicit `cargo +nightly`). New stables land via
+# the env var outranks the pin file), minimal-versions' nightly resolver
+# step (reached via explicit `cargo +nightly`). The api job uses the pin file
+# like every other gate (`just gate-api`). New stables land via
 # canary.yml + a reviewed toolchain-bump PR — never by drift.
 on:
   workflow_call:
@@ -30,13 +31,18 @@ jobs:
       # The file names the channel AND components (rustfmt, clippy).
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # Rustdoc is a build product (docs.rs renders it at publish): broken
-      # intra-doc links and bad doc syntax fail here, not on docs.rs.
-      - run: cargo doc --workspace --no-deps --locked
-        env:
-          RUSTDOCFLAGS: -D warnings
+      # The gate runner. Every gate command lives in the justfile and
+      # NOWHERE else — `just gate-contract` fails this build if a workflow
+      # runs one any other way (scripts/gate.py). Version-pinned like
+      # cargo-fuzz and cargo-deny below; `rust-cache` keeps ~/.cargo/bin.
+      - run: cargo install just --version 1.46.0 --locked
+      # fmt + clippy + rustdoc (a build product: broken intra-doc links fail
+      # here, not on docs.rs). The commands are in `just gate-lint`.
+      # The contract itself: this job fails if any workflow here runs a gate
+      # command that is not a `just` recipe, or if a `gate-*` recipe is one
+      # nothing runs. It also self-tests, so it cannot be a green no-op.
+      - run: just gate-contract
+      - run: just gate-lint
 
   # Supply-chain & license gate (see deny.toml): permissive-only dep licenses +
   # RustSec security advisories + a crates.io-only source policy. Reads the
@@ -47,9 +53,18 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2 (cargo-deny 0.20.2)
-        with:
-          command: check licenses advisories sources
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      # The gate runner. Every gate command lives in the justfile and
+      # NOWHERE else — `just gate-contract` fails this build if a workflow
+      # runs one any other way (scripts/gate.py). Version-pinned like
+      # cargo-fuzz and cargo-deny below; `rust-cache` keeps ~/.cargo/bin.
+      - run: cargo install just --version 1.46.0 --locked
+      # cargo-deny run as a PINNED BINARY rather than a third-party action:
+      # the action had no local equivalent at all, so the licence/advisory
+      # gate was one a developer could not run before pushing.
+      - run: cargo install cargo-deny --version 0.20.2 --locked
+      - run: just gate-supply-chain
 
   test:
     name: test (${{ matrix.os }})
@@ -63,7 +78,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-      - run: cargo test --workspace --locked
+      # The gate runner. Every gate command lives in the justfile and
+      # NOWHERE else — `just gate-contract` fails this build if a workflow
+      # runs one any other way (scripts/gate.py). Version-pinned like
+      # cargo-fuzz and cargo-deny below; `rust-cache` keeps ~/.cargo/bin.
+      - run: cargo install just --version 1.46.0 --locked
+      - run: just gate-test
+      # The four perf tripwires (`#[ignore]`d in the default run — release-
+      # timed, with 30–200× headroom) run on the ONE lane whose timing is
+      # stable enough to trust, alone (`--test-threads=1`): the linear-parser
+      # and compose-cost pins (r69a, C2), the CLI's wide-stack wall-clock
+      # gates (r69b item 9), the kernel's real-bound drives (r73), and the
+      # read-through race harness's six perf forms. The commands are in
+      # `just gate-perf`, so they are runnable before pushing — which they
+      # were not while they existed only in this file.
+      - if: matrix.os == 'ubuntu-latest'
+        run: just gate-perf
 
   # The MSRV contract (docs/stability.md): the workspace compiles — every
   # target, every platform the test matrix covers, doctests included — on
@@ -84,32 +114,22 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Read the declared MSRV from Cargo.toml
-        id: msrv
-        shell: bash
-        run: |
-          version="$(grep -m1 '^rust-version' Cargo.toml | cut -d '"' -f 2)"
-          if [ -z "$version" ]; then
-            echo "::error::no rust-version found in Cargo.toml"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          # rust-toolchain.toml overrides the installed DEFAULT at cargo-run
-          # time — without this, the job would silently check the PINNED
-          # toolchain and the MSRV gate would be green-but-vacuous. The env
-          # var outranks the pin file; every later step in this job now
-          # really runs the floor toolchain.
-          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (SHA-pinned; channel via toolchain input)
-        with:
-          toolchain: ${{ steps.msrv.outputs.version }}
-          targets: wasm32-wasip1
+      # The floor toolchain is installed BY the recipe, which reads
+      # `rust-version` from Cargo.toml — so the version lives in exactly one
+      # place and this job cannot check a different one. (It used to be read
+      # here as well, into RUSTUP_TOOLCHAIN, which is two readings of one
+      # fact.) The pinned toolchain is installed first only so `cargo` and
+      # `just` exist at all.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-      - run: cargo check --workspace --all-targets --locked
-      # Cross-compilation is host-independent — once is enough.
-      - if: matrix.os == 'ubuntu-latest'
-        run: cargo check -p nml-lsp --target wasm32-wasip1 --locked
-      - run: cargo test --doc --workspace --locked
+      # The gate runner. Every gate command lives in the justfile and
+      # NOWHERE else — `just gate-contract` fails this build if a workflow
+      # runs one any other way (scripts/gate.py). Version-pinned like
+      # cargo-fuzz and cargo-deny below; `rust-cache` keeps ~/.cargo/bin.
+      - run: cargo install just --version 1.46.0 --locked
+      # `just gate-msrv` reads the floor from Cargo.toml itself, so this job
+      # and a developer's machine cannot disagree about what the MSRV IS.
+      - run: just gate-msrv
 
   # Publish-readiness, continuously: `cargo package` validates metadata,
   # file sets, and (via its verify build) that each publishable crate
@@ -126,7 +146,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-      - run: cargo package --workspace --exclude 'nml-tutorial-*' --exclude nml-cookbook --locked
+      # The gate runner. Every gate command lives in the justfile and
+      # NOWHERE else — `just gate-contract` fails this build if a workflow
+      # runs one any other way (scripts/gate.py). Version-pinned like
+      # cargo-fuzz and cargo-deny below; `rust-cache` keeps ~/.cargo/bin.
+      - run: cargo install just --version 1.46.0 --locked
+      - run: just gate-package
 
   # Declared version bounds are promises (`serde = "1"` claims we build
   # against serde 1.0.0). Resolve every DIRECT dependency to its declared
@@ -148,8 +173,46 @@ jobs:
         with:
           toolchain: nightly
       - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-      - run: cargo +nightly update -Zdirect-minimal-versions
-      - run: cargo check --workspace --all-targets
+      # The gate runner. Every gate command lives in the justfile and
+      # NOWHERE else — `just gate-contract` fails this build if a workflow
+      # runs one any other way (scripts/gate.py). Version-pinned like
+      # cargo-fuzz and cargo-deny below; `rust-cache` keeps ~/.cargo/bin.
+      - run: cargo install just --version 1.46.0 --locked
+      - run: just gate-minimal-versions
+
+  # The PUBLIC API contract. `nml`'s libraries are consumed by PATH and by
+  # PINNED REV (the consumer's `nml-pin.toml`), never resolved from
+  # crates.io, so cargo's version resolution protects nobody — one fold
+  # shipped EIGHTEEN breaking API changes and three of them
+  # were discovered by the consumer failing to compile, days later. Two
+  # checks, because neither is complete alone: the RECORD
+  # (`cargo public-api`) shows every public item that moved, including
+  # shapes no lint models; the CLASSIFIER (`cargo-semver-checks`) names
+  # what a record cannot see — above all a new PRIVATE field on a public
+  # struct, which makes it unconstructible downstream while every public
+  # item stays identical (measured on `ast::Arm`).
+  api:
+    name: public API
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The classifier needs the baseline commit, not just this one.
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      # The gate runner. Every gate command lives in the justfile and
+      # NOWHERE else — `just gate-contract` fails this build if a workflow
+      # runs one any other way (scripts/gate.py). Version-pinned like
+      # cargo-fuzz and cargo-deny below; `rust-cache` keeps ~/.cargo/bin.
+      - run: cargo install just --version 1.46.0 --locked
+      # The record is fresh, stamped and in the ledger; then what moved is
+      # classified against the base branch. The two pinned tools are
+      # installed BY the recipe, so a local run installs the same versions.
+      - run: just gate-api
+        env:
+          NML_API_BASELINE: ${{ github.event.pull_request.base.sha || 'HEAD~1' }}
 
   fuzz-smoke:
     name: fuzz smoke
@@ -185,21 +248,18 @@ jobs:
           key: fuzz-corpus-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-
-      - name: smoke-run fuzz targets
-        working-directory: fuzz
-        # Every target in fuzz_targets/ runs — a target that exists but is
-        # never smoked is a regression net with a hole in it. The tracked
-        # seeds/<target>/ landmarks and the fixtures corpus give the
-        # coverage-guided mutator a running start (real documents,
-        # boundary literals) instead of starting from zero bytes each run;
-        # the first dir is the writable corpus, the rest are read-only —
-        # the same layout the Justfile's local `fuzz` recipe uses.
-        run: |
-          for target in number document money format duration validate; do
-            mkdir -p "corpus/$target" "seeds/$target"  # fresh checkouts have no corpus dir; libFuzzer requires it
-            cargo +nightly fuzz run "$target" "corpus/$target" "seeds/$target" ../tests/fixtures/valid \
-              -- -runs=20000 -max_total_time=60 -dict=nml.dict
-          done
+      # The gate runner. Every gate command lives in the justfile and
+      # NOWHERE else — `just gate-contract` fails this build if a workflow
+      # runs one any other way (scripts/gate.py). Version-pinned like
+      # cargo-fuzz and cargo-deny below; `rust-cache` keeps ~/.cargo/bin.
+      - run: cargo install just --version 1.46.0 --locked
+      - name: smoke-run every fuzz target
+        # Every target in fuzz_targets/ runs, ENUMERATED FROM THE DIRECTORY
+        # (r69a, C1): a hand-kept list silently omitted the RFC 0019 item-0
+        # targets for a whole certification arc. The loop is in
+        # `just gate-fuzz`, so the sweep is reproducible locally; `just fuzz
+        # <target>` is the deep dive on one.
+        run: just gate-fuzz
       # actions/cache saves only on job SUCCESS (post-if), so the run that
       # FINDS a crash would otherwise discard both its grown corpus and the
       # reproducer libFuzzer writes to fuzz/artifacts — preserve the

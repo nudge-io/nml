@@ -9,10 +9,11 @@
 use crate::cst::ast::{
     AstNode, BlockDecl, Decl, Entry, Facet, OneOfDecl, Root, TypeExpr, TypeExprKind,
 };
-use crate::cst::syntax::{node_span, token_span};
+use crate::cst::syntax::{content_span, token_span};
 use crate::cst::value::decode_string_token;
 use crate::model::{EnumDef, FieldDef, FieldType, MixinRef, ModelDef, ModelKind, OneOfDef};
 use crate::schema::ExtractedSchema;
+use crate::span::Span;
 use crate::types::{PrimitiveType, Value};
 
 /// Extract model / enum / oneof definitions from a parsed CST.
@@ -41,19 +42,30 @@ fn extract_model(block: &BlockDecl, kind: ModelKind) -> ModelDef {
     if let Some(body) = block.body() {
         for entry in body.entries() {
             match entry {
-                Entry::FieldDef(fd) => fields.push(FieldDef {
-                    name: token_text(fd.name()),
-                    field_type: fd
-                        .type_expr()
-                        .map(|t| resolve_field_type(&t))
-                        .unwrap_or_else(unknown_type),
-                    optional: fd.optional(),
-                    shorthand: fd.shorthand(),
-                    default_value: fd.default().and_then(|v| v.decode().ok()),
-                    directives: extract_directives(fd.directives()),
-                    doc: fd.doc_comment(),
-                    span: node_span(fd.syntax()),
-                }),
+                Entry::FieldDef(fd) => {
+                    // The CONTENT span — first to last significant token — as
+                    // the AST's body entries carry (`lower::body_entry`): the
+                    // anchor a structural deletion resolves by equality, and the
+                    // location a field-anchored finding renders (the node span
+                    // starts at the indentation the parser flushed into it).
+                    let span = content_span(fd.syntax());
+                    fields.push(FieldDef {
+                        name: token_text(fd.name()),
+                        field_type: fd
+                            .type_expr()
+                            .map(|t| resolve_field_type(&t))
+                            .unwrap_or_else(unknown_type),
+                        optional: fd.optional(),
+                        shorthand: fd.shorthand(),
+                        default_value: fd.default().and_then(|v| v.decode().ok()),
+                        directives: extract_directives(fd.directives()),
+                        doc: fd.doc_comment(),
+                        span,
+                        type_span: fd
+                            .type_expr()
+                            .map_or(Span::empty(span.end), |t| content_span(t.syntax())),
+                    });
+                }
                 // A typed modifier (`|name type?`) declares a field too. Modifiers
                 // are never the scalar-shorthand field.
                 Entry::Modifier(m) => {
@@ -66,7 +78,8 @@ fn extract_model(block: &BlockDecl, kind: ModelKind) -> ModelDef {
                             default_value: None,
                             directives: extract_directives(m.directives()),
                             doc: m.doc_comment(),
-                            span: node_span(m.syntax()),
+                            span: content_span(m.syntax()),
+                            type_span: content_span(te.syntax()),
                         });
                     }
                 }
@@ -90,7 +103,7 @@ fn extract_model(block: &BlockDecl, kind: ModelKind) -> ModelDef {
             })
             .unwrap_or_default(),
         fields,
-        span: node_span(block.syntax()),
+        span: content_span(block.syntax()),
     }
 }
 
@@ -118,7 +131,7 @@ fn extract_enum(block: &BlockDecl) -> EnumDef {
         name: name_text(block),
         variants,
         source: None,
-        span: node_span(block.syntax()),
+        span: content_span(block.syntax()),
     }
 }
 
@@ -139,7 +152,7 @@ fn extract_oneof(decl: &OneOfDecl) -> OneOfDef {
                 Some((value, model))
             })
             .collect(),
-        span: node_span(decl.syntax()),
+        span: content_span(decl.syntax()),
     }
 }
 
@@ -153,7 +166,7 @@ fn extract_directives(
         .map(|d| crate::types::Directive {
             name: token_text(d.name()),
             arg: d.value().and_then(|v| v.decode().ok()),
-            span: node_span(d.syntax()),
+            span: content_span(d.syntax()),
         })
         .collect()
 }
@@ -176,7 +189,7 @@ fn extract_facets_as<T: Clone>(
         return out;
     };
     for f in list.facets() {
-        let span = node_span(f.syntax());
+        let span = content_span(f.syntax());
         let Some(value) = decode(&f) else {
             continue;
         };
@@ -202,7 +215,7 @@ fn facet_magnitude(f: &Facet) -> Option<(String, crate::span::Span)> {
     if let Some(dl) = f.duration_literal() {
         let components = dl.components();
         let first = components.first()?.0.text().to_string();
-        let span = node_span(dl.syntax());
+        let span = content_span(dl.syntax());
         let text = if f.dash().is_some() {
             format!("-{}", first)
         } else {
@@ -210,7 +223,7 @@ fn facet_magnitude(f: &Facet) -> Option<(String, crate::span::Span)> {
         };
         return Some((text, span));
     }
-    let span = node_span(f.syntax());
+    let span = content_span(f.syntax());
     match (f.dash(), f.number()) {
         (Some(_), Some(n)) => Some((format!("-{}", n.text()), span)),
         (None, Some(n)) => Some((n.text().to_string(), span)),

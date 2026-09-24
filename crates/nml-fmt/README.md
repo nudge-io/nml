@@ -9,11 +9,14 @@ use nml_fmt::formatter::format_source;
 let formatted = format_source(source)?;
 ```
 
-- **Comment-preserving** — `format_source` parses via the lossless CST, so
+- **Comment-preserving** — `format_source` prints from the lossless CST, so
   own-line and trailing comments survive formatting in place.
 - **Canonical style** — 4-space indentation, canonical string quoting,
-  aligned `oneof`/arm arrows, `set<T>` and `(K -> V)` type rendering,
-  `?`/`+` suffix rendering.
+  `set<T>` and `(K -> V)` type rendering, `?`/`+` suffix rendering
+  ([`spec/style.md`](../../spec/style.md) is normative).
+- **Your alignment, not ours** — the formatter never invents an aligned
+  column and never destroys one: an aligned run of `oneof`/arm arrows stays
+  aligned byte for byte, an unaligned one keeps its single space.
 - **Idempotent** — formatting a formatted file is a no-op (tested).
 
 The `nml fmt` command in [`nml-cli`](https://crates.io/crates/nml-cli) wraps

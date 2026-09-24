@@ -23,6 +23,12 @@
 "is "
 "by "
 "as "
+# RFC 0019/0020: the instance-layer header clause and its separator — the
+# corpus held ZERO `uses` clauses across every target (r103-cov), because
+# mutation must rediscover a keyword in declaration-header position one
+# byte at a time and nothing here handed it over.
+"uses "
+", "
 
 # ── type names ──────────────────────────────────────────────────────────
 "string"
@@ -111,3 +117,29 @@
 "// "
 "#live"
 "#restart"
+# The four the LANGUAGE interprets (RFC 0019 merge policies): the corpus
+# held none of them either, so the layer engine's policy arms were never
+# reached from a fuzzed document (r103-cov).
+"#sealed"
+"#identity"
+"#append"
+"#overlay"
+
+# ── hostile characters (source-character policy) ────────────────────────
+# Raw bytes the policy must diagnose, never pass or mangle. U+E0067
+# (TAG LATIN SMALL LETTER G): the invisible-ASCII tag block.
+"\xf3\xa0\x81\xa7"
+# U+FEFF raw (interior BOM), U+202E (RLO bidi), U+0085 (NEL), U+2028 (LS)
+"\xef\xbb\xbf"
+"\xe2\x80\xae"
+"\xc2\x85"
+"\xe2\x80\xa8"
+# Private-use sentinels U+E000/U+E00F: the remove-judgment's marker
+# range — values already holding them steer the sentinel picker (and
+# all-16-present is its fail-closed refusal).
+"\xee\x80\x80"
+"\xee\x80\x8f"
+# Quote runs: the delete-splice relex corners (quote-merge shapes).
+"\"\""
+"\"\"\""
+"\"\"\"\""

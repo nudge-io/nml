@@ -3,7 +3,7 @@
 Open any `.nml` file. Look at the **status bar** (bottom-right):
 
 - `nml: <package> <version>` — the schema governing this file. Hover for the
-  **content hash** (`blake3:{hash8}` plus the full hash), delivery channel,
+  **content hash** (`blake3:{hash8}` plus the full hash), the schema's source,
   binding, and server label — the auditable chain from squiggle to store slot.
 - `nml: no schema` — nothing governs this file yet. Commit a
   `<name>.package.nml`, or run your tool's `schema sync`.

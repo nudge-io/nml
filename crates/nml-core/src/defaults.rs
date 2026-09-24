@@ -24,6 +24,8 @@ use crate::types::{SpannedValue, Value};
 
 /// Recursion bound mirroring the validator's `MAX_VALIDATION_DEPTH`. Bounds the
 /// *depth* of recursion into authored and materialized structure.
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="64" — nesting depth when a model's defaults are materialized
 const MAX_DEFAULT_DEPTH: u32 = 64;
 
 /// Upper bound on the number of nested models materialized from defaults in a
@@ -34,6 +36,8 @@ const MAX_DEFAULT_DEPTH: u32 = 64;
 /// missing-required-field validation error rather than memory exhaustion. The
 /// limit is far above any real config (materialization is rare and shallow in
 /// practice).
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="1024" — models materialized for defaults in one pass
 const MAX_MATERIALIZED_MODELS: u32 = 1024;
 
 /// Inject schema defaults into `body`, dispatching on whether `root` names a
@@ -72,6 +76,8 @@ where
 /// Materialization bound for declaration-reference inlining: far beyond any
 /// real composition depth, so a pathological reference chain degrades to
 /// "reference left in place" (reported by symbols/validation), never a hang.
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="16" — chained default references followed
 const MAX_REFERENCE_DEPTH: u32 = 16;
 
 /// [`from_body_defaulted`] at **document** scope (RFC 0013): properties whose
@@ -95,7 +101,7 @@ pub fn from_document_defaulted<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
-    let body = match doc.block(keyword, name).body() {
+    let block = match doc.block_decl(keyword, name) {
         Some(b) => b,
         None => {
             return Err(serde::de::Error::custom(format!(
@@ -103,13 +109,40 @@ where
             )));
         }
     };
-    let inlined = inline_array_references(doc, body, 0);
+    uses_guard(block)?;
+    let inlined = inline_array_references(doc, &block.body, 0);
     from_body_defaulted(index, keyword, &inlined, resolver)
+}
+
+/// Fail closed on layered instances (RFC 0019): every deserialization
+/// entry that can SEE the block header must refuse a `uses`-bearing block
+/// — its raw body is not its effective config, and reading it would
+/// silently substitute schema defaults for layer-provided values (the
+/// runtime booting with the wrong config and no error). One guard, every
+/// header-aware entry; body-only entries (`from_body_defaulted`) cannot
+/// see the clause and rely on their callers coming through here.
+fn uses_guard(block: &BlockDecl) -> Result<(), de::Error> {
+    if block.uses.is_empty() {
+        return Ok(());
+    }
+    Err(de::Error::De(format!(
+        "instance '{}' declares `uses` layers; its raw body is not its \
+         effective config — compose the stack (RFC 0019) and deserialize \
+         the resolved body instead",
+        block.name.name
+    )))
 }
 
 /// Rewrite `x = SomeArrayName` properties into the inline nested-list form
 /// when `SomeArrayName` is a top-level array declaration, recursively (a
 /// materialized array's own properties may reference further arrays).
+/// RFC 0019: per-layer array-reference inlining against the layer's OWN
+/// document (array declarations are file-local). The compose engine's step-3
+/// entry point; wraps the depth-guarded walker `from_document_defaulted` uses.
+pub fn inline_layer_array_references(doc: &crate::query::Document<'_>, body: &Body) -> Body {
+    inline_array_references(doc, body, 0)
+}
+
 fn inline_array_references(doc: &crate::query::Document<'_>, body: &Body, depth: u32) -> Body {
     if depth >= MAX_REFERENCE_DEPTH {
         return body.clone();
@@ -218,6 +251,7 @@ pub fn from_block_defaulted<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
+    uses_guard(block)?;
     from_body_defaulted(index, &block.keyword.name, &block.body, resolver)
 }
 
@@ -1178,6 +1212,73 @@ mod tests {
         );
     }
 
+    /// Materialization stops at
+    /// [`MAX_DEFAULT_DEPTH`] — a fully-defaultable chain longer than the
+    /// bound is synthesized only that deep (well inside the model
+    /// budget).
+    #[test]
+    fn default_materialization_stops_at_the_depth_bound() {
+        let depth = MAX_DEFAULT_DEPTH as usize + 8;
+        let mut src = format!("model l{depth}:\n    v string = \"x\"\n\n");
+        for i in (0..depth).rev() {
+            src.push_str(&format!("model l{i}:\n    a l{}\n\n", i + 1));
+        }
+        let idx = index_from(&src);
+        let out = apply_defaults(
+            &idx,
+            "l0",
+            &body_of("l0 X:\n    a:\n        v = \"keep\"\n"),
+        );
+        let nodes = count_nested(&out);
+        assert!(
+            nodes < depth,
+            "a {depth}-deep chain must not materialize in full: {nodes}"
+        );
+        assert!(nodes <= MAX_DEFAULT_DEPTH as usize && nodes > 8, "{nodes}");
+    }
+
+    /// Array references are inlined only inside
+    /// [`MAX_REFERENCE_DEPTH`] levels of nesting — exactly at the bound a
+    /// reference stays a reference.
+    #[test]
+    fn array_reference_inlining_stops_at_the_reference_depth() {
+        fn nested(levels: usize) -> String {
+            let mut src =
+                String::from("[]thing items:\n    - one:\n        v = \"x\"\n\nthing top:\n");
+            for k in 1..=levels {
+                src.push_str(&format!("{}n{k}:\n", "    ".repeat(k)));
+            }
+            src.push_str(&format!("{}x = items\n", "    ".repeat(levels + 1)));
+            src
+        }
+        fn innermost(body: &Body, levels: usize) -> &BodyEntry {
+            let mut body = body;
+            for _ in 0..levels {
+                body = match &body.entries[0].kind {
+                    BodyEntryKind::NestedBlock(nb) => &nb.body,
+                    other => panic!("expected a nested block, got {other:?}"),
+                };
+            }
+            &body.entries[0]
+        }
+        for (levels, inlined) in [
+            (MAX_REFERENCE_DEPTH as usize - 1, true),
+            (MAX_REFERENCE_DEPTH as usize, false),
+        ] {
+            let src = nested(levels);
+            let file = crate::cst::parse_to_ast(&src).unwrap();
+            let doc = crate::query::Document::new(&file);
+            let block = doc.block_decl("thing", "top").expect("top");
+            let out = inline_layer_array_references(&doc, &block.body);
+            let leaf = innermost(&out, levels);
+            assert_eq!(
+                matches!(leaf.kind, BodyEntryKind::NestedBlock(_)),
+                inlined,
+                "{levels} levels: {leaf:?}"
+            );
+        }
+    }
+
     fn count_nested(body: &Body) -> usize {
         body.entries
             .iter()
@@ -1238,6 +1339,40 @@ mod tests {
         let resolver = ValueResolver::new(|_| None);
         let p: Prompt = from_block_defaulted(&idx, block, &resolver).unwrap();
         assert_eq!(p.output_format, "text");
+    }
+
+    #[test]
+    fn from_block_defaulted_refuses_uses_bearing_blocks() {
+        // Fail closed (RFC 0019): this entry sees only the raw body, so a
+        // layered instance would silently read schema defaults in place
+        // of layer-provided values — it must error, not mis-read.
+        #[derive(Debug, serde::Deserialize)]
+        struct Prompt {}
+        let idx = index_from("model prompt:\n    outputFormat string = \"text\"\n");
+        let file = crate::cst::parse_to_ast(
+            "prompt base:\n    outputFormat = \"json\"\n\nprompt P uses base:\n    other = \"z\"\n",
+        )
+        .unwrap();
+        let block = match &file.declarations[1].kind {
+            DeclarationKind::Block(b) => b,
+            _ => panic!(),
+        };
+        let resolver = ValueResolver::new(|_| None);
+        let err = from_block_defaulted::<Prompt>(&idx, block, &resolver).unwrap_err();
+        assert!(
+            err.to_string().contains("uses"),
+            "names the cause and the fix: {err}"
+        );
+        // The document-level entry sees the same header and refuses the
+        // same way — fetching the body through `Document::block()` used
+        // to drop the clause and slip past the guard.
+        let doc = crate::query::Document::new(&file);
+        let err =
+            from_document_defaulted::<Prompt>(&idx, &doc, "prompt", "P", &resolver).unwrap_err();
+        assert!(
+            err.to_string().contains("uses"),
+            "document-level entry is guarded too: {err}"
+        );
     }
 
     #[test]

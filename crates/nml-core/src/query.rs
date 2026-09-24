@@ -29,7 +29,8 @@
 //! ```
 
 use crate::ast::*;
-use crate::types::Value;
+use crate::span::Span;
+use crate::types::{SpannedValue, Value};
 
 /// A queryable wrapper around a parsed NML [`File`].
 pub struct Document<'a> {
@@ -46,14 +47,27 @@ impl<'a> Document<'a> {
     ///
     /// Returns a [`BlockQuery`] for further drilling into properties and nested blocks.
     pub fn block(&self, keyword: &str, name: &str) -> BlockQuery<'a> {
-        for decl in &self.file.declarations {
-            if let DeclarationKind::Block(block) = &decl.kind {
-                if block.keyword.name == keyword && block.name.name == name {
-                    return BlockQuery::Found(&block.body);
-                }
-            }
+        match self.block_decl(keyword, name) {
+            Some(block) => BlockQuery::Found(&block.body),
+            None => BlockQuery::NotFound,
         }
-        BlockQuery::NotFound
+    }
+
+    /// The full declaration for `keyword name`, when present — for callers
+    /// that need header facts (the `uses` clause, spans) rather than just
+    /// the body. `block()` is this with the header dropped.
+    pub fn block_decl(&self, keyword: &str, name: &str) -> Option<&'a BlockDecl> {
+        self.file
+            .declarations
+            .iter()
+            .find_map(|decl| match &decl.kind {
+                DeclarationKind::Block(block)
+                    if block.keyword.name == keyword && block.name.name == name =>
+                {
+                    Some(block)
+                }
+                _ => None,
+            })
     }
 
     /// Iterate over all block declarations matching a keyword.
@@ -177,6 +191,102 @@ impl<'a> BlockQuery<'a> {
             BlockQuery::NotFound => None,
         }
     }
+
+    /// The strings of the list-valued entry `name`, in EITHER spelling
+    /// the language admits for a `[]string` field — the block form
+    /// (`files:` + `- "x"` items) and the inline array (`files = ["x"]`)
+    /// — each with its own span: a quoted literal's, or a bare name's
+    /// (`- server`, lowered as a reference). The ONE read for a consumer
+    /// that judged the field through a schema: a loader reading one
+    /// spelling silently disagreed with the meta-schema that accepted
+    /// both. Elements of any other shape are left out (the schema's
+    /// finding, not the reader's). `None` when the block has no entry
+    /// `name`; a body naming it twice does not parse (NML2093), so no
+    /// reader ever runs over one. A template-string element is reported
+    /// in [`StringList::templates`], never read as text.
+    pub fn string_list(&self, name: &str) -> Option<StringList<'a>> {
+        self.body()?
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.kind {
+                BodyEntryKind::NestedBlock(nb) if nb.name.name == name => {
+                    let mut list = StringList::new(nb.name.span);
+                    for e in &nb.body.entries {
+                        let BodyEntryKind::ListItem(item) = &e.kind else {
+                            continue;
+                        };
+                        match &item.kind {
+                            ListItemKind::Shorthand { value, .. } => list.push(value),
+                            ListItemKind::Reference(id) => list.items.push(StringItem {
+                                text: &id.name,
+                                span: id.span,
+                            }),
+                            _ => {}
+                        }
+                    }
+                    Some(list)
+                }
+                BodyEntryKind::Property(p) if p.name.name == name => {
+                    let mut list = StringList::new(p.name.span);
+                    if let Value::Array(elements) = &p.value.value {
+                        for element in elements {
+                            list.push(element);
+                        }
+                    }
+                    Some(list)
+                }
+                _ => None,
+            })
+    }
+}
+
+/// One element of a list-valued entry read by [`BlockQuery::string_list`]:
+/// a quoted literal or a bare name, with its own span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StringItem<'a> {
+    pub text: &'a str,
+    pub span: Span,
+}
+
+/// A list-valued entry read by [`BlockQuery::string_list`]: the key's span
+/// (for a finding about the list as a whole) and its strings in source
+/// order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringList<'a> {
+    pub key: Span,
+    pub items: Vec<StringItem<'a>>,
+    /// The spans of elements that are TEMPLATE strings (`"a{{x}}"`) — a
+    /// value the meta-schema admits as a `string` that names no plain text
+    /// (its expression segments are the embedder's). Never in `items`; a
+    /// reader that needs literals refuses them located, so an element it
+    /// cannot read is never an element it silently dropped (a manifest's
+    /// `denyRefs` veto that never fired, a `files` glob that claimed
+    /// less than it said). Elements of any other shape stay the schema's
+    /// finding.
+    pub templates: Vec<Span>,
+}
+
+impl<'a> StringList<'a> {
+    fn new(key: Span) -> Self {
+        Self {
+            key,
+            items: Vec::new(),
+            templates: Vec::new(),
+        }
+    }
+
+    /// Classify one element: a quoted literal or a bare name is a
+    /// string of the list; a template string is reported, not read.
+    fn push(&mut self, value: &'a SpannedValue) {
+        match &value.value {
+            Value::String(s) | Value::Reference(s) => self.items.push(StringItem {
+                text: s,
+                span: value.span,
+            }),
+            Value::TemplateString(_) => self.templates.push(value.span),
+            _ => {}
+        }
+    }
 }
 
 /// Result of looking up a value in the AST.
@@ -292,6 +402,44 @@ fn find_property<'a>(body: &'a Body, name: &str) -> ValueQuery<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `string_list` reads both spellings alike — the block form and the
+    /// inline array — with each string's own span and the key's; a bare
+    /// name is a string, anything else is not; a missing entry is `None`.
+    #[test]
+    fn string_list_reads_both_spellings_with_spans() {
+        let src = "package p:\n    files:\n        - \"a/**\"\n        - server\n        - 1\n        - \"t/{{x}}\"\n    \
+                   inline = [\"a/**\", server, 1, \"t/{{x}}\"]\n    scalar = \"x\"\n";
+        let file = crate::parse(src).unwrap();
+        let doc = Document::new(&file);
+        let p = doc.block("package", "p");
+        let block = p.string_list("files").expect("block form");
+        let inline = p.string_list("inline").expect("inline form");
+        let texts = |l: &StringList<'_>| {
+            l.items
+                .iter()
+                .map(|i| i.text.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&block), ["a/**", "server"]);
+        assert_eq!(texts(&inline), ["a/**", "server"]);
+        assert_eq!(&src[block.key.start..block.key.end], "files");
+        assert_eq!(&src[inline.key.start..inline.key.end], "inline");
+        for l in [&block, &inline] {
+            assert_eq!(&src[l.items[0].span.start..l.items[0].span.end], "\"a/**\"");
+            assert_eq!(&src[l.items[1].span.start..l.items[1].span.end], "server");
+            // The template element is reported by span, never read as
+            // text — and the number is neither (the schema's finding).
+            assert_eq!(l.templates.len(), 1, "{l:?}");
+            assert_eq!(
+                &src[l.templates[0].start..l.templates[0].end],
+                "\"t/{{x}}\""
+            );
+        }
+        assert!(p.string_list("scalar").is_some_and(|l| l.items.is_empty()));
+        assert!(p.string_list("absent").is_none());
+        assert!(BlockQuery::NotFound.string_list("files").is_none());
+    }
     use crate::cst::parse_to_ast;
 
     fn parse_doc(source: &str) -> File {

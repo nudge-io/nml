@@ -1,0 +1,13 @@
+[]validator validators:
+    |deny:
+        - "x"
+    .shared:
+        a = 1
+    p = 2
+    - a:
+        files:
+            - "x/**"
+        note = "n"
+    - "k":
+        b = 1
+    - r

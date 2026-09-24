@@ -1,0 +1,24 @@
+// RFC 0019 Summary example: identity merge + sealed fields, clean.
+model step:
+    name string+
+    action string #sealed
+    locator string
+
+model flow:
+    entrypoint string #sealed
+    steps []step #identity
+
+flow memberLookup:
+    entrypoint = "search"
+    steps:
+        - search:
+            action = "type"
+            locator = "#q"
+        - submitSearch:
+            action = "click"
+            locator = "#submit"
+
+flow cuXyzMemberLookup uses memberLookup:
+    steps:
+        - submitSearch:
+            locator = "#search-button"

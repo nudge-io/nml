@@ -50,7 +50,7 @@ use crate::types::{Directive, PrimitiveType, SpannedValue, Value};
 /// Where an effective value came from. `Span` is byte offsets into ONE file,
 /// so provenance always carries the file; a schema-synthesized default has no
 /// source location at all.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum Origin {
     File {
         file: PathBuf,
@@ -272,6 +272,8 @@ impl FieldChange {
 
 /// Bounds recursion (mirrors the validator/defaulter guards — this walks
 /// schema-validated input, but stays hardened anyway).
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="64" — nesting depth the structural diff will descend
 const MAX_DEPTH: u32 = 64;
 
 /// Diff two multi-file documents for the instance of `root_model`.
@@ -388,6 +390,7 @@ pub fn synthesize_config_root(root_name: &str, fields: &[ConfigRootField]) -> Mo
                 directives: Vec::new(),
                 doc: None,
                 span: nospan,
+                type_span: nospan,
             }
         })
         .collect();
@@ -408,14 +411,61 @@ pub fn synthesize_config_root(root_name: &str, fields: &[ConfigRootField]) -> Mo
 /// via `apply_array_shared_properties`) so the differ sees real values (RFC
 /// 0032 P3 contract). `$ENV` is left UNresolved — secret values never transit
 /// the diff (`Value::Secret` compares by variable name).
+/// The synthetic key carrying a block's `uses` refs in the diffable view
+/// (RFC 0019). A NON-identifier spelling the parser can never produce, so
+/// a real field named `uses` cannot collide; consumers that enumerate
+/// diff paths recognize base-layer swaps by this constant.
+/// The key under which a block's `uses` list travels in a wrapped body —
+/// an embedder that diffs whole files (the platform's config reload and
+/// schema-conformance passes do) reads it back by this name.
+pub const USES_DIFF_KEY: &str = "(uses)";
+
+/// A parsed [`File`] as the [`Body`] the differ walks: every block or array
+/// declaration becomes one entry, a block's `uses` list travelling as the
+/// synthetic [`USES_DIFF_KEY`] property. With [`config_root_fields_from_files`]
+/// this is how an embedder diffs two whole configuration files.
 pub fn wrap_file_as_body(file: &File) -> Body {
     let mut entries = Vec::new();
     for decl in &file.declarations {
         let (name, body) = match &decl.kind {
-            DeclarationKind::Block(b) => (
-                b.keyword.clone(),
-                crate::resolve::apply_shared_properties(&b.body),
-            ),
+            DeclarationKind::Block(b) => {
+                let mut body = crate::resolve::apply_shared_properties(&b.body);
+                // RFC 0019: the `uses` clause is part of the block's
+                // effective configuration — swapping a base layer swaps
+                // every inherited value, so the reload differ must see it.
+                // Keyed by a NON-identifier name (`(uses)`) the parser can
+                // never produce, so a real field named `uses` cannot
+                // collide.
+                if !b.uses.is_empty() {
+                    let refs = b
+                        .uses
+                        .iter()
+                        .map(|r| {
+                            crate::types::SpannedValue::new(
+                                crate::types::Value::Reference(r.name.clone()),
+                                r.span,
+                            )
+                        })
+                        .collect();
+                    body.entries.insert(
+                        0,
+                        BodyEntry {
+                            span: decl.span,
+                            kind: BodyEntryKind::Property(crate::ast::Property {
+                                name: crate::ast::Identifier {
+                                    name: USES_DIFF_KEY.to_string(),
+                                    span: decl.span,
+                                },
+                                value: crate::types::SpannedValue::new(
+                                    crate::types::Value::Array(refs),
+                                    decl.span,
+                                ),
+                            }),
+                        },
+                    );
+                }
+                (b.keyword.clone(), body)
+            }
             DeclarationKind::Array(a) => {
                 // The synth root models an array as `List(item)`, so its
                 // diffable content is its ELEMENTS (shared properties merged in).
@@ -722,6 +772,7 @@ fn diff_unmodeled_remainder(
             directives: Vec::new(),
             doc: None,
             span: Span { start: 0, end: 0 },
+            type_span: Span { start: 0, end: 0 },
         };
         let items_field = model
             .fields
@@ -1785,7 +1836,7 @@ fn arm_target_str(a: &crate::ast::Arm) -> String {
     use crate::ast::ArmTarget;
     match &a.target {
         ArmTarget::Reference(id) => id.name.clone(),
-        ArmTarget::Literal { value, .. } => format!("{value:?}"),
+        ArmTarget::Literal(t) => format!("{:?}", t.value),
         ArmTarget::Inline { name, .. } => format!("{}:", name.name),
     }
 }
@@ -1794,7 +1845,7 @@ fn arm_target_eq(a: &crate::ast::ArmTarget, b: &crate::ast::ArmTarget, depth: u3
     use crate::ast::ArmTarget;
     match (a, b) {
         (ArmTarget::Reference(x), ArmTarget::Reference(y)) => x.name == y.name,
-        (ArmTarget::Literal { value: av, .. }, ArmTarget::Literal { value: bv, .. }) => av == bv,
+        (ArmTarget::Literal(a), ArmTarget::Literal(b)) => a.value == b.value,
         (ArmTarget::Inline { name: an, body: ab }, ArmTarget::Inline { name: bn, body: bb }) => {
             an.name == bn.name && body_eq_bounded(ab, bb, depth + 1)
         }
@@ -2136,7 +2187,7 @@ fn arm_target_diff_value(arm: &crate::ast::Arm) -> Value {
     use crate::ast::ArmTarget;
     match &arm.target {
         ArmTarget::Reference(id) => Value::String(id.name.clone()),
-        ArmTarget::Literal { value, .. } => Value::String(value.clone()),
+        ArmTarget::Literal(t) => Value::String(t.value.clone()),
         ArmTarget::Inline { name, .. } => Value::String(format!("{}:", name.name)),
     }
 }
@@ -2241,6 +2292,61 @@ fn push(path: &FieldPath, kind: ChangeKind, origin: Origin, out: &mut Vec<FieldC
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn uses_clause_change_is_visible_to_the_differ() {
+        // RFC 0019: swapping a base layer must never classify as a no-op —
+        // it swaps every inherited value.
+        let parse = |src: &str| crate::cst::parse_to_ast(src).unwrap();
+        let v1 = parse("flow tenant uses prodBase:\n    label = \"x\"\n");
+        let v2 = parse("flow tenant uses devBase:\n    label = \"x\"\n");
+        let same = parse("flow tenant uses prodBase:\n    label = \"x\"\n");
+        let b1 = wrap_file_as_body(&v1);
+        let b2 = wrap_file_as_body(&v2);
+        let b3 = wrap_file_as_body(&same);
+        assert_ne!(
+            serde_json::to_string(&b1).unwrap(),
+            serde_json::to_string(&b2).unwrap(),
+            "base swap must change the diffable body"
+        );
+        assert_eq!(
+            serde_json::to_string(&b1).unwrap(),
+            serde_json::to_string(&b3).unwrap(),
+            "identical uses must not change it"
+        );
+        // A real field named `uses` cannot collide with the synthetic key.
+        let with_field = parse("flow t:\n    uses = \"a\"\n");
+        let wf = wrap_file_as_body(&with_field);
+        assert!(!serde_json::to_string(&wf).unwrap().contains(USES_DIFF_KEY));
+    }
+
+    /// The synthetic key is a NAME on the wire, not an implementation
+    /// detail: it rides the diffable body a reload differ renders, so
+    /// renaming it renames a property path an operator reads. Every
+    /// assertion written against the constant alone renames WITH it —
+    /// this one names the string, both where it must appear and where it
+    /// must not.
+    #[test]
+    fn the_uses_clause_travels_under_the_name_the_parser_cannot_mint() {
+        assert_eq!(USES_DIFF_KEY, "(uses)");
+        let parse = |src: &str| crate::cst::parse_to_ast(src).unwrap();
+        let wired = serde_json::to_string(&wrap_file_as_body(&parse(
+            "flow tenant uses prodBase:\n    label = \"x\"\n",
+        )))
+        .unwrap();
+        assert!(
+            wired.contains("(uses)"),
+            "the uses list must ride the body under its published name: {wired}"
+        );
+        let plain =
+            serde_json::to_string(&wrap_file_as_body(&parse("flow t:\n    uses = \"a\"\n")))
+                .unwrap();
+        assert!(
+            !plain.contains("(uses)"),
+            "a real field named `uses` must not be spelled as the synthetic key: {plain}"
+        );
+    }
+
     use super::*;
     use crate::ast::DeclarationKind;
 
@@ -2829,10 +2935,7 @@ mod tests {
                         name: "v".into(),
                         span: nospan,
                     },
-                    value: SpannedValue {
-                        value: Value::Number(leaf.into()),
-                        span: nospan,
-                    },
+                    value: SpannedValue::new(Value::Number(leaf.into()), nospan),
                 }),
             }]);
             for _ in 0..levels {

@@ -1,5 +1,6 @@
 //! Error types for NML parsing and validation.
 
+use crate::diagnostic::Suggestion;
 use crate::span::Span;
 use thiserror::Error;
 
@@ -39,15 +40,42 @@ pub enum ParseErrorKind {
     /// A carriage return not followed by a line feed. Line endings are LF or
     /// CRLF (spec: Source text); a bare CR is invisible in most tools and is
     /// either corruption or content smuggling, never intent.
-    BareCarriageReturn,
-    /// A raw control character (C0 other than tab and line endings, or DEL)
-    /// anywhere in source. Control characters are content, and content
-    /// belongs in escapes (`\u{1B}`), where review can see it.
-    ForbiddenControlCharacter { ch: char },
+    BareCarriageReturn {
+        /// Inside a string literal (content, whose fix is the `\\r` escape)
+        /// or in token position (transport, whose fix is deletion).
+        in_string: bool,
+    },
+    /// A raw control character (any Unicode Cc — C0, DEL, or the C1
+    /// range — other than tab and line endings) anywhere in source.
+    /// Control characters are content, and content belongs in escapes
+    /// (`\u{1B}`), where review can see it.
+    ForbiddenControlCharacter {
+        ch: char,
+        /// Inside a string literal, where the character is CONTENT and a
+        /// value-preserving machine repair exists (see [`Repairs`]); in
+        /// token position no repair is sound.
+        in_string: bool,
+    },
     /// An invisible character that can make source display differently than
-    /// it parses: a bidirectional control (Trojan Source, CVE-2021-42574) or
-    /// an interior U+FEFF. The `\u{…}` escape is the sanctioned spelling.
-    InvisibleCharacter { ch: char },
+    /// it parses: a bidirectional control (Trojan Source, CVE-2021-42574),
+    /// an interior U+FEFF, a U+2028/U+2029 line/paragraph separator, or a
+    /// Unicode tag character (U+E0000–U+E007F).
+    /// The `\u{…}` escape is the sanctioned spelling.
+    InvisibleCharacter {
+        ch: char,
+        /// Inside a string literal, where the resolution space is
+        /// enumerable (see [`Repairs`]); in token position no repair is
+        /// sound.
+        in_string: bool,
+        /// Deletion provably removes JUST this character — the
+        /// sentinel judgment plus the delete-splice lex-integrity
+        /// check (`cst::value::RepairJudge::remove_preserves_value`).
+        /// Only then is the *remove* alternative offered; where
+        /// deletion would disturb the string's structure (a line
+        /// flipping blank, quote runs merging, a CR gluing to an LF)
+        /// the escape stands alone. Always `false` in token position.
+        remove_sound: bool,
+    },
     /// Content on a multi-line string's opening line (the Swift/Java rule:
     /// content begins on a new line). Text there would participate in
     /// dedent's min-indent — the one way transport interpretation could
@@ -70,6 +98,11 @@ pub enum ParseErrorKind {
     /// A deliberate resource bound was hit (`what` names the axis). The
     /// bound is a DoS defense on untrusted input, documented in the index.
     NestingLimit { what: &'static str },
+    /// The source is longer than the token stream can index (`u32`
+    /// bounds — the same 4 GiB ceiling as `rowan::TextSize`). Emitted
+    /// INSTEAD of lexing: the tree is empty and this is its one finding.
+    /// A resource bound like `NestingLimit`, never a panic.
+    SourceTooLarge { len: usize, max: usize },
     /// `set<a, b>` — the map-habit typo; elements are alternatives.
     /// Machine-fixable: the comma becomes `|`.
     SetSeparator,
@@ -80,6 +113,22 @@ pub enum ParseErrorKind {
     UnknownTypeConstructor { found: String },
     /// A `#directive` key repeated on one field.
     DuplicateDirective,
+    /// A body declares one name twice (NML2093): `shown` is the name as its
+    /// sigil spells it (`|allow`, `.retry`), `first` the span of the first
+    /// occurrence's name, `two_spellings` when a block `k:` met an inline
+    /// `k = …` (the message's clarifier). Emitted beside every parse by the
+    /// kernel's name rules (the `entry_names` pass); no repair exists —
+    /// which entry is meant is unknowable.
+    DuplicateEntry {
+        shown: String,
+        first: Span,
+        two_spellings: bool,
+    },
+    /// A file declares one name twice at the top level (NML1000): every
+    /// declaration — block, array, `const`, `template`, `oneof` — shares one
+    /// namespace so references stay unambiguous. `first` spans the first
+    /// declaration's name. The same pass as [`Self::DuplicateEntry`].
+    DuplicateDeclaration { name: String, first: Span },
     /// An unknown (`Some`) or unterminated (`None`) string escape.
     InvalidEscape { escape: Option<char> },
     /// A malformed `\u{…}` escape; the payload names the precise failure so
@@ -169,6 +218,8 @@ pub enum SecretRefIssue {
 
 /// Echoed-source bound: enough to recognize the token, too little to flood
 /// a terminal (long strings render via their kind's description instead).
+///
+/// LIMIT: reach=content guards=output surface=kernel shown="32" — source characters a diagnostic echoes back at you
 pub(crate) const MAX_ECHO: usize = 32;
 
 /// Bound on a machine-fix replacement carried **whole** in an error
@@ -176,6 +227,8 @@ pub(crate) const MAX_ECHO: usize = 32;
 /// be truncated — a partial rewrite would corrupt the file — so past this
 /// bound the fix is omitted rather than clipped. Generous for any literal
 /// a human wrote; a stingy cap on what a hostile file can amplify.
+///
+/// LIMIT: reach=content guards=output surface=kernel shown="64" — bytes of source one machine-applicable fix may capture
 pub(crate) const MAX_FIX_CAPTURE: usize = 64;
 
 /// The separator-strip machine fix, whole-or-none: the replacement
@@ -209,6 +262,38 @@ impl ExpectedItem {
             ExpectedItem::Kind(k) => k.describe().to_string(),
             ExpectedItem::Desc(d) => (*d).to_string(),
         }
+    }
+}
+
+/// The teaching tail for the character classes whose generic escape
+/// advice alone would mislead — one exhaustive classifier, so a
+/// character can never collect two tails. The line breaks (NEL, LS,
+/// PS) are the ones renderers actually display as line breaks, where
+/// the author almost always meant `\n` (VT/FF are controls no renderer
+/// breaks on; they keep the generic message). The tag block is an
+/// invisible ASCII mirror: its raw form is a hidden-text channel, and
+/// its one legitimate modern use — emoji tag sequences — is content
+/// that belongs in escapes.
+fn char_class_hint(ch: char) -> &'static str {
+    match ch {
+        // NEL sits in BOTH ambiguity classes — a Unicode mandatory
+        // line break AND the CP-1252 ellipsis byte (0x85) — so its
+        // hint teaches all three readings its repair enumerates, in
+        // the same order.
+        '\u{85}' => {
+            " — this is a Unicode line break: write `\\n` for a line break, \
+             the escape to keep the character, or `…` if the byte is \
+             Windows-1252 mojibake"
+        }
+        '\u{2028}' | '\u{2029}' => {
+            " — this is a Unicode line break: write `\\n` for a line break, \
+             or the escape to keep the character"
+        }
+        '\u{E0000}'..='\u{E007F}' => {
+            " — tag characters mirror ASCII invisibly (a hidden-text \
+             channel); for an emoji tag sequence, write the escapes"
+        }
+        _ => "",
     }
 }
 
@@ -256,19 +341,26 @@ impl ParseErrorKind {
                 format!("unexpected character `{}`", echo(&ch.to_string()))
             }
             TabInIndent => "tabs are not permitted in indentation; use spaces".to_string(),
-            BareCarriageReturn => "bare carriage return (a CR with no following LF); \
+            BareCarriageReturn { .. } => "bare carriage return (a CR with no following LF); \
                                    line endings are LF or CRLF — for a literal CR in a \
                                    string, write `\\r`"
                 .to_string(),
-            ForbiddenControlCharacter { ch } => format!(
+            // The advised spelling IS the shared one (`unicode_escape`)
+            // — the same string the machine repair inserts and the
+            // formatter emits, so advice and tooling can never drift.
+            ForbiddenControlCharacter { ch, .. } => format!(
                 "raw control character U+{:04X} is not permitted in source; \
-                 write it as `\\u{{{:X}}}` inside a string",
-                *ch as u32, *ch as u32
+                 write it as `{}` inside a string{}",
+                *ch as u32,
+                crate::source_policy::unicode_escape(*ch),
+                char_class_hint(*ch)
             ),
-            InvisibleCharacter { ch } => format!(
+            InvisibleCharacter { ch, .. } => format!(
                 "invisible character U+{:04X} can make source display differently \
-                 than it parses; write it as `\\u{{{:X}}}` inside a string",
-                *ch as u32, *ch as u32
+                 than it parses; write it as `{}` inside a string{}",
+                *ch as u32,
+                crate::source_policy::unicode_escape(*ch),
+                char_class_hint(*ch)
             ),
             MultilineOpeningContent => "multi-line string content must begin on the \
                                         line after the opening `\"\"\"` (text on the \
@@ -294,6 +386,9 @@ impl ParseErrorKind {
                 )
             }
             NestingLimit { what } => format!("maximum {what} nesting depth exceeded"),
+            SourceTooLarge { len, max } => format!(
+                "source is {len} bytes; a single NML source is parsed only up to {max} bytes"
+            ),
             SetSeparator => "set elements are alternatives separated by '|', not ','".to_string(),
             ReservedTypeKeyword => {
                 "'map' is reserved for a future map type — only 'set' takes type arguments today"
@@ -305,6 +400,21 @@ impl ParseErrorKind {
             ),
             DuplicateDirective => {
                 "duplicate directive — each directive may appear once per field".to_string()
+            }
+            DuplicateEntry {
+                shown,
+                two_spellings,
+                ..
+            } => {
+                let clarifier = if *two_spellings {
+                    format!(" (`{shown}:` and `{shown} = …` are two spellings of one entry)")
+                } else {
+                    String::new()
+                };
+                format!("duplicate entry '{shown}' — a body declares each name once{clarifier}")
+            }
+            DuplicateDeclaration { name, .. } => {
+                format!("duplicate declaration '{name}' — a file declares each name once")
             }
             InvalidEscape { escape: Some(ch) } => format!(
                 "unknown escape sequence '\\{}' (valid escapes: \\\" \\\\ \\n \\t \\r \\s \\u{{…}})",
@@ -377,7 +487,7 @@ impl ParseErrorKind {
             UnterminatedString { .. } => codes::UNTERMINATED_STRING,
             UnexpectedCharacter { .. } => codes::UNEXPECTED_CHARACTER,
             TabInIndent => codes::TAB_IN_INDENT,
-            BareCarriageReturn => codes::BARE_CARRIAGE_RETURN,
+            BareCarriageReturn { .. } => codes::BARE_CARRIAGE_RETURN,
             ForbiddenControlCharacter { .. } => codes::FORBIDDEN_CONTROL,
             InvisibleCharacter { .. } => codes::INVISIBLE_CHARACTER,
             MultilineOpeningContent => codes::MULTILINE_OPENING_CONTENT,
@@ -385,10 +495,13 @@ impl ParseErrorKind {
             MultilineClosingMisaligned { .. } => codes::MULTILINE_CLOSING_MISALIGNED,
             BadDedent { .. } => codes::BAD_DEDENT,
             NestingLimit { .. } => codes::NESTING_LIMIT,
+            SourceTooLarge { .. } => codes::SOURCE_TOO_LARGE,
             SetSeparator => codes::SET_SEPARATOR,
             ReservedTypeKeyword => codes::RESERVED_TYPE_KEYWORD,
             UnknownTypeConstructor { .. } => codes::UNKNOWN_TYPE_CONSTRUCTOR,
             DuplicateDirective => codes::DUPLICATE_DIRECTIVE,
+            DuplicateEntry { .. } => codes::DUPLICATE_ENTRY,
+            DuplicateDeclaration { .. } => codes::DUPLICATE_DECLARATION,
             InvalidEscape { .. } => codes::INVALID_ESCAPE,
             InvalidUnicodeEscape { .. } => codes::INVALID_ESCAPE,
             InvalidNumber { .. } => codes::INVALID_NUMBER,
@@ -400,61 +513,313 @@ impl ParseErrorKind {
         })
     }
 
-    /// A machine-applicable fix, derived from the payload. `span` is the
-    /// error's anchor. Fixes stay conservative: only byte replacements that
-    /// provably preserve intent.
-    pub fn suggestion(&self, span: Span) -> Option<(String, Span)> {
+    /// The escape spelling the in-string repair inserts for this
+    /// kind's character — and the SAME string the reclassifier's
+    /// soundness judge splices before granting the in-string reading
+    /// (`cst::value`'s decode-equality gate), so the judged and the
+    /// applied spellings can never diverge. `None` for kinds with no
+    /// in-string escape repair.
+    pub(crate) fn in_string_escape(&self) -> Option<String> {
         use ParseErrorKind::*;
         match self {
-            ReplacedSyntax { old, new } => Some((
+            BareCarriageReturn { .. } => Some("\\r".to_string()),
+            ForbiddenControlCharacter { ch, .. } | InvisibleCharacter { ch, .. } => {
+                Some(crate::source_policy::unicode_escape(*ch))
+            }
+            _ => None,
+        }
+    }
+
+    /// The machine-repair space, derived from the payload — see
+    /// [`Repairs`] for the applier contract. `span` is the error's
+    /// anchor. Repairs stay conservative: a singular [`Repairs::Fix`]
+    /// only where the rewrite provably preserves intent; genuine
+    /// ambiguity is enumerated as [`Repairs::Alternatives`], which no
+    /// applier ever picks from.
+    pub fn repairs(&self, span: Span) -> Repairs {
+        use crate::source_policy::{unicode_escape, windows_1252_repair};
+        use ParseErrorKind::*;
+        match self {
+            ReplacedSyntax { old, new } => Repairs::DidYouMean(
                 (*new).to_string(),
                 Span::new(span.start, span.start + old.len()),
-            )),
+            ),
             // `&&` → `&`, over the span the emission anchored on both amps.
-            DoubleAmp => Some(("&".to_string(), span)),
-            // Deleting the stray CR provably preserves intent: it is never
-            // content (that spelling is `\r`) and never a line ending.
-            BareCarriageReturn => Some((String::new(), span)),
+            DoubleAmp => Repairs::DidYouMean("&".to_string(), span),
+            // A bare CR in token position has NO machine repair: on a
+            // CR-terminated ("old Mac") file every CR IS a line ending,
+            // so deleting it glues lines together, and the one
+            // value-preserving repair (a line break) is exactly the
+            // control character the shared injection guard refuses.
+            // INSIDE a string literal the CR is content, and the
+            // value-preserving fix is its escape.
+            BareCarriageReturn { in_string: false } => Repairs::None,
+            BareCarriageReturn { in_string: true } => {
+                Repairs::Fix(self.in_string_escape().expect("carries one"), span)
+            }
+            // A raw control INSIDE a string is content; which repair is
+            // value-preserving depends on the character's ambiguity class.
+            ForbiddenControlCharacter {
+                ch,
+                in_string: true,
+            } => match *ch {
+                // NEL is the one character in BOTH ambiguity classes — a
+                // Unicode mandatory line break AND a CP-1252 mojibake
+                // artifact (0x85 displays as `…`) — hence uniquely three
+                // readings: the line break meant, the byte kept, the
+                // ellipsis the author's editor actually showed.
+                '\u{85}' => Repairs::Alternatives(vec![
+                    ("\\n".to_string(), span),
+                    (unicode_escape('\u{85}'), span),
+                    ("…".to_string(), span),
+                ]),
+                // A mapped C1 byte is either deliberate content (keep it,
+                // escaped and visible) or the classic double-decode
+                // (repair to what the CP-1252 author typed) — the reader
+                // must choose.
+                ch => match windows_1252_repair(ch) {
+                    Some(repair) => Repairs::Alternatives(vec![
+                        (unicode_escape(ch), span),
+                        (repair.to_string(), span),
+                    ]),
+                    // C0, DEL, and the five unmapped C1 bytes: the escape
+                    // is the ONE value-preserving reading — singular and
+                    // auto-appliable, exactly like NML0016's in-string
+                    // `\r`.
+                    None => Repairs::Fix(self.in_string_escape().expect("carries one"), span),
+                },
+            },
+            // An invisible INSIDE a string: the resolution space is
+            // enumerable — and offered whole only where every entry is
+            // sound.
+            InvisibleCharacter {
+                ch,
+                in_string: true,
+                remove_sound,
+            } => match *ch {
+                // LS/PS: a line break was meant, or the separator
+                // itself — deletion is never offered, so `remove_sound`
+                // is deliberately unread here (the reclassifier still
+                // judges it rather than duplicate this class knowledge;
+                // one bounded judgment wasted on a rare char).
+                '\u{2028}' | '\u{2029}' => Repairs::Alternatives(vec![
+                    ("\\n".to_string(), span),
+                    (unicode_escape(*ch), span),
+                ]),
+                // Bidi controls, interior FEFF, tag characters: nearly
+                // always pasted or hostile — remove it, or keep it
+                // visibly (escaped). The remove arm is offered only
+                // where deletion is PROVEN to remove just this
+                // character (`remove_sound` — the sentinel judgment +
+                // the delete-splice relex); where it is not, the set
+                // COLLAPSES to the singular escape [`Repairs::Fix`] —
+                // never a one-entry `Alternatives`, which would
+                // auto-apply under the sole-candidate rule while
+                // violating the ≥ 2 contract the variant documents.
+                other if *remove_sound => Repairs::Alternatives(vec![
+                    (String::new(), span),
+                    (unicode_escape(other), span),
+                ]),
+                _ => Repairs::Fix(self.in_string_escape().expect("carries one"), span),
+            },
+            // In TOKEN position neither class has a sound repair: the
+            // character is structure, and any rewrite is a guess about
+            // what the structure should have been.
+            ForbiddenControlCharacter {
+                in_string: false, ..
+            }
+            | InvisibleCharacter {
+                in_string: false, ..
+            } => Repairs::None,
             // Rewriting the closing line's indent is provably
             // value-preserving: the line is edge-trimmed either way.
-            MultilineClosingMisaligned { expected, .. } => Some((" ".repeat(*expected), span)),
+            MultilineClosingMisaligned { expected, .. } => {
+                Repairs::Fix(" ".repeat(*expected), span)
+            }
             // Deleting the trailing dot provably preserves the value
             // (`1299.` → `1299`). The dot is the literal's final byte, so
             // the fix needs no (possibly truncated) raw text.
             NumberTrailingDot { .. } if span.end > span.start => {
-                Some((String::new(), Span::new(span.end - 1, span.end)))
+                Repairs::Fix(String::new(), Span::new(span.end - 1, span.end))
             }
             // Stripping separators provably preserves the value (spelling,
             // never value); the producer captured the whole replacement or
             // none (MAX_FIX_CAPTURE — a truncated rewrite would corrupt).
             NumberBadSeparator {
                 stripped: Some(s), ..
-            } => Some((s.clone(), span)),
+            } => Repairs::DidYouMean(s.clone(), span),
             // The comma becomes the alternative separator, in place.
-            SetSeparator => Some(("|".to_string(), span)),
-            UnknownTypeConstructor { found } => {
-                crate::suggest::suggest(found, ["set"]).map(|s| (s.to_string(), span))
-            }
+            SetSeparator => Repairs::DidYouMean("|".to_string(), span),
+            UnknownTypeConstructor { found } => crate::suggest::suggest(found, ["set"])
+                .map(|s| Repairs::DidYouMean(s.to_string(), span))
+                .unwrap_or(Repairs::None),
             BadSecretRef {
                 reason: SecretRefIssue::UnknownNamespace(ns),
             } => {
                 // The namespace sub-span: after `$`, before `.`.
-                crate::suggest::suggest(ns, crate::cst::KNOWN_NAMESPACES.iter().copied()).map(|s| {
-                    (
-                        s.to_string(),
-                        Span::new(span.start + 1, span.start + 1 + ns.len()),
-                    )
-                })
+                crate::suggest::suggest(ns, crate::cst::KNOWN_NAMESPACES.iter().copied())
+                    .map(|s| {
+                        Repairs::DidYouMean(
+                            s.to_string(),
+                            Span::new(span.start + 1, span.start + 1 + ns.len()),
+                        )
+                    })
+                    .unwrap_or(Repairs::None)
             }
-            _ => None,
+            _ => Repairs::None,
         }
+    }
+}
+
+/// The machine-repair space of a classified syntax error (RFC 0023
+/// follow-on D1) — not merely what replacement text exists, but what an
+/// applier may DO with it. Each variant is a semantic contract:
+///
+/// * [`Repairs::DidYouMean`] — a near-miss respelling of what the author
+///   typed (`=>` → `->`, a misspelled namespace); singular, and
+///   machine-applicable when it is the diagnostic's sole candidate.
+/// * [`Repairs::Fix`] — the single provably intent-preserving rewrite
+///   (an indent, a value-preserving escape); auto-applied by `nml fix`
+///   under the same sole-candidate rule.
+/// * [`Repairs::Alternatives`] — the enumerated resolution space where
+///   the author's intent is genuinely ambiguous (a pasted NEL: line
+///   break, kept byte, or mojibake ellipsis?). Structurally never
+///   auto-applied: every applier's sole-candidate filter matches exactly
+///   one suggestion, and N ≥ 2 alternatives can never be one — the
+///   editor presents each as a separate action instead.
+/// * [`Repairs::None`] — no machine repair is sound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Repairs {
+    /// No sound machine repair exists.
+    None,
+    /// A near-miss respelling: `(replacement, span)`.
+    DidYouMean(String, Span),
+    /// The single provably intent-preserving rewrite: `(replacement, span)`.
+    Fix(String, Span),
+    /// The enumerated resolution space, in presentation order (most
+    /// likely intent first). Always ≥ 2 entries — a singular repair is
+    /// [`Repairs::Fix`] — and never auto-applied.
+    Alternatives(Vec<(String, Span)>),
+}
+
+#[cfg(test)]
+mod repair_tests {
+    use super::*;
+
+    /// The soundness judge splices `in_string_escape()`; the repair
+    /// inserts what `repairs()` constructs. This pin makes the coupling
+    /// structural: for every in-string policy kind, the judged spelling
+    /// IS the applied spelling (the singular fix equals it; every
+    /// alternatives set contains it as the keep-the-character arm) — an
+    /// edit that lets them diverge auto-applies an UNJUDGED replacement
+    /// and fails here.
+    #[test]
+    fn the_judged_escape_is_the_applied_escape_for_every_policy_kind() {
+        let span = Span::new(10, 11);
+        let cases: Vec<ParseErrorKind> = vec![
+            ParseErrorKind::BareCarriageReturn { in_string: true },
+            // Singular-fix class (C0), mapped C1, NEL, LS, bidi, tag.
+            ParseErrorKind::ForbiddenControlCharacter {
+                ch: '\u{1}',
+                in_string: true,
+            },
+            ParseErrorKind::ForbiddenControlCharacter {
+                ch: '\u{93}',
+                in_string: true,
+            },
+            ParseErrorKind::ForbiddenControlCharacter {
+                ch: '\u{85}',
+                in_string: true,
+            },
+            ParseErrorKind::InvisibleCharacter {
+                ch: '\u{2028}',
+                in_string: true,
+                remove_sound: false,
+            },
+            // The remove-granted forms keep the judged escape as the
+            // keep-the-character arm…
+            ParseErrorKind::InvisibleCharacter {
+                ch: '\u{202E}',
+                in_string: true,
+                remove_sound: true,
+            },
+            ParseErrorKind::InvisibleCharacter {
+                ch: '\u{E0067}',
+                in_string: true,
+                remove_sound: true,
+            },
+            // …and the COLLAPSED forms (remove refused) surface it as
+            // the singular Fix — covered by the Fix arm below.
+            ParseErrorKind::InvisibleCharacter {
+                ch: '\u{202E}',
+                in_string: true,
+                remove_sound: false,
+            },
+            ParseErrorKind::InvisibleCharacter {
+                ch: '\u{FEFF}',
+                in_string: true,
+                remove_sound: false,
+            },
+        ];
+        for kind in cases {
+            let judged = kind.in_string_escape().expect("policy kinds carry one");
+            match kind.repairs(span) {
+                Repairs::Fix(replacement, s) => {
+                    assert_eq!(replacement, judged, "{kind:?}");
+                    assert_eq!(s, span);
+                }
+                Repairs::Alternatives(alts) => {
+                    assert!(
+                        alts.iter().any(|(r, s)| *r == judged && *s == span),
+                        "{kind:?}: alternatives must contain the judged escape: {alts:?}"
+                    );
+                }
+                other => panic!("{kind:?}: expected a repair, got {other:?}"),
+            }
+        }
+        // The collapse, pinned shape-exactly (D-C): a remove-refused
+        // bidi/FEFF/tag character carries the singular Fix whose
+        // replacement IS the judged escape — never a one-entry
+        // Alternatives (which would auto-apply while violating the
+        // variant's ≥ 2 contract), and never the remove arm.
+        let collapsed = ParseErrorKind::InvisibleCharacter {
+            ch: '\u{202E}',
+            in_string: true,
+            remove_sound: false,
+        };
+        match collapsed.repairs(span) {
+            Repairs::Fix(replacement, s) => {
+                assert_eq!(
+                    replacement,
+                    collapsed.in_string_escape().expect("carries one")
+                );
+                assert_eq!(s, span);
+            }
+            other => panic!("the collapse must be the singular Fix, got {other:?}"),
+        }
+        // And the granted form still enumerates remove + escape, ≥ 2.
+        let granted = ParseErrorKind::InvisibleCharacter {
+            ch: '\u{202E}',
+            in_string: true,
+            remove_sound: true,
+        };
+        match granted.repairs(span) {
+            Repairs::Alternatives(alts) => {
+                assert_eq!(alts.len(), 2, "{alts:?}");
+                assert!(alts.iter().any(|(r, _)| r.is_empty()), "{alts:?}");
+            }
+            other => panic!("the granted form stays enumerated, got {other:?}"),
+        }
+        // And kinds with no in-string escape judge nothing.
+        assert_eq!(ParseErrorKind::DoubleAmp.in_string_escape(), None);
     }
 }
 
 #[derive(Debug, Clone, Error)]
 pub enum NmlError {
-    /// A syntax error (lexing or parsing — the phase distinction carried no
-    /// information the kind's code doesn't; RFC 0009 merged the variants).
+    /// A syntax or structural error (lexing, parsing, or the name rules over
+    /// the lowered tree — the phase distinction carried no information the
+    /// kind's code doesn't; RFC 0009 merged the variants).
     #[error("{}", kind.message())]
     Syntax { kind: ParseErrorKind, span: Span },
 
@@ -511,7 +876,9 @@ impl NmlError {
                 match kind {
                     crate::money::MoneyErrorKind::UnknownCurrency { code, code_span } => {
                         match crate::suggest::suggest(code, crate::money::currency_codes()) {
-                            Some(s) => diag.with_suggestion(s, *code_span),
+                            Some(s) => {
+                                diag.with_suggestion(Suggestion::did_you_mean(s).at(*code_span))
+                            }
                             None => diag,
                         }
                     }
@@ -530,7 +897,9 @@ impl NmlError {
                             unit,
                             DurationUnit::ALL.iter().map(|u| u.suffix()),
                         ) {
-                            Some(s) => diag.with_suggestion(s, *unit_span),
+                            Some(s) => {
+                                diag.with_suggestion(Suggestion::did_you_mean(s).at(*unit_span))
+                            }
                             None => diag,
                         }
                     }
@@ -541,11 +910,11 @@ impl NmlError {
                     DurationErrorKind::FractionalMagnitude {
                         equivalent: Some(equivalent),
                         ..
-                    } => diag.with_suggestion(equivalent, *span),
+                    } => diag.with_suggestion(Suggestion::did_you_mean(equivalent).at(*span)),
                     // The merged form replaces the whole literal (`1h2h` →
                     // `3h`) — value-preserving by construction.
                     DurationErrorKind::DuplicateUnit { merged } => {
-                        diag.with_suggestion(merged, *span)
+                        diag.with_suggestion(Suggestion::did_you_mean(merged).at(*span))
                     }
                     // No machine fix (completing or deleting the dangling
                     // magnitude would change the value); the related span
@@ -561,24 +930,39 @@ impl NmlError {
                     Some(code) => diag.with_code(code),
                     None => diag,
                 };
-                let diag = match kind.suggestion(*span) {
-                    // Empty or whitespace-only replacements are mechanical
-                    // fixes (deletions, indent rewrites) — structurally a
-                    // fix, never a did-you-mean (there is no near-miss
-                    // *spelling* of nothing or of whitespace).
-                    Some((replacement, fix_span))
-                        if replacement.chars().all(char::is_whitespace) =>
-                    {
-                        diag.with_fix(replacement, fix_span)
+                // The kind DECLARES its repair class (RFC 0023 D1) —
+                // no textual heuristic decides fix-vs-did-you-mean.
+                let diag = match kind.repairs(*span) {
+                    Repairs::None => diag,
+                    Repairs::DidYouMean(replacement, s) => {
+                        diag.with_suggestion(Suggestion::did_you_mean(replacement).at(s))
                     }
-                    Some((replacement, fix_span)) => diag.with_suggestion(replacement, fix_span),
-                    None => diag,
+                    Repairs::Fix(replacement, s) => {
+                        diag.with_suggestion(Suggestion::fix(replacement).at(s))
+                    }
+                    // Each alternative is a Fix-kind suggestion: the
+                    // renderer previews them capped, the editor offers
+                    // each as its own action, and the sole-candidate rule
+                    // keeps every applier's hands off (N ≥ 2, never one).
+                    Repairs::Alternatives(alts) => {
+                        alts.into_iter().fold(diag, |d, (replacement, s)| {
+                            d.with_suggestion(Suggestion::fix(replacement).at(s))
+                        })
+                    }
                 };
                 // Related info (RFC 0009): an unterminated string's failure
-                // can surface far from its opening delimiter — label it.
+                // can surface far from its opening delimiter — label it;
+                // a repeated name is judged at the later occurrence and
+                // the first is the note (same file: the note inherits).
                 match kind {
                     ParseErrorKind::UnterminatedString { open, .. } => {
                         diag.with_related(*open, "string opened here")
+                    }
+                    ParseErrorKind::DuplicateEntry { shown, first, .. } => {
+                        diag.with_related(*first, format!("'{shown}' first declared here"))
+                    }
+                    ParseErrorKind::DuplicateDeclaration { name, first } => {
+                        diag.with_related(*first, format!("'{name}' first declared here"))
                     }
                     _ => diag,
                 }
@@ -596,3 +980,27 @@ impl NmlError {
 
 /// Convenience type alias for results with [`NmlError`].
 pub type NmlResult<T> = Result<T, NmlError>;
+
+#[cfg(test)]
+mod bound_tests {
+    use super::{MAX_ECHO, MAX_FIX_CAPTURE, echo, echo_capture, strip_separators_fix};
+
+    /// An echo is clipped at [`MAX_ECHO`]
+    /// characters plus an ellipsis, its capture one past the bound so
+    /// the ellipsis is decidable, and a machine fix is carried whole or
+    /// not at all past [`MAX_FIX_CAPTURE`] bytes.
+    #[test]
+    fn echo_and_fix_capture_are_bounded_by_the_published_constants() {
+        let long = "x".repeat(MAX_ECHO + 9);
+        assert_eq!(echo(&long), format!("{}…", "x".repeat(MAX_ECHO)));
+        assert_eq!(echo(&"x".repeat(MAX_ECHO)), "x".repeat(MAX_ECHO));
+        assert_eq!(echo_capture(&long).chars().count(), MAX_ECHO + 1);
+        let at_bound = "1_".repeat(MAX_FIX_CAPTURE / 2);
+        assert_eq!(at_bound.len(), MAX_FIX_CAPTURE);
+        assert_eq!(
+            strip_separators_fix(&at_bound),
+            Some("1".repeat(MAX_FIX_CAPTURE / 2))
+        );
+        assert_eq!(strip_separators_fix(&"1_".repeat(MAX_FIX_CAPTURE)), None);
+    }
+}

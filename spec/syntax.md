@@ -14,9 +14,12 @@ the *same document*: line endings are transport, not content, so CRLF
 normalizes to LF inside multiline string values, and no value can observe
 which convention the file used (a fuzzed property test holds the parser to
 this). A carriage return with no following line feed is an error
-([NML0016](../crates/nml-core/assets/error-index.md#nml0016)) with a
-machine-applicable deletion fix. This fence is re-transcribed to CRLF by
-the docs harness before it runs, making the claim executable:
+([NML0016](../crates/nml-core/assets/error-index.md#nml0016)) — reported
+without a machine fix in token position (on a CR-terminated old-Mac file
+every CR is a line ending, and deleting it would glue lines together);
+inside a string the machine fix is the `\r` escape. This fence is
+re-transcribed to CRLF by the docs harness before it runs, making the
+claim executable:
 
 ```nml check eol=crlf
 service Api:
@@ -27,19 +30,28 @@ service Api:
         """
 ```
 
-**Raw source is printable.** C0 control characters (other than tab and
-line endings) and DEL are rejected wherever they appear — values,
-comments, or between tokens
+**Raw source is printable.** Every Unicode control character (general
+category Cc — C0, DEL, and the C1 range U+0080–U+009F), other than tab
+and line endings, is rejected wherever it appears — values, comments,
+or between tokens
 ([NML0017](../crates/nml-core/assets/error-index.md#nml0017)). Control
 characters are content, and content belongs in `\u{…}` escapes, where
-review can see it. Tab is legal raw in string content; indentation
-restricts it separately (NML0005).
+review can see it; C1's one-byte CSI (U+009B) is the same
+terminal-injection primitive as ESC. Tab is legal raw in string
+content; indentation restricts it separately (NML0005).
 
-**Nothing invisible may steer the reader.** The bidirectional control
-characters U+202A–U+202E and U+2066–U+2069 (the Trojan Source attack,
-CVE-2021-42574) and interior U+FEFF are rejected in raw form
-([NML0018](../crates/nml-core/assets/error-index.md#nml0018)); the banned
-set matches rustc's. Right-to-left text itself is unaffected — Hebrew and
+**Nothing invisible may steer the reader.** The explicit bidirectional
+controls U+202A–U+202E and U+2066–U+2069 (the Trojan Source attack,
+CVE-2021-42574), interior U+FEFF, the U+2028/U+2029 line and
+paragraph separators, and the Unicode tag block U+E0000–U+E007F (an
+invisible ASCII mirror — raw, a hidden-text channel; emoji tag
+sequences are written with escapes) are rejected in raw form
+([NML0018](../crates/nml-core/assets/error-index.md#nml0018)). The bidi
+set matches rustc's Trojan-Source lints; the whole set is a strict
+superset of rustc's, per the display-vs-parse guidance of UTS #55 —
+with the separators banned, every Unicode line-boundary character
+outside LF/CRLF is diagnosed (NEL, VT and FF as controls; a bare CR by
+its own rule, NML0016). Right-to-left text itself is unaffected — Hebrew and
 Arabic values need no bidi controls. A *leading* U+FEFF is accepted as a
 byte-order mark for Windows-editor interoperability.
 
@@ -59,7 +71,7 @@ service MyService:  // inline comment
 ### Whitespace and Indentation
 
 NML uses indentation to define structure. The canonical indentation unit is **4 spaces**.
-Tabs are not permitted.
+Tabs are not permitted. What the formatter writes, in full, is [Canonical Style](style.md).
 
 The lexer emits synthetic `INDENT` and `DEDENT` tokens based on indentation level changes,
 similar to Python's tokenizer.
@@ -172,7 +184,12 @@ resolved (e.g. an unset environment variable), the next value is tried. The fina
 value in the chain is used if all preceding values fail.
 
 Fallbacks produce a `Fallback(primary, fallback)` node in the AST and can be
-chained to arbitrary depth.
+chained. Each arm is one level of value nesting (`a | b | c` reads as `a`,
+else `b | c`), so a chain is held to the same nesting bound as blocks, values
+and types — 64 arms; past it is `NML0007`. A chain is written on one line: a
+`|` that ends a line has no arm and is an error (NML0002, at the pipe) — the
+next line is the next entry, never the arm — and a `|` that starts a line is
+a modifier block, not a continuation.
 
 ### Number Literals
 
@@ -443,6 +460,18 @@ urlRoutes:
     homeRoute = "/"
     postLoginRoute = "/home"
 ```
+
+Within one body a name is declared at most once across the property
+(`key = …`), nested-block (`key:`) and field-definition (`key type`)
+spellings; a second declaration is an error (NML2093) at the later
+occurrence. At the file scope every declaration — block, array,
+`const`, `template`, `oneof` — shares one namespace, and a second
+declaration under one name is an error (NML1000) at the later name.
+Both are parse-time rules: a text that breaks either is ill-formed and
+is refused as a syntax error is. Names are compared byte-for-byte. The
+`|` and `.` prefixes are separate namespaces (`|allow` is not `allow`),
+and a modifier's type declaration beside its value is declare-then-assign,
+not a repeat. List items are positional and may repeat.
 
 ### Lists
 

@@ -44,6 +44,29 @@ use nml_core::diagnostic::Diagnostic;
 /// their anchor. Only a finding with no single defining anchor would stay
 /// unattributed.
 pub fn load_schema(sources: &[(&str, &str)]) -> (ExtractedSchema, Vec<Diagnostic>) {
+    // One source at a time: each parse's CST + AST is dropped before the
+    // next source is parsed, so the peak is one source's parse, not all.
+    let parts = sources.iter().map(|(name, text)| {
+        let (extracted, errors) = nml_core::cst::extract_schema(text);
+        (*name, extracted, errors)
+    });
+    load_schema_parts(parts)
+}
+
+/// A schema source already parsed and extracted: its load name, its
+/// definitions, and the parse findings to attribute to it.
+pub type SchemaPart<'a> = (&'a str, ExtractedSchema, Vec<Diagnostic>);
+
+/// [`load_schema`] over pre-extracted sources — the loader's real body.
+/// A caller that has ALREADY parsed a source (the checked file in `nml
+/// check`, `validate` and `fix`; the editor's model buffer) hands the
+/// extraction in instead of the text, so the loader never re-parses
+/// bytes the caller holds an AST for (a double parse was the largest
+/// term of `check`'s peak memory). Findings, order, and
+/// attribution are exactly [`load_schema`]'s.
+pub fn load_schema_parts<'a>(
+    sources: impl IntoIterator<Item = SchemaPart<'a>>,
+) -> (ExtractedSchema, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
 
     let mut schema = ExtractedSchema::default();
@@ -53,21 +76,20 @@ pub fn load_schema(sources: &[(&str, &str)]) -> (ExtractedSchema, Vec<Diagnostic
     let mut seen_models = HashSet::new();
     let mut seen_enums = HashSet::new();
     let mut seen_oneofs = HashSet::new();
-    for (name, text) in sources {
-        let (mut extracted, errors) = nml_core::cst::extract_schema(text);
-        diagnostics.extend(errors.into_iter().map(|d| d.with_source(*name)));
+    for (name, mut extracted, errors) in sources {
+        diagnostics.extend(errors.into_iter().map(|d| d.with_source(name)));
         // Stamp each definition with its declaring source before the merge:
         // definition-anchored findings (composition, oneof integrity, arity,
         // cycles) copy it so they render `file:line:col` against the right
         // file instead of a directory-prefixed byte span.
         for m in &mut extracted.models {
-            m.source = Some((*name).to_string());
+            m.source = Some(name.to_string());
         }
         for o in &mut extracted.oneofs {
-            o.source = Some((*name).to_string());
+            o.source = Some(name.to_string());
         }
         for e in &mut extracted.enums {
-            e.source = Some((*name).to_string());
+            e.source = Some(name.to_string());
         }
         for m in &extracted.models {
             // Traits share the model namespace (RFC 0011): a trait and a
@@ -128,21 +150,34 @@ pub fn load_schema(sources: &[(&str, &str)]) -> (ExtractedSchema, Vec<Diagnostic
     // judged exactly where it is written.
     diagnostics.extend(crate::schema::default_diagnostics(&schema));
 
+    // `oneof` integrity (arm models exist, unique values, name collisions,
+    // no arm field named like the discriminator) is an error: a malformed
+    // union cannot be validated against. BEFORE inheritance resolution,
+    // for the same reason as the defaults: the shadow rule locates the
+    // field where it is DECLARED — on the arm, or on the trait or model an
+    // arm mixes in — and the resolved copies carry no origin.
+    diagnostics.extend(find_oneof_errors(&schema));
+
     resolve_model_inheritance(&mut schema);
 
     // Positional-shorthand (`+`, RFC 0005) arity — axis-aware, checked post-inheritance
     // so an inherited `!` and a child `!` are caught together (RFC 0005 §8).
     diagnostics.extend(find_shorthand_errors(&schema));
 
-    // `oneof` integrity (arm models exist, unique values, name collisions) is
-    // an error: a malformed union cannot be validated against.
-    diagnostics.extend(find_oneof_errors(&schema));
-
     // Enum tidiness (duplicate variants, empty enums) — warnings.
     diagnostics.extend(find_enum_errors(&schema));
 
     // Severity travels with the diagnostic (warning at the source).
     diagnostics.extend(find_model_cycles(&schema));
+
+    // RFC 0019 merge-policy declarations (NML2068) and unreachable-seal
+    // lints (NML2076) — owned HERE so every consumer of the loader (both
+    // CLI verbs, the LSP's schema passes, embedders) inherits them with
+    // per-source attribution; no verb can forget the call.
+    diagnostics.extend(nml_core::layers::validate_merge_policies_over(
+        &schema.models,
+        &schema.oneofs,
+    ));
 
     (schema, diagnostics)
 }
@@ -202,6 +237,74 @@ mod tests {
         load_schema(&named_refs)
     }
     use crate::schema::SchemaValidator;
+
+    /// NML2054 is judged BEFORE inheritance resolution and attributed to the
+    /// arm's own source: an own field lands at the field in the arm's file,
+    /// the union's note in the union's file; an inherited field lands at
+    /// the arm's `is` reference with the field's note in the trait's file —
+    /// never, as a walk over the resolved copies would have it, a deletion
+    /// of the trait's field misattributed to the arm's file.
+    #[test]
+    fn a_shadowed_discriminator_is_located_where_it_is_declared_across_sources() {
+        use nml_core::diagnostic::codes;
+        use nml_core::span::Span;
+        let shadow = |diags: &[Diagnostic]| -> Vec<Diagnostic> {
+            diags
+                .iter()
+                .filter(|d| d.code == Some(codes::SHADOWED_DISCRIMINATOR))
+                .cloned()
+                .collect()
+        };
+        let (_, diags) = load_schema(&[
+            (
+                "unions.model.nml",
+                "oneof record by kind:\n    \"log\" -> logEntry\n",
+            ),
+            ("arms.model.nml", "model logEntry:\n    kind string?\n"),
+        ]);
+        let rows = shadow(&diags);
+        assert_eq!(rows.len(), 1, "{diags:?}");
+        assert_eq!(rows[0].source.as_deref(), Some("arms.model.nml"));
+        assert_eq!(rows[0].span, Some(Span::new(20, 32)), "at `kind string?`");
+        assert_eq!(rows[0].suggestions.len(), 1, "the deletion");
+        assert_eq!(rows[0].related.len(), 1);
+        assert_eq!(
+            rows[0].related[0].source.as_deref(),
+            Some("unions.model.nml")
+        );
+        assert!(matches!(rows[0].severity, Severity::Error));
+
+        let (_, diags) = load_schema(&[
+            (
+                "unions.model.nml",
+                "oneof record by kind:\n    \"log\" -> logEntry\n",
+            ),
+            ("traits.model.nml", "trait tagged:\n    kind string?\n"),
+            (
+                "arms.model.nml",
+                "model logEntry is tagged:\n    msg string?\n",
+            ),
+        ]);
+        let rows = shadow(&diags);
+        assert_eq!(rows.len(), 1, "{diags:?}");
+        assert_eq!(rows[0].source.as_deref(), Some("arms.model.nml"));
+        assert_eq!(rows[0].span, Some(Span::new(18, 24)), "at `is tagged`");
+        assert!(rows[0].suggestions.is_empty(), "{:?}", rows[0]);
+        assert_eq!(rows[0].related.len(), 2);
+        assert_eq!(
+            rows[0].related[0].source.as_deref(),
+            Some("traits.model.nml")
+        );
+        assert_eq!(
+            rows[0].related[0].span,
+            Span::new(18, 30),
+            "the trait's field"
+        );
+        assert_eq!(
+            rows[0].related[1].source.as_deref(),
+            Some("unions.model.nml")
+        );
+    }
 
     /// RFC 0030: per-source findings carry their source name — a parse error
     /// names the broken file, and a cross-source duplicate names the *second*

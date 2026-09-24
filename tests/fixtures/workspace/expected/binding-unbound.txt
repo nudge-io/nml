@@ -1,0 +1,4 @@
+file      docs/unclaimed.nml
+root      tests/fixtures/workspace  (--root)
+binding   none — closed universe (2 manifest(s) discovered); no files glob claims this file
+layers    none — composition denied (NML2064)

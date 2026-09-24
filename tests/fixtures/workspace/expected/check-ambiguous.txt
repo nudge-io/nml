@@ -1,0 +1,3 @@
+shared/x.flow.nml: error[NML2087]: 2 manifests claim this file: demo.package.nml (shared, files[0] = "shared/**/*.flow.nml"), other.package.nml (sharedToo, files[0] = "shared/**/*.flow.nml") — an ambiguously-claimed file is denied: it validates under no binding and nothing runs against it; remove or narrow one claim (a `schemaPackages` pin in the nearest live project config chooses between package names, never between two manifests of one name)
+for more information, run: nml explain NML2087
+error: 1 error(s)

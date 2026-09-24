@@ -1,0 +1,8 @@
+// A bodyless declaring block: pure stack assembly, clean.
+model thing:
+    v string
+
+thing base:
+    v = "b"
+
+thing assembled uses base

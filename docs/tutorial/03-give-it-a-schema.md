@@ -12,7 +12,8 @@ beside it.
 
 ## Models type your keywords
 
-A schema lives in a `.model.nml` file. A `model` declaration types every
+A schema lives in a `.model.nml` file (`.schema.nml` is the same thing to
+every tool — one spelling per team). A `model` declaration types every
 block whose keyword matches its name — `model service` types `service Api:`
 (and `service Anything:`). Each field is `name type`:
 
@@ -126,7 +127,9 @@ Read the field types you haven't met as declarations yet:
   opt-out if you truly want to allow literal tokens in a field (you usually
   don't; see below).
 
-`nml validate skylight.model.nml` checks the schema itself is well-formed.
+`nml validate skylight.model.nml` checks the schema's own symbols — duplicate
+declarations and unresolved references (that is all `validate` does; `nml check`
+is what type-checks instances against it).
 
 ## Run the validator
 
@@ -178,14 +181,18 @@ fix). `nml explain NML2000` prints the code's full documentation offline.
 Delete the `host` line:
 
 ```text
-app.nml:1:9: error[NML2007]: missing required field 'host' (defined in model 'service')
+app.nml:11:9: error[NML2007]: missing required field 'host' (defined in model 'service')
 ```
 
 Quote the port (`port = "8080"`):
 
 ```text
-app.nml:3:12: error[NML2008]: type mismatch for 'port': expected number, got string
+app.nml:13:12: error[NML0001]: number field 'port': a quoted number was replaced by the number literal (drop the quotes) (did you mean "8080"?)
 ```
+
+(a quoted number under a `number` field is one the parser can repair, so it
+arrives as a parse-band code with a machine-applicable fix — `nml fix`
+drops the quotes for you.)
 
 And the one from Chapter 2's warning — try a literal dev fallback on the
 secret:
@@ -202,7 +209,7 @@ service Api:
 ```
 
 ```text
-app.nml:6:37: error[NML2006]: type mismatch for 'apiKey': expected environment variable ($ENV.VARIABLE_NAME), got string
+app.nml:6:38: error[NML2006]: type mismatch for 'apiKey': expected environment variable ($ENV.VARIABLE_NAME), got string
 ```
 
 A `secret` field is reference-only, deliberately: a literal leg would put a
@@ -281,8 +288,10 @@ Rule of thumb: humans iterate leniently, CI runs `--strict`.
 
 ## Common mistakes
 
-- **Forgetting `--schema`.** Plain `nml check` only parses; if nothing
-  points at your models, nothing is validated against them.
+- **Forgetting `--schema`.** A file that declares its own models validates
+  with plain `nml check` (Chapter 2's self-contained file did). Split the
+  models into their own file and nothing points at them until you pass
+  `--schema <dir>` — or let a package manifest bind them (Chapter 9).
 - **Model name ≠ keyword.** `model services` will never match `service Api:`
   — the model's name must equal the block keyword exactly.
 - **Marker on the wrong side.** Optional is `string?`, not `?string`; the

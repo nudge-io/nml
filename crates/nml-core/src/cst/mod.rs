@@ -15,16 +15,25 @@
 //!    and the error list is capped, so adversarial input is safe (RFC 0004 §9).
 //!
 //! Public surface: `parse` (→ lossless `Parse`), `parse_to_ast` /
-//! `parse_to_ast_all` (→ semantic `ast`), `parse_with_comments`,
-//! `extract_schema`, the `ast` / `extract` / `lower` layers, and `edit`
-//! (structural green-tree splicing, RFC 0030 P2).
+//! `parse_to_ast_all` (→ semantic `ast`), `parse_checked` (→ the checked
+//! lossless tree, the formatter's door),
+//! `extract_schema`, the `ast` / `extract` layers, and `edit`
+//! (structural green-tree splicing, RFC 0030 P2). The tree → AST lowering
+//! (`lower`) is crate-private: every AST a consumer receives comes through
+//! `parse_lowered`, so the rules emitted beside it (the name rules, the
+//! source-character policy) are total by visibility, not by the absence
+//! of callers (RFC 0026 B-15) — a public door would compile:
+//!
+//! ```compile_fail,E0603
+//! use nml_core::cst::lower::to_ast_with_errors;
+//! ```
 
 pub mod ast;
 pub mod duration_query;
 pub mod edit;
 pub mod extract;
 mod lexer;
-pub mod lower;
+pub(crate) mod lower;
 mod parser;
 mod syntax;
 mod value;
@@ -32,7 +41,16 @@ mod value;
 pub use duration_query::{DurationLiteralAt, duration_literal_at, duration_literals_in};
 pub use syntax::{NmlLanguage, SyntaxKind, SyntaxNode, SyntaxToken};
 pub(crate) use value::KNOWN_NAMESPACES;
-pub use value::{ValueErrors, decode_value, decode_value_all};
+pub use value::{ValueErrors, decode_value, decode_value_all, string_content_window};
+
+/// The canonical indentation unit of NML source — `spec/syntax.md`: "The
+/// canonical indentation unit is **4 spaces**". The ONE spelling: what the
+/// formatter writes at every level, the level width a canonical-form
+/// snippet nests by, and the unit a minted line falls back to when the
+/// document it lands in offers none ([`edit::indentation_unit_at`]). Tabs
+/// are not indentation (the lexer's `TabInIndent` finding), so the unit
+/// is spaces.
+pub const INDENT_UNIT: &str = "    ";
 
 use crate::error::NmlError;
 use rowan::GreenNode;
@@ -45,10 +63,100 @@ pub struct Parse {
     suppressed: usize,
 }
 
+/// Where a parse's significant tokens begin and end ([`Parse::token_boundaries`]).
+#[derive(Debug, Clone, Default)]
+pub struct TokenBoundaries {
+    starts: std::collections::BTreeSet<usize>,
+    ends: std::collections::BTreeSet<usize>,
+}
+
+impl TokenBoundaries {
+    /// Whether `span` begins at a significant token's first byte and ends at
+    /// one's last byte. An empty span is a position and aligns anywhere.
+    pub fn aligns(&self, span: crate::span::Span) -> bool {
+        span.start == span.end
+            || (self.starts.contains(&span.start) && self.ends.contains(&span.end))
+    }
+
+    /// The span-site invariant, judged by the site's SHAPE
+    /// ([`crate::span::SpanShape`]) and never by its name: `Ok(())`, or the
+    /// reason it fails. The ONE implementation every reader shares — the
+    /// corpus pin, the `document` fuzz target and the alignment pin in this
+    /// file — so a carrier cannot be held to one rule here and another
+    /// there. The reason is `&'static str` because a fuzz target runs this
+    /// on every input and must allocate nothing when it holds.
+    ///
+    /// A content window gets the STRONGER rule, not the weaker one: on
+    /// character boundaries (an applier splices it, and an unterminated
+    /// literal ending in a multi-byte character used to cut one in half —
+    /// RFC 0026 decision 2) AND strictly inside the token that carries it,
+    /// because a window equal to the whole token satisfies the byte rule
+    /// and still corrupts the fix.
+    pub fn check(&self, site: crate::span::SpanSite, source: &str) -> Result<(), &'static str> {
+        use crate::span::SpanShape;
+        let span = site.span;
+        if span.start > span.end || span.end > source.len() {
+            return Err("is out of bounds");
+        }
+        match site.shape {
+            SpanShape::Aligned => {
+                if self.aligns(span) {
+                    Ok(())
+                } else {
+                    Err("is not token-aligned")
+                }
+            }
+            SpanShape::ContentWindow { token } => {
+                if !self.aligns(token) {
+                    Err("sits in a token that is not itself token-aligned")
+                } else if !(token.start < span.start && span.end <= token.end) {
+                    Err("is not strictly inside the token that carries it")
+                } else if !source.is_char_boundary(span.start) || !source.is_char_boundary(span.end)
+                {
+                    Err("is not a character-boundary window")
+                } else {
+                    Ok(())
+                }
+            }
+            SpanShape::TemplateExpression { token } => {
+                if !self.aligns(token) {
+                    Err("sits in a token that is not itself token-aligned")
+                } else if !(token.start <= span.start && span.end <= token.end) {
+                    Err("is not inside the token that carries it")
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 impl Parse {
     /// The root of the typed syntax tree.
     pub fn syntax(&self) -> SyntaxNode {
         SyntaxNode::new_root(self.green.clone())
+    }
+
+    /// The byte boundaries of this parse's significant tokens — where every
+    /// span an AST or schema node carries begins and ends. The content-span
+    /// invariant in its exact form, for EVERY input: a non-empty span is
+    /// token-aligned (the byte-level [`crate::span::Span::is_content_in`]
+    /// is its proxy for terminated documents — an unterminated string token
+    /// runs to the end of the file, line breaks included, and a span ending
+    /// on it ends on that token's last byte all the same).
+    pub fn token_boundaries(&self) -> TokenBoundaries {
+        let mut out = TokenBoundaries::default();
+        for tok in self
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind().is_significant())
+        {
+            let r = tok.text_range();
+            out.starts.insert(syntax::text_offset(r.start()));
+            out.ends.insert(syntax::text_offset(r.end()));
+        }
+        out
     }
 
     /// Every diagnostic collected during lexing and parsing.
@@ -73,19 +181,40 @@ impl Parse {
     }
 }
 
-/// Single cap on reported diagnostics, applied *at emission* in both the lexer
-/// (`super::MAX_ERRORS`) and the parser, then again on the merged list below —
-/// so memory stays bounded during and after parsing on pathological input
-/// (RFC 0004 §9, "bounded output").
-pub(crate) const MAX_ERRORS: usize = 128;
+use crate::diagnostic::MAX_ERRORS;
+thread_local! {
+    /// Parses begun on this thread — see [`parses_on_this_thread`].
+    static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-/// Parse NML source into a lossless CST. Never fails, never panics.
+/// How many times [`parse`] has run on the calling thread. The
+/// structural seam behind the one-parse-per-target pins: `nml check`,
+/// `validate` and `fix` and the editor's diagnostics each derive every
+/// view of a target (AST, extracted schema, findings) from ONE parse, and
+/// their pins read this counter across the verb instead of timing it.
+/// Thread-local so parallel test threads never see each other's parses;
+/// a plain counter, never an environment knob.
+pub fn parses_on_this_thread() -> usize {
+    PARSES.with(|c| c.get())
+}
+
+/// Parse NML source into a lossless CST. Never fails, never panics: a
+/// source past the token stream's 4 GiB bound yields an empty tree and
+/// one typed [`ParseErrorKind::SourceTooLarge`](crate::error::ParseErrorKind::SourceTooLarge)
+/// error, exactly as any other lexical finding.
 pub fn parse(source: &str) -> Parse {
-    let lexed = lexer::lex(source);
-    let mut p = parser::Parser::new(&lexed.tokens);
+    parse_bounded(source, lexer::MAX_SOURCE_LEN)
+}
+
+/// [`parse`] under an explicit source ceiling — the seam the bound's pin
+/// fakes; `parse` passes the real one.
+fn parse_bounded(source: &str, max_len: usize) -> Parse {
+    PARSES.with(|c| c.set(c.get() + 1));
+    let lexed = lexer::lex_bounded(source, max_len);
+    let mut p = parser::Parser::new(lexed.src, &lexed.tokens);
     p.parse_root();
     let (events, parse_errors, parser_suppressed) = p.finish_parse();
-    let green = parser::build_tree(&lexed.tokens, &events);
+    let green = parser::build_tree(lexed.src, &lexed.tokens, &events);
 
     let mut errors = lexed.errors;
     errors.extend(parse_errors);
@@ -111,12 +240,42 @@ pub fn parse(source: &str) -> Parse {
 ///
 /// This is the all-errors form: value validation (escapes, money precision,
 /// `$ENV` namespaces, number range) is deferred to decode, so a single
-/// [`lower::to_ast_with_errors`] pass collects those, merged with the syntactic
-/// errors. Use this to report every problem at once; [`parse_to_ast`] is the
+/// lowering pass (crate-private, reached only through this module's parse
+/// funnel) collects those, merged with the syntactic errors. Use this to
+/// report every problem at once; [`parse_to_ast`] is the
 /// single-error drop-in derived from it.
 pub fn parse_to_ast_all(source: &str) -> (crate::ast::File, Vec<crate::diagnostic::Diagnostic>) {
     let (_parsed, file, errors, suppressed) = parse_lowered(source);
     (file, finalize_diagnostics(errors, suppressed))
+}
+
+/// The truncation marker's row shape, shared by the composer
+/// ([`finalize_diagnostics`]) and the recognizer ([`suppressed_count`])
+/// so the rendered row and the read-back can never drift: the exact
+/// suppressed count, then this tail, then the cap and a closing paren.
+const SUPPRESSED_ROW_TAIL: &str = " additional error(s) suppressed (limit ";
+
+/// The one truncation-marker row [`finalize_diagnostics`] appends.
+fn suppressed_row(suppressed: usize) -> String {
+    format!("{suppressed}{SUPPRESSED_ROW_TAIL}{MAX_ERRORS})")
+}
+
+/// The exact count a diagnostics list reports as suppressed (RFC 0009's
+/// truncation honesty, read back): recognizes the marker row
+/// `finalize_diagnostics` appends — `Severity::Info`, no code, the
+/// shared row shape anchored at BOTH ends (the suffix stripped, the
+/// whole remaining prefix parsed as the count) — and returns its N;
+/// `0` with no marker present. Consumers that budget for findings
+/// hidden past the cap (the `nml fix` convergence gate) read the count
+/// through this, never by re-deriving the format.
+pub fn suppressed_count(diags: &[crate::diagnostic::Diagnostic]) -> usize {
+    let tail = format!("{SUPPRESSED_ROW_TAIL}{MAX_ERRORS})");
+    diags
+        .iter()
+        .filter(|d| d.severity == crate::diagnostic::Severity::Info && d.code.is_none())
+        .filter_map(|d| d.message.strip_suffix(&tail[..]))
+        .filter_map(|prefix| prefix.parse::<usize>().ok())
+        .sum()
 }
 
 /// The ONE findings boundary (RFC 0009): bounded output (RFC 0004 §9) with
@@ -136,23 +295,34 @@ fn finalize_diagnostics(
     let mut out: Vec<crate::diagnostic::Diagnostic> =
         errors.iter().map(NmlError::to_diagnostic).collect();
     if suppressed > 0 {
-        out.push(crate::diagnostic::Diagnostic::info(format!(
-            "{suppressed} additional error(s) suppressed (limit {MAX_ERRORS})"
+        out.push(crate::diagnostic::Diagnostic::info(suppressed_row(
+            suppressed,
         )));
     }
     out
 }
 
-/// Shared core: parse to the CST, lower to the semantic AST, and merge the
-/// syntactic + semantic errors into one position-sorted list. Returns the
-/// [`Parse`] too (callers needing the tree, e.g. for comments). The single home
-/// for the parse → AST + diagnostics pipeline.
+/// Shared core: parse to the CST, lower to the semantic AST, judge the name
+/// rules over it, and merge the syntactic + semantic errors into one
+/// position-sorted list. Returns the [`Parse`] too (callers needing the
+/// tree, e.g. for comments). The single home for the parse → AST +
+/// diagnostics pipeline — every AST-producing entry point derives from it,
+/// so a rule emitted here is total over every text a consumer parses.
 fn parse_lowered(source: &str) -> (Parse, crate::ast::File, Vec<NmlError>, usize) {
     use ast::AstNode as _;
     let parsed = parse(source);
     let root = ast::Root::cast(parsed.syntax()).expect("parse always yields a Root node");
     let (file, mut errors, lower_suppressed) = lower::to_ast_with_errors(&root);
     errors.extend(parsed.errors().iter().cloned());
+    // The name rules (NML1000 at the file scope, NML2093 in every body)
+    // run beside every parse, so no consumer can skip them: a text that
+    // declares a name twice does not parse — `parse_to_ast` refuses it as
+    // it refuses a stray token, and the all-findings forms report it
+    // located beside the syntax findings. The tree keeps both
+    // occurrences (best-effort structure for tooling; the merge and the
+    // validator judge each entry as authored).
+    let (name_errors, names_suppressed) = crate::entry_names::check(&file);
+    errors.extend(name_errors);
     // The source-character policy (spec: Source text) runs beside every
     // parse, so no consumer can forget it. Its teaching diagnostic
     // supersedes the lexer's generic `UnexpectedCharacter` at the same
@@ -160,6 +330,116 @@ fn parse_lowered(source: &str) -> (Parse, crate::ast::File, Vec<NmlError>, usize
     // bounded, so past its cap the generic error survives (per-site
     // coverage is never silently narrowed).
     let (policy_errors, policy_suppressed) = crate::source_policy::check(source);
+    // A bare CR INSIDE a string literal is content, not transport: its
+    // machine fix is the `\r` escape, never a deletion (which would
+    // change the value). The policy scan is context-free; the lexed
+    // string tokens supply the context — but only where the string
+    // reading is CERTAIN: an UNTERMINATED string's token swallows to
+    // EOF, and trusting it flipped every following transport CR to
+    // "content", whose machine fix then rewrote line endings into
+    // literal `\r` text — gluing an old-Mac file's line structure into
+    // a string value (probed). Tokens named by an unterminated-string
+    // error are excluded.
+    // Cap note: this reads the CAPPED parse-error list, so a ≥128-error
+    // flood before a stray quote can suppress the UnterminatedString
+    // entry — the glue vector stays closed anyway because
+    // finalize_diagnostics truncates the position-sorted merge at the
+    // SAME constant, and lexer errors never occur inside a string
+    // token's range, so the evictors always sort first and any
+    // guard-blind in-string fix is truncated before it can render
+    // (pinned by `a_flooded_stray_quote_still_grants_no_in_string_fix`).
+    let unterminated: Vec<usize> = errors
+        .iter()
+        .filter_map(|e| match e {
+            NmlError::Syntax {
+                kind: crate::error::ParseErrorKind::UnterminatedString { open, .. },
+                ..
+            } => Some(open.start),
+            _ => None,
+        })
+        .collect();
+    let strings: Vec<(usize, usize, syntax::SyntaxToken)> = parsed
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == syntax::SyntaxKind::String)
+        .filter(|t| !unterminated.contains(&usize::from(t.text_range().start())))
+        .map(|t| {
+            let r = t.text_range();
+            (usize::from(r.start()), usize::from(r.end()), t)
+        })
+        .collect();
+    let mut judges: std::collections::HashMap<usize, value::RepairJudge> =
+        std::collections::HashMap::new();
+    let policy_errors: Vec<NmlError> = policy_errors
+        .into_iter()
+        .map(|e| {
+            use crate::error::ParseErrorKind::*;
+            match e {
+                NmlError::Syntax { kind, span } => {
+                    // The in-string reading is granted per REPAIR
+                    // SOUNDNESS, not per position: the character must sit
+                    // inside a CERTAIN string token (the A2 guard above
+                    // excluded unterminated ones) AND splicing the kind's
+                    // own escape (`ParseErrorKind::in_string_escape` —
+                    // the SAME string the repair inserts) must leave the
+                    // decoded value byte-identical (`value::RepairJudge`
+                    // — decode itself judges, so blank edge lines,
+                    // min-indent-bearing blank lines, dropped opening
+                    // padding, and backslash gluing all refuse without
+                    // being named here). Refused characters keep the
+                    // token-position reading: the diagnostic stands,
+                    // with no repair.
+                    // The containing-token find is hoisted so BOTH
+                    // judgments — the escape keep-judgment and, for
+                    // invisibles only, the remove judgment (D-C) —
+                    // share one `judges` lookup.
+                    let escape = kind.in_string_escape();
+                    let judge = match &escape {
+                        Some(_) => strings
+                            .iter()
+                            .find(|&&(s, e, _)| s < span.start && span.end <= e)
+                            .map(|(s, _, tok)| {
+                                &*judges
+                                    .entry(*s)
+                                    .or_insert_with(|| value::RepairJudge::new(tok.text(), *s))
+                            }),
+                        None => None,
+                    };
+                    let sound = match (&escape, &judge) {
+                        (Some(escape), Some(judge)) => judge.escape_preserves_value(span, escape),
+                        _ => false,
+                    };
+                    let kind = match kind {
+                        BareCarriageReturn { .. } if sound => {
+                            BareCarriageReturn { in_string: true }
+                        }
+                        ForbiddenControlCharacter { ch, .. } if sound => {
+                            ForbiddenControlCharacter {
+                                ch,
+                                in_string: true,
+                            }
+                        }
+                        InvisibleCharacter { ch, .. } if sound => InvisibleCharacter {
+                            ch,
+                            in_string: true,
+                            // Judged ONLY where the keep-judgment
+                            // passed: an unsound escape already keeps
+                            // the whole token-position reading, and the
+                            // remove grant is meaningless without a
+                            // sound keep arm beside it.
+                            remove_sound: judge
+                                .expect("a sound judgment implies a judge")
+                                .remove_preserves_value(span),
+                        },
+                        other => other,
+                    };
+                    NmlError::Syntax { kind, span }
+                }
+                other => other,
+            }
+        })
+        .collect();
     let policy_spans: std::collections::HashSet<(usize, usize)> = policy_errors
         .iter()
         .map(|e| (e.span().start, e.span().end))
@@ -174,7 +454,7 @@ fn parse_lowered(source: &str) -> (Parse, crate::ast::File, Vec<NmlError>, usize
     errors.extend(policy_errors);
     errors.sort_by_key(|e| e.span().start);
     coalesce_expected(&mut errors);
-    let suppressed = parsed.suppressed + lower_suppressed + policy_suppressed;
+    let suppressed = parsed.suppressed + lower_suppressed + policy_suppressed + names_suppressed;
     (parsed, file, errors, suppressed)
 }
 
@@ -229,9 +509,10 @@ fn coalesce_expected(errors: &mut Vec<NmlError>) {
     }
 }
 
-/// Parse to the owned AST, returning the **first** error by source position — a
-/// drop-in for the legacy `crate::parse`. Derived from [`parse_to_ast_all`];
-/// callers wanting every diagnostic use that directly.
+/// Parse to the owned AST, returning the **first** error by source position.
+/// This is what `nml_core::parse` names (`lib.rs`: the ergonomic alias).
+/// Derived from [`parse_to_ast_all`]; callers wanting every diagnostic use
+/// that directly.
 pub fn parse_to_ast(source: &str) -> crate::error::NmlResult<crate::ast::File> {
     // Derived from `parse_lowered` (not `parse_to_ast_all`): the abort path
     // keeps `NmlError`; only the findings-report boundary speaks Diagnostic.
@@ -299,13 +580,36 @@ pub fn parse_and_extract(
     crate::schema::ExtractedSchema,
     Vec<crate::diagnostic::Diagnostic>,
 ) {
+    let (file, schema, mut diags, facet_diags) = parse_and_extract_split(source);
+    diags.extend(facet_diags);
+    (file, schema, diags)
+}
+
+/// [`parse_and_extract`] with its two finding sets kept apart: the parse
+/// findings ([`parse_to_ast_all`]'s list, exactly) and the RFC 0018 facet
+/// definition rules. A surface that must report the parse findings on
+/// their own AND feed the schema loader (`nml check`, `validate`, `fix`,
+/// the editor's model-buffer passes) gets both from ONE parse and hands
+/// the extraction to the loader in place of the text
+/// (`nml_validate::loader::load_schema_parts`). Those surfaces used to
+/// parse the same bytes twice, holding the first AST across the second
+/// parse — the single largest term of `check`'s peak memory on dense
+/// input.
+pub fn parse_and_extract_split(
+    source: &str,
+) -> (
+    crate::ast::File,
+    crate::schema::ExtractedSchema,
+    Vec<crate::diagnostic::Diagnostic>,
+    Vec<crate::diagnostic::Diagnostic>,
+) {
     use ast::AstNode as _;
     let (parsed, lowered_ast, errors, suppressed) = parse_lowered(source);
     let root = ast::Root::cast(parsed.syntax()).expect("parse always yields a Root node");
     let facet_diags = crate::schema::facet_definition_diagnostics(&lowered_ast);
-    let mut diags = finalize_diagnostics(errors, suppressed);
-    diags.extend(facet_diags);
-    (lowered_ast, extract::extract(&root), diags)
+    let diags = finalize_diagnostics(errors, suppressed);
+    let schema = extract::extract(&root);
+    (lowered_ast, schema, diags, facet_diags)
 }
 
 /// The leading documentation comment of the top-level declaration named `name`
@@ -337,61 +641,62 @@ pub fn doc_comment_for(source: &str, name: &str) -> Option<String> {
     item.doc_comment()
 }
 
-/// A source comment extracted from the CST (RFC 0004 §4.3). Comments are not part
-/// of the semantic [`ast`](crate::ast); they are surfaced here as a side channel
-/// for tools (e.g. the formatter) that must preserve them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Comment {
-    /// Comment text after the leading `//`, verbatim except for trailing
-    /// whitespace (so `////` dividers and deliberate spacing survive).
-    pub text: String,
-    /// Span covering the comment from `//` to end of line (exclusive of the newline).
-    pub span: crate::span::Span,
-    /// True when only whitespace precedes the comment on its line; false when it
-    /// trails code on the same line.
-    pub own_line: bool,
-}
-
-/// Parse to the semantic AST **with comments**. Comments are read from the
-/// **lossless tree** itself, in source order, with own-line/trailing placement
-/// derived from their position — no separate side-channel pass.
-pub fn parse_with_comments(
-    source: &str,
-) -> crate::error::NmlResult<(crate::ast::File, Vec<Comment>)> {
-    let (parsed, file, errors, _suppressed) = parse_lowered(source);
+/// Parse to the **lossless tree**, refusing exactly what [`parse_to_ast`]
+/// refuses — a syntax error, a repeated name, a source-character violation,
+/// a value that does not decode. The formatter's door: it prints from the
+/// tree, so it needs the tree, and it must refuse an invalid document for
+/// the same reason `gofmt` and `rustfmt` do (a tree recovered from errors is
+/// a guess at the author's intent, and writing a guess back over their file
+/// is how a formatter loses work).
+///
+/// The tree it returns holds every byte of the source — comments,
+/// whitespace, the author's line breaks — so it is what you want when the
+/// answer has to be written back into the same file: [`edit`] applies a
+/// change through it without reformatting anything else, and
+/// `nml_fmt::formatter::format_source` prints a whole file from it. When
+/// you only need the MEANING, [`parse_to_ast`] gives you the semantic tree
+/// and is the cheaper door.
+///
+/// Which of the two refusals you get is the same in both: a
+/// [`crate::error::NmlError`] carrying every finding, not the first.
+///
+/// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use nml_core::cst::parse_checked;
+///
+/// let tree = parse_checked("// a note\nconst A = 1\n")?;
+/// assert_eq!(tree.text().to_string(), "// a note\nconst A = 1\n");
+/// assert!(parse_checked("const A = 1\nconst A = 2\n").is_err());
+/// # Ok(())
+/// # }
+/// ```
+pub fn parse_checked(source: &str) -> crate::error::NmlResult<SyntaxNode> {
+    let (parsed, _file, errors, _suppressed) = parse_lowered(source);
     match errors.into_iter().next() {
         Some(e) => Err(e),
-        None => Ok((file, comments_of(&parsed.syntax()))),
+        None => Ok(parsed.syntax()),
     }
 }
 
-/// Extract source-ordered [`Comment`]s from the CST's comment tokens.
-fn comments_of(root: &SyntaxNode) -> Vec<Comment> {
-    root.descendants_with_tokens()
-        .filter_map(|e| e.into_token())
-        .filter(|t| t.kind() == SyntaxKind::Comment)
-        .map(|t| {
-            let raw = t.text();
-            Comment {
-                text: raw.strip_prefix("//").unwrap_or(raw).trim_end().to_string(),
-                span: syntax::token_span(&t),
-                own_line: is_own_line(&t),
-            }
-        })
-        .collect()
+/// The file's line terminator — what a minted or re-emitted line ends with,
+/// so neither an insertion nor a reformat leaves a CRLF file with one LF
+/// line. The ONE speller: `cst::edit` mints with it and `nml-fmt` finishes
+/// with it, so the two writers cannot disagree about a file's transport.
+pub fn line_terminator(source: &str) -> &'static str {
+    if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
-/// A comment is "own-line" when only whitespace precedes it on its line.
-fn is_own_line(tok: &SyntaxToken) -> bool {
-    let mut prev = tok.prev_token();
-    while let Some(t) = prev {
-        match t.kind() {
-            SyntaxKind::Newline => return true, // reached line start
-            SyntaxKind::Whitespace => prev = t.prev_token(),
-            _ => return false, // code precedes it → trailing
-        }
-    }
-    true // start of file
+/// Interpret a [`SyntaxKind::String`] token into its semantic value —
+/// escapes decoded, a multi-line body dedented. For the string tokens that
+/// sit OUTSIDE a [`SyntaxKind::Value`] node (a `oneof` arm's selector, an
+/// arm's selector or target), which have no [`ast::ValueNode`] to decode
+/// through.
+pub fn decode_string(tok: &SyntaxToken) -> Result<String, NmlError> {
+    value::decode_string_token(tok)
 }
 
 #[cfg(test)]
@@ -410,6 +715,126 @@ mod tests {
     }
 
     use super::*;
+
+    /// The embedder's path — `parse_to_ast`, the first error by position —
+    /// refuses a repeated name as it refuses a stray token: NML2093 in a
+    /// body, NML1000 at the file scope, each with the first occurrence as
+    /// the note. No consumer that parses text can skip the rule.
+    #[test]
+    fn parse_to_ast_refuses_a_repeated_name_as_it_refuses_a_stray_token() {
+        let err = parse_to_ast("thing t:\n    v = 1\n    v = 2\n").expect_err("refused");
+        assert!(
+            matches!(
+                err,
+                NmlError::Syntax {
+                    kind: crate::error::ParseErrorKind::DuplicateEntry { .. },
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let d = err.to_diagnostic();
+        assert_eq!(d.code, Some(crate::diagnostic::codes::DUPLICATE_ENTRY));
+        assert_eq!(d.related.len(), 1, "{d:?}");
+        let err =
+            parse_to_ast("thing a:\n    v = 1\n\nthing a:\n    v = 2\n").expect_err("refused");
+        let d = err.to_diagnostic();
+        assert_eq!(
+            d.code,
+            Some(crate::diagnostic::codes::DUPLICATE_DECLARATION)
+        );
+        assert_eq!(d.related[0].message, "'a' first declared here");
+        assert!(parse_checked("thing t:\n    v = 1\n    v = 2\n").is_err());
+    }
+
+    /// Every AST-producing entry point derives from ONE pipeline: the
+    /// all-findings forms carry the name rules located beside the syntax
+    /// findings — in the PARSE set, not the facet set — and the best-effort
+    /// forms keep both occurrences in the tree for structure-driven tooling.
+    #[test]
+    fn every_parse_entry_point_carries_the_name_rules() {
+        use crate::diagnostic::codes;
+        let src = "model m:\n    a string\n    a number\n\nm x:\n    a = 1\n\nm x:\n    a = 2\n";
+        let expect = |diags: &[crate::diagnostic::Diagnostic], who: &str| {
+            let codes: Vec<_> = diags.iter().filter_map(|d| d.code).collect();
+            assert_eq!(
+                codes,
+                [codes::DUPLICATE_ENTRY, codes::DUPLICATE_DECLARATION],
+                "{who}: {diags:?}"
+            );
+        };
+        let (file, diags) = parse_to_ast_all(src);
+        expect(&diags, "parse_to_ast_all");
+        assert_eq!(
+            file.declarations.len(),
+            3,
+            "the tree keeps both occurrences"
+        );
+        let (_file, _schema, parse_diags, facet_diags) = parse_and_extract_split(src);
+        expect(&parse_diags, "parse_and_extract_split");
+        assert!(facet_diags.is_empty(), "{facet_diags:?}");
+        let (_file, _schema, diags) = parse_and_extract(src);
+        expect(&diags, "parse_and_extract");
+        let (_schema, diags) = extract_schema(src);
+        expect(&diags, "extract_schema");
+        assert_eq!(parse_best_effort(src).declarations.len(), 3);
+        assert_eq!(parse_best_effort_with_tree(src).0.declarations.len(), 3);
+        // Position-sorted with the rest, and counted under the one cap.
+        let (_file, diags) = parse_to_ast_all("thing t:\n    v = 1\n    v = 2\n    w = \"\n");
+        let codes: Vec<_> = diags.iter().filter_map(|d| d.code).collect();
+        assert_eq!(codes[0], codes::DUPLICATE_ENTRY, "{diags:?}");
+        assert_eq!(codes[1], codes::UNTERMINATED_STRING, "{diags:?}");
+    }
+
+    /// The parser's own token copy is twelve bytes too.
+    #[test]
+    fn parser_tok_is_twelve_bytes() {
+        assert_eq!(parser::TOK_SIZE, 12);
+    }
+
+    /// The 4 GiB bound as `parse` reports it: an EMPTY `Root` (nothing
+    /// lexed, so nothing to be lossless over), exactly one typed
+    /// `SourceTooLarge` finding carrying NML0022, zero suppressed — and
+    /// the same text parses clean under the real bound. Faked bound: a
+    /// 4 GiB allocation is not a unit test.
+    #[test]
+    fn a_source_past_the_bound_parses_to_an_empty_tree_and_one_typed_error() {
+        let src = "service App:\n    port = 1\n";
+        let over = parse_bounded(src, 8);
+        assert_eq!(over.errors().len(), 1);
+        assert!(
+            matches!(
+                over.errors()[0],
+                NmlError::Syntax {
+                    kind: crate::error::ParseErrorKind::SourceTooLarge { .. },
+                    ..
+                }
+            ),
+            "{:?}",
+            over.errors()
+        );
+        assert_eq!(
+            over.errors()[0].to_diagnostic().code,
+            Some(crate::diagnostic::codes::SOURCE_TOO_LARGE)
+        );
+        assert_eq!(over.suppressed(), 0);
+        let root = over.syntax();
+        assert_eq!(root.kind(), SyntaxKind::Root);
+        assert_eq!(root.children_with_tokens().count(), 0, "an empty tree");
+        assert!(parse(src).errors().is_empty(), "clean under the real bound");
+    }
+
+    /// The parse counter counts every entry to `parse` on this thread —
+    /// the seam the one-parse-per-target pins in the CLI and the editor
+    /// read. Three public entries, three parses.
+    #[test]
+    fn parse_counter_counts_every_parse_on_this_thread() {
+        let before = parses_on_this_thread();
+        let _ = parse("a = 1\n");
+        let _ = parse_to_ast_all("a = 1\n");
+        let _ = parse_and_extract_split("a = 1\n");
+        assert_eq!(parses_on_this_thread() - before, 3);
+    }
 
     /// Minimal typed wrapper used by the structural tests. The full typed-wrapper
     /// layer (all node kinds) lands in P4 (`cst::ast`) with its consumers; until
@@ -746,22 +1171,21 @@ mod tests {
         assert_eq!(doc_comment_for(src, "Nope"), None);
     }
 
+    /// The checked door hands back the LOSSLESS tree — comments and all —
+    /// and refuses what `parse_to_ast` refuses. Comments are tree tokens;
+    /// there is no side channel to keep in step with them.
     #[test]
-    fn parse_with_comments_extracts_from_tree() {
-        // Same fixture as the legacy lexer's comment test — own-line vs trailing
-        // placement must match.
+    fn parse_checked_yields_the_lossless_tree() {
         let src = "// header\nservice App: // trailing\n    // indented\n    port = 8080 // why\n";
-        let (file, comments) = parse_with_comments(src).unwrap();
-        assert_eq!(file.declarations.len(), 1);
-        assert_eq!(comments.len(), 4);
-        assert_eq!(comments[0].text, " header");
-        assert!(comments[0].own_line);
-        assert_eq!(comments[1].text, " trailing");
-        assert!(!comments[1].own_line);
-        assert_eq!(comments[2].text, " indented");
-        assert!(comments[2].own_line);
-        assert_eq!(comments[3].text, " why");
-        assert!(!comments[3].own_line);
+        let tree = parse_checked(src).expect("valid");
+        assert_eq!(tree.text().to_string(), src, "the tree is byte-faithful");
+        let comments = tree
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == SyntaxKind::Comment)
+            .count();
+        assert_eq!(comments, 4);
+        assert!(parse_checked("service A:\n    x = = 1\n").is_err());
     }
 
     #[test]
@@ -814,6 +1238,116 @@ mod tests {
             "{:?}",
             marker.message
         );
+    }
+
+    /// The suppression row round-trips through its recognizer (D-A):
+    /// what `finalize_diagnostics` composes, `suppressed_count` reads
+    /// back exactly — the shared-const coupling, pinned. Near-miss
+    /// shapes (wrong severity, a code, a prefixed message) read 0.
+    #[test]
+    fn suppressed_count_roundtrips_the_marker_row() {
+        for n in [1usize, 2, 128, 272, 10_000] {
+            let row = crate::diagnostic::Diagnostic::info(suppressed_row(n));
+            assert_eq!(suppressed_count(&[row]), n, "{n}");
+        }
+        assert_eq!(suppressed_count(&[]), 0);
+        // Anchoring: an ordinary Info row, an Error carrying the text,
+        // and a marker with leading junk are all NOT the marker.
+        let not_markers = [
+            crate::diagnostic::Diagnostic::info("nothing suppressed here"),
+            crate::diagnostic::Diagnostic::error(suppressed_row(7)),
+            crate::diagnostic::Diagnostic::info(format!("note: {}", suppressed_row(7))),
+        ];
+        assert_eq!(suppressed_count(&not_markers), 0);
+        // And the real pipeline's row is recognized end-to-end.
+        let mut src = String::from("service App:\n");
+        for i in 0..400 {
+            src.push_str(&format!("    k{i} = 9.999 USD\n"));
+        }
+        let (_ast, diags) = parse_to_ast_all(&src);
+        assert_eq!(suppressed_count(&diags), 400 - MAX_ERRORS);
+    }
+
+    /// The findings boundary is exact AT its edge, not merely far past it:
+    /// at the cap every finding is reported and no marker rides along; ONE
+    /// past it exactly one is clipped and the marker says `1`; far past,
+    /// the marker's count is the exact excess. A count a layer clipped
+    /// upstream adds to the merge's own clip on the SAME single row, and an
+    /// upstream clip alone is still reported.
+    #[test]
+    fn the_findings_boundary_is_exact_at_the_cap_and_one_past_it() {
+        let errs = |n: usize| -> Vec<NmlError> {
+            (0..n)
+                .map(|i| {
+                    NmlError::syntax(
+                        crate::error::ParseErrorKind::NestingLimit { what: "block" },
+                        crate::span::Span::new(i, i + 1),
+                    )
+                })
+                .collect()
+        };
+        let markers = |d: &[crate::diagnostic::Diagnostic]| {
+            d.iter()
+                .filter(|x| x.severity == crate::diagnostic::Severity::Info && x.code.is_none())
+                .count()
+        };
+        let at = finalize_diagnostics(errs(MAX_ERRORS), 0);
+        assert_eq!(at.len(), MAX_ERRORS);
+        assert_eq!(markers(&at), 0, "nothing is clipped at the cap");
+
+        let past = finalize_diagnostics(errs(MAX_ERRORS + 1), 0);
+        assert_eq!(past.len(), MAX_ERRORS + 1, "the cap's rows plus one marker");
+        assert_eq!(markers(&past), 1);
+        assert_eq!(suppressed_count(&past), 1);
+
+        let far = finalize_diagnostics(errs(MAX_ERRORS + 400), 0);
+        assert_eq!(far.len(), MAX_ERRORS + 1);
+        assert_eq!(suppressed_count(&far), 400);
+
+        let both = finalize_diagnostics(errs(MAX_ERRORS + 5), 7);
+        assert_eq!(markers(&both), 1, "one row carries both clips");
+        assert_eq!(suppressed_count(&both), 12);
+
+        let upstream_only = finalize_diagnostics(errs(1), 1);
+        assert_eq!(upstream_only.len(), 2);
+        assert_eq!(suppressed_count(&upstream_only), 1);
+    }
+
+    /// A parse's own findings are bounded and its clip is counted: a text
+    /// whose LEXICAL and SYNTACTIC findings together pass the cap yields
+    /// exactly `MAX_ERRORS` rows out of `parse`, and reported + suppressed
+    /// still adds up to every finding the two halves raise alone.
+    #[test]
+    fn a_parses_findings_are_clipped_at_the_cap_and_the_clip_is_counted() {
+        let lexical = "\u{7}\n".repeat(100);
+        let syntactic = "= 1\n".repeat(100);
+        let raised = |p: &Parse| p.errors().len() + p.suppressed();
+        let left = parse(&lexical);
+        let right = parse(&syntactic);
+        let both = parse(&format!("{lexical}{syntactic}"));
+        assert_eq!(both.errors().len(), MAX_ERRORS, "bounded output");
+        assert_eq!(
+            raised(&both),
+            raised(&left) + raised(&right),
+            "…and nothing is lost: {} + {}",
+            raised(&left),
+            raised(&right)
+        );
+        assert!(
+            both.suppressed() > left.suppressed(),
+            "the merge's own clip adds to each half's"
+        );
+    }
+
+    /// One over-long VALUE clips its own decode findings, and that clip is
+    /// carried into the document's count — never dropped on the floor.
+    #[test]
+    fn a_single_values_clipped_decode_findings_are_still_counted() {
+        let bad = 200;
+        let src = format!("thing t:\n    v = \"{}\"\n", "\\q".repeat(bad));
+        let (_file, diags) = parse_to_ast_all(&src);
+        assert_eq!(diags.len(), MAX_ERRORS + 1);
+        assert_eq!(suppressed_count(&diags), bad - MAX_ERRORS);
     }
 
     #[test]
@@ -1269,7 +1803,9 @@ service App is Base:
                         matches!(kind, crate::error::ParseErrorKind::NumberTrailingDot { .. }),
                         "{src:?}: expected NumberTrailingDot, got {kind:?}"
                     );
-                    let (replacement, fix) = kind.suggestion(span).expect("fix exists");
+                    let crate::error::Repairs::Fix(replacement, fix) = kind.repairs(span) else {
+                        panic!("{src:?}: fix exists");
+                    };
                     assert_eq!(replacement, "", "{src:?}");
                     assert_eq!(
                         (fix.start, fix.end),
@@ -1540,6 +2076,40 @@ service App is Base:
         // Closing on the content line: no alignment exists to check.
         let (_, diags) = parse_to_ast_all("service App:\n    x = \"\"\"\n        content\"\"\"\n");
         assert!(diags.is_empty(), "{diags:?}");
+
+        // UNTERMINATED (P2 gate): with no closing delimiter the
+        // trailing blank line is a recovery artifact, not the closing
+        // quotes — NML0003 tells the real story and NML0020 must not
+        // fire (its phantom fix used to APPLY, rewriting whitespace at
+        // EOF on a string with nothing to align).
+        let (_, diags) = parse_to_ast_all("service App:\n    doc = \"\"\"\n        body\n      \n");
+        let m: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+        assert!(m.iter().any(|s| s.contains("NML0003")), "{m:?}");
+        assert!(
+            m.iter().all(|s| !s.contains("NML0020")),
+            "no alignment exists on an unterminated string: {m:?}"
+        );
+
+        // The escaped-close corner: `\"""` at EOF is lexer-UNTERMINATED
+        // (the backslash pairs one closing quote) even though the text
+        // ends in three quotes — the parity flag agrees with the lexer
+        // and no NML0020 collateral appears.
+        let (_, diags) = parse_to_ast_all("service App:\n    doc = \"\"\"x\\\"\"\"");
+        let codes: Vec<String> = diags
+            .iter()
+            .filter_map(|d| d.code.map(|c| c.to_string()))
+            .collect();
+        assert!(codes.contains(&"NML0003".to_string()), "{codes:?}");
+        assert!(!codes.contains(&"NML0020".to_string()), "{codes:?}");
+
+        // Even-run control: an interior line ending `a\\` (escaped
+        // backslash, even run) with a TERMINATED misaligned close —
+        // the gate must keep this real NML0020 (guards the parity
+        // direction).
+        let (_, diags) =
+            parse_to_ast_all("service App:\n    x = \"\"\"\n        a\\\\\n    \"\"\"\n");
+        let m: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+        assert!(m.iter().any(|s| s.contains("NML0020")), "{m:?}");
     }
 
     /// NML0005's principle extends into multiline bodies: a tab in a body
@@ -2018,6 +2588,103 @@ service App is Base:
         );
     }
 
+    fn block_of(src: &str) -> crate::ast::BlockDecl {
+        let (file, diags) = parse_to_ast_all(src);
+        assert!(
+            diags.is_empty(),
+            "unexpected diagnostics for {src:?}: {diags:?}"
+        );
+        match &file.declarations[0].kind {
+            crate::ast::DeclarationKind::Block(b) => b.clone(),
+            other => panic!("expected block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uses_clause_lowers_in_authored_order() {
+        let b = block_of("flow F uses alpha, beta:\n    a = 1\n");
+        let refs: Vec<&str> = b.uses.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(refs, ["alpha", "beta"]);
+        assert!(b.extends.is_empty());
+    }
+
+    #[test]
+    fn uses_clause_with_is_keeps_both() {
+        let b = block_of("flow F is T uses base:\n    a = 1\n");
+        assert_eq!(b.extends.len(), 1);
+        assert_eq!(b.uses.len(), 1);
+        assert_eq!(b.uses[0].name, "base");
+    }
+
+    #[test]
+    fn uses_ref_named_as_is_rejected_loudly() {
+        // `flow F uses as base:` — `as` is never a layer ref; the annotation
+        // rejection claims it and the parse errors instead of misbinding.
+        let p = parse("flow F uses as base:\n    a = 1\n");
+        assert!(
+            !p.errors().is_empty(),
+            "expected a parse error for `uses as`"
+        );
+    }
+
+    #[test]
+    fn bodyless_uses_declaration_parses_clean() {
+        let b = block_of("flow F uses base\n");
+        assert_eq!(b.uses[0].name, "base");
+        assert!(b.body.entries.is_empty());
+    }
+
+    #[test]
+    fn repeated_or_misordered_header_clauses_error_loudly() {
+        // Regression class: any stray header clause used to fall through
+        // the missing-colon leniency into a SILENT declaration split (the
+        // body landing on a bogus block) — which `nml fmt` then wrote to
+        // disk. The clause loop makes every shape loud.
+        for src in [
+            "flow F uses base is T:\n    x = 1\n", // is after uses
+            "flow F uses a uses b:\n    x = 1\n",  // repeated uses
+            "flow F is A is B:\n    x = 1\n",      // repeated is
+            "[]x ys uses base:\n    - one\n",      // clause on array decl
+        ] {
+            let p = parse(src);
+            assert!(!p.errors().is_empty(), "must error loudly: {src:?}");
+        }
+    }
+
+    #[test]
+    fn header_clauses_never_continue_across_newlines() {
+        // Regression: the clause-ref path lacked the same-line rule every
+        // other header decision has, so a trailing comma (or a dangling
+        // `uses`/`is`) consumed the NEXT declaration's tokens as refs —
+        // silently, in the `uses X,\nY:` shape (zero diagnostics, Y
+        // swallowed as a ref, its body attached to the wrong block).
+        for src in [
+            "service A uses X,\nY:\n    port = 1\n",
+            "service A uses\nservice B:\n    port = 1\n",
+            "service A uses X,\r\nY:\r\n    port = 1\r\n",
+            "service A is\nservice B:\n    port = 1\n",
+        ] {
+            let (file, diags) = parse_to_ast_all(src);
+            assert!(!diags.is_empty(), "must error loudly: {src:?}");
+            // The next-line tokens survive as their OWN declaration —
+            // never as refs of the dangling clause.
+            let refs: Vec<String> = file
+                .declarations
+                .iter()
+                .filter_map(|d| match &d.kind {
+                    crate::ast::DeclarationKind::Block(b) => Some(b),
+                    _ => None,
+                })
+                .flat_map(|b| b.uses.iter().chain(b.extends.iter()))
+                .map(|r| r.name.clone())
+                .collect();
+            assert!(
+                !refs.iter().any(|r| r == "Y" || r == "service" || r == "B"),
+                "next-line tokens are never clause refs: {refs:?} in {src:?}"
+            );
+        }
+    }
+
     #[test]
     fn valid_edge_cases_parse_clean() {
         let corpus = [
@@ -2030,6 +2697,11 @@ service App is Base:
             "service App:\n    items = [1, 2, 3,]\n",    // trailing comma in array
             "const C = a | b | c\n",                     // const with fallback chain
             "[]x ys:\n    .shared = 1\n    - One:\n        a = 1\n", // array decl: shared + named item
+            "flow F uses base:\n    a = 1\n",                        // RFC 0019 uses clause
+            "flow F uses a, b, c:\n    x = 1\n",                     // multi-ref uses
+            "flow F uses base\n", // pure stack assembly (no colon)
+            "flow F is T uses base:\n    a = 1\n", // is + uses, canonical order
+            "model M:\n    uses string\n", // `uses` stays a legal field name
         ];
         for src in corpus {
             parse_ok(src);
@@ -2148,12 +2820,13 @@ service App is Base:
             use ast::AstNode as _;
             if let Some(root) = ast::Root::cast(p.syntax()) {
                 let _ = extract::extract(&root);
-                let _ = lower::to_ast(&root);
+                let _ = lower::to_ast_with_errors(&root);
             }
-            // The public drop-ins compose parse + lower (+ comment extraction +
-            // schema extraction); prove they are panic-free on any source too.
+            // The public drop-ins compose parse + lower (+ the checked-tree
+            // door + schema extraction); prove they are panic-free on any
+            // source too.
             let _ = parse_to_ast(&src);
-            let _ = parse_with_comments(&src);
+            let _ = parse_checked(&src);
             let _ = extract_schema(&src);
         }
     }
@@ -2238,8 +2911,9 @@ service App is Base:
         );
 
         // In token position: the policy error replaces the generic
-        // unexpected-character error — exactly one diagnostic, the one
-        // that teaches the fix.
+        // unexpected-character error — exactly one char diagnostic, the
+        // one that teaches the fix. (The parser's recovery NML0002s are
+        // a separate accompaniment, hence the filter idiom.)
         let (_, diags) = parse_to_ast_all("service App:\n    x = \u{1}1\n");
         let about_char: Vec<String> = diags
             .iter()
@@ -2249,7 +2923,112 @@ service App is Base:
         assert_eq!(about_char.len(), 1, "{about_char:?}");
         assert!(about_char[0].contains("NML0017"), "{about_char:?}");
 
-        // The bare-CR diagnostic carries the machine-applicable deletion.
+        // The closed classes' new members ride the same supersede: NEL
+        // (C1 → NML0017) and LS (steering invisible → NML0018), at
+        // token position and inside strings.
+        for (src, policy) in [
+            ("service App:\n    x\u{85} = 1\n", "NML0017"),
+            ("service App:\n    x\u{2028} = 1\n", "NML0018"),
+            ("service App:\n    x\u{E0067} = 1\n", "NML0018"),
+        ] {
+            let (_, diags) = parse_to_ast_all(src);
+            let about_char: Vec<String> = diags
+                .iter()
+                .map(|d| d.to_string())
+                .filter(|m| m.contains(policy) || m.contains("NML0004"))
+                .collect();
+            assert_eq!(about_char.len(), 1, "{src:?}: {about_char:?}");
+            assert!(about_char[0].contains(policy), "{about_char:?}");
+            // The mojibake clause is NEL's alone (0x85 is a CP-1252
+            // byte; LS/PS and tags have no such reading) — guards the
+            // hint-arm split against re-merging. The NEL row itself
+            // keeps it, in token position too.
+            assert_eq!(
+                about_char[0].contains("Windows-1252"),
+                policy == "NML0017",
+                "{src:?}: {about_char:?}"
+            );
+        }
+        let (_, diags) = parse_to_ast_all("service App:\n    x = \"a\u{85}b\"\n");
+        let rendered: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+        assert_eq!(
+            rendered.len(),
+            1,
+            "in-string NEL is the policy's alone: {rendered:?}"
+        );
+
+        assert!(
+            rendered[0].contains("NML0017") && rendered[0].contains("Unicode line break"),
+            "the line-break hint teaches the line-break intent: {rendered:?}"
+        );
+        assert!(
+            rendered[0].contains("Windows-1252"),
+            "NEL's hint teaches its third reading — the mojibake \
+             ellipsis — mirroring its three repair arms: {rendered:?}"
+        );
+
+        // The tag block (U+E0000–E007F) is an invisible ASCII mirror: in
+        // a string or a comment a raw tag character was ZERO diagnostics
+        // — a hidden payload channel through review. The policy scan is
+        // context-free, so membership alone closes every position.
+        for src in [
+            "service App:\n    x = \"a\u{E0067}b\"\n",
+            "service App:\n    // note\u{E0067}\n    x = 1\n",
+        ] {
+            let (_, diags) = parse_to_ast_all(src);
+            let tags: Vec<String> = diags
+                .iter()
+                .map(|d| d.to_string())
+                .filter(|m| m.contains("NML0018"))
+                .collect();
+            assert_eq!(tags.len(), 1, "{src:?}: {diags:?}");
+            assert_eq!(
+                diags.len(),
+                1,
+                "the surrounding syntax parses clean — the policy diagnostic \
+                 is the ONLY finding: {src:?}: {diags:?}"
+            );
+            assert!(
+                tags[0].contains("U+E0067") && tags[0].contains("tag characters"),
+                "the tag hint names the channel and the emoji use: {tags:?}"
+            );
+        }
+
+        // An UNTERMINATED string never grants in-string context: on an
+        // old-Mac file with a stray quote, the swallowed-to-EOF token
+        // must not flip the following TRANSPORT CRs to content (whose
+        // `\r` fix would glue the file's line structure into a string).
+        // Both open shapes pin the guard: the single- and triple-quote
+        // openers record different open spans, but each starts exactly
+        // at its String token's start.
+        for src in [
+            "service App:\r    a = \"stray x\r    b = 2\r",
+            "service App:\r    a = \"\"\"stray\r    b = 2\r",
+        ] {
+            let (_, diags) = parse_to_ast_all(src);
+            let cr: Vec<String> = diags
+                .iter()
+                .map(|d| d.to_string())
+                .filter(|m| m.contains("NML0016"))
+                .collect();
+            assert!(!cr.is_empty(), "{src:?}: {diags:?}");
+            assert!(
+                cr.iter().all(|m| !m.contains("(fix:")),
+                "no CR behind a stray quote may carry the in-string fix: {cr:?}"
+            );
+        }
+
+        // The bare-CR diagnostic carries the `\r` escape INSIDE a
+        // string, where the CR is content — and NO machine fix in token
+        // position, where a deletion glues lines on a CR-terminated file.
+        let (_, diags) = parse_to_ast_all("service App:\n    tag = \"a\rb\"\n");
+        let cr: Vec<String> = diags
+            .iter()
+            .map(|d| d.to_string())
+            .filter(|m| m.contains("NML0016"))
+            .collect();
+        assert_eq!(cr.len(), 1, "{cr:?}");
+        assert!(cr[0].contains("(fix: `\\r`)"), "{cr:?}");
         let (_, diags) = parse_to_ast_all("service App:\r    port = 1\n");
         let cr: Vec<String> = diags
             .iter()
@@ -2257,12 +3036,389 @@ service App is Base:
             .filter(|m| m.contains("NML0016"))
             .collect();
         assert_eq!(cr.len(), 1, "{cr:?}");
-        assert!(cr[0].contains("(fix: remove)"), "{cr:?}");
+        assert!(
+            !cr[0].contains("(fix:"),
+            "no machine fix in token position: {cr:?}"
+        );
     }
 
     /// A leading U+FEFF is a byte-order mark: accepted, filed as trivia
     /// (lossless), and invisible to the policy. Everywhere else it is
     /// NML0018.
+    /// The cap coincidence made structural (r30 F4): with ≥128 lexer
+    /// errors ahead of a stray quote, the UnterminatedString entry is
+    /// suppressed past MAX_ERRORS and the A2 guard goes blind — but the
+    /// rendered window truncates at the SAME constant on the
+    /// position-sorted merge, and lexer errors never occur inside a
+    /// string token's range, so the evictors always sort first and no
+    /// guard-blind in-string fix can ever render. If the two caps
+    /// diverge, this fails.
+    #[test]
+    fn a_flooded_stray_quote_still_grants_no_in_string_fix() {
+        // 130 unexpected-character errors, then a stray quote, then
+        // transport CRs the blind flip would have granted `\r` fixes.
+        let mut src = String::from("service App:\n");
+        for _ in 0..130 {
+            src.push_str("    ~\n");
+        }
+        src.push_str("    a = \"stray x\r    b = 2\r");
+        let (_, diags) = parse_to_ast_all(&src);
+        assert!(
+            diags.iter().all(|d| !d.to_string().contains("(fix")),
+            "no fix may render behind a suppressed unterminated-string error"
+        );
+        assert!(
+            diags.iter().any(|d| d.to_string().contains("suppressed")),
+            "the flood must report suppression honestly: {} diags",
+            diags.len()
+        );
+    }
+
+    /// The judge's size cap (D-B): a string token over
+    /// `MAX_JUDGED_TOKEN_BYTES` is never decode-judged — the policy
+    /// diagnostic stands with NO machine fix (fail-closed, the token
+    /// text never decoded); the same content under the cap keeps its
+    /// singular escape fix. Boundary-exact: the cap itself is judged,
+    /// one byte past it is not.
+    #[test]
+    fn an_oversized_string_token_refuses_machine_repair_and_keeps_the_diagnostic() {
+        let cap = 64 * 1024;
+        let rendered_0017 = |src: &str| -> Vec<String> {
+            let (_, diags) = parse_to_ast_all(src);
+            diags
+                .iter()
+                .map(|d| d.to_string())
+                .filter(|m| m.contains("NML0017"))
+                .collect()
+        };
+        // Token text = `"` + filler + C0 + `"`; filler sized so the
+        // token is exactly one byte OVER the cap…
+        let over = format!("service App:\n    x = \"{}\u{1}\"\n", "a".repeat(cap - 2));
+        let hits = rendered_0017(&over);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            !hits[0].contains("(fix"),
+            "an over-cap token must refuse machine repair: {}…",
+            &hits[0][..120.min(hits[0].len())]
+        );
+        // …and exactly AT the cap, where the fix is granted.
+        let at = format!("service App:\n    x = \"{}\u{1}\"\n", "a".repeat(cap - 3));
+        let hits = rendered_0017(&at);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0].contains("(fix: `\\u{1}`)"),
+            "at-cap content keeps its singular escape fix: {}…",
+            &hits[0][..120.min(hits[0].len())]
+        );
+    }
+
+    /// The in-string repair taxonomy (RFC 0023 D1): each ambiguity
+    /// class of NML0017/NML0018 content gets exactly its enumerated
+    /// resolution space — singular where one reading is provable,
+    /// alternatives where intent is genuinely open, and none at all in
+    /// token position, where any rewrite is a structural guess.
+    #[test]
+    fn in_string_policy_characters_carry_their_repair_taxonomy() {
+        let rendered_for = |src: &str, code: &str| -> String {
+            let (_, diags) = parse_to_ast_all(src);
+            let hits: Vec<String> = diags
+                .iter()
+                .map(|d| d.to_string())
+                .filter(|m| m.contains(code))
+                .collect();
+            assert_eq!(hits.len(), 1, "{src:?}: {diags:?}");
+            hits[0].clone()
+        };
+
+        // C0 in a string: the escape is the ONE value-preserving
+        // reading — singular, auto-appliable (NML0016's `\r` shape).
+        let m = rendered_for("service App:\n    x = \"a\u{1}b\"\n", "NML0017");
+        assert!(m.contains("(fix: `\\u{1}`)"), "{m}");
+
+        // The five unmapped C1 bytes (CP-1252 holes) are singular too.
+        let m = rendered_for("service App:\n    x = \"a\u{90}b\"\n", "NML0017");
+        assert!(m.contains("(fix: `\\u{90}`)"), "{m}");
+
+        // NEL: the one character in BOTH ambiguity classes — line
+        // break | kept byte | mojibake ellipsis. Three alternatives,
+        // rendered in full (no truncation tail), never auto-applied.
+        let m = rendered_for("service App:\n    x = \"a\u{85}b\"\n", "NML0017");
+        assert!(m.contains("(fixes: `\\n`, `\\u{85}`, `…`)"), "{m}");
+        assert!(!m.contains("more"), "three renders whole: {m}");
+
+        // A mapped C1 byte: keep it escaped, or repair the
+        // double-decode to what the CP-1252 author typed.
+        let m = rendered_for("service App:\n    x = \"a\u{93}b\"\n", "NML0017");
+        assert!(m.contains("(fixes: `\\u{93}`, `\u{201C}`)"), "{m}");
+
+        // LS/PS: a line break was meant, or the separator itself.
+        let m = rendered_for("service App:\n    x = \"a\u{2028}b\"\n", "NML0018");
+        assert!(m.contains("(fixes: `\\n`, `\\u{2028}`)"), "{m}");
+
+        // Bidi controls, interior FEFF, tags: remove | keep escaped —
+        // and the deletion alternative reads `remove`, in the singular
+        // arm's vocabulary, never an empty backtick pair.
+        let m = rendered_for("service App:\n    x = \"a\u{202E}b\"\n", "NML0018");
+        assert!(m.contains("(fixes: remove, `\\u{202E}`)"), "{m}");
+        let m = rendered_for("service App:\n    x = \"a\u{E0067}b\"\n", "NML0018");
+        assert!(m.contains("(fixes: remove, `\\u{E0067}`)"), "{m}");
+        let m = rendered_for("service App:\n    x = \"a\u{FEFF}b\"\n", "NML0018");
+        assert!(m.contains("(fixes: remove, `\\u{FEFF}`)"), "{m}");
+
+        // The in-string reading is granted by DECODE-JUDGED soundness
+        // (`escape_preserves_value`): the escape must leave the decoded
+        // value byte-identical. Every corrupting geometry refuses for
+        // exactly the reason it corrupts — blank edge lines are dropped
+        // from the value (r28: an applied `\r` fix turned `"body"`
+        // into `"body\n\r"` with a clean post-state), a blank middle
+        // line's blankness can hold min-indent up (r29: escaping it
+        // re-indented every line), the opening line's padding is
+        // dropped, and a preceding backslash glues the spliced escape
+        // into different text. Content lines keep their repairs.
+        let no_fix = |src: &str, code: &str| {
+            let (_, diags) = parse_to_ast_all(src);
+            let hits: Vec<String> = diags
+                .iter()
+                .map(|d| d.to_string())
+                .filter(|m| m.contains(code))
+                .collect();
+            assert!(!hits.is_empty(), "{src:?}: {diags:?}");
+            assert!(
+                hits.iter().all(|m| !m.contains("(fix")),
+                "no repair in a dropped edge line: {src:?}: {hits:?}"
+            );
+        };
+        // Aligned blank closing line (no NML0020 in play): bare CR, NEL.
+        no_fix(
+            "service App:\n    doc = \"\"\"\n        body\n        \u{D}\"\"\"\n",
+            "NML0016",
+        );
+        no_fix(
+            "service App:\n    doc = \"\"\"\n        body\n        \u{85}\"\"\"\n",
+            "NML0017",
+        );
+        // Blank opening line (CR not followed by LF).
+        no_fix(
+            "service App:\n    doc = \"\"\"\u{D}  \n        body\n        \"\"\"\n",
+            "NML0016",
+        );
+        // r29 geometries. A blank middle line whose indent is BELOW the
+        // content's min-indent: escaping makes it participate and drops
+        // min for every line (the whole value re-indents) — refused.
+        no_fix(
+            "service App:\n    doc = \"\"\"\n        body\n \u{D} \n        more\n        \"\"\"\n",
+            "NML0016",
+        );
+        // The empty-min corner: the ONLY body line is blank; escaping
+        // it changes min from 0 to its own indent — refused.
+        no_fix(
+            "service App:\n    doc = \"\"\"\n \u{D} \n\"\"\"\n",
+            "NML0016",
+        );
+        // A non-blank opening line's leading PADDING is dropped by the
+        // NML0019 recovery; an escape there would join the value with
+        // the padding after it — refused.
+        no_fix(
+            "service App:\n    doc = \"\"\" \u{C}hey\n        world\n        \"\"\"\n",
+            "NML0017",
+        );
+        // A raw backslash before the character glues the spliced escape
+        // into different text (`a\\` + `\\u{1}` reads as an escaped
+        // backslash then literal `u{1}`) — refused.
+        no_fix("service App:\n    x = \"a\\\u{1}b\"\n", "NML0017");
+        // A blank middle line ALIGNED with the content's min-indent is
+        // geometry-inert: its bytes are value bytes and the escape is
+        // exact — the repair stays (over-narrowing guard).
+        let m = rendered_for(
+            "service App:\n    doc = \"\"\"\n    body\n    \u{D} \n    more\n    \"\"\"\n",
+            "NML0016",
+        );
+        assert!(m.contains("(fix: `\\r`)"), "{m}");
+        // Opening-line CONTENT (after the dropped padding) is value
+        // bytes — the repair stays.
+        let m = rendered_for(
+            "service App:\n    doc = \"\"\"x\u{1}y\n        world\n        \"\"\"\n",
+            "NML0017",
+        );
+        assert!(m.contains("(fix: `\\u{1}`)"), "{m}");
+
+        // CONTENT lines keep their repairs — the middle of the body and
+        // a non-blank closing line are value bytes (over-narrowing guard).
+        let m = rendered_for(
+            "service App:\n    doc = \"\"\"\n        a\u{1}b\n        \"\"\"\n",
+            "NML0017",
+        );
+        assert!(m.contains("(fix: `\\u{1}`)"), "{m}");
+        let m = rendered_for(
+            "service App:\n    doc = \"\"\"\n        body\n        x\u{1}\"\"\"\n",
+            "NML0017",
+        );
+        assert!(m.contains("(fix: `\\u{1}`)"), "{m}");
+
+        // Behind an UNTERMINATED string (the A2 guard) the string
+        // reading is uncertain, so the in-string taxonomy must stay
+        // silent for EVERY policy kind — a bidi control swallowed by a
+        // stray quote gets the diagnostic, never the remove|escape
+        // alternatives.
+        let (_, diags) = parse_to_ast_all("service App:\n    a = \"stray\n    b = \"x\u{202E}y\n");
+        let bidi: Vec<String> = diags
+            .iter()
+            .map(|d| d.to_string())
+            .filter(|m| m.contains("NML0018"))
+            .collect();
+        assert!(!bidi.is_empty(), "{diags:?}");
+        assert!(
+            bidi.iter().all(|m| !m.contains("(fix")),
+            "no repair behind an uncertain string reading: {bidi:?}"
+        );
+
+        // TOKEN position: no repair, either class — the character is
+        // structure there, and a rewrite would be a guess.
+        for src in [
+            "service App:\n    x\u{85} = 1\n",
+            "service App:\n    x\u{2028} = 1\n",
+            "service App:\n    x\u{E0067} = 1\n",
+            "service App:\n    x\u{1} = 1\n",
+        ] {
+            let (_, diags) = parse_to_ast_all(src);
+            for d in &diags {
+                let m = d.to_string();
+                assert!(
+                    !m.contains("(fix"),
+                    "token position carries no repair: {src:?}: {m}"
+                );
+            }
+        }
+    }
+
+    /// The sentinel-judged remove grant (D-C): the *remove* arm of a
+    /// bidi/FEFF/tag character's enumerated alternatives is offered
+    /// ONLY where deletion provably removes just that character — the
+    /// sentinel judgment (decode with a marker escape vs. decode with
+    /// the deletion) plus the delete-splice lex-integrity clause (the
+    /// spliced text must stay ONE clean String token). Where either
+    /// refuses, the set COLLAPSES to the singular escape fix — one
+    /// suggestion, auto-appliable, never a phantom remove.
+    #[test]
+    fn the_remove_arm_is_sentinel_judged_and_collapses_where_unsound() {
+        use crate::diagnostic::codes;
+        let d18 = |src: &str| -> Vec<crate::diagnostic::Diagnostic> {
+            let (_, diags) = parse_to_ast_all(src);
+            diags
+                .into_iter()
+                .filter(|d| d.code == Some(codes::INVISIBLE_CHARACTER))
+                .collect()
+        };
+        let escape_only = |src: &str, escape: &str| {
+            let hits = d18(src);
+            assert_eq!(hits.len(), 1, "{src:?}: {hits:?}");
+            let suggestions = &hits[0].suggestions;
+            assert_eq!(
+                suggestions.len(),
+                1,
+                "an unsound removal must collapse to the escape alone: {src:?}: {suggestions:?}"
+            );
+            assert_eq!(suggestions[0].replacement, escape, "{src:?}");
+        };
+        let remove_and_escape = |src: &str, escape: &str| {
+            let hits = d18(src);
+            assert_eq!(hits.len(), 1, "{src:?}: {hits:?}");
+            let suggestions = &hits[0].suggestions;
+            assert_eq!(suggestions.len(), 2, "{src:?}: {suggestions:?}");
+            assert!(
+                suggestions.iter().any(|s| s.replacement.is_empty()),
+                "sound removal keeps the remove arm: {src:?}: {suggestions:?}"
+            );
+            assert!(
+                suggestions.iter().any(|s| s.replacement == escape),
+                "{src:?}: {suggestions:?}"
+            );
+        };
+
+        // Sentinel EXHAUSTION: a value already holding all sixteen
+        // candidates U+E000–E00F leaves the picker nothing to mark
+        // with — the judgment refuses fail-closed and the set
+        // collapses, even in an otherwise-safe position. (The escape
+        // still auto-applies: exhaustion costs the remove arm, never
+        // the repair — the error-index NML0018 sentence states this
+        // split.)
+        let all16: String = ('\u{E000}'..='\u{E00F}').collect();
+        escape_only(
+            &format!("service App:\n    x = \"{all16}a\u{FEFF}b\"\n"),
+            "\\u{FEFF}",
+        );
+        // Picker SKIP: only U+E000 taken — the picker moves to U+E001
+        // and the sound remove arm survives.
+        remove_and_escape(
+            "service App:\n    x = \"\u{E000}a\u{FEFF}b\"\n",
+            "\\u{FEFF}",
+        );
+
+        // P1 — last-line blank flip: deleting the FEFF turns the final
+        // body line blank, which the edge trim then DROPS from the
+        // value ("body\n⟨char⟩" would silently become "body"). The
+        // sentinel judgment refuses; the escape stands alone.
+        escape_only(
+            "service App:\n    doc = \"\"\"\n        body\n        \u{FEFF}\"\"\"\n",
+            "\\u{FEFF}",
+        );
+        // P7 — middle-line min-indent flip: the FEFF's line holds the
+        // body's min-indent DOWN (indent 1 under content at 8);
+        // deleting it turns the line blank, min-indent jumps, and the
+        // whole value re-indents. Refused; escape alone.
+        escape_only(
+            "service App:\n    doc = \"\"\"\n        body\n \u{FEFF}\n        more\n        \"\"\"\n",
+            "\\u{FEFF}",
+        );
+        // P2 — quote merge: the FEFF separates `""` from `"`; deleting
+        // it glues them into a CLOSING `\"\"\"` and the rest of the file
+        // is re-tokenized (decode of the old token text cannot see
+        // this — the delete-splice still decodes to the "right" value,
+        // which is exactly why the lex-integrity clause exists).
+        // Refused; escape alone.
+        let p2 = "service App:\n    doc = \"\"\"\n        a\n        \"\"\u{FEFF}\"\n        \"\"\"\n    port = 1\n";
+        escape_only(p2, "\\u{FEFF}");
+        // …and applying that ONE offered fix leaves a file that parses
+        // clean with the value preserved (the escape spells the same
+        // character the raw byte carried).
+        let hits = d18(p2);
+        let sug = &hits[0].suggestions[0];
+        let mut fixed = String::new();
+        fixed.push_str(&p2[..sug.span.start]);
+        fixed.push_str(&sug.replacement);
+        fixed.push_str(&p2[sug.span.end..]);
+        let (_, diags) = parse_to_ast_all(&fixed);
+        assert!(
+            diags.is_empty(),
+            "the applied escape must land clean: {diags:?}"
+        );
+        let before = decode_value(&first_value_node(&parse(p2).syntax())).expect("value");
+        let after = decode_value(&first_value_node(&parse(&fixed).syntax())).expect("value");
+        assert_eq!(before.value, after.value, "the fix preserves the value");
+        // The four-quote corner: `\"\"` ⟨char⟩ `\"\"` — deletion makes
+        // `\"\"\"\"`, an early close plus a stray quote. Same refusal.
+        escape_only(
+            "service App:\n    doc = \"\"\"\n        a\n        \"\"\u{FEFF}\"\"\n        \"\"\"\n    port = 1\n",
+            "\\u{FEFF}",
+        );
+        // P12 — CR glue: the FEFF sits between a bare CR and an LF;
+        // deleting it fuses them into a CRLF line ending, and the CR
+        // silently leaves the VALUE (transport now, content before).
+        // The sentinel judgment refuses; escape alone.
+        escape_only(
+            "service App:\n    doc = \"\"\"\n        x\r\u{FEFF}\n        y\n        \"\"\"\n",
+            "\\u{FEFF}",
+        );
+
+        // Sound geometries keep the full enumeration — a mid-paragraph
+        // FEFF in a multiline body, and a single-line bidi control.
+        remove_and_escape(
+            "service App:\n    doc = \"\"\"\n        a\u{FEFF}b\n        \"\"\"\n",
+            "\\u{FEFF}",
+        );
+        remove_and_escape("service App:\n    x = \"a\u{202E}b\"\n", "\\u{202E}");
+    }
+
     #[test]
     fn leading_bom_accepted_interior_feff_rejected() {
         let src = "\u{FEFF}service App:\n    port = 1\n";
@@ -2526,6 +3682,330 @@ service App is Base:
                 .iter()
                 .any(|m| m.contains("set<(K -> V)>")),
             "bare arms inside angles point at the parenthesized fix"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Tree-builder timing gates (RFC 0004 §4.3 comment attachment).
+    // Generated in-process (a 200k-line file has no business in the
+    // repo); bounds are catastrophic-regression tripwires for the two
+    // named complexity traps in `build_tree` — a per-comment rescan of
+    // the trivia run (`dedent_ends_run` is probed once per run) and a
+    // front-removal release of held comments (`deferred` is a deque).
+    // Each shape costs ~10–20 ms fixed in release; the trap cost ~20 s.
+    // Deliberately loose (absolutes drift across machines). `--ignored`
+    // only: `cargo test -p nml-core --release --lib -- --ignored perf_`.
+    // ───────────────────────────────────────────────────────────────
+
+    /// Number of generated comment lines per timing gate.
+    const PERF_COMMENT_LINES: usize = 200_000;
+
+    /// Parse `src` under `bound`, and pin the two properties the gate must not
+    /// buy speed with: losslessness and a clean parse.
+    fn perf_parse(name: &str, src: &str, bound: std::time::Duration) {
+        let started = std::time::Instant::now();
+        let parsed = parse(src);
+        let elapsed = started.elapsed();
+        assert!(
+            parsed.errors().is_empty(),
+            "{name}: parse must be clean: {:?}",
+            parsed.errors()
+        );
+        assert_eq!(
+            parsed.syntax().text().to_string(),
+            src,
+            "{name}: stays lossless"
+        );
+        assert!(
+            elapsed < bound,
+            "{name}: parsed in {elapsed:?}, over the {bound:?} tripwire \
+             — a tree-builder complexity trap regressed (RFC 0004 §4.3)"
+        );
+    }
+
+    /// A body-indented own-line comment run ending at the body's last entry:
+    /// every comment sits before the same closing dedent (the rescan trap).
+    #[test]
+    #[ignore = "timing gate — run with --release -- --ignored"]
+    fn perf_body_comment_run_parses_within_bounds() {
+        let src = format!(
+            "service App:\n{}    port = 1\n",
+            "    // p\n".repeat(PERF_COMMENT_LINES)
+        );
+        perf_parse("body-comment-run", &src, std::time::Duration::from_secs(2));
+    }
+
+    /// A column-0 own-line comment run between two declarations: every comment
+    /// is deferred past the closing dedent and released together (the
+    /// front-removal trap).
+    #[test]
+    #[ignore = "timing gate — run with --release -- --ignored"]
+    fn perf_deferred_comment_run_parses_within_bounds() {
+        let src = format!(
+            "service App:\n    port = 1\n{}\nservice B:\n    port = 2\n",
+            "// p\n".repeat(PERF_COMMENT_LINES)
+        );
+        perf_parse(
+            "deferred-comment-run",
+            &src,
+            std::time::Duration::from_secs(2),
+        );
+    }
+
+    /// A column-0 comment run before the first declaration — the license-header
+    /// / manifest shape RFC 0019 item 0 parses on every invocation.
+    #[test]
+    #[ignore = "timing gate — run with --release -- --ignored"]
+    fn perf_header_comment_run_parses_within_bounds() {
+        let src = format!(
+            "{}service S:\n    port = 1\n",
+            "// p\n".repeat(PERF_COMMENT_LINES)
+        );
+        perf_parse(
+            "header-comment-run",
+            &src,
+            std::time::Duration::from_secs(2),
+        );
+    }
+
+    /// The shape-aware verdict at each shape's edges. The point is the
+    /// STRONGER rule a content window gets: the byte rule alone (in bounds,
+    /// on character boundaries) admits a window equal to the WHOLE token,
+    /// and splicing that over a literal's delimiters rewrites `"GE" -> h`
+    /// into `GET -> h` — so the window must also be strictly inside the
+    /// token it carries.
+    #[test]
+    fn the_site_verdict_holds_each_shape_to_its_own_rule() {
+        use crate::span::{Span, SpanShape, SpanSite};
+        let src = "thing t:\n    v = \"caf\u{e9}\"\n";
+        let boundaries = parse(src).token_boundaries();
+        let token = Span::new(
+            src.find('"').expect("the literal"),
+            src.rfind('"').expect("the literal") + 1,
+        );
+        let window = Span::new(token.start + 1, token.end - 1);
+        let ok = |site: SpanSite| boundaries.check(site, src);
+        // A whole span: the token, not its inside.
+        assert_eq!(ok(SpanSite::aligned("w", token)), Ok(()));
+        assert!(ok(SpanSite::aligned("w", window)).is_err());
+        // A content window: inside the delimiters, on character boundaries.
+        assert_eq!(ok(SpanSite::window("c", window, token)), Ok(()));
+        // The structurally ill-shaped sites are built as the STRUCT: the
+        // constructor refuses them at the mint, and the check must refuse
+        // them too, for a site built any other way.
+        assert!(
+            ok(SpanSite {
+                kind: "c",
+                span: token,
+                shape: SpanShape::ContentWindow { token }
+            })
+            .is_err(),
+            "a window equal to its token passes the byte rule and corrupts a fix"
+        );
+        assert!(
+            ok(SpanSite {
+                kind: "c",
+                span: Span::new(token.start, window.end),
+                shape: SpanShape::ContentWindow { token }
+            })
+            .is_err(),
+            "a window that starts on the opening delimiter"
+        );
+        assert!(
+            ok(SpanSite::window(
+                "c",
+                Span::new(window.start, window.end - 1),
+                token
+            ))
+            .is_err(),
+            "the literal's last character is two bytes: its middle is no boundary"
+        );
+        assert!(
+            ok(SpanSite {
+                kind: "c",
+                span: window,
+                shape: SpanShape::ContentWindow { token: window }
+            })
+            .is_err(),
+            "a window whose token is not itself token-aligned"
+        );
+        // A template expression: inside its token, delimiters included.
+        assert_eq!(ok(SpanSite::expression("e", window, token)), Ok(()));
+        assert_eq!(ok(SpanSite::expression("e", token, token)), Ok(()));
+        assert!(
+            ok(SpanSite::expression("e", Span::new(0, token.end), token)).is_err(),
+            "an expression reaching outside its token"
+        );
+        // Out of bounds, whatever the shape.
+        let past = Span::new(src.len(), src.len() + 1);
+        assert!(ok(SpanSite::aligned("w", past)).is_err());
+        assert!(
+            ok(SpanSite {
+                kind: "c",
+                span: past,
+                shape: SpanShape::ContentWindow { token }
+            })
+            .is_err()
+        );
+        assert!(ok(SpanSite::expression("e", past, token)).is_err());
+    }
+
+    /// A missing fallback arm (`"a" |`) recovers to a token-less node: its
+    /// span is a POSITION (the empty span at its start), never its raw
+    /// extent over the trivia after the bar, and the fallback's merged span
+    /// stays the `"a"` token — so every span of the best-effort tree is
+    /// token-aligned, as the `document` fuzz target holds for every input.
+    #[test]
+    fn a_missing_fallback_arm_keeps_every_span_token_aligned() {
+        use super::ast::AstNode as _;
+        for src in [
+            "service App:\n    k = \"a\" |\n    m = 1\n",
+            "service App:\n    k = \"a\" | \n",
+            "service App:\n    k = \"a\" | // gone\n    m = 1\n",
+            "service App:\n    k = \"a\" |\n",
+        ] {
+            let parsed = parse(src);
+            let root = super::ast::Root::cast(parsed.syntax()).expect("a Root");
+            let (file, lowered_errors, _) = super::lower::to_ast_with_errors(&root);
+            assert!(
+                !parsed.errors().is_empty() || !lowered_errors.is_empty(),
+                "the missing arm is an error: {src:?}"
+            );
+            let boundaries = parsed.token_boundaries();
+            let mut sites = 0;
+            crate::ast::for_each_span(&file, &mut |site| {
+                sites += 1;
+                // Each site by the shape its emitter declared — the same
+                // verdict `content_spans` and the `document` fuzz target read.
+                if let Err(why) = boundaries.check(site, src) {
+                    panic!(
+                        "{} span {:?} ({:?}) {why} in {src:?}",
+                        site.kind,
+                        site.span,
+                        src.get(site.span.start..site.span.end)
+                    );
+                }
+            });
+            assert!(sites > 0, "{src:?}");
+            // The chain ends at its line: the fallback's content span is the
+            // `"a"` token alone in EVERY shape, a following line included
+            // (the chain never takes that line's name as its arm —
+            // `a_fallback_chain_ends_at_its_line`).
+            let crate::ast::DeclarationKind::Block(block) = &file.declarations[0].kind else {
+                panic!("a block: {src:?}");
+            };
+            let crate::ast::BodyEntryKind::Property(property) = &block.body.entries[0].kind else {
+                panic!("a property: {src:?}");
+            };
+            let span = property.value.span;
+            assert_eq!(
+                &src[span.start..span.end],
+                "\"a\"",
+                "the value's span is the primary alone, the missing arm a position: {src:?}"
+            );
+        }
+    }
+
+    /// A fallback chain never crosses a line break (RFC 0026 decision 2): a
+    /// `|` that ends a line has no arm — ONE NML0002 at the pipe, naming the
+    /// line break (or the end of the file) — and the next line parses as its
+    /// own entry, never as the arm. The chain used to continue past the break
+    /// (`m` swallowed as the arm, `= 1` reported twice on line 3). In list
+    /// position the chain is NML0021 once and the next item is its own.
+    #[test]
+    fn a_fallback_chain_ends_at_its_line() {
+        use super::ast::AstNode as _;
+        let entries = |src: &str| -> (Vec<NmlError>, crate::ast::File) {
+            let parsed = parse(src);
+            let root = super::ast::Root::cast(parsed.syntax()).expect("a Root");
+            let (file, lowered, _) = super::lower::to_ast_with_errors(&root);
+            let mut errors: Vec<NmlError> = parsed.errors().to_vec();
+            errors.extend(lowered);
+            (errors, file)
+        };
+        for (src, found) in [
+            ("service App:\n    k = \"a\" |\n    m = 1\n", "a line break"),
+            (
+                "service App:\n    k = \"a\" | // gone\n    m = 1\n",
+                "a line break",
+            ),
+            ("service App:\n    k = \"a\" |\n", "a line break"),
+            ("service App:\n    k = \"a\" |", "end of file"),
+        ] {
+            let (errors, file) = entries(src);
+            assert_eq!(errors.len(), 1, "one row: {src:?} {errors:?}");
+            let pipe = src.find('|').expect("the pipe");
+            assert_eq!(
+                errors[0].span(),
+                crate::span::Span::new(pipe, pipe + 1),
+                "at the pipe: {src:?}"
+            );
+            assert_eq!(
+                errors[0].message(),
+                format!("expected a value after `|`, found {found}"),
+                "{src:?}"
+            );
+            let crate::ast::DeclarationKind::Block(block) = &file.declarations[0].kind else {
+                panic!("a block: {src:?}");
+            };
+            let names: Vec<&str> = block
+                .body
+                .entries
+                .iter()
+                .filter_map(|e| match &e.kind {
+                    crate::ast::BodyEntryKind::Property(p) => Some(p.name.name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let want: &[&str] = if src.contains("m = 1") {
+                &["k", "m"]
+            } else {
+                &["k"]
+            };
+            assert_eq!(names, want, "the next line is its own entry: {src:?}");
+        }
+        // List position: one NML0021 for the chain, the next item its own.
+        let (errors, file) = entries("[]a b:\n    - \"a\" |\n    - \"b\"\n");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(
+            errors[0].to_diagnostic().code,
+            Some(crate::diagnostic::codes::FALLBACK_IN_LIST_ITEM),
+            "{errors:?}"
+        );
+        let crate::ast::DeclarationKind::Array(array) = &file.declarations[0].kind else {
+            panic!("an array");
+        };
+        assert_eq!(array.body.items.len(), 2, "{array:?}");
+    }
+
+    /// A multiline (`"""`) template is segmented on its DECODED text — the
+    /// dedented body, quotes gone — so the literal segments are the string's
+    /// content and the expression is found where it is; segmenting the raw
+    /// token would keep the indentation and the quote remnants as literal
+    /// text.
+    #[test]
+    fn a_multiline_template_is_segmented_on_its_decoded_text() {
+        use crate::types::{TemplateSegment, Value};
+        let v = decode_first("\"\"\"\n    Hello {{ name }}\n    \"\"\"");
+        let Value::TemplateString(segs) = v else {
+            panic!("a template: {v:?}");
+        };
+        assert_eq!(
+            crate::template::segments_to_string(&segs),
+            "Hello {{ name }}"
+        );
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert!(
+            matches!(&segs[0], TemplateSegment::Literal(l) if l == "Hello "),
+            "{segs:?}"
+        );
+        assert!(
+            matches!(
+                &segs[1],
+                TemplateSegment::Expression { namespace, path, .. }
+                    if namespace == "name" && path.is_empty()
+            ),
+            "{segs:?}"
         );
     }
 }

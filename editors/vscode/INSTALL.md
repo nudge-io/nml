@@ -1,6 +1,6 @@
-# Installing the NML Extension in Cursor
+# Building and installing the extension from source (VS Code and Cursor)
 
-Complete steps to build, package, and install the NML language extension (with LSP) into Cursor.
+Steps to build, package and install the NML extension from this checkout. A packaged VSIX already carries the language server as WebAssembly, so Steps 1-2 — a *native* server — are optional.
 
 **Host compatibility:** the extension requires VS Code API **1.91+** (`engines.vscode` in `package.json`). Current Cursor releases satisfy this — the same VSIX installs in both VS Code and Cursor.
 
@@ -26,7 +26,10 @@ cargo build -p nml-lsp --release
 cp target/release/nml-lsp ~/.cargo/bin/nml-lsp
 ```
 
-The extension defaults to `~/.cargo/bin/nml-lsp`. If you want a different location, set `nml.server.path` in Cursor settings after installation.
+The extension resolves its server in three steps: `nml.server.path` if you set it, then the WASM backend
+bundled in the VSIX, then `~/.cargo/bin/nml-lsp`. So a packaged VSIX already carries a server — Steps 1-2 are
+for running a *native* one, which you select by setting `nml.server.path` (an absolute path; a leading `~/`
+expands) in Cursor settings after installation.
 
 ## Step 3: Compile the extension TypeScript
 
@@ -38,7 +41,8 @@ pnpm install
 just compile-ext
 ```
 
-This compiles TypeScript into `out/` and bundles `dist/extension.js`. The VSIX ships the bundle — if you skip this step, the extension will use stale code.
+This type-checks and compiles TypeScript into `out/` (`tsc -b`). The bundle the VSIX ships,
+`dist/extension.js`, is written by the packaging step below (`vscode:prepublish`), not here.
 
 ## Step 4: Package the VSIX
 
@@ -48,10 +52,11 @@ just package-ext
 
 Or from `editors/vscode/` after WASM is built: `pnpm run package`.
 
-## Step 5: Install in Cursor
+## Step 5: Install the VSIX
 
 ```bash
-cursor --install-extension editors/vscode/*.vsix
+code --install-extension editors/vscode/*.vsix     # VS Code
+cursor --install-extension editors/vscode/*.vsix   # Cursor
 ```
 
 ## Step 6: Reload Cursor
@@ -78,7 +83,7 @@ Then reload Cursor.
 ## Troubleshooting
 
 - **No "NML Language Server" in Output dropdown**: The extension didn't activate. Check Extensions view — is `NML Language Support` installed and enabled?
-- **"Failed to start language server"**: The binary path is wrong. Verify with `which nml-lsp` or set `nml.server.path` in Cursor settings.
+- **"failed to start the NML language server"**: the toast names the remedy for the server it tried. Bundled WebAssembly server: check that the `ms-vscode.wasm-wasi-core` extension is installed and enabled. `nml.server.path`: check the path (`which nml-lsp`), or clear the setting to use the bundled server. **NML: Show Language Server Log** has the cause.
 - **Changes not taking effect**: Run `just compile-ext` (or `just package-ext`) before installing the VSIX. The VSIX bundles `dist/extension.js`, not the TypeScript source.
 - **Binary didn't change after rebuild**: Cursor sets `CARGO_TARGET_DIR` to a sandbox temp folder. Run `unset CARGO_TARGET_DIR` before `cargo build`. Verify with `md5 target/release/nml-lsp` before and after.
 - **Cmd+Click not working**: Reload Cursor after installing. The LSP must be running (check Output panel).

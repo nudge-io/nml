@@ -1,0 +1,19 @@
+// RFC 0015 × RFC 0019: a union `as` switch that would discard an
+// assigned sealed field is backstopped (NML2060), and the survivor
+// keeps its established variant.
+model card:
+    pan string #sealed
+
+model cash:
+    amount string
+
+model wallet:
+    payment (card | cash)
+
+wallet base:
+    payment as card:
+        pan = "4111"
+
+wallet t uses base:
+    payment as cash:
+        amount = "5"

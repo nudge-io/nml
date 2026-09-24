@@ -21,6 +21,29 @@ blake3 = "1"
 # Locates the per-user schema-package store (XDG / Application Support).
 dirs = "6"
 
+# The workspace kernel's realpath on Windows (RFC 0019 item 0, L3): NO
+# `\\?\` verbatim prefix — the LSP round-trips these paths through URIs,
+# which mishandle verbatim paths. `dunce` is byte-for-byte `std` off
+# Windows, so it is a Windows-only dependency here; never call
+# `std::fs::canonicalize` on Windows.
+[target.'cfg(windows)'.dependencies]
+dunce = "1"
+
+# The race-free read-through (RFC 0019 item 0, E35: `workspace::fs::
+# open_beneath` / `write_beneath`) — `openat2(RESOLVE_BENEATH |
+# RESOLVE_NO_SYMLINKS)` on Linux, the per-component `openat(O_NOFOLLOW)`
+# chain elsewhere, `renameat` for the fixer's write. `rustix` is the SAFE
+# binding for exactly these calls (MSRV 1.63 ≤ ours), so the crate carries
+# no `unsafe` and `#![forbid(unsafe_code)]` holds; `libc` + `unsafe` was
+# the alternative and was declined. Confined to `fs.rs` by the source
+# ratchet, like `dunce`. On wasi the same chain runs through wasi-libc's
+# `openat(O_NOFOLLOW)` (`path_open` with `lookupflags = 0` per component,
+# host-confined to the preopen): std's own `lookup_flags(0)` is unstable
+# (`wasi_ext`, rust-lang/rust#71213), so it cannot be used on the pinned
+# stable toolchain.
+[target.'cfg(any(unix, target_os = "wasi"))'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }
+
 [features]
 # Shared test fixtures (demo package manifest/sources, publish helpers) for
 # downstream crates' test suites. Never enabled in production builds.
@@ -29,6 +52,17 @@ test-support = []
 [dev-dependencies]
 # Only the validator/`de` agreement test deserializes through `nml-core::de`.
 serde = { workspace = true }
+# The workspace kernel's source ratchet (RFC 0019 item 0, A15; r69b) walks
+# the kernel's AST with `syn` instead of a hand-written lexer, so every
+# spelling rustc accepts (comments, raw identifiers, bidi whitespace, UFCS,
+# qualified paths) is seen as rustc sees it. Already in the lock (a
+# `serde_derive` dependency); test-only; the declared floor is the locked
+# version — the one the ratchet's pins were proven on.
+syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "visit"] }
+# The ratchet's macro-body walk names `TokenTree`; already in the lock (syn's
+# dependency). The floor is the locked version, as for `syn`: a `1` floor let the
+# minimal-versions job resolve 1.0.0, below what `syn` itself requires.
+proc-macro2 = "1.0.107"
 # Cross-platform mtime setting for the GC aging tests: `std` cannot open a
 # directory handle to retime it on Windows (needs FILE_FLAG_BACKUP_SEMANTICS);
 # `filetime::set_file_mtime` does this correctly on every platform.

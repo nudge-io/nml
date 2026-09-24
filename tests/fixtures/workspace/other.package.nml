@@ -1,0 +1,14 @@
+package other:
+    version = "0.1.0"
+    formatVersion = 1
+
+[]schema schemas:
+    - core:
+        file = "core.model.nml"
+
+[]validator validators:
+    - sharedToo:
+        files:
+            - "shared/**/*.flow.nml"
+        schemas:
+            - core

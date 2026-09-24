@@ -1,0 +1,22 @@
+model thing:
+    v string
+
+thing a:
+    v = "a"
+
+thing b uses a:
+    v = "b"
+
+thing:
+    name = "Stripe"
+   c uses a:
+    v = "c"
+
+thing d uses b, c:
+    v = "d"
+
+thing x uses y:
+    v = "x"
+
+thing y uses x:
+    v = "y"

@@ -23,6 +23,7 @@ use crate::cst::lexer::LexToken;
 use crate::cst::syntax::{SyntaxKind, raw};
 use crate::error::NmlError;
 use crate::span::Span;
+use std::collections::VecDeque;
 
 /// A flat tree-construction instruction. `Tombstone` is an abandoned marker the
 /// builder skips; `Token` consumes the next non-trivia token.
@@ -34,22 +35,46 @@ pub(super) enum Event {
 }
 
 /// Maximum block/value nesting depth — bounds recursion so adversarial nesting
-/// cannot overflow the stack (RFC 0004 §9). Matches the legacy `MAX_NESTING_DEPTH`.
+/// cannot overflow the stack (RFC 0004 §9).
+///
+/// A fallback chain counts too. `a | b | c` is flat in the source and in the
+/// CST, but it lowers to `Fallback(a, Fallback(b, c))` — one level of value
+/// nesting per arm — and every consumer of the tree recurses through that
+/// (validation, equality, the formatter's comparison, `Drop`). A chain's
+/// LENGTH is therefore nesting depth, and is held to the same bound.
+///
+/// LIMIT: reach=content guards=memory surface=kernel shown="64" — nesting depth of blocks, bodies and values the parser will descend, and arms in one fallback chain
 const MAX_DEPTH: u32 = 64;
 
 /// A non-trivia token in the parser's view: kind, source text (for contextual
 /// keywords and currency codes), start offset (for diagnostics), and whether a
 /// `Newline` trivia precedes it (for line-significant decisions — NML keeps
-/// `Newline` as lossless trivia, but a fallback `|` must not cross a line).
-struct Tok<'a> {
+/// `Newline` as lossless trivia, but a fallback chain sits on one line; a
+/// zero-width layout marker passes the flag on to the token after it).
+struct Tok {
     kind: SyntaxKind,
-    text: &'a str,
-    offset: usize,
     newline_before: bool,
+    offset: u32,
+    len: u32,
 }
 
+impl Tok {
+    fn start(&self) -> usize {
+        self.offset as usize
+    }
+
+    fn end(&self) -> usize {
+        self.start() + self.len as usize
+    }
+}
+
+#[cfg(test)]
+pub(super) const TOK_SIZE: usize = std::mem::size_of::<Tok>();
+
 pub(super) struct Parser<'a> {
-    toks: Vec<Tok<'a>>,
+    /// The source the tokens index into (text is sliced on demand).
+    src: &'a str,
+    toks: Vec<Tok>,
     pos: usize,
     depth: u32,
     events: Vec<Event>,
@@ -93,8 +118,8 @@ impl Marker {
 }
 
 impl<'a> Parser<'a> {
-    pub(super) fn new(tokens: &[LexToken<'a>]) -> Self {
-        let mut toks = Vec::new();
+    pub(super) fn new(src: &'a str, tokens: &[LexToken]) -> Self {
+        let mut toks = Vec::with_capacity(tokens.len() / 2);
         let mut newline_before = false;
         for t in tokens {
             if t.kind.is_trivia() {
@@ -103,13 +128,24 @@ impl<'a> Parser<'a> {
             }
             toks.push(Tok {
                 kind: t.kind,
-                text: t.text,
-                offset: t.offset,
                 newline_before,
+                offset: t.offset,
+                len: t.len,
             });
-            newline_before = false;
+            // A layout marker is zero-width and sits on no line (RFC 0004
+            // §4.2.1): the line break before it belongs to the next real
+            // token, so a `|`, a `#` or a name after a `Dedent` still reads
+            // as next-line. A `|deny:` block after an item's body was
+            // taken for the item's same-line fallback chain (NML0021), and
+            // a next-line `#directive` after an indented value was pulled
+            // in silently.
+            if !matches!(t.kind, SyntaxKind::Indent | SyntaxKind::Dedent) {
+                newline_before = false;
+            }
         }
+        toks.shrink_to_fit();
         Self {
+            src,
             toks,
             pos: 0,
             depth: 0,
@@ -131,7 +167,7 @@ impl<'a> Parser<'a> {
     }
 
     fn current_text(&self) -> &'a str {
-        self.toks.get(self.pos).map_or("", |t| t.text)
+        self.token_text_at(self.pos)
     }
 
     fn at(&self, kind: SyntaxKind) -> bool {
@@ -223,7 +259,7 @@ impl<'a> Parser<'a> {
     ) {
         let found = self.toks.get(self.pos).map(|t| crate::error::FoundToken {
             kind: t.kind,
-            text: crate::error::echo_capture(t.text),
+            text: crate::error::echo_capture(&self.src[t.start()..t.end()]),
         });
         self.error_kind(crate::error::ParseErrorKind::Expected {
             expected,
@@ -236,8 +272,8 @@ impl<'a> Parser<'a> {
     /// never a caret between characters); empty at end-of-input.
     fn current_span(&self) -> Span {
         match self.toks.get(self.pos) {
-            Some(t) => Span::new(t.offset, t.offset + t.text.len()),
-            None => Span::empty(self.toks.last().map_or(0, |t| t.offset + t.text.len())),
+            Some(t) => Span::new(t.start(), t.end()),
+            None => Span::empty(self.toks.last().map_or(0, Tok::end)),
         }
     }
 
@@ -251,7 +287,7 @@ impl<'a> Parser<'a> {
     /// whose true extent is not the current token (e.g. `&&`, whose fix
     /// must cover both amps). Span policy stays explicit and central.
     fn error_kind_at(&mut self, kind: crate::error::ParseErrorKind, span: Span) {
-        if self.errors.len() < super::MAX_ERRORS {
+        if self.errors.len() < crate::diagnostic::MAX_ERRORS {
             self.errors.push(NmlError::syntax(kind, span));
         } else {
             self.suppressed += 1;
@@ -271,7 +307,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// [`Self::err_recover`] with a classified kind (RFC 0009).
+    /// [`Self::err_recover_expected`] with a classified kind (RFC 0009).
     fn err_recover_kind(&mut self, kind: crate::error::ParseErrorKind) {
         self.error_kind(kind);
         if !self.at_eof() {
@@ -344,15 +380,95 @@ impl<'a> Parser<'a> {
         let m = self.start();
         self.bump(); // keyword
         self.name();
-        self.reject_decl_annotation();
-        self.extends_clause();
-        // `host H is Base as modelB:` — the annotation can trail the `is`
-        // clause too; both header exits are guarded.
-        self.reject_decl_annotation();
+        self.header_clauses();
         if self.eat(SyntaxKind::Colon) {
             self.body();
         }
         m.complete(self, SyntaxKind::BlockDecl);
+    }
+
+    /// The declaration header's clause loop — ONE place that knows the
+    /// clause vocabulary (`is`, `uses`), the canonical order (`is` before
+    /// `uses`), and the fail-loud recovery for every stray header token
+    /// (`as` annotations, repeated clauses, misordered clauses). A fixed
+    /// clause pipeline diagnoses only the mistakes it anticipated and lets
+    /// everything else fall through the missing-colon leniency into a
+    /// silent declaration split; a loop makes silent splitting structurally
+    /// impossible for every current and future clause.
+    /// The header-clause vocabulary — ONE list, consumed by the block
+    /// clause loop and the array-decl rejection alike, so a future clause
+    /// cannot be added to one and silently split declarations in the other.
+    const HEADER_CLAUSE_KEYWORDS: [&'static str; 2] = ["is", "uses"];
+
+    fn at_header_clause(&self) -> bool {
+        Self::HEADER_CLAUSE_KEYWORDS.iter().any(|k| self.at_kw(k))
+    }
+
+    /// Fail-loud recovery for a stray header clause: error with `desc`,
+    /// consume the clause keyword and its refs, so the colon and body still
+    /// attach to the REAL declaration. One recovery contract for every
+    /// stray-clause site.
+    fn stray_clause(&mut self, desc: &'static str, ctx: &'static str) {
+        self.expected(
+            vec![
+                crate::error::ExpectedItem::Kind(SyntaxKind::Colon),
+                crate::error::ExpectedItem::Desc(desc),
+            ],
+            Some(ctx),
+        );
+        self.bump(); // the clause keyword
+        self.consume_clause_refs();
+    }
+
+    fn header_clauses(&mut self) {
+        let mut seen_is = false;
+        let mut seen_uses = false;
+        loop {
+            self.reject_decl_annotation();
+            if self.at_kw("is") {
+                if seen_is || seen_uses {
+                    self.stray_clause(
+                        if seen_is {
+                            "a body — one `is` clause per declaration \
+                             (list every parent in it, comma-separated)"
+                        } else {
+                            "a body — the `is` clause precedes `uses` \
+                             (canonical order: `keyword name is … uses …:`)"
+                        },
+                        "in a declaration header",
+                    );
+                    continue;
+                }
+                seen_is = true;
+                self.extends_clause();
+                continue;
+            }
+            if self.at_kw("uses") {
+                if seen_uses {
+                    self.stray_clause(
+                        "a body — one `uses` clause per declaration \
+                         (list every layer ref in it, comma-separated)",
+                        "in a declaration header",
+                    );
+                    continue;
+                }
+                seen_uses = true;
+                self.uses_clause();
+                continue;
+            }
+            break;
+        }
+    }
+
+    /// Consume a stray clause's `Ident (, Ident)*` refs on the same line —
+    /// shared recovery for every header-clause error path.
+    fn consume_clause_refs(&mut self) {
+        while self.at(SyntaxKind::Ident) && !self.newline_before() {
+            self.bump();
+            if !self.eat(SyntaxKind::Comma) {
+                break;
+            }
+        }
     }
 
     /// `[] item_keyword name : body?`
@@ -363,6 +479,16 @@ impl<'a> Parser<'a> {
         self.expect_desc(SyntaxKind::Ident, "an item keyword");
         self.name();
         self.reject_decl_annotation();
+        // Array declarations take no header clauses: a stray clause must
+        // fail loudly here or the missing-colon leniency silently splits
+        // the declaration (same hazard class the block clause loop closes;
+        // same vocabulary list, so a new clause covers both shapes).
+        while self.at_header_clause() {
+            self.stray_clause(
+                "a body — array declarations take no header clauses",
+                "after an array declaration name",
+            );
+        }
         if self.eat(SyntaxKind::Colon) {
             self.body();
         }
@@ -445,17 +571,66 @@ impl<'a> Parser<'a> {
     }
 
     /// `is Parent (, Parent)*`
+    /// Caller (the clause loop) has already established `at_kw("is")`.
     fn extends_clause(&mut self) {
-        if !self.at_kw("is") {
-            return;
-        }
         let m = self.start();
         self.bump(); // is
         self.expect_parent_name();
-        while self.eat(SyntaxKind::Comma) {
+        // Same-line discipline: a header clause never continues onto the
+        // next line (see `uses_clause`).
+        while self.at(SyntaxKind::Comma) && !self.newline_before() {
+            self.bump();
             self.expect_parent_name();
         }
         m.complete(self, SyntaxKind::Extends);
+    }
+
+    /// RFC 0019: `uses Ref (, Ref)*` — layer-composition refs on an instance
+    /// declaration, a sibling of the `is` clause (canonical order: `is` first,
+    /// `uses` second; both optional).
+    /// Caller (the clause loop) has already established `at_kw("uses")`.
+    fn uses_clause(&mut self) {
+        let m = self.start();
+        self.bump(); // uses
+        self.expect_layer_ref();
+        // Same-line discipline: a header clause never continues onto the
+        // next line. A trailing comma (or a dangling `uses`) must error
+        // and consume NOTHING — continuing across the newline swallowed
+        // the NEXT declaration's tokens as refs, silently in the
+        // `uses X,\nY:` shape (zero diagnostics, Y consumed as a ref,
+        // its body attached to the wrong block).
+        while self.at(SyntaxKind::Comma) && !self.newline_before() {
+            self.bump();
+            self.expect_layer_ref();
+        }
+        m.complete(self, SyntaxKind::Uses);
+    }
+
+    /// A layer ref in a `uses` clause — see [`Self::expect_clause_ref`] for
+    /// the shared `as`-guard contract.
+    fn expect_layer_ref(&mut self) {
+        self.expect_clause_ref("a layer reference", "in a `uses` clause");
+    }
+
+    /// A name inside a header clause (`is` parents, `uses` refs) — but NEVER
+    /// the contextual keyword `as`: `host H is as modelB:` must leave `as`
+    /// for [`Self::reject_decl_annotation`] (which follows every clause) so
+    /// the error names the real problem and the body stays on the real
+    /// declaration. ONE guard, shared by every clause parser — the contract
+    /// cannot drift per clause.
+    fn expect_clause_ref(&mut self, desc: &'static str, ctx: &'static str) {
+        if self.at_kw("as") {
+            self.expected(vec![crate::error::ExpectedItem::Desc(desc)], Some(ctx));
+            return; // leave `as` for the annotation rejection
+        }
+        // Same-line rule, same as every other header decision: an ident on
+        // the NEXT line is the next entry, never this clause's ref —
+        // error and consume nothing so it survives recovery.
+        if self.at(SyntaxKind::Ident) && !self.newline_before() {
+            self.bump();
+        } else {
+            self.expected(vec![crate::error::ExpectedItem::Desc(desc)], Some(ctx));
+        }
     }
 
     /// A parent name in an `is` clause — but NEVER the contextual keyword `as`:
@@ -464,14 +639,7 @@ impl<'a> Parser<'a> {
     /// body stays on the real declaration, instead of `as` being swallowed as a
     /// bogus parent and the diagnostic pointing at the wrong thing.
     fn expect_parent_name(&mut self) {
-        if self.at_kw("as") {
-            self.expected(
-                vec![crate::error::ExpectedItem::Desc("a parent name")],
-                Some("in an `is` clause"),
-            );
-            return; // leave `as` for the annotation rejection
-        }
-        self.expect_desc(SyntaxKind::Ident, "a parent name");
+        self.expect_clause_ref("a parent name", "in an `is` clause");
     }
 
     /// The declaration/property name, wrapped for typed access.
@@ -561,7 +729,7 @@ impl<'a> Parser<'a> {
                 if self.eat(SyntaxKind::Colon) {
                     let found = self.toks.get(self.pos).map(|t| crate::error::FoundToken {
                         kind: t.kind,
-                        text: crate::error::echo_capture(t.text),
+                        text: crate::error::echo_capture(&self.src[t.start()..t.end()]),
                     });
                     self.error_kind(crate::error::ParseErrorKind::Expected {
                         expected: vec![crate::error::ExpectedItem::Desc(
@@ -982,20 +1150,94 @@ impl<'a> Parser<'a> {
     }
 
     /// `value (| value)*` — wrapped in a `Fallback` node only if a same-line `|`
-    /// follows. A `|` at the start of the next line is a modifier, not a fallback
-    /// continuation, so the chain must not cross a newline.
+    /// follows. A chain is one line: a `|` at the start of the next line is a
+    /// modifier, not a continuation, and a `|` that ENDS a line has no arm —
+    /// reported once, at the pipe ([`Self::missing_fallback_arm`]), so the
+    /// next line parses as its own entry. (The chain used to continue past
+    /// the line break and take the next entry's name as its arm: `k = "a" |`
+    /// over `m = 1` swallowed `m` and reported `= 1` twice on the wrong line.)
     fn value_or_fallback(&mut self) {
         let m = self.start();
         self.value();
         if self.at_fallback_pipe() {
+            let mut arms = 1u32;
             while self.at_fallback_pipe() {
+                if arms == MAX_DEPTH {
+                    self.error_kind(crate::error::ParseErrorKind::NestingLimit {
+                        what: "fallback chain",
+                    });
+                    self.skip_rest_of_line();
+                    break;
+                }
+                // The pipe's own span, taken BEFORE it is consumed: at the
+                // end of the file the stream behind the cursor is a
+                // zero-width layout marker, not the pipe.
+                let pipe = self.current_span();
                 self.bump(); // |
+                if !self.arm_on_this_line() {
+                    self.missing_fallback_arm(pipe);
+                    break;
+                }
                 self.value();
+                arms += 1;
             }
             m.complete(self, SyntaxKind::Fallback);
         } else {
             m.abandon(self);
         }
+    }
+
+    /// Consume what is left of the current line as ONE `Error` node, token by
+    /// token — no value is parsed, so nothing is lowered and nothing recurses.
+    /// The over-long tail of a fallback chain goes here (the `body` rule's
+    /// `skip_block`, for a line): the tree stays lossless and the next line
+    /// parses as its own entry.
+    fn skip_rest_of_line(&mut self) {
+        let m = self.start();
+        while self.arm_on_this_line() {
+            self.bump();
+        }
+        m.complete(self, SyntaxKind::Error);
+    }
+
+    /// Whether the token after a just-consumed `|` is an ARM: a significant
+    /// token on the pipe's line ([`Self::at_fallback_pipe`] is the same rule
+    /// for the pipe). A line break, the end of the file, or a zero-width
+    /// layout marker means no arm — a `Dedent` sits on no line at all (it
+    /// carries the line break of the token after it, and at the end of the
+    /// file there is none to carry), so testing `newline_before` alone read
+    /// the block's closing marker as an arm and `value()` reported a dedent
+    /// where the rule is a missing arm.
+    fn arm_on_this_line(&self) -> bool {
+        self.toks
+            .get(self.pos)
+            .is_some_and(|t| !t.newline_before && t.kind != SyntaxKind::Eof && !t.kind.is_layout())
+    }
+
+    /// NML0002 for a fallback `|` with no arm on its line, ONCE, anchored at
+    /// `pipe` — the span of the `|` just consumed, taken by the caller before
+    /// the bump (a token span, RFC 0026 B-23) — naming what stood in for the
+    /// arm: a line break, or the end of the file.
+    fn missing_fallback_arm(&mut self, pipe: Span) {
+        // What stood in for the arm: a line break (the next token carries
+        // one, whatever it is), else the end of the file or of the block —
+        // a zero-width marker on the pipe's own line, or `Eof`.
+        let found = self
+            .toks
+            .get(self.pos)
+            .filter(|t| t.newline_before)
+            .map(|_| crate::error::FoundToken {
+                kind: SyntaxKind::Newline,
+                text: String::new(),
+            });
+        self.error_kind_at(
+            crate::error::ParseErrorKind::Expected {
+                expected: vec![crate::error::ExpectedItem::Desc("a value")],
+                found,
+                context: Some("after `|`"),
+            },
+            pipe,
+        );
     }
 
     /// NML0021: a fallback chain in a list position. Emitted ONCE per
@@ -1029,8 +1271,12 @@ impl<'a> Parser<'a> {
         while at_chain(self) {
             self.bump(); // |
             // Mirror `value_or_fallback`'s leg shape (fuzz-proven to
-            // terminate); on garbage after `|`, stop — the error below
-            // already covers the dangling pipe.
+            // terminate): a leg sits on the pipe's line, and on garbage
+            // after `|`, stop — the error below already covers the
+            // dangling pipe (one row per chain, never a second NML0002).
+            if !self.arm_on_this_line() {
+                break;
+            }
             if matches!(
                 self.current(),
                 SyntaxKind::Role
@@ -1049,7 +1295,7 @@ impl<'a> Parser<'a> {
         let end = self
             .toks
             .get(self.pos.saturating_sub(1))
-            .map_or(start.end, |t| t.offset + t.text.len());
+            .map_or(start.end, Tok::end);
         self.error_kind_at(
             crate::error::ParseErrorKind::FallbackInListItem,
             Span::new(start.start, end),
@@ -1076,7 +1322,7 @@ impl<'a> Parser<'a> {
                 // Anchor across BOTH amps (the just-bumped first + the
                 // current second), so the `&&`→`&` fix covers the exact
                 // bytes.
-                let first = self.toks[self.pos - 1].offset;
+                let first = self.toks[self.pos - 1].start();
                 self.error_kind_at(
                     crate::error::ParseErrorKind::DoubleAmp,
                     Span::new(first, first + 2),
@@ -1162,8 +1408,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn token_text_at(&self, idx: usize) -> &str {
-        self.toks.get(idx).map_or("", |t| t.text)
+    fn token_text_at(&self, idx: usize) -> &'a str {
+        self.toks
+            .get(idx)
+            .map_or("", |t| &self.src[t.start()..t.end()])
     }
 
     /// A unit suffix must follow the number on the same line — otherwise an
@@ -1291,14 +1539,15 @@ impl<'a> Parser<'a> {
 /// newlines are invisible to consumers, so only comment placement is meaningful;
 /// the total token sequence is unchanged, so the tree stays byte-faithful.
 /// `Tombstone` events (abandoned markers) are skipped.
-pub(super) fn build_tree(full: &[LexToken<'_>], events: &[Event]) -> GreenNode {
+pub(super) fn build_tree(src: &str, full: &[LexToken], events: &[Event]) -> GreenNode {
     let mut b = TreeBuilder {
         inner: rowan::GreenNodeBuilder::new(),
+        src,
         full,
         cursor: 0,
         at_line_start: true,
         indent_stack: vec![0],
-        deferred: Vec::new(),
+        deferred: VecDeque::new(),
     };
     b.inner.start_node(raw(SyntaxKind::Root));
     for event in events {
@@ -1344,7 +1593,9 @@ pub(super) fn build_tree(full: &[LexToken<'_>], events: &[Event]) -> GreenNode {
 /// emitted token text byte-identical to the source.
 struct TreeBuilder<'a> {
     inner: rowan::GreenNodeBuilder<'static>,
-    full: &'a [LexToken<'a>],
+    /// The source the tokens index into.
+    src: &'a str,
+    full: &'a [LexToken],
     cursor: usize,
     /// `true` while only whitespace/layout has been emitted since the last
     /// newline — i.e. the next comment would be *own-line*, not trailing.
@@ -1355,14 +1606,17 @@ struct TreeBuilder<'a> {
     /// Own-line comments held back from a closing body, each with its source
     /// column and the token indices (comment + trailing layout) to emit, in
     /// source order. Released into a scope once that scope is no deeper than the
-    /// comment's column.
-    deferred: Vec<DeferredComment>,
+    /// comment's column. A deque: groups are released from the FRONT in source
+    /// order, and a run of N held comments must release in O(N), not O(N²).
+    deferred: VecDeque<DeferredComment>,
 }
 
 /// A comment held back from a closing body until its target (outer) scope opens.
 struct DeferredComment {
     column: usize,
-    tokens: Vec<usize>,
+    /// The comment token and its trailing layout — contiguous by construction
+    /// (`defer_comment` advances the cursor over them), so a range, not a list.
+    tokens: std::ops::Range<usize>,
 }
 
 impl TreeBuilder<'_> {
@@ -1370,7 +1624,7 @@ impl TreeBuilder<'_> {
     /// (the latter only for the zero-width layout markers).
     fn emit(&mut self, idx: usize) {
         let tok = &self.full[idx];
-        self.inner.token(raw(tok.kind), tok.text);
+        self.inner.token(raw(tok.kind), tok.text(self.src));
         self.at_line_start = match tok.kind {
             SyntaxKind::Newline => true,
             SyntaxKind::Whitespace | SyntaxKind::Indent | SyntaxKind::Dedent => self.at_line_start,
@@ -1381,7 +1635,7 @@ impl TreeBuilder<'_> {
             // emits immediately after it (zero if the line is unindented).
             SyntaxKind::Indent => {
                 let width = match self.full.get(idx + 1) {
-                    Some(ws) if ws.kind == SyntaxKind::Whitespace => ws.text.len(),
+                    Some(ws) if ws.kind == SyntaxKind::Whitespace => ws.len as usize,
                     _ => 0,
                 };
                 self.indent_stack.push(width);
@@ -1402,7 +1656,7 @@ impl TreeBuilder<'_> {
         // invariant outranks §4.3 attachment: flush everything still held
         // (the same precision-for-losslessness trade `release_deferred`
         // documents for non-monotonic columns).
-        if !self.deferred.is_empty() && !self.full[self.cursor].text.is_empty() {
+        if !self.deferred.is_empty() && self.full[self.cursor].len != 0 {
             for d in std::mem::take(&mut self.deferred) {
                 for idx in d.tokens {
                     self.emit(idx);
@@ -1419,8 +1673,14 @@ impl TreeBuilder<'_> {
     /// scope (RFC 0004 §4.3).
     fn flush_leading(&mut self) {
         self.release_deferred();
+        // Every comment in the trivia run at the cursor is followed by the SAME
+        // first non-trivia token, so "does a body-closing dedent follow?" is
+        // one probe per run — probing per comment rescanned the rest of the
+        // run each time, which made a run of N own-line comments cost O(N²).
+        let dedent_ahead = self.dedent_ends_run(self.cursor);
         while self.cursor < self.full.len() && self.full[self.cursor].kind.is_trivia() {
-            if self.full[self.cursor].kind == SyntaxKind::Comment && self.should_defer() {
+            if self.full[self.cursor].kind == SyntaxKind::Comment && self.should_defer(dedent_ahead)
+            {
                 self.defer_comment();
             } else {
                 self.bump();
@@ -1441,33 +1701,34 @@ impl TreeBuilder<'_> {
             .indent_stack
             .last()
             .expect("indent stack is never empty");
-        while self.deferred.first().is_some_and(|d| d.column >= top) {
-            let d = self.deferred.remove(0);
-            for idx in d.tokens {
-                self.emit(idx);
+        while self.deferred.front().is_some_and(|d| d.column >= top) {
+            if let Some(d) = self.deferred.pop_front() {
+                for idx in d.tokens {
+                    self.emit(idx);
+                }
             }
         }
     }
 
     /// Whether the comment at the cursor is own-line, sits before a body-closing
-    /// dedent, and is indented shallower than the scope that dedent closes — in
-    /// which case it belongs to an outer scope and must be deferred past the dedent.
-    fn should_defer(&self) -> bool {
-        let col = self.column_at(self.cursor);
-        self.is_own_line(self.cursor)
-            && self.dedent_follows(self.cursor)
-            && col
+    /// dedent (`dedent_ahead`, probed once for its whole trivia run), and is
+    /// indented shallower than the scope that dedent closes — in which case it
+    /// belongs to an outer scope and must be deferred past the dedent.
+    fn should_defer(&self, dedent_ahead: bool) -> bool {
+        dedent_ahead
+            && self.column_at(self.cursor)
                 < *self
                     .indent_stack
                     .last()
                     .expect("indent stack is never empty")
+            && self.is_own_line(self.cursor)
     }
 
     /// Hold the cursor comment and its trailing layout (up to the next comment or
     /// non-trivia) as one deferred group, advancing past them without emitting.
     fn defer_comment(&mut self) {
         let column = self.column_at(self.cursor);
-        let mut tokens = vec![self.cursor];
+        let start = self.cursor;
         self.cursor += 1;
         while self.cursor < self.full.len()
             && matches!(
@@ -1475,17 +1736,19 @@ impl TreeBuilder<'_> {
                 SyntaxKind::Whitespace | SyntaxKind::Newline
             )
         {
-            tokens.push(self.cursor);
             self.cursor += 1;
         }
-        self.deferred.push(DeferredComment { column, tokens });
+        self.deferred.push_back(DeferredComment {
+            column,
+            tokens: start..self.cursor,
+        });
     }
 
     /// Source column of the token at `idx`: the width of its line's leading
     /// indentation (the whitespace immediately preceding it), or zero at column 0.
     fn column_at(&self, idx: usize) -> usize {
         match idx.checked_sub(1).map(|p| &self.full[p]) {
-            Some(ws) if ws.kind == SyntaxKind::Whitespace => ws.text.len(),
+            Some(ws) if ws.kind == SyntaxKind::Whitespace => ws.len as usize,
             _ => 0,
         }
     }
@@ -1502,10 +1765,11 @@ impl TreeBuilder<'_> {
         true // start of file
     }
 
-    /// Whether the next non-trivia token after the comment at `idx` is a `Dedent`
-    /// (so the comment is the last thing in a body about to close).
-    fn dedent_follows(&self, idx: usize) -> bool {
-        self.full[idx + 1..]
+    /// Whether the trivia run starting at `from` ends at a `Dedent` — the first
+    /// non-trivia token at or after `from` closes a body, so every own-line
+    /// comment in the run is the tail of a body about to close.
+    fn dedent_ends_run(&self, from: usize) -> bool {
+        self.full[from..]
             .iter()
             .find(|t| !t.kind.is_trivia())
             .is_some_and(|t| t.kind == SyntaxKind::Dedent)
@@ -1532,5 +1796,191 @@ impl TreeBuilder<'_> {
         for _ in 0..len {
             self.bump();
         }
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::MAX_DEPTH;
+    use crate::diagnostic::{Diagnostic, codes};
+    use crate::span::Span;
+
+    /// `levels` nested blocks under one declaration, a property at the
+    /// bottom. The declaration's own body is a level too, so the deepest
+    /// shape the bound admits is `MAX_DEPTH - 1` nested blocks.
+    fn nested(levels: u32) -> String {
+        let mut src = String::from("thing t:\n");
+        for k in 1..=levels {
+            src.push_str(&format!("{}n{k}:\n", "    ".repeat(k as usize)));
+        }
+        src.push_str(&format!("{}v = 1\n", "    ".repeat(levels as usize + 1)));
+        src
+    }
+
+    /// The line an array nest hangs from, kept beside its generator so the
+    /// refusal's span can be spelled in bytes.
+    const ARRAY_HEAD: &str = "thing t:\n    v = ";
+
+    /// `levels` nested array literals as one property's value.
+    fn arrays(levels: u32) -> String {
+        format!(
+            "{ARRAY_HEAD}{}1{}\n",
+            "[".repeat(levels as usize),
+            "]".repeat(levels as usize)
+        )
+    }
+
+    /// The line a type nest hangs from.
+    const TYPE_HEAD: &str = "model m:\n    f ";
+
+    /// `levels` nested type constructors as one field's type.
+    fn types(levels: u32) -> String {
+        format!(
+            "{TYPE_HEAD}{}string{}\n",
+            "set<".repeat(levels as usize),
+            ">".repeat(levels as usize)
+        )
+    }
+
+    /// The nesting-limit rows of a parse, in source order.
+    fn limits(src: &str) -> Vec<Diagnostic> {
+        crate::cst::parse_to_ast_all(src)
+            .1
+            .into_iter()
+            .filter(|d| d.code == Some(codes::NESTING_LIMIT))
+            .collect()
+    }
+
+    /// Nesting past [`MAX_DEPTH`] is reported;
+    /// well inside it a deep chain parses clean.
+    #[test]
+    fn nesting_is_bounded_by_max_depth() {
+        let (_, errors) = crate::cst::parse_to_ast_all(&nested(MAX_DEPTH + 2));
+        assert!(!errors.is_empty(), "past the bound the parse must report");
+        let (_, errors) = crate::cst::parse_to_ast_all(&nested(MAX_DEPTH / 4));
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// Every nesting kind is bounded AT its own edge, not merely somewhere
+    /// past it: the deepest admitted shape parses clean, and one level more
+    /// is refused ONCE — with the kind named and the row over the token that
+    /// crossed the bound. The admitted count differs by shape because each
+    /// shape already sits inside levels the same counter charges: a
+    /// declaration's body is one (so `MAX_DEPTH - 1` nested blocks, and
+    /// `MAX_DEPTH - 1` array literals in one of its values, fit), and a
+    /// field's type expression is a second (so `MAX_DEPTH - 2` type
+    /// constructors fit). An array literal is a value, judged by the value
+    /// and type recursion's shared guard — so the kind it names is `type`.
+    #[test]
+    fn every_nesting_kind_is_bounded_at_its_own_edge() {
+        // Blocks.
+        let at = nested(MAX_DEPTH - 1);
+        assert!(
+            crate::cst::parse_to_ast_all(&at).1.is_empty(),
+            "the deepest admitted block chain parses clean"
+        );
+        let past = nested(MAX_DEPTH);
+        let rows = limits(&past);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].message, "maximum block nesting depth exceeded");
+        // The row sits on the zero-width indent that opened the over-deep
+        // body: the first byte of the deepest line.
+        let deepest = past.len() - (4 * (MAX_DEPTH as usize + 1) + "v = 1\n".len());
+        assert_eq!(rows[0].span, Some(Span::empty(deepest)));
+
+        // Array literals.
+        assert!(
+            crate::cst::parse_to_ast_all(&arrays(MAX_DEPTH - 1))
+                .1
+                .is_empty(),
+            "the deepest admitted array nest parses clean"
+        );
+        let rows = limits(&arrays(MAX_DEPTH));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].message, "maximum type nesting depth exceeded");
+        let last_bracket = ARRAY_HEAD.len() + MAX_DEPTH as usize - 1;
+        assert_eq!(
+            rows[0].span,
+            Some(Span::new(last_bracket, last_bracket + 1))
+        );
+
+        // Types.
+        assert!(
+            crate::cst::parse_to_ast_all(&types(MAX_DEPTH - 2))
+                .1
+                .is_empty(),
+            "the deepest admitted type nest parses clean"
+        );
+        let past = types(MAX_DEPTH - 1);
+        assert_eq!(
+            crate::cst::parse_to_ast_all(&past).1.len(),
+            1,
+            "reported once, and nothing else"
+        );
+        let rows = limits(&past);
+        assert_eq!(rows[0].message, "maximum type nesting depth exceeded");
+        let leaf = TYPE_HEAD.len() + 4 * (MAX_DEPTH as usize - 1);
+        assert_eq!(rows[0].span, Some(Span::new(leaf, leaf + "string".len())));
+    }
+
+    fn chain(arms: usize) -> String {
+        let legs: Vec<String> = (0..arms).map(|i| i.to_string()).collect();
+        format!("service App:\n    x = {}\n    y = 1\n", legs.join(" | "))
+    }
+
+    /// A chain lowers to one nested value per arm, so its length is held to
+    /// the nesting bound: AT the bound it parses clean, one arm past it is
+    /// reported ONCE — over the pipe that would have opened the arm past the
+    /// bound — and the entry after it still parses as its own.
+    #[test]
+    fn a_fallback_chain_is_bounded_by_max_depth() {
+        let (_, errors) = crate::cst::parse_to_ast_all(&chain(MAX_DEPTH as usize));
+        assert!(errors.is_empty(), "at the bound: {errors:?}");
+
+        let past = chain(MAX_DEPTH as usize + 1);
+        let (file, errors) = crate::cst::parse_to_ast_all(&past);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, Some(codes::NESTING_LIMIT));
+        assert!(
+            errors[0].message.contains("fallback chain"),
+            "{}",
+            errors[0].message
+        );
+        let pipe = past
+            .char_indices()
+            .filter(|(_, c)| *c == '|')
+            .map(|(i, _)| i)
+            .nth(MAX_DEPTH as usize - 1)
+            .expect("a chain one arm past the bound spells MAX_DEPTH pipes");
+        assert_eq!(errors[0].span, Some(Span::new(pipe, pipe + 1)));
+        let debug = format!("{file:?}");
+        assert!(debug.contains("\"y\""), "the next entry survives: {debug}");
+    }
+
+    /// The refused tail is kept, token for token: the tree is still lossless.
+    #[test]
+    fn an_over_long_chain_round_trips() {
+        let src = chain(MAX_DEPTH as usize * 3);
+        assert_eq!(crate::cst::parse(&src).syntax().to_string(), src);
+    }
+
+    /// THE defect: 60 000 arms (about 400 KB, a tenth of the source cap) sent
+    /// `nml check`, `nml fmt` and the language server into a stack overflow —
+    /// an abort no caller can catch — because the lowered value nested 60 000
+    /// deep. Run on a 1 MiB stack, the wasm guest's, where the old overflow
+    /// arrived soonest: parse, lower, a full walk and the drop must all fit.
+    #[test]
+    fn a_huge_fallback_chain_cannot_exhaust_the_stack() {
+        let src = chain(100_000);
+        let worker = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let (file, errors) = crate::cst::parse_to_ast_all(&src);
+                // `Debug` walks the whole lowered value, as validation does.
+                assert!(format!("{file:?}").contains("Fallback"));
+                errors.len()
+            })
+            .expect("spawn");
+        assert_eq!(worker.join().expect("no overflow, no panic"), 1);
     }
 }

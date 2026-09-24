@@ -1,0 +1,5 @@
+service App:
+    doc = """
+        line ""﻿" tail
+        """
+    y = "z"

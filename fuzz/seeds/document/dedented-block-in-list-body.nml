@@ -1,0 +1,10 @@
+[]validator validators:
+    - a:
+        files:
+            - "x/**"
+    stray:
+        allowRefs:
+            - "y"
+    - b:
+        files:
+            - "z/**"

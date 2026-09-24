@@ -13,6 +13,7 @@ use nml_core::schema_index::{BodyShape, NameableVariant};
 use nml_core::span::Span;
 use nml_core::types::{PrimitiveType, Value};
 use nml_core::{FieldTarget, SchemaIndex};
+use nml_validate::fs::read_leaf;
 use nml_validate::schema::MembershipSemantics;
 
 use crate::diagnostics::{self, SchemaMode};
@@ -20,8 +21,47 @@ use crate::duration_lsp::{self, DurationUnitContext};
 use crate::packages::{self, Resolution, WorkspaceView};
 use crate::position::{self, LineIndex};
 
-const MAX_DIR_DEPTH: usize = 20;
-const MAX_FILE_COUNT: usize = 10_000;
+/// Bytes of ONE workspace file the editor holds — indexed from disk or
+/// OPEN as a buffer — the bound the CLI reads a check target under
+/// (`nml-cli`'s `MAX_TARGET_BYTES`, pinned equal in `nml limits`'
+/// census), so the editor and the CI gate refuse a file at one size.
+/// Past it a file is not indexed and the editor says so
+/// (`window/logMessage`), and an open buffer is not stored: its one
+/// diagnostic is the kernel's cap sentence, nothing parses it, and
+/// `nml/schemaInfo` says so. (An open buffer used to be "the truth at
+/// any size": a 300 MiB buffer cost 244 s and 11 GB — 23 GB of NUL
+/// bytes — and reported GREEN where `nml check` refuses the same file
+/// in 24 ms.) The index has no bound of its own on depth or file count:
+/// it is the kernel's one enumeration of the root, under the kernel's
+/// bounds.
+///
+/// LIMIT: reach=content guards=memory surface=editor shown="16 MiB" — bytes of one workspace file the editor holds, indexed or open; past it the file is not indexed (said) and an open buffer is refused with one row
+pub const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
+
+/// The noun [`MAX_INDEX_BYTES`] applies to, in the kernel's refusal
+/// sentence — spelled once, so the index sweep, the watcher and the disk
+/// fallback refuse an oversized file in the same words.
+const INDEXED_FILE: &str = "an indexed workspace file";
+
+/// The noun the cap sentence names for a refused open buffer.
+const OPEN_DOCUMENT: &str = "an open document";
+
+/// Bytes read when locating a related note's OWN file on disk (an open
+/// buffer is the truth and costs nothing): a note's line index is not
+/// worth an unbounded read; over the cap the renderer falls back loudly,
+/// as for any unlocatable file.
+///
+/// LIMIT: reach=content guards=memory surface=editor shown="8 MiB" — bytes read when locating a related note's file
+const MAX_LOCATE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Code actions minted from one diagnostic's wire `suggestions`: the
+/// producer's own alternative bound (`MAX_FIX_ALTERNATIVES` in
+/// nml-validate), applied here to VALID entries, so a hostile or buggy
+/// client can neither mint unbounded actions from one diagnostic nor
+/// bury a legitimate entry behind malformed padding.
+///
+/// LIMIT: reach=content guards=output surface=editor shown="8" — code actions minted from one diagnostic's suggestions
+const MAX_SUGGESTION_ACTIONS: usize = 8;
 
 /// The server's shared state, held behind `Arc`. `NmlLanguageServer` `Deref`s
 /// to this, so every `self.field`/`self.method()` on state-only methods reads
@@ -46,8 +86,198 @@ struct CachedDiagnostics {
     items: Arc<Vec<tower_lsp::lsp_types::Diagnostic>>,
 }
 
+impl CachedDiagnostics {
+    /// The cache's ONE read rule: an entry serves only against the text
+    /// it was computed from and the resolver generation of that compute
+    /// — an insert from a compute that raced an edit, or a resolution
+    /// that moved on, reads as a miss. Every consumer reads through it.
+    fn is_fresh(&self, current: &str, generation: u64) -> bool {
+        self.text == current && self.generation == generation
+    }
+}
+
+/// The document store: every text the server serves — open buffers and
+/// indexed disk copies — with a STAMP beside each: the store's write
+/// counter at the document's last write. The resolver's universe cache
+/// compares one stamp per discovery read to know a stored input is
+/// unchanged, never the text. Reads deref to the map; a write goes
+/// through [`Self::insert`] and [`Self::remove`], the only two writers,
+/// so a stamp can never miss a change. Beside an OPEN buffer's text sits
+/// the client's version of it (`didOpen`/`didChange`): the number a
+/// versioned workspace edit names, so a client refuses the edit once the
+/// buffer moved on (LSP 3.17 §WorkspaceEdit); an indexed disk copy has
+/// none — the disk is its master.
+#[derive(Default)]
+struct DocumentStore {
+    texts: HashMap<Url, String>,
+    stamps: HashMap<Url, u64>,
+    versions: HashMap<Url, i32>,
+    /// The `(len, mtime)` of the file an INDEXED copy was read from, for
+    /// a client that does not watch: discovery compares it against a
+    /// `stat` before answering from the copy. An open buffer has none —
+    /// the buffer is the master while it is open, and no keystroke pays a
+    /// syscall — so every write through [`Self::insert`] clears the entry
+    /// and only an index read puts one back.
+    disk: HashMap<Url, (u64, Option<std::time::SystemTime>)>,
+    writes: u64,
+}
+
+impl DocumentStore {
+    fn insert(&mut self, uri: Url, text: String, version: Option<i32>) {
+        self.writes += 1;
+        self.stamps.insert(uri.clone(), self.writes);
+        match version {
+            Some(v) => {
+                self.versions.insert(uri.clone(), v);
+            }
+            None => {
+                self.versions.remove(&uri);
+            }
+        }
+        self.disk.remove(&uri);
+        self.texts.insert(uri, text);
+    }
+
+    /// Record what an indexed copy was read from, straight after the
+    /// [`Self::insert`] that stored its text.
+    fn note_disk(&mut self, uri: Url, stamp: (u64, Option<std::time::SystemTime>)) {
+        self.disk.insert(uri, stamp);
+    }
+
+    /// What the indexed copy at `uri` was read from; `None` for an open
+    /// buffer and for a copy read before any stamp was recorded.
+    fn disk_stamp(&self, uri: &Url) -> Option<(u64, Option<std::time::SystemTime>)> {
+        self.disk.get(uri).copied()
+    }
+
+    fn remove(&mut self, uri: &Url) -> Option<String> {
+        self.stamps.remove(uri);
+        self.versions.remove(uri);
+        self.disk.remove(uri);
+        self.texts.remove(uri)
+    }
+
+    fn stamp(&self, uri: &Url) -> Option<u64> {
+        self.stamps.get(uri).copied()
+    }
+
+    /// The client's version of an open buffer; `None` for a document
+    /// the client did not open (an indexed copy — the disk is its
+    /// master, and a versioned edit names `null`).
+    fn version(&self, uri: &Url) -> Option<i32> {
+        self.versions.get(uri).copied()
+    }
+}
+
+impl std::ops::Deref for DocumentStore {
+    type Target = HashMap<Url, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.texts
+    }
+}
+
+/// The document store as the resolver's overlay reads it: text and stamp
+/// by canonical path — and, for a client that does not watch the
+/// workspace, the disk check that keeps an indexed copy honest
+/// ([`Self::refresh_indexed`]).
+struct Documents<'a>(&'a Inner);
+
+impl Documents<'_> {
+    /// Re-read the INDEXED copy at `uri` when its file moved.
+    ///
+    /// A watching client's events are the freshness contract, so this is
+    /// skipped outright for one — read first, before any lock or syscall.
+    /// Without one, an indexed copy would be stale forever: it carries a
+    /// store stamp, so the universe memo's disk branch never runs for it.
+    ///
+    /// An OPEN buffer is never touched: the client's buffer is the master
+    /// while it is open (LSP 3.17), and a pull must not pay a `stat` per
+    /// keystroke. Nor is this a poll: it runs only where discovery was
+    /// about to read the path anyway, so the cost is the one the security
+    /// lane's note N3 already accounts (one stat per indexed read, per
+    /// pull). A file that cannot be stat-ed is left alone — a deletion is
+    /// the watcher's case, and the kernel's own reader reports an
+    /// unreadable input where discovery meets it.
+    ///
+    /// The re-read goes through the kernel's one capped reader, which
+    /// takes its size from the OPEN handle, so an oversized file is
+    /// refused without being read in. The stamp recorded is the one taken
+    /// BEFORE the read: a file that changes again mid-read leaves a stamp
+    /// the next pull disagrees with, and re-reads.
+    fn refresh_indexed(&self, uri: &Url, path: &Path) {
+        if self
+            .0
+            .watching_files
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let indexed = self
+            .0
+            .indexed_uris
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(uri);
+        if !indexed {
+            return;
+        }
+        let open = self
+            .0
+            .open_docs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(uri);
+        if open {
+            return;
+        }
+        let Some(now) = packages::disk_stamp(path) else {
+            return;
+        };
+        let unchanged = self
+            .0
+            .documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .disk_stamp(uri)
+            == Some(now);
+        if unchanged {
+            return;
+        }
+        let Ok(text) = read_leaf(path, MAX_INDEX_BYTES, INDEXED_FILE) else {
+            return;
+        };
+        let mut docs = self.0.documents.lock().unwrap_or_else(|e| e.into_inner());
+        docs.insert(uri.clone(), text, None);
+        docs.note_disk(uri.clone(), now);
+    }
+}
+
+impl packages::OpenDocuments for Documents<'_> {
+    fn text(&self, path: &Path) -> Option<String> {
+        let uri = Url::from_file_path(path).ok()?;
+        self.refresh_indexed(&uri, path);
+        self.0
+            .documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&uri)
+            .cloned()
+    }
+
+    fn stamp(&self, path: &Path) -> Option<u64> {
+        let uri = Url::from_file_path(path).ok()?;
+        self.refresh_indexed(&uri, path);
+        self.0
+            .documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stamp(&uri)
+    }
+}
+
 pub struct Inner {
-    documents: Mutex<HashMap<Url, String>>,
+    documents: Mutex<DocumentStore>,
     /// Per-document diagnostics cache (RFC 0010 tier 1), filled lazily by
     /// whichever consumer computes first — the document pull or hover's
     /// explanation lookup — so hover never recomputes per-request and the
@@ -61,13 +291,35 @@ pub struct Inner {
     /// didClose). Guards watched-file disk events from clobbering an open
     /// buffer — while a file is open the client buffer is its source of truth.
     open_docs: Mutex<HashSet<Url>>,
+    /// Open buffers REFUSED at [`MAX_INDEX_BYTES`] (their byte length):
+    /// never stored, so no handler can parse one; the pull answers with
+    /// the cap row and `nml/schemaInfo` with the same note. Cleared by
+    /// a change under the bound or a close.
+    refused_buffers: Mutex<HashMap<Url, u64>>,
     scoped_models: Mutex<HashMap<String, Vec<ModelDef>>>,
     scoped_enums: Mutex<HashMap<String, Vec<EnumDef>>>,
     scoped_oneofs: Mutex<HashMap<String, Vec<OneOfDef>>>,
-    project_config: Mutex<nml_core::ProjectConfig>,
-    /// Canonicalized workspace roots captured at initialize; watched-file
-    /// events outside these roots are ignored.
+    /// Canonicalized workspace roots captured at initialize, SORTED;
+    /// watched-file events outside these roots are ignored. Sorted
+    /// because two of the three rules over this list pick "the first
+    /// root a path starts with" — the universe a document resolves in
+    /// (`PackageResolver::anchor_for`) and the name every finding
+    /// carries (`packages::source_name_of`) — while the third
+    /// (`packages::canonical_above_roots`) walks ancestors and picks the
+    /// OUTERMOST. Sorted, an ancestor precedes its descendants and all
+    /// three agree; unsorted, the client's `workspaceFolders` order
+    /// decided which of two NESTED folders governs, and the LSP
+    /// specification gives that order no meaning (a folder added later
+    /// lands at the end, so the same session could answer two ways
+    /// before and after a `didChangeWorkspaceFolders`).
     workspace_roots: Mutex<Vec<PathBuf>>,
+    /// Roots handed to `initialize` whose workspace index has not been built
+    /// yet, in the client's own URI spelling. `initialize` records them and
+    /// returns; `initialized` drains them and does the walk. The handshake is
+    /// therefore never held open by a filesystem sweep — measured at 458 ms
+    /// (warm) / 1.69 s (cold) for a 73k-entry checkout, during which
+    /// tower-lsp's single-task `join!` can answer nothing else.
+    pending_index_roots: Mutex<Vec<Url>>,
     membership: MembershipSemantics,
     /// Schema-package resolution (RFC 0030): pins > auto-association >
     /// unbound fallback, definitions from workspace manifests > store >
@@ -87,10 +339,54 @@ pub struct Inner {
     /// registered no such command must never receive an unexecutable action
     /// (negotiation, not assumption). `None` = no client support declared.
     explain_command: Mutex<Option<String>>,
+    /// Client capability: `workspace.workspaceEdit.documentChanges` (LSP
+    /// 3.17 §WorkspaceEdit) — every edit the server hands out names the
+    /// target document's VERSION through `documentChanges`, so a client
+    /// refuses an edit computed against a buffer that has since moved on;
+    /// undeclared, only plain `changes` are legal and the edit is that.
+    versioned_edits: std::sync::atomic::AtomicBool,
+    /// Client capability: `workspace.workspaceEdit.resourceOperations`
+    /// names `create` — an action that creates a file (a pin or opt-out
+    /// with no live config to write into) exists only for a client that
+    /// declared it can create one; undeclared, no such action is offered.
+    creates_files: std::sync::atomic::AtomicBool,
+    /// Client capability: `workspace.diagnostics.refreshSupport` (LSP 3.17's
+    /// spelling, read from the raw `initialize` params by [`crate::session::NmlService`];
+    /// lsp-types 0.94.1's `workspace.diagnostic` spelling is read here) — the
+    /// client re-pulls every open document on `workspace/diagnostic/refresh`
+    /// (LSP 3.17). Declared, a pull that REDISCOVERS the universe (a
+    /// manifest or project-config buffer opened, edited or closed; a store
+    /// pointer moved) asks for that refresh once, so the other open
+    /// documents' reports — and the actions offered from them, the grant
+    /// on the manifest included — are current without a refocus;
+    /// undeclared, they heal on their own next pull.
+    refresh_diagnostics: std::sync::atomic::AtomicBool,
+    /// LSP 3.17's own spelling of that capability as the LAST `initialize`
+    /// frame sent it, parked by [`crate::session::NmlService`] for the `initialize`
+    /// HANDLER to take. The peek runs on every `initialize` frame — it is a
+    /// look at raw JSON, upstream of tower-lsp's lifecycle — and tower-lsp
+    /// refuses a duplicate `initialize` without running the handler; parking
+    /// instead of applying is what keeps a refused frame's capabilities from
+    /// reaching the server. (Applied directly, a second `initialize` turned
+    /// the refresh on for a client that never declared it, and the pull that
+    /// then asks such a client waits on an answer it will never send.)
+    raw_refresh_declaration: std::sync::atomic::AtomicBool,
+    /// Client capability: `workspace.didChangeWatchedFiles.dynamicRegistration`
+    /// (LSP 3.17) AND an accepted `**/*.nml` registration — the two halves
+    /// of "this client tells us when the disk moves". Both, because a
+    /// client may declare the capability and still refuse the
+    /// registration, and the server asked for years without reading the
+    /// answer. Watching, an indexed copy is fresh by construction and
+    /// discovery touches no syscall for one; NOT watching, discovery
+    /// re-stats an indexed copy before answering from it
+    /// ([`Documents::refresh_indexed`]) — without which a manifest fixed
+    /// outside the editor kept its NML2088 forever and a cross-file quick
+    /// fix spliced at offsets the disk no longer had.
+    watching_files: std::sync::atomic::AtomicBool,
 }
 
 pub struct NmlLanguageServer {
-    client: Client,
+    client: crate::ask::ClientDoor,
     inner: Arc<Inner>,
     /// Store-health transitions the resolver emits during resolution (which
     /// has no `Client` of its own). Drained in the document-pull handler —
@@ -119,6 +415,21 @@ struct BuildConfig {
     store: Option<nml_validate::store::Store>,
     membership: MembershipSemantics,
     injected: Option<nml_validate::package::SchemaPackage>,
+}
+
+/// The path of a workspace folder the client named: canonical where
+/// the platform has `realpath` (an operator's own symlink is followed,
+/// so a folder opened through a link and a file under its target are
+/// one root), else AS SPELLED. WASI has no `realpath`, so
+/// `std::fs::canonicalize` fails for every path there; a folder
+/// dropped on that failure made every document of the bundled WASM
+/// server "outside every workspace folder" — no folder anchor, no
+/// index, no finding, no note. The kernel re-verifies the spelling
+/// when it anchors a universe at the folder (`WorkspaceRoot::editor`),
+/// so an absent folder still fixes no universe.
+fn folder_path(uri: &Url) -> Option<PathBuf> {
+    let path = uri.to_file_path().ok()?;
+    Some(dunce::canonicalize(&path).unwrap_or(path))
 }
 
 impl NmlLanguageServer {
@@ -163,11 +474,12 @@ impl NmlLanguageServer {
         )
     }
 
-    /// Embedder/test seam: identical to [`Self::new`] except the
+    /// Test seam (the in-process harness): identical to [`Self::new`] except the
     /// schema-package store is supplied by the caller instead of resolved from
     /// the user environment (`NML_SCHEMA_STORE_DIR` / platform data dir). The
     /// in-process test harness injects a tempdir store here; an embedder may
     /// inject its own store, or `None` to run storeless.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_store(client: Client, store: Option<nml_validate::store::Store>) -> Self {
         Self::build(
             client,
@@ -188,26 +500,28 @@ impl NmlLanguageServer {
         } = cfg;
         let (store_events_tx, store_events_rx) = tokio::sync::mpsc::channel(64);
         Self {
-            client,
+            client: crate::ask::ClientDoor::new(client),
             inner: Arc::new(Inner {
-                documents: Mutex::new(HashMap::new()),
+                documents: Mutex::new(DocumentStore::default()),
                 diags_cache: Mutex::new(HashMap::new()),
                 indexed_uris: Mutex::new(HashSet::new()),
                 open_docs: Mutex::new(HashSet::new()),
                 scoped_models: Mutex::new(HashMap::new()),
                 scoped_enums: Mutex::new(HashMap::new()),
                 scoped_oneofs: Mutex::new(HashMap::new()),
-                project_config: Mutex::new(nml_core::ProjectConfig::default()),
                 workspace_roots: Mutex::new(Vec::new()),
+                refused_buffers: Mutex::new(HashMap::new()),
+                pending_index_roots: Mutex::new(Vec::new()),
                 membership,
-                resolver: packages::PackageResolver::with_injected(
-                    store,
-                    store_events_tx,
-                    injected,
-                ),
+                resolver: packages::PackageResolver::new(store, store_events_tx, injected),
                 insert_replace_support: std::sync::atomic::AtomicBool::new(false),
                 label_details_support: std::sync::atomic::AtomicBool::new(false),
                 explain_command: Mutex::new(None),
+                versioned_edits: std::sync::atomic::AtomicBool::new(false),
+                creates_files: std::sync::atomic::AtomicBool::new(false),
+                refresh_diagnostics: std::sync::atomic::AtomicBool::new(false),
+                raw_refresh_declaration: std::sync::atomic::AtomicBool::new(false),
+                watching_files: std::sync::atomic::AtomicBool::new(false),
             }),
             store_events: Mutex::new(store_events_rx),
         }
@@ -215,73 +529,92 @@ impl NmlLanguageServer {
 }
 
 impl Inner {
-    fn find_nml_files(dir: &Path, files: &mut Vec<std::path::PathBuf>, depth: usize) {
-        if depth > MAX_DIR_DEPTH || files.len() >= MAX_FILE_COUNT {
-            return;
-        }
-        let entries = match crate::wasi_fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        for entry in entries {
-            let is_symlink = entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false);
-            if is_symlink {
+    /// Index the workspace roots — the KERNEL's enumeration (step 0e-b):
+    /// every `.nml` file the universe walk saw under a root is read, up
+    /// to [`MAX_INDEX_BYTES`], into the document store and marked indexed
+    /// (a regular file only, never a symlink, a FIFO or a policy-skipped
+    /// subtree: the walk's own rules); the root's `nml-project.nml` is
+    /// indexed like every other file — the tooling config a document
+    /// reads under is the kernel's nearest live config for THAT document,
+    /// never a global read from a root. There is no second walk under a
+    /// second bound:
+    /// what the kernel denies is not indexed, and the editor SAYS so —
+    /// the returned lines, one per denial (a truncated root indexes
+    /// nothing, a spent unit's files are absent, an unloadable live
+    /// input) and one per file refused at the byte bound, are the
+    /// caller's `window/logMessage`s.
+    fn index_workspace(&self, roots: &[Url]) -> Vec<String> {
+        let mut said = Vec::new();
+        let canonical_roots = self
+            .workspace_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for root in roots {
+            let Some(path) = folder_path(root) else {
                 continue;
-            }
-            let path = entry.path();
-            if path.is_dir() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                // `target` is excluded for the same reason rust-analyzer
-                // excludes it: `cargo package` copies full crate sources —
-                // `.nml` fixtures included — under `target/package/`, and
-                // indexing those copies pollutes the schema registry with
-                // duplicate definitions from files nobody is editing.
-                if name != "node_modules" && name != "target" && !name.starts_with('.') {
-                    Self::find_nml_files(&path, files, depth + 1);
-                }
-            } else if path.extension().is_some_and(|e| e == "nml") {
-                files.push(path);
-                if files.len() >= MAX_FILE_COUNT {
-                    return;
+            };
+            // The resolver reads the document store (stamps, texts) while
+            // it discovers: no store lock is held across the call.
+            let index = {
+                let buffers = self.open_buffer_paths();
+                let documents = Documents(self);
+                let view = WorkspaceView {
+                    roots: &canonical_roots,
+                    buffers: &buffers,
+                    documents: &documents,
+                };
+                self.resolver.index(&path, &view)
+            };
+            said.extend(index.denials);
+            let mut docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            let mut indexed = self.indexed_uris.lock().unwrap_or_else(|e| e.into_inner());
+            for file in index.files {
+                let stamp = packages::disk_stamp(&file);
+                match read_leaf(&file, MAX_INDEX_BYTES, INDEXED_FILE) {
+                    Ok(content) => {
+                        if let Ok(uri) = Url::from_file_path(&file) {
+                            docs.insert(uri.clone(), content, None);
+                            if let Some(stamp) = stamp {
+                                docs.note_disk(uri.clone(), stamp);
+                            }
+                            indexed.insert(uri);
+                        }
+                    }
+                    Err(why) => said.push(format!("`{}` is not indexed: {why}", file.display())),
                 }
             }
         }
+        said
     }
 
-    fn index_workspace(&self, roots: &[Url]) {
-        let mut docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-        let mut indexed = self.indexed_uris.lock().unwrap_or_else(|e| e.into_inner());
-        for root in roots {
-            let path = match root.to_file_path() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            let project_file = path.join("nml-project.nml");
-            if project_file.exists() {
-                if let Ok(content) = fs::read_to_string(&project_file) {
-                    let file = nml_core::cst::parse_best_effort(&content);
-                    let config = nml_core::ProjectConfig::from_file(&file);
-                    *self
-                        .project_config
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = config;
-                    if let Ok(uri) = Url::from_file_path(&project_file) {
-                        docs.insert(uri.clone(), content);
-                        indexed.insert(uri);
-                    }
+    /// The indexed disk copy of a just-closed document, re-read under
+    /// [`MAX_INDEX_BYTES`] like every indexed file; a copy that cannot be
+    /// read (gone, or past the bound) leaves the index, and the denial
+    /// comes back for the handler to say the way the index and the
+    /// watcher say it.
+    fn reindex_closed(&self, uri: &Url) -> Option<String> {
+        let path = uri.to_file_path().ok()?;
+        let stamp = packages::disk_stamp(&path);
+        match read_leaf(&path, MAX_INDEX_BYTES, INDEXED_FILE) {
+            Ok(content) => {
+                let mut docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+                docs.insert(uri.clone(), content, None);
+                if let Some(stamp) = stamp {
+                    docs.note_disk(uri.clone(), stamp);
                 }
+                None
             }
-
-            let mut files = Vec::new();
-            Self::find_nml_files(&path, &mut files, 0);
-            for path in files {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(uri) = Url::from_file_path(&path) {
-                        docs.insert(uri.clone(), content);
-                        indexed.insert(uri);
-                    }
-                }
+            Err(why) => {
+                self.documents
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(uri);
+                self.indexed_uris
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(uri);
+                Some(format!("`{}` is not indexed: {why}", path.display()))
             }
         }
     }
@@ -300,7 +633,7 @@ impl Inner {
         let mut scoped_oneofs: HashMap<String, Vec<OneOfDef>> = HashMap::new();
 
         for (uri, source) in docs.iter() {
-            if !uri.as_str().ends_with(".model.nml") {
+            if !is_schema_source(uri) {
                 continue;
             }
             let scope = extract_schema_scope(uri.as_str());
@@ -400,33 +733,13 @@ impl Inner {
     /// embedder defaults) when no ancestor file exists. The last-edit-wins
     /// global clobber is gone: per-document resolution reads the tree.
     fn diagnostic_config_for(&self, uri: &Url) -> diagnostics::DiagnosticConfig {
-        let nearest = uri.to_file_path().ok().and_then(|p| {
-            let p = dunce::canonicalize(&p).unwrap_or(p);
-            let roots = self
-                .workspace_roots
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            let doc_text = |path: &Path| -> Option<String> {
-                let uri = Url::from_file_path(path).ok()?;
-                self.documents
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&uri)
-                    .cloned()
-            };
-            let view = WorkspaceView {
-                roots: &roots,
-                manifests: &[],
-                doc_text: &doc_text,
-            };
-            packages::nearest_project_config(&p, &view).map(|(_, config)| config)
-        });
-        let mut config = match nearest {
-            Some(pc) => self.config_from_project(&pc),
-            None => self.diagnostic_config(),
-        };
-        config.uri_is_registry_source = uri.as_str().ends_with(".model.nml");
+        // Through the one workspace view (and the one document-path
+        // rule, `project_config_of`): the config a document reads under
+        // is looked up for the path the kernel judges — a link inside
+        // the root stays a link — never for a whole-path-canonicalized
+        // twin of it.
+        let mut config = self.config_from_project(&self.project_config_of(uri));
+        config.uri_is_registry_source = is_schema_source(uri);
         config
     }
 
@@ -449,35 +762,23 @@ impl Inner {
             membership,
             uri_is_registry_source: false,
             load_pass_owns_composition: false,
+            grant: None,
         }
     }
 
-    fn diagnostic_config(&self) -> diagnostics::DiagnosticConfig {
-        let pc = self
-            .project_config
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let membership = if pc.member_keywords.is_empty()
-            && pc.builtin_refs.is_empty()
-            && pc.user_ref_prefix.is_none()
-        {
-            self.membership.clone()
-        } else {
-            MembershipSemantics {
-                member_keywords: pc.member_keywords.clone(),
-                builtin_refs: pc.builtin_refs.clone(),
-                user_ref_prefix: pc.user_ref_prefix.clone(),
-            }
-        };
-
-        diagnostics::DiagnosticConfig {
-            template_namespaces: pc.template_namespaces.clone(),
-            modifiers: pc.modifiers.clone(),
-            membership,
-            uri_is_registry_source: false,
-            load_pass_owns_composition: false,
-        }
+    /// The live project config the document at `uri` reads under — the
+    /// kernel's nearest one through the one workspace view — else the
+    /// EMBEDDER default: what a file outside every workspace root, or
+    /// under a root with no `nml-project.nml` above it, reads under. (The
+    /// root's `nml-project.nml` used to be read into a global at index
+    /// time and on every edit, so a file outside every root got the LAST
+    /// indexed or edited root's modifiers and namespaces.)
+    fn project_config_of(&self, uri: &Url) -> nml_core::ProjectConfig {
+        self.with_workspace_view(uri, |path, view| {
+            self.resolver.project_config_for(path, view)
+        })
+        .flatten()
+        .unwrap_or_default()
     }
 
     /// Resolve a document against the schema-package machinery (RFC 0030).
@@ -505,42 +806,56 @@ impl Inner {
         f: impl FnOnce(&Path, &WorkspaceView<'_>) -> R,
     ) -> Option<R> {
         let path = uri.to_file_path().ok()?;
-        // Roots are canonicalized at initialize; an un-canonicalized document
-        // path (macOS /tmp → /private/tmp, symlinked checkouts) would fail
-        // every starts_with, silently unrooting resolution — and letting the
-        // ancestor walk escape the workspace.
-        let path = dunce::canonicalize(&path).unwrap_or(path);
         let roots = self
             .workspace_roots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let manifests: Vec<(PathBuf, String)> = {
-            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
-            docs.iter()
-                .filter(|(u, _)| u.as_str().ends_with(".package.nml"))
-                .filter_map(|(u, text)| {
-                    let p = u.to_file_path().ok()?;
-                    // Canonicalized like the resolved document path — a
-                    // symlinked workspace must not break is_self/root checks.
-                    Some((dunce::canonicalize(&p).unwrap_or(p), text.clone()))
-                })
-                .collect()
-        };
-        let doc_text = |p: &Path| -> Option<String> {
-            let uri = Url::from_file_path(p).ok()?;
-            self.documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&uri)
-                .cloned()
-        };
+        // Roots are canonicalized at initialize; an un-canonicalized document
+        // path (macOS /tmp → /private/tmp, symlinked checkouts) would fail
+        // every starts_with, silently unrooting resolution — and letting the
+        // ancestor walk escape the workspace. Canonical ABOVE the root only:
+        // a link an author committed inside the root stays a link for the
+        // kernel to judge (NML2083, as `nml check` says), where resolving
+        // the whole path judged the link's TARGET under whatever claims it.
+        let path = canonical_above_roots(path, &roots);
+        // The unsaved buffers the kernel overlays on the disk (step 0e):
+        // an open manifest, config or declared source resolves live, and a
+        // buffer at a path the disk lacks exists for the walk.
+        let buffers = self.open_buffer_paths();
+        let documents = Documents(self);
         let view = WorkspaceView {
             roots: &roots,
-            manifests: &manifests,
-            doc_text: &doc_text,
+            buffers: &buffers,
+            documents: &documents,
         };
         Some(f(&path, &view))
+    }
+
+    /// The open (unsaved-capable) documents — the overlay the kernel's
+    /// `OverlayFs` lays over the disk — spelled by the ONE document-path
+    /// rule (`canonical_above_roots`): canonical above the root, untouched
+    /// below, so a buffer opened through a linked directory inside the
+    /// root sits at the LINK in the overlay, never at its target. The walk
+    /// never enters a link, so an unsaved manifest behind one is no
+    /// resolution input (the parent-canonical spelling used here placed
+    /// it at the target: a live manifest, from an unsaved buffer behind a
+    /// link, that could close or re-claim the universe). Indexed disk
+    /// documents are not buffers: the disk already has them.
+    fn open_buffer_paths(&self) -> Vec<PathBuf> {
+        let roots = self
+            .workspace_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let open = self.open_docs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<PathBuf> = open
+            .iter()
+            .filter_map(|u| u.to_file_path().ok())
+            .map(|p| canonical_above_roots(p, &roots))
+            .collect();
+        out.sort();
+        out
     }
 
     /// The schema definitions a document's editor surfaces must use:
@@ -560,15 +875,162 @@ impl Inner {
         }
     }
 
+    /// The universe a `.model.nml` buffer's two schema passes load
+    /// against, assembled BEFORE the validator runs — `check_one`'s
+    /// universe assembly, for the editor: the covering package's
+    /// declared sources (buffer-first), a store or in-binary snapshot,
+    /// or the workspace registry set — and whether that universe lets
+    /// the load pass OWN composition verdicts (authoritative for a
+    /// snapshot, a declared set and an untruncated registry set;
+    /// partial for a truncated registry set or a non-file buffer, where
+    /// the validator's mixin verdicts stay). Returns the coverage
+    /// outcome, the sources as `(name, text)`, the buffer's own name in
+    /// that universe and the ownership flag.
+    fn model_universe_for(
+        &self,
+        uri: &Url,
+        text: &str,
+        own_name: &str,
+        roots: &[PathBuf],
+    ) -> (
+        packages::VocabularyOutcome,
+        Vec<(String, String)>,
+        String,
+        bool,
+    ) {
+        let name_of = |p: &Path| packages::source_name_of(p, roots);
+        let outcome = self.vocabulary_for_document(uri);
+        let universe = match &outcome {
+            packages::VocabularyOutcome::Covered(vocab) => &vocab.universe,
+            _ => &packages::SchemaUniverse::None,
+        };
+        // A file buffer's universe is assembled by NAME — the
+        // resolution's key, the one document-path rule — so no path
+        // is canonicalized here (a symlink-spelled buffer prefix used
+        // to fail the declared-entry identity check and double-enter
+        // its own universe: a wall of false duplicate errors).
+        let (sources, own_name, owns_composition) = match uri.to_file_path() {
+            Ok(_) => {
+                match universe {
+                    // Store/in-binary coverage: the package's
+                    // hash-verified source snapshot IS the universe —
+                    // no disk reads at all.
+                    packages::SchemaUniverse::Snapshot(pkg) => {
+                        let sources = snapshot_universe(own_name, text, &pkg.sources);
+                        (sources, own_name.to_string(), true)
+                    }
+                    packages::SchemaUniverse::Declared(paths) if !paths.is_empty() => {
+                        let read = |p: &Path| -> Option<String> {
+                            let file_uri = Url::from_file_path(p).ok()?;
+                            let buffered = self
+                                .documents
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(&file_uri)
+                                .cloned();
+                            // A declared source read from disk here is
+                            // capped exactly as discovery caps it (the
+                            // kernel's one reader, 4 MiB for a source).
+                            buffered.or_else(|| {
+                                packages::read_input_at_leaf(
+                                    nml_validate::workspace::InputKind::Source,
+                                    p,
+                                )
+                                .ok()
+                            })
+                        };
+                        let sources = declared_universe(own_name, text, paths, &read, &name_of);
+                        (sources, own_name.to_string(), true)
+                    }
+                    // Uncovered: the universe is the WORKSPACE
+                    // REGISTRY SET — every `.model.nml` the server
+                    // holds (indexed + open), the same one namespace
+                    // the registry validator, goto-definition, and
+                    // hover resolve against (RFC 0012). Anything
+                    // narrower contradicts the server's own
+                    // navigation: a mixin defined one directory over
+                    // would squiggle "unknown" while F12 jumps to it.
+                    // No filesystem walk: `documents` already carries
+                    // the freshest text for every member. Composition
+                    // ownership holds only while the whole set fits
+                    // the cap — beyond it the load pass would judge
+                    // `is` targets against a truncated namespace the
+                    // validator sees in full.
+                    _ => {
+                        let docs: Vec<(String, String)> = self
+                            .documents
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .iter()
+                            .filter(|(u, _)| is_schema_source(u) && *u != uri)
+                            .filter_map(|(u, t)| {
+                                let p = u.to_file_path().ok()?;
+                                Some((name_of(&p), t.clone()))
+                            })
+                            .collect();
+                        let (sources, truncated) = registry_universe(own_name, text, docs);
+                        (sources, own_name.to_string(), !truncated)
+                    }
+                }
+            }
+            // A non-file buffer (untitled, virtual scheme) still
+            // validates — as its own single-source universe, which can
+            // never judge composition.
+            Err(()) => (
+                vec![(uri.to_string(), text.to_string())],
+                uri.to_string(),
+                false,
+            ),
+        };
+        (outcome, sources, own_name, owns_composition)
+    }
+
     /// Full validation of one document: package-bound (exclusive validator +
     /// binding identity) when a package claims it, the scope-registry path
     /// otherwise, plus any degraded-state notes pinned to the top of file.
     fn validate_document(&self, uri: &Url, text: &str) -> Vec<tower_lsp::lsp_types::Diagnostic> {
         let mut dc = self.diagnostic_config_for(uri);
         let resolved = self.resolve_document(uri);
+        // The document's name on every finding (step 0f): its KEY under
+        // a workspace root, its path outside every root — and the root
+        // a foreign note's key is turned back into a path through.
+        let roots = self
+            .workspace_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        // ONE canonicalization rule for a document path — the one
+        // `with_workspace_view` resolved under (`canonical_above_roots`):
+        // an author's link inside the root stays a link here too, so the
+        // name every finding carries is the key the kernel judged (the
+        // resolution's own), never the link's target's.
+        let canonical = uri
+            .to_file_path()
+            .ok()
+            .map(|p| canonical_above_roots(p, &roots));
+        // The root a foreign note's key is turned back into a path
+        // through: the universe the document resolved in (its folder's,
+        // or a derived one).
+        let own_root = resolved
+            .as_ref()
+            .and_then(|r| r.root.as_ref().map(|(root, _)| root.clone()));
+        let name_of = |p: &Path| packages::source_name_of(p, &roots);
+        let own_name = resolved
+            .as_ref()
+            .and_then(|r| r.key.as_ref())
+            .map(|k| k.to_string())
+            .or_else(|| canonical.as_deref().map(name_of))
+            .unwrap_or_else(|| uri.to_string());
         let bound = matches!(
             resolved.as_ref().map(|r| &r.resolution),
             Some(Resolution::Bound(_))
+        );
+        // The universe refused the file (a walk that did not finish):
+        // the notes are the whole report — no parse band, no schema or
+        // source pass, no composition — as `nml check` validates nothing.
+        let refused = matches!(
+            resolved.as_ref().map(|r| &r.resolution),
+            Some(Resolution::Refused)
         );
         // Schema passes for a `.model.nml` buffer, assembled BEFORE the
         // validator runs: whether the validator's mixin verdicts may be
@@ -582,106 +1044,78 @@ impl Inner {
         // too would double-report composition errors whose package-identity
         // suffix defeats the exact-duplicate suppression (CLI parity: the
         // CLI validates it per the project's binding as well).
-        let model_pass = (!bound && uri.as_str().ends_with(".model.nml")).then(|| {
-            let outcome = self.vocabulary_for_document(uri);
-            let universe = match &outcome {
-                packages::VocabularyOutcome::Covered(vocab) => &vocab.universe,
-                _ => &packages::SchemaUniverse::None,
-            };
-            let (sources, own_name, owns_composition) = match uri.to_file_path() {
-                Ok(own_path) => {
-                    // Canonicalized like `with_workspace_view`'s document
-                    // path: coverage was resolved against canonical roots
-                    // and manifest dirs, so a symlink-spelled buffer path
-                    // (`/tmp` vs `/private/tmp`) would fail the
-                    // declared-entry identity check below and double-enter
-                    // its own universe — a wall of false duplicate errors.
-                    let own_path = dunce::canonicalize(&own_path).unwrap_or(own_path);
-                    match universe {
-                        // Store/in-binary coverage: the package's
-                        // hash-verified source snapshot IS the universe —
-                        // no disk reads at all.
-                        packages::SchemaUniverse::Snapshot(pkg) => {
-                            let (sources, own_name) =
-                                snapshot_universe(&own_path, text, &pkg.sources);
-                            (sources, own_name, true)
-                        }
-                        packages::SchemaUniverse::Declared(paths) if !paths.is_empty() => {
-                            let read = |p: &Path| -> Option<String> {
-                                let file_uri = Url::from_file_path(p).ok()?;
-                                let buffered = self
-                                    .documents
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .get(&file_uri)
-                                    .cloned();
-                                buffered.or_else(|| fs::read_to_string(p).ok())
-                            };
-                            let (sources, own_name) =
-                                declared_universe(&own_path, text, paths, &read);
-                            (sources, own_name, true)
-                        }
-                        // Uncovered: the universe is the WORKSPACE
-                        // REGISTRY SET — every `.model.nml` the server
-                        // holds (indexed + open), the same one namespace
-                        // the registry validator, goto-definition, and
-                        // hover resolve against (RFC 0012). Anything
-                        // narrower contradicts the server's own
-                        // navigation: a mixin defined one directory over
-                        // would squiggle "unknown" while F12 jumps to it.
-                        // No filesystem walk: `documents` already carries
-                        // the freshest text for every member. Composition
-                        // ownership holds only while the whole set fits
-                        // the cap — beyond it the load pass would judge
-                        // `is` targets against a truncated namespace the
-                        // validator sees in full.
-                        _ => {
-                            let docs: Vec<(String, String)> = self
-                                .documents
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .iter()
-                                .filter(|(u, _)| u.as_str().ends_with(".model.nml") && *u != uri)
-                                .filter_map(|(u, t)| {
-                                    let p = u.to_file_path().ok()?;
-                                    Some((p.to_string_lossy().into_owned(), t.clone()))
-                                })
-                                .collect();
-                            let (sources, own_name, truncated) =
-                                registry_universe(&own_path, text, docs);
-                            (sources, own_name, !truncated)
-                        }
-                    }
-                }
-                // A non-file buffer (untitled, virtual scheme) still
-                // validates — as its own single-source universe, which can
-                // never judge composition.
-                Err(()) => (
-                    vec![(uri.to_string(), text.to_string())],
-                    uri.to_string(),
-                    false,
-                ),
-            };
-            (outcome, sources, own_name, owns_composition)
-        });
+        let model_pass = (!bound && !refused && is_schema_source(uri))
+            .then(|| self.model_universe_for(uri, text, &own_name, &roots));
         dc.load_pass_owns_composition = model_pass.as_ref().is_some_and(|(_, _, _, owns)| *owns);
-        let mut diags = match resolved.as_ref().map(|r| &r.resolution) {
-            Some(Resolution::Bound(b)) => {
+        // The universe's composition grant for this document (step 0e):
+        // `compose_file` denies and permits exactly as `nml check` does.
+        dc.grant = resolved.as_ref().map(|r| r.grant.clone());
+        // Locating a related note's OWN file (`Related.source`): an open
+        // buffer first (its unsaved text is the truth), else disk —
+        // memoized per compute (several notes can share a file) and
+        // capped (a note's line index is not worth an unbounded read;
+        // over the cap the renderer falls back loudly, as for any
+        // unlocatable file).
+        let located: std::cell::RefCell<std::collections::HashMap<String, Option<(Url, String)>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+        let locate = |src: &str| -> Option<(Url, String)> {
+            if let Some(hit) = located.borrow().get(src) {
+                return hit.clone();
+            }
+            // A key names its file through the document's root (step
+            // 0f); a name outside every root is already a path.
+            let path = match (&own_root, Path::new(src).is_absolute()) {
+                (Some(root), false) => root.join(src),
+                _ => PathBuf::from(src),
+            };
+            let resolved = {
+                let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+                locate_source(&docs, &path)
+            };
+            located
+                .borrow_mut()
+                .insert(src.to_string(), resolved.clone());
+            resolved
+        };
+        // ONE parse per publish: the buffer's AST, its own
+        // extracted definitions and the parse findings feed `compute`,
+        // and a `.model.nml` buffer's two schema passes below reuse the
+        // same extraction — cloned definitions, never a re-parse of the
+        // text (the load pass used to parse the buffer a second time and
+        // the source pass a third).
+        // A REFUSED document is never parsed: its notes are the whole
+        // report, as for a buffer past the size bound (the parse count is
+        // pinned still across its pulls).
+        let parsed = (!refused).then(|| diagnostics::ParsedBuffer::parse(text));
+        let own_part = model_pass
+            .as_ref()
+            .zip(parsed.as_ref())
+            .map(|(_, parsed)| (parsed.own_defs.clone(), parsed.parse_errors.clone()));
+        let declaration = parsed
+            .as_ref()
+            .and_then(|parsed| first_declaration(&parsed.file));
+        let mut diags = match (resolved.as_ref().map(|r| &r.resolution), parsed) {
+            (_, None) | (Some(Resolution::Refused), _) => Vec::new(),
+            (Some(Resolution::Bound(b)), Some(parsed)) => {
                 let identity = b.identity();
-                diagnostics::compute(
+                diagnostics::compute_parsed(
                     text,
+                    parsed,
                     &SchemaMode::Package {
                         validator: &b.validator,
                         identity,
                     },
                     &dc,
                     Some(uri),
+                    &own_name,
+                    &locate,
                 )
             }
-            _ => {
+            (_, Some(parsed)) => {
                 let (models, enums, oneofs) = self.models_for_file(uri);
-                diagnostics::compute(
+                diagnostics::compute_parsed(
                     text,
+                    parsed,
                     &SchemaMode::Registry {
                         models: &models,
                         enums: &enums,
@@ -689,29 +1123,21 @@ impl Inner {
                     },
                     &dc,
                     Some(uri),
+                    &own_name,
+                    &locate,
                 )
             }
         };
         if let Some(resolved) = &resolved {
-            let top = tower_lsp::lsp_types::Range::new(
-                tower_lsp::lsp_types::Position::new(0, 0),
-                tower_lsp::lsp_types::Position::new(0, 0),
+            note_rows(
+                &resolved.notes,
+                text,
+                declaration,
+                uri,
+                &own_name,
+                &locate,
+                &mut diags,
             );
-            for note in &resolved.notes {
-                let line_index = LineIndex::new(text);
-                let range = note.span.map(|sp| line_index.range(sp)).unwrap_or(top);
-                diags.push(tower_lsp::lsp_types::Diagnostic {
-                    range,
-                    severity: Some(if note.warning {
-                        tower_lsp::lsp_types::DiagnosticSeverity::WARNING
-                    } else {
-                        tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION
-                    }),
-                    message: note.message.clone(),
-                    source: Some("nml".to_string()),
-                    ..Default::default()
-                });
-            }
         }
         // Schema passes for a `.model.nml` buffer, over the universe
         // assembled above. First the LOAD pass — `load_schema`, the same
@@ -723,54 +1149,47 @@ impl Inner {
         // re-derive extraction errors the parse band already emitted, so
         // exact duplicates (same range, message, severity) are suppressed
         // rather than double-squiggled.
-        if let Some((outcome, sources, own_name, owns_composition)) = model_pass {
-            for diag in
-                diagnostics::schema_load_pass(&own_name, &sources, Some(uri), owns_composition)
-            {
-                let duplicate = diags.iter().any(|d| {
-                    d.range == diag.range
-                        && d.message == diag.message
-                        && d.severity == diag.severity
-                });
-                if !duplicate {
-                    diags.push(diag);
-                }
+        if let Some(((outcome, sources, own_name, owns_composition), (own_schema, own_errors))) =
+            model_pass.zip(own_part)
+        {
+            // The source pass borrows the extraction the load pass then
+            // consumes; its rows are pushed after the load pass's, as
+            // they always were.
+            let source_diags = match &outcome {
+                packages::VocabularyOutcome::Covered(vocab) => diagnostics::schema_source_pass(
+                    text,
+                    &own_schema,
+                    &own_errors,
+                    vocab,
+                    Some(uri),
+                ),
+                _ => Vec::new(),
+            };
+            for diag in diagnostics::schema_load_pass(
+                &own_name,
+                &sources,
+                Some(uri),
+                owns_composition,
+                (own_schema, own_errors),
+            ) {
+                push_unless_duplicate(&mut diags, diag);
             }
-            match outcome {
-                packages::VocabularyOutcome::Covered(vocab) => {
-                    for diag in diagnostics::schema_source_pass(text, &vocab, Some(uri)) {
-                        let duplicate = diags.iter().any(|d| {
-                            d.range == diag.range
-                                && d.message == diag.message
-                                && d.severity == diag.severity
-                        });
-                        if !duplicate {
-                            diags.push(diag);
-                        }
+            match &outcome {
+                packages::VocabularyOutcome::Covered(_) => {
+                    for diag in source_diags {
+                        push_unless_duplicate(&mut diags, diag);
                     }
                 }
-                // The bounded claims walk hit its cap: coverage is honestly
-                // unknown, so say so ONCE (info, top of file) and name the
-                // remedy — declaring the file makes coverage walk-free.
-                // Multiple candidates ⇒ no name (guessing one would mislead).
-                packages::VocabularyOutcome::Undetermined { candidates } => {
-                    let name = match candidates.as_slice() {
-                        [single] => format!("'{single}'? "),
-                        _ => String::new(),
-                    };
-                    diags.push(tower_lsp::lsp_types::Diagnostic {
-                        range: tower_lsp::lsp_types::Range::new(
-                            tower_lsp::lsp_types::Position::new(0, 0),
-                            tower_lsp::lsp_types::Position::new(0, 0),
-                        ),
-                        severity: Some(tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION),
-                        message: format!(
-                            "package coverage undetermined ({name}root exceeds the scan bound); \
-                             declare this file in the package's []schema to get directive vocabulary"
-                        ),
-                        source: Some("nml".to_string()),
-                        ..Default::default()
-                    });
+                // Judged under no vocabulary for a reason the author can
+                // act on — the bounded claims walk hit its cap, or two or
+                // more packages could cover the file and none declares it:
+                // said ONCE (info, top of file) in the kernel's one sentence,
+                // as `nml check` says it.
+                packages::VocabularyOutcome::Undetermined
+                | packages::VocabularyOutcome::Ambiguous { .. } => {
+                    for diag in diagnostics::coverage_note(text, &outcome, Some(uri)) {
+                        push_unless_duplicate(&mut diags, diag);
+                    }
                 }
                 // Definitively uncovered files stay silent — plain-nml
                 // schema authors are never punished for the mechanism.
@@ -781,22 +1200,151 @@ impl Inner {
     }
 }
 
+/// The resolution's degraded-state notes as rows on the document —
+/// `check_one`'s universe report, for the editor: each at its anchor
+/// (the top of the file, the first declaration, a span) under the
+/// severity and code the CLI prints it under (NML2087 an error, NML2080
+/// a warning), so the editor and the CI gate show one verdict; a kernel
+/// row's related notes (NML2091's first failing source line) are
+/// located through the same locator a finding's notes use — one
+/// mapping, one `relatedInformation`. Pushed onto `rows`, the document's
+/// own rows so far: a wrapping row located on ITS OWN document (an
+/// unloadable manifest's NML2088 at the manifest's first finding) whose
+/// wrapped finding the document already reports — same range, the
+/// wrapper's `cause` code — is folded into that row (RFC 0026 decision
+/// 6): one finding, one squiggle, the row a user acts on (its quick fix,
+/// its notes), which gains the wrapper's context as a related location
+/// ([`LOAD_NOTE`]). A governed file's row is never folded (its document
+/// reports nothing of the manifest's).
+fn note_rows(
+    notes: &[packages::DegradedNote],
+    text: &str,
+    declaration: Option<nml_core::span::Span>,
+    uri: &Url,
+    own_name: &str,
+    locate: &dyn Fn(&str) -> Option<(Url, String)>,
+    rows: &mut Vec<tower_lsp::lsp_types::Diagnostic>,
+) {
+    let top = tower_lsp::lsp_types::Range::new(
+        tower_lsp::lsp_types::Position::new(0, 0),
+        tower_lsp::lsp_types::Position::new(0, 0),
+    );
+    let line_index = LineIndex::new(text);
+    for note in notes {
+        let range = match note.anchor {
+            packages::NoteAnchor::Top => top,
+            packages::NoteAnchor::Declaration => {
+                declaration.map(|sp| line_index.range(sp)).unwrap_or(top)
+            }
+            packages::NoteAnchor::At(sp) => line_index.range(sp),
+        };
+        let twin = note.cause.and_then(|cause| {
+            let code = tower_lsp::lsp_types::NumberOrString::String(cause.to_string());
+            rows.iter_mut()
+                .find(|d| d.range == range && d.code.as_ref() == Some(&code))
+        });
+        if let Some(twin) = twin {
+            twin.related_information.get_or_insert_with(Vec::new).push(
+                tower_lsp::lsp_types::DiagnosticRelatedInformation {
+                    location: tower_lsp::lsp_types::Location {
+                        uri: uri.clone(),
+                        range,
+                    },
+                    message: LOAD_NOTE.to_string(),
+                },
+            );
+            continue;
+        }
+        // A kernel row keeps the severity and code the CLI prints
+        // it under (NML2087 an error, NML2080 a warning), so the
+        // editor and the CI gate show one verdict.
+        let severity = match note.severity {
+            nml_core::diagnostic::Severity::Error => {
+                tower_lsp::lsp_types::DiagnosticSeverity::ERROR
+            }
+            nml_core::diagnostic::Severity::Warning => {
+                tower_lsp::lsp_types::DiagnosticSeverity::WARNING
+            }
+            _ => tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION,
+        };
+        // A kernel row's related notes (NML2091's first failing
+        // source line) are located through the same locator a
+        // finding's notes use — one mapping, one `relatedInformation`.
+        let related_information = (!note.related.is_empty()).then(|| {
+            diagnostics::related_information(
+                Some(own_name),
+                &note.related,
+                None,
+                uri,
+                &line_index,
+                own_name,
+                locate,
+            )
+        });
+        rows.push(tower_lsp::lsp_types::Diagnostic {
+            range,
+            severity: Some(severity),
+            code: note
+                .code
+                .map(|c| tower_lsp::lsp_types::NumberOrString::String(c.to_string())),
+            message: note.message.clone(),
+            source: Some("nml".to_string()),
+            related_information,
+            // The row's remedies, each naming its file when that is not
+            // this document (a failed manifest's did-you-mean on a
+            // governed file): the code-action handler offers the quick
+            // fix on the manifest, as it offers a located finding's.
+            data: diagnostics::suggestion_data(
+                &note.suggestions,
+                |s| s.source.as_deref(),
+                own_name,
+            ),
+            ..Default::default()
+        });
+    }
+}
+
+/// The related location a manifest's own finding carries when the
+/// universe's NML2088 row was folded into it ([`note_rows`]): the
+/// wrapper's context — the load fails here — stated once, on the row a
+/// user acts on.
+pub(crate) const LOAD_NOTE: &str = "the manifest fails to load here (NML2088)";
+
+/// Push `diag` unless an exact twin (range, message, severity) is already
+/// published — the cross-pass suppression: a `.model.nml` buffer's schema
+/// passes re-derive extraction errors the parse band already emitted.
+fn push_unless_duplicate(
+    diags: &mut Vec<tower_lsp::lsp_types::Diagnostic>,
+    diag: tower_lsp::lsp_types::Diagnostic,
+) {
+    let duplicate = diags
+        .iter()
+        .any(|d| d.range == diag.range && d.message == diag.message && d.severity == diag.severity);
+    if !duplicate {
+        diags.push(diag);
+    }
+}
+
 impl NmlLanguageServer {
-    /// Surface store-health transitions (Ready↔Failed, shadow warnings) the
-    /// resolver queued during resolution, as `window/logMessage`. Called from
-    /// the document-pull handler — the frequent path that holds the `Client` —
-    /// so it replaces the deleted background notifier. Drain fully under the
-    /// lock into a `Vec`, then log outside it (never hold a lock across await).
     /// This document's diagnostics via the RFC 0010 tier-1 cache — computed
     /// at most once per text state, by whichever consumer asks first (the
     /// document pull or hover's explanation lookup). The entry is validated
     /// against the CURRENT buffer text, so an insert from a compute that
     /// raced an edit reads as a miss — never served as stale ranges. `None`
-    /// for an unknown document.
+    /// for an unknown document. Returns the exact TEXT the items were
+    /// computed against beside them, so a consumer that edits (the
+    /// code-action path) can resolve against that text instead of
+    /// re-reading the document map — coherent even if a `didChange`
+    /// interleaves between its own snapshot and this call.
     async fn cached_diagnostics(
         &self,
         uri: &Url,
-    ) -> Option<Arc<Vec<tower_lsp::lsp_types::Diagnostic>>> {
+    ) -> Option<(String, Arc<Vec<tower_lsp::lsp_types::Diagnostic>>)> {
+        // A refused open buffer has no text to validate: the cap row is
+        // its whole report, nothing is parsed, nothing is cached.
+        if let Some(row) = self.refused_buffer_row(uri) {
+            return Some((String::new(), Arc::new(vec![row])));
+        }
         let text = self
             .documents
             .lock()
@@ -814,11 +1362,12 @@ impl NmlLanguageServer {
             .unwrap_or_else(|e| e.into_inner())
             .get(uri)
         {
-            if entry.text == text && entry.generation == generation {
-                return Some(Arc::clone(&entry.items));
+            if entry.is_fresh(&text, generation) {
+                return Some((text, Arc::clone(&entry.items)));
             }
         }
         let items = Arc::new(self.validate_document(uri, &text));
+        let validated = text.clone();
         // Store-health events queued during this resolution surface promptly
         // on whichever path computed (the drain's charter).
         self.drain_store_events().await;
@@ -833,7 +1382,7 @@ impl NmlLanguageServer {
                     items: Arc::clone(&items),
                 },
             );
-        Some(items)
+        Some((validated, items))
     }
 
     /// The RFC 0010 tier-1 hover augmentation at a position: explanation
@@ -845,10 +1394,15 @@ impl NmlLanguageServer {
         uri: &Url,
         pos: Position,
     ) -> Option<(String, Range)> {
-        let items = self.cached_diagnostics(uri).await?;
+        let (_, items) = self.cached_diagnostics(uri).await?;
         explanations_at_position(&items, pos)
     }
 
+    /// Surface store-health transitions (Ready↔Failed, shadow warnings) the
+    /// resolver queued during resolution, as `window/logMessage`. Called from
+    /// the document-pull handler — the frequent path that holds the `Client` —
+    /// so it replaces the deleted background notifier. Drain fully under the
+    /// lock into a `Vec`, then log outside it (never hold a lock across await).
     async fn drain_store_events(&self) {
         let events: Vec<packages::StoreEvent> = {
             let mut rx = self.store_events.lock().unwrap_or_else(|e| e.into_inner());
@@ -869,11 +1423,23 @@ impl NmlLanguageServer {
     /// `didChange` triggers a document pull) and re-pulls dependents when they
     /// gain focus. A model or project-config edit only updates the shared
     /// registry/config here; every affected file heals on its next pull.
-    fn on_change(&self, uri: Url, text: String) {
+    fn on_change(&self, uri: Url, text: String, version: Option<i32>) {
+        // THE one writer of buffer text, so the one cap: a buffer past
+        // the bound is refused HERE — never stored, so no handler can
+        // parse it — exactly as the index and the watcher refuse the
+        // same file on disk and `nml check` refuses it as a target.
+        if text.len() > MAX_INDEX_BYTES {
+            self.refuse_buffer(uri, text.len() as u64);
+            return;
+        }
+        self.refused_buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uri);
         self.documents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(uri.clone(), text.clone());
+            .insert(uri.clone(), text.clone(), version);
         // This document's cached diagnostics are stale (text changed). The
         // project-config and registry branches below clear wholesale — those
         // changes affect every document.
@@ -883,57 +1449,97 @@ impl NmlLanguageServer {
             .remove(&uri);
 
         // Segment-anchored: `foo-nml-project.nml` is an ordinary document,
-        // not project config — a bare suffix match would let it clobber the
-        // global config that `nearest_project_config` never reads from it.
-        if uri.as_str().ends_with("/nml-project.nml") {
-            let file = nml_core::cst::parse_best_effort(&text);
-            let config = nml_core::ProjectConfig::from_file(&file);
-            *self
-                .project_config
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = config;
-            // Project config (modifiers, template namespaces) shapes every
-            // document's diagnostics — wholesale invalidation.
+        // not project config. A project config (modifiers, template
+        // namespaces) shapes every document's diagnostics through the
+        // kernel's nearest-config lookup, which reads this buffer —
+        // wholesale invalidation, no global to load.
+        if uri.as_str().rsplit('/').next() == Some(nml_validate::workspace::PROJECT_CONFIG_NAME) {
             self.diags_cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
             return;
         }
-        if uri.as_str().ends_with(".model.nml") {
+        if is_schema_source(&uri) {
             self.rebuild_schema_registry();
         }
     }
 }
 
 impl Inner {
+    /// Refuse an open buffer of `len` bytes: any stored text at the URI
+    /// (an earlier version, an indexed disk copy) goes — the buffer is
+    /// the truth and the truth is refused — and every consumer that
+    /// read it is told (the registry for a `.model.nml`, every document
+    /// for a project config), exactly as a change would.
+    fn refuse_buffer(&self, uri: Url, len: u64) {
+        self.refused_buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(uri.clone(), len);
+        self.documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uri);
+        self.diags_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uri);
+        if uri.as_str().rsplit('/').next() == Some(nml_validate::workspace::PROJECT_CONFIG_NAME) {
+            self.diags_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        } else if is_schema_source(&uri) {
+            self.rebuild_schema_registry();
+        }
+    }
+
+    /// The one row a refused open buffer reports (the kernel's cap
+    /// sentence, uncoded like the CLI's target refusal), or `None` for a
+    /// buffer under the bound.
+    fn refused_buffer_row(&self, uri: &Url) -> Option<tower_lsp::lsp_types::Diagnostic> {
+        let len = *self
+            .refused_buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(uri)?;
+        let zero = tower_lsp::lsp_types::Position::new(0, 0);
+        Some(tower_lsp::lsp_types::Diagnostic {
+            range: tower_lsp::lsp_types::Range::new(zero, zero),
+            severity: Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR),
+            message: nml_validate::fs::too_large(Some(len), MAX_INDEX_BYTES, OPEN_DOCUMENT),
+            source: Some("nml".to_string()),
+            ..Default::default()
+        })
+    }
+
     fn find_definition(
         &self,
         name: &str,
         current_uri: &Url,
         enclosing_keyword: Option<&str>,
     ) -> Option<(Url, Range)> {
-        let docs: HashMap<Url, String> = self
-            .documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        // BORROWED, never copied: this map holds every indexed file's
+        // full text, so cloning it charged the whole workspace's bytes to
+        // one keystroke-frequency request. The readers below are free
+        // functions over the map and never re-enter the server, so the
+        // guard is simply held across them.
+        let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         find_definition_in_docs(&docs, name, current_uri, enclosing_keyword)
     }
 
     fn find_schema_definition(&self, name: &str, current_uri: &Url) -> Option<(Url, Range)> {
-        let docs: HashMap<Url, String> = self
-            .documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        // BORROWED, never copied: this map holds every indexed file's
+        // full text, so cloning it charged the whole workspace's bytes to
+        // one keystroke-frequency request. The readers below are free
+        // functions over the map and never re-enter the server, so the
+        // guard is simply held across them.
+        let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
 
         let file_scope = extract_file_scope(current_uri.as_str());
 
-        let mut model_uris: Vec<&Url> = docs
-            .keys()
-            .filter(|u| u.as_str().ends_with(".model.nml"))
-            .collect();
+        let mut model_uris: Vec<&Url> = docs.keys().filter(|u| is_schema_source(u)).collect();
 
         if let Some(ref scope) = file_scope {
             let scope = scope.clone();
@@ -959,20 +1565,22 @@ impl Inner {
     }
 
     fn find_tagged_ref_definition(&self, role_ref: &str) -> Option<Location> {
-        let docs: HashMap<Url, String> = self
-            .documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        // BORROWED, never copied: this map holds every indexed file's
+        // full text, so cloning it charged the whole workspace's bytes to
+        // one keystroke-frequency request. The readers below are free
+        // functions over the map and never re-enter the server, so the
+        // guard is simply held across them.
+        let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         find_tagged_ref_definition_in_docs(&docs, role_ref)
     }
 
     fn find_tagged_ref_hover(&self, keyword: &str, name: &str) -> Option<String> {
-        let docs: HashMap<Url, String> = self
-            .documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        // BORROWED, never copied: this map holds every indexed file's
+        // full text, so cloning it charged the whole workspace's bytes to
+        // one keystroke-frequency request. The readers below are free
+        // functions over the map and never re-enter the server, so the
+        // guard is simply held across them.
+        let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         find_tagged_ref_hover_in_docs(&docs, keyword, name)
     }
 
@@ -1011,7 +1619,24 @@ impl Inner {
 /// Uncovered-universe bound: a pathological workspace must not turn
 /// every diagnostics pull into an unbounded load. Manifest-declared
 /// universes are author-bounded and uncapped.
+///
+/// LIMIT: reach=content guards=memory surface=editor shown="128" — files an uncovered universe loads for one diagnostics pull
 const MAX_UNIVERSE_FILES: usize = 128;
+
+/// A related note's OWN file, by path: an open buffer first (its unsaved
+/// text is the truth), else disk under [`MAX_LOCATE_BYTES`] through the
+/// kernel's one reader at the file's own leaf (`read_leaf`: the open
+/// never blocks, a non-regular file or a leaf swapped for a link is
+/// refused) — `None` over the cap or refused, so the renderer falls back
+/// loudly, as for any unlocatable file.
+fn locate_source(docs: &HashMap<Url, String>, path: &Path) -> Option<(Url, String)> {
+    let url = Url::from_file_path(path).ok()?;
+    let text = match docs.get(&url) {
+        Some(text) => text.clone(),
+        None => read_leaf(path, MAX_LOCATE_BYTES as usize, "a related note's file").ok()?,
+    };
+    Some((url, text))
+}
 
 /// Assemble a COVERED `.model.nml` buffer's validation universe from its
 /// package's `[]schema` paths, in MANIFEST order — merge order decides
@@ -1025,41 +1650,38 @@ const MAX_UNIVERSE_FILES: usize = 128;
 /// problem, reported there); a covered-but-undeclared buffer (the
 /// sibling trap) is appended AFTER the declared set, so duplicate
 /// attribution lands on the undeclared file — the one whose declaration
-/// status is in question. `own_path` is canonicalized by the caller so
-/// the declared-entry identity check cannot be defeated by symlink or
-/// case spelling.
+/// status is in question. The declared-entry identity is the kernel's
+/// NAME on both sides (the one document-path rule), never a second
+/// canonicalization.
 fn declared_universe(
-    own_path: &Path,
+    own_name: &str,
     own_text: &str,
     declared: &[PathBuf],
     read: &dyn Fn(&Path) -> Option<String>,
-) -> (Vec<(String, String)>, String) {
-    let name_of = |p: &Path| p.to_string_lossy().into_owned();
-    let own_name = name_of(own_path);
-    // Compare canonical paths on both sides (`/var` vs `/private/var` on
-    // macOS, manifest symlink spelling, case-insensitive FS). Callers
-    // canonicalize before invoking, but tests and defensive parity do too.
-    let own_canonical = dunce::canonicalize(own_path).unwrap_or_else(|_| own_path.to_path_buf());
+    name_of: &dyn Fn(&Path) -> String,
+) -> Vec<(String, String)> {
     let mut sources: Vec<(String, String)> = Vec::new();
     let mut own_declared = false;
     for entry in declared {
-        // Manifest entries may be symlink- or case-spelled; canonicalize
-        // for identity. A missing entry fails to canonicalize and keeps
-        // its authored spelling; `read` then fails the same way and it
-        // is skipped.
-        let entry_canonical = dunce::canonicalize(entry);
-        let is_own = entry_canonical.as_deref().unwrap_or(entry) == own_canonical.as_path();
-        if is_own {
+        // Identity by the kernel's NAME — the key under a root, the path
+        // outside one — on both sides: the own document's name is the
+        // resolution's key, a declared entry's the key its path spells
+        // (`name_of`), and both came through the one document-path rule,
+        // so no canonicalization decides here (a link inside the root is
+        // the link on both sides; the case the kernel verified is the
+        // case both carry). A missing entry keeps its authored spelling;
+        // `read` then fails and it is skipped.
+        if name_of(entry) == own_name {
             own_declared = true;
-            sources.push((own_name.clone(), own_text.to_string()));
+            sources.push((own_name.to_string(), own_text.to_string()));
         } else if let Some(text) = read(entry) {
             sources.push((name_of(entry), text));
         }
     }
     if !own_declared {
-        sources.push((own_name.clone(), own_text.to_string()));
+        sources.push((own_name.to_string(), own_text.to_string()));
     }
-    (sources, own_name)
+    sources
 }
 
 /// Assemble an UNCOVERED `.model.nml` buffer's validation universe from
@@ -1078,18 +1700,17 @@ fn declared_universe(
 /// validator) rather than reporting false "unknown `is` target" errors
 /// for definitions that dropped with the tail.
 fn registry_universe(
-    own_path: &Path,
+    own_name: &str,
     own_text: &str,
     mut docs: Vec<(String, String)>,
-) -> (Vec<(String, String)>, String, bool) {
-    let own_name = own_path.to_string_lossy().into_owned();
+) -> (Vec<(String, String)>, bool) {
     docs.sort_by(|a, b| a.0.cmp(&b.0));
     let truncated = docs.len() > MAX_UNIVERSE_FILES.saturating_sub(1);
     docs.truncate(MAX_UNIVERSE_FILES.saturating_sub(1));
     let mut sources = Vec::with_capacity(docs.len() + 1);
-    sources.push((own_name.clone(), own_text.to_string()));
+    sources.push((own_name.to_string(), own_text.to_string()));
     sources.extend(docs);
-    (sources, own_name, truncated)
+    (sources, truncated)
 }
 
 /// Assemble a STORE-covered buffer's validation universe: the package's
@@ -1099,25 +1720,52 @@ fn registry_universe(
 /// workspace, so the buffer cannot be one of them — and logical names
 /// (`[a-z][a-z0-9-]*`) can never collide with the buffer's absolute-path
 /// key, so no dedup is needed or possible.
+/// The span of a document's first declaration — where a note anchored
+/// at [`packages::NoteAnchor::Declaration`] sits (an inert `package`/
+/// `project` block); `None` for a document that declares nothing.
+fn first_declaration(file: &nml_core::ast::File) -> Option<nml_core::span::Span> {
+    file.declarations.first().map(|d| d.span)
+}
+
 fn snapshot_universe(
-    own_path: &Path,
+    own_name: &str,
     own_text: &str,
-    sources: &[(String, String)],
-) -> (Vec<(String, String)>, String) {
-    let own_name = own_path.to_string_lossy().into_owned();
+    sources: &[(String, std::sync::Arc<str>)],
+) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::with_capacity(sources.len() + 1);
-    out.extend(sources.iter().cloned());
-    out.push((own_name.clone(), own_text.to_string()));
-    (out, own_name)
+    out.extend(
+        sources
+            .iter()
+            .map(|(name, text)| (name.clone(), (**text).to_string())),
+    );
+    out.push((own_name.to_string(), own_text.to_string()));
+    out
+}
+
+/// Canonicalize `path` and require the result inside one of the
+/// (already-canonical) `roots` — the ONE containment predicate for any
+/// surface that turns an untrusted path into a filesystem read. The
+/// order is load-bearing: canonicalize FIRST (resolving symlinks), then
+/// contain — check-then-canonicalize is the classic symlink escape.
+/// Pure containment: symlink *policy* stays with callers that have one
+/// (a symlink check must run BEFORE canonicalization, which erases the
+/// evidence). Fail-closed: a path that cannot canonicalize is `None`.
+fn canonical_within_roots(path: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    let canonical = dunce::canonicalize(path).ok()?;
+    roots
+        .iter()
+        .any(|root| canonical.starts_with(root))
+        .then_some(canonical)
 }
 
 /// Whether a watched-file event should be honored.
 ///
-/// Mirrors the safety rules of `index_workspace`/`find_nml_files`: the path
-/// must not be a symlink, and it must canonicalize to a location inside one
-/// of the (canonicalized) workspace roots. Clients can send arbitrary
-/// `file://` URIs in watched-file notifications, so this is the boundary
-/// check that keeps the server from reading files outside the workspace.
+/// Mirrors the rules the kernel's walk indexes under: the path must not be
+/// a symlink, and it must canonicalize to a location inside one of the
+/// (canonicalized) workspace roots ([`canonical_within_roots`]).
+/// Clients can send arbitrary `file://` URIs in watched-file
+/// notifications, so this is the boundary check that keeps the server
+/// from reading files outside the workspace.
 fn watched_file_is_eligible(path: &Path, roots: &[PathBuf]) -> bool {
     let is_symlink = fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
@@ -1125,10 +1773,7 @@ fn watched_file_is_eligible(path: &Path, roots: &[PathBuf]) -> bool {
     if is_symlink {
         return false;
     }
-    match dunce::canonicalize(path) {
-        Ok(canonical) => roots.iter().any(|root| canonical.starts_with(root)),
-        Err(_) => false,
-    }
+    canonical_within_roots(path, roots).is_some()
 }
 
 /// A watched-change path in the resolver's namespace. Roots are
@@ -1231,17 +1876,30 @@ fn find_tagged_ref_hover_in_docs(
 
 // ── Schema scoping ────────────────────────────────────────────
 
+/// Whether a document is a schema source — the kernel's admission
+/// (`*.model.nml`, `*.schema.nml`:
+/// [`nml_validate::workspace::is_schema_source_name`]), the one spelling
+/// both front ends read: what feeds the registry, opens the schema
+/// passes, answers directive completion and hover, and is re-read on
+/// change. The editor keeps no predicate of its own.
+fn is_schema_source(uri: &Url) -> bool {
+    nml_validate::workspace::is_schema_source_name(uri.as_str())
+}
+
+/// The registry scope of a schema source: its stem, by the kernel's
+/// spelling ([`nml_validate::workspace::schema_source_stem`] — `core`
+/// for `core.model.nml` and `core.schema.nml` alike); empty for any
+/// other name.
 fn extract_schema_scope(uri_str: &str) -> String {
     let filename = uri_str.rsplit('/').next().unwrap_or(uri_str);
-    filename
-        .strip_suffix(".model.nml")
+    nml_validate::workspace::schema_source_stem(filename)
         .unwrap_or("")
         .to_string()
 }
 
 fn extract_file_scope(uri_str: &str) -> Option<String> {
     let filename = uri_str.rsplit('/').next().unwrap_or(uri_str);
-    if filename.ends_with(".model.nml") {
+    if nml_validate::workspace::is_schema_source_name(filename) {
         return None;
     }
     let stem = filename.strip_suffix(".nml")?;
@@ -1290,10 +1948,7 @@ fn find_definition_in_docs(
     // (Skip when cursor is on the declaration keyword itself)
     if !is_on_keyword {
         if let Some(keyword) = enclosing_keyword {
-            let mut model_uris: Vec<&Url> = docs
-                .keys()
-                .filter(|u| u.as_str().ends_with(".model.nml"))
-                .collect();
+            let mut model_uris: Vec<&Url> = docs.keys().filter(|u| is_schema_source(u)).collect();
 
             if let Some(ref scope) = file_scope {
                 let scope = scope.clone();
@@ -1324,7 +1979,7 @@ fn find_definition_in_docs(
     // (Skip when cursor is on the declaration keyword itself)
     if !is_on_keyword {
         for (uri, source) in docs.iter() {
-            if !uri.as_str().ends_with(".model.nml") {
+            if !is_schema_source(uri) {
                 continue;
             }
             let file = nml_core::cst::parse_best_effort(source);
@@ -1724,7 +2379,19 @@ fn build_document_symbols(file: &File, line_index: &LineIndex) -> Vec<DocumentSy
                             arm.value.clone(),
                             Some(arm.model.name.clone()),
                             SymbolKind::ENUM_MEMBER,
-                            span_to_range(arm.model.span, line_index),
+                            // The WHOLE arm (`"value" -> Model`): LSP 3.17
+                            // §DocumentSymbol requires `selectionRange` to
+                            // be contained by `range`, and an arm has no
+                            // span of its own to take. The model's alone
+                            // does not contain the value literal — it does
+                            // not even touch it — so a conforming client
+                            // drops the arm (VS Code logs and discards the
+                            // symbol), and the outline lost every arm of
+                            // every `oneof`.
+                            span_to_range(
+                                Span::new(arm.value_span.start, arm.model.span.end),
+                                line_index,
+                            ),
                             span_to_range(arm.value_span, line_index),
                             Vec::new(),
                         )
@@ -1823,7 +2490,7 @@ fn build_body_symbols(body: &Body, line_index: &LineIndex) -> Vec<DocumentSymbol
 fn arm_selector_label(selector: &ArmSelector) -> String {
     match selector {
         ArmSelector::Role(r) => r.clone(),
-        ArmSelector::Literal(k) => quote_nml_string(k),
+        ArmSelector::Literal(k) => nml_core::source_policy::string_literal(k),
         ArmSelector::Else => "else".into(),
     }
 }
@@ -1831,7 +2498,7 @@ fn arm_selector_label(selector: &ArmSelector) -> String {
 fn arm_target_label(target: &ArmTarget) -> String {
     match target {
         ArmTarget::Reference(id) => id.name.clone(),
-        ArmTarget::Literal { value, .. } => format!("{value:?}"),
+        ArmTarget::Literal(t) => format!("{:?}", t.value),
         ArmTarget::Inline { name, .. } => format!("{}:", name.name),
     }
 }
@@ -2728,22 +3395,10 @@ fn ambiguous_candidates<'i>(
     None
 }
 
-/// Quote a string as an NML literal for outline labels — same escaping as fmt.
-fn quote_nml_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
+// String-literal quoting for labels, snippets and hover values lives in
+// `nml_core::source_policy::string_literal` — THE one speller, which re-escapes
+// the source policy's banned set (a local table here silently diverged
+// the day the policy grew, leaking raw steering bytes into editor UI).
 
 /// True when the cursor sits at or after the end of the last `->` token on
 /// the line — the arm **target** side (RFC 0007). Mid-selector typing must
@@ -2785,11 +3440,12 @@ fn arm_selector_completion_items(
     let mut items = Vec::new();
     if let Some(enum_def) = index.arm_key_enum_def(key) {
         for (i, variant) in enum_def.variants.iter().enumerate() {
+            let quoted = nml_core::source_policy::string_literal(variant);
             items.push(CompletionItem {
-                label: format!("\"{variant}\""),
+                label: quoted.clone(),
                 kind: Some(CompletionItemKind::ENUM_MEMBER),
                 detail: Some("arm selector key".to_string()),
-                insert_text: Some(format!("\"{variant}\" -> ")),
+                insert_text: Some(format!("{quoted} -> ")),
                 sort_text: Some(format!("0_{i:03}")),
                 ..Default::default()
             });
@@ -3475,7 +4131,7 @@ fn field_sort_key(field: &FieldDef, idx: usize) -> String {
 /// The authored FORM of a field: modifier-declared fields are written with
 /// the `|` sigil (`|vis = …`), plain fields without. The one predicate behind
 /// form matching (value governors), tier-1 form agreement, labels, and
-/// insert-text sigils — the round-20 layer's central concept, named once.
+/// insert-text sigils — the completion layer's central concept, named once.
 fn is_modifier_form(field: &FieldDef) -> bool {
     matches!(field.field_type, FieldType::Modifier(_))
 }
@@ -3505,16 +4161,15 @@ fn field_insert_text(index: &SchemaIndex, field: &FieldDef) -> String {
 
 /// Parse the wire `suggestions` payload of a diagnostic's `data` (see the
 /// diagnostics.rs producer): every valid `{replacement, start, end, kind}`
-/// entry, capped at the producer's own alternative bound
+/// entry — with `source`, the document the edit lands in, when it is not
+/// this one (the action is minted on THAT document) — capped at the
+/// producer's own alternative bound
 /// (`MAX_FIX_ALTERNATIVES` in nml-validate). Parse-then-cap, in that order:
 /// the cap counts VALID entries — so a hostile/buggy client can neither mint
 /// unbounded actions from one diagnostic nor bury a legitimate entry behind
 /// malformed padding — and the singleton-preferred gate downstream counts
 /// only real suggestions.
-fn parse_suggestion_entries(
-    suggestions: &[serde_json::Value],
-) -> Vec<(String, usize, usize, String)> {
-    const MAX_SUGGESTION_ACTIONS: usize = 8;
+fn parse_suggestion_entries(suggestions: &[serde_json::Value]) -> Vec<SuggestionEntry> {
     suggestions
         .iter()
         .filter_map(|s| {
@@ -3523,15 +4178,67 @@ fn parse_suggestion_entries(
             // An inverted span would round-trip as a spec-invalid LSP Range;
             // fail closed like every other malformed entry.
             (start <= end).then_some(())?;
-            Some((
-                s.get("replacement")?.as_str()?.to_string(),
+            // `source` is the file the edit lands in when it is not this
+            // document (`Suggestion::source`, a key); absent = this one.
+            let source = match s.get("source") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(v) => Some(v.as_str()?.to_string()),
+            };
+            Some(SuggestionEntry {
+                replacement: s.get("replacement")?.as_str()?.to_string(),
                 start,
                 end,
-                s.get("kind")?.as_str()?.to_string(),
-            ))
+                kind: s.get("kind")?.as_str()?.to_string(),
+                source,
+            })
         })
         .take(MAX_SUGGESTION_ACTIONS)
         .collect()
+}
+
+/// One `data.suggestions[]` entry as the client round-tripped it.
+struct SuggestionEntry {
+    replacement: String,
+    start: usize,
+    end: usize,
+    kind: String,
+    source: Option<String>,
+}
+
+/// The `layers` object `nml/schemaInfo` carries — the `--json` `binding`
+/// row's, from the kernel's one spelling.
+fn layers_value(grant: &nml_validate::workspace::Grant) -> serde_json::Value {
+    serde_json::to_value(grant.wire()).unwrap_or(serde_json::Value::Null)
+}
+
+/// The binding's grant for the `(0,0)` hover, in `nml binding`'s words —
+/// the kernel's one spelling of the rows (`LayerGrant::rules`) joined on
+/// one line, or the one denied sentence (`Grant::DENIED`); nothing for a
+/// file no binding governs.
+fn layers_summary(grant: &nml_validate::workspace::Grant) -> Option<String> {
+    use nml_validate::workspace::Grant;
+    match grant {
+        Grant::Granted { grant, .. } => Some(format!(
+            "granted — {}",
+            grant.rules().collect::<Vec<_>>().join(", ")
+        )),
+        Grant::NoGrant { .. } => Some(Grant::DENIED.to_string()),
+        Grant::Ambiguous { .. } | Grant::Unbound { .. } => None,
+    }
+}
+
+/// Push `action` unless an action with the same title and edit is already
+/// offered — one insertion asked for by two diagnostics is one action.
+fn push_unique_action(actions: &mut Vec<CodeActionOrCommand>, action: CodeAction) {
+    let twin = actions.iter().any(|a| match a {
+        CodeActionOrCommand::CodeAction(existing) => {
+            existing.title == action.title && existing.edit == action.edit
+        }
+        CodeActionOrCommand::Command(_) => false,
+    });
+    if !twin {
+        actions.push(CodeActionOrCommand::CodeAction(action));
+    }
 }
 
 /// When the cursor is at the value position of a `oneof` instance's discriminator
@@ -3793,7 +4500,7 @@ fn simplify_number_action(source: &str, offset: usize) -> Option<SimplifyNumber>
 
 fn format_value(value: &Value) -> String {
     match value {
-        Value::String(s) => format!("\"{}\"", s),
+        Value::String(s) => nml_core::source_policy::string_literal(s),
         Value::Number(n) => n.to_string(),
         Value::Money(m) => m.format_display(),
         Value::Duration(d) => d.to_string(),
@@ -3876,9 +4583,12 @@ fn count_triple_quotes(line: &str) -> usize {
 }
 
 /// Compute the desired indentation (in spaces) for a new line inserted after
-/// `line_idx` in the given source lines.  This drives `onTypeFormatting` for
-/// the `\n` trigger so the cursor lands at the right column.
-fn compute_indent_after_line(lines: &[&str], line_idx: usize) -> usize {
+/// `line_idx` in the given source lines — one `unit` deeper after a block
+/// header, the unit being the one a structural insertion there would nest
+/// by (`nml_core::cst::edit::indentation_unit_at`: the file's own, the
+/// canonical four when the file offers none). This drives `onTypeFormatting`
+/// for the `\n` trigger so the cursor lands at the right column.
+fn compute_indent_after_line(lines: &[&str], line_idx: usize, unit: usize) -> usize {
     let effective_idx = if line_idx < lines.len() {
         let mut idx = line_idx;
         while idx > 0 && lines[idx].trim().is_empty() {
@@ -3905,7 +4615,7 @@ fn compute_indent_after_line(lines: &[&str], line_idx: usize) -> usize {
     let prev_indent = line.len() - line.trim_start().len();
 
     if trimmed.ends_with(':') && !trimmed.starts_with("//") {
-        return prev_indent + 4;
+        return prev_indent + unit;
     }
 
     prev_indent
@@ -3965,7 +4675,7 @@ fn quoted_value_item(
     edit_ranges: Option<(Range, Range)>,
     insert_replace: bool,
 ) -> CompletionItem {
-    let quoted = format!("\"{variant}\"");
+    let quoted = nml_core::source_policy::string_literal(variant);
     let text_edit = edit_ranges.map(|(insert, replace)| {
         if insert_replace {
             CompletionTextEdit::InsertAndReplace(InsertReplaceEdit {
@@ -4059,123 +4769,183 @@ enum ProjectEdit {
     OptOut,
 }
 
+impl Inner {
+    /// The workspace edit applying `edits` to `uri` — one file's case of
+    /// [`Self::workspace_edits`].
+    ///
+    /// Callers must not hold the `documents` lock: the versioned shape
+    /// reads it (`std::sync::Mutex` is not re-entrant).
+    fn workspace_edit(&self, uri: Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
+        self.workspace_edits(vec![(uri, edits)])
+    }
+
+    /// The workspace edit applying each file's `edits` — the ONE shape
+    /// every action the server hands out takes, a rename across files
+    /// included: `documentChanges` naming each document's client VERSION
+    /// (an open buffer's; `null` for a file the client did not open, whose
+    /// master is the disk) when the client declared
+    /// `workspace.workspaceEdit.documentChanges`, so it refuses an edit
+    /// computed against text that has since moved on (LSP 3.17
+    /// §WorkspaceEdit, `OptionalVersionedTextDocumentIdentifier`); plain
+    /// `changes` otherwise — the only shape such a client can apply.
+    ///
+    /// Sorted by URI: `documentChanges` is an ORDERED array, and a hash
+    /// map's iteration order would hand the same rename out in a different
+    /// order every call.
+    fn workspace_edits(&self, mut per_file: Vec<(Url, Vec<TextEdit>)>) -> WorkspaceEdit {
+        per_file.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));
+        if self
+            .versioned_edits
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            return WorkspaceEdit {
+                document_changes: Some(DocumentChanges::Edits(
+                    per_file
+                        .into_iter()
+                        .map(|(uri, edits)| TextDocumentEdit {
+                            text_document: OptionalVersionedTextDocumentIdentifier {
+                                version: docs.version(&uri),
+                                uri,
+                            },
+                            edits: edits.into_iter().map(OneOf::Left).collect(),
+                        })
+                        .collect(),
+                )),
+                ..Default::default()
+            };
+        }
+        WorkspaceEdit {
+            changes: Some(per_file.into_iter().collect()),
+            ..Default::default()
+        }
+    }
+
+    /// The workspace edit creating `uri` with `content` — `None` for a
+    /// client that declared no `create` resource operation: an action it
+    /// cannot apply is never offered.
+    fn create_file_edit(&self, uri: Url, content: String) -> Option<WorkspaceEdit> {
+        if !self
+            .creates_files
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        Some(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(vec![
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                    uri: uri.clone(),
+                    options: None,
+                    annotation_id: None,
+                })),
+                DocumentChangeOperation::Edit(TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier { uri, version: None },
+                    edits: vec![OneOf::Left(TextEdit {
+                        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                        new_text: content,
+                    })],
+                }),
+            ])),
+            ..Default::default()
+        })
+    }
+
+    /// Whether an action may WRITE `path`: inside a workspace root, never
+    /// beyond (a root marker in `$HOME` must not make the editor create
+    /// `~/nml-project.nml`; a derived universe above every folder is read,
+    /// never written). Containment only — no ancestor allowance: for any
+    /// file INSIDE a workspace root the binding walk
+    /// (`ancestors_within_roots`) is bounded by that root, so every
+    /// legitimate write target already satisfies this check, and root
+    /// markers are attacker-influenced (`rootMarkers` is a plain string
+    /// list) — an out-of-workspace target is exactly the write this
+    /// guard refuses.
+    fn may_write(&self, path: &Path) -> bool {
+        self.workspace_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|r| path.starts_with(r))
+    }
+
+    /// The text of `path` as an action edits it — the open buffer's
+    /// (its unsaved text is what the computed offsets must be valid
+    /// against), else the disk's under the cap the kernel reads that
+    /// kind of input with.
+    fn editable_text(&self, uri: &Url, path: &Path) -> Option<String> {
+        let buffered = self
+            .documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(uri)
+            .cloned();
+        buffered.or_else(|| packages::read_input_at_leaf(packages::input_kind_of(path), path).ok())
+    }
+}
+
 impl NmlLanguageServer {
     /// Build the workspace edit for a pin/opt-out action targeting the
-    /// nearest `nml-project.nml` (structural CST insert into the existing
-    /// `project` block — RFC 0030 P2) or creating one at the binding's root.
+    /// nearest LIVE `nml-project.nml` — `existing`, the kernel's answer
+    /// (`project_config_path_for`) — with a structural CST insert into its
+    /// `project` block (RFC 0030 P2), or creating one at the binding's
+    /// anchor `root`.
     /// Injection-safe twice over: package names are charset-constrained at
     /// package load, and the CST splice refuses any snippet that does not
     /// parse as plain body entries.
     fn project_edit_action(
         &self,
-        file_path: &Path,
+        existing: Option<&Path>,
         root: &Path,
         title: String,
         edit: ProjectEdit,
     ) -> Option<CodeAction> {
-        // The action writes files: it must never target a path outside the
-        // workspace (a root marker in `$HOME` must not make the editor
-        // create `~/nml-project.nml`). Containment only — no ancestor
-        // allowance: for any file INSIDE a workspace root the binding walk
-        // (`ancestors_within_roots`) is bounded by that root, so every
-        // legitimate binding root already satisfies this check. A binding
-        // root ABOVE the workspace can only come from an out-of-workspace
-        // file whose unbounded walk matched a marker in `$HOME` or another
-        // shared ancestor — and root markers are attacker-influenced
-        // (`rootMarkers` is a plain string list), so that is exactly the
-        // write this guard exists to refuse.
-        {
-            let roots = self
-                .workspace_roots
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if !roots.iter().any(|r| root.starts_with(r)) {
-                return None;
-            }
+        // The action writes a file: never one outside the workspace
+        // (`may_write`) — a binding root ABOVE the workspace can only come
+        // from an out-of-workspace file whose unbounded walk matched a
+        // marker in `$HOME` or another shared ancestor.
+        if !self.may_write(root) || existing.is_some_and(|p| !self.may_write(p)) {
+            return None;
         }
 
-        // Nearest existing nml-project.nml between the file and its root.
-        let mut existing: Option<PathBuf> = None;
-        let mut dir = file_path.parent();
-        while let Some(d) = dir {
-            let candidate = d.join("nml-project.nml");
-            if candidate.is_file() {
-                existing = Some(candidate);
-                break;
-            }
-            if d == root {
-                break;
-            }
-            dir = d.parent();
-        }
-
+        // The edit lands in the kernel's nearest LIVE config for the
+        // document (the rule pins are resolved under, through the
+        // overlay), else in a new config at the binding's anchor: its own
+        // manifest's directory, or a live marker directory above it —
+        // both live while the binding is (inputs beside a manifest are
+        // never inerted by it). A disk walk by `is_file()` used to pick
+        // the nearest FILE instead: an inert tenant-committed config (a
+        // pin there changes nothing; an opt-out already written there
+        // hid the action) and never an unsaved config the overlay
+        // already resolves through.
         let workspace_edit = match existing {
             Some(project_path) => {
-                // Open-document text wins over disk — an unsaved buffer is
-                // the text the computed offsets must be valid against.
-                let text = Url::from_file_path(&project_path)
-                    .ok()
-                    .and_then(|u| {
-                        self.documents
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&u)
-                            .cloned()
-                    })
-                    .or_else(|| std::fs::read_to_string(&project_path).ok())?;
+                let uri = Url::from_file_path(project_path).ok()?;
+                let text = self.editable_text(&uri, project_path)?;
                 let new_text = project_file_insertion(&text, &edit)?;
-                // Whole-document replacement: the CST splice returns the
-                // complete new text, and a single full-range TextEdit is the
-                // simplest LSP shape that is guaranteed byte-exact — no
-                // offset→Position math for a structural edit to get subtly
-                // wrong, and the file is a small config so the payload cost
-                // is irrelevant.
+                // The CST splice returns the complete new text; the edit
+                // handed out is its ONE hunk — the inserted lines, at
+                // their line start — so the client's undo, cursor and
+                // diff see an insertion, never a whole-file rewrite.
+                let hunk = nml_core::cst::edit::single_hunk(&text, &new_text);
                 let line_index = LineIndex::new(&text);
-                let uri = Url::from_file_path(&project_path).ok()?;
-                let mut changes = std::collections::HashMap::new();
-                changes.insert(
+                self.workspace_edit(
                     uri,
                     vec![TextEdit {
-                        range: line_index.range(nml_core::span::Span::new(0, text.len())),
-                        new_text,
+                        range: line_index.range(hunk.span),
+                        new_text: hunk.replacement,
                     }],
-                );
-                WorkspaceEdit {
-                    changes: Some(changes),
-                    ..Default::default()
-                }
+                )
             }
             None => {
                 let project_path = root.join("nml-project.nml");
                 let uri = Url::from_file_path(&project_path).ok()?;
-                let content = match &edit {
-                    ProjectEdit::Pin(name) => {
-                        format!("project Project:\n    schemaPackages:\n        - {name}\n")
-                    }
-                    ProjectEdit::OptOut => {
-                        "project Project:\n    autoAssociate = false\n".to_string()
-                    }
-                };
-                WorkspaceEdit {
-                    document_changes: Some(DocumentChanges::Operations(vec![
-                        DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
-                            uri: uri.clone(),
-                            options: None,
-                            annotation_id: None,
-                        })),
-                        DocumentChangeOperation::Edit(TextDocumentEdit {
-                            text_document: OptionalVersionedTextDocumentIdentifier {
-                                uri,
-                                version: None,
-                            },
-                            edits: vec![OneOf::Left(TextEdit {
-                                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-                                new_text: content,
-                            })],
-                        }),
-                    ])),
-                    ..Default::default()
-                }
+                // A new file has no indentation to read: the edit lands in
+                // the bare skeleton through the SAME insertion an existing
+                // config receives, so it nests by the canonical unit — the
+                // file `nml fmt` would write (the formatter's fixed point,
+                // pinned) — and the two shapes have one spelling.
+                let content = project_file_insertion(PROJECT_SKELETON, &edit)?;
+                self.create_file_edit(uri, content)?
             }
         };
 
@@ -4187,10 +4957,285 @@ impl NmlLanguageServer {
         })
     }
 
+    /// The quick fix for one round-tripped suggestion `entry` of `diag`, a
+    /// diagnostic of `own` (whose cached text is `own_text`): resolved
+    /// through the ONE resolver both appliers share (RFC 0023) against the
+    /// text of the file the edit lands in — this document, or the one the
+    /// suggestion names (`source`: an open buffer's text first, else the
+    /// disk's), as a versioned edit on THAT file. A singleton batch per
+    /// suggestion — N did-you-mean alternatives share one span and are N
+    /// actions (`Overlap` is a batch-applier verdict and never fires
+    /// here); any refusal (the injection guard, a stale span, an
+    /// unparsable source, a block already holding the entry) is no
+    /// action, never a guess.
+    fn suggestion_action(
+        &self,
+        own: &Url,
+        own_text: &str,
+        entry: &SuggestionEntry,
+        total: usize,
+        diag: &Diagnostic,
+    ) -> Option<CodeAction> {
+        use nml_core::diagnostic::SuggestionKind;
+        // An unknown kind is no action, never a guess.
+        let kind = SuggestionKind::from_wire_name(&entry.kind)?;
+        // The wire's entry through the one door: its kind with its
+        // payload, at its anchor, in the file the wire named when it
+        // named one (the diagnostic's own otherwise).
+        let anchored = nml_core::diagnostic::Suggestion::of(kind, entry.replacement.clone())
+            .at(nml_core::span::Span::new(entry.start, entry.end));
+        let suggestion = match &entry.source {
+            Some(key) => anchored.in_file(key.clone()),
+            None => anchored,
+        };
+        let (target, text) = match &entry.source {
+            None => (own.clone(), own_text.to_string()),
+            Some(key) => self.suggestion_target(own, key)?,
+        };
+        let resolved =
+            nml_core::cst::edit::resolve_suggestions(&text, std::slice::from_ref(&suggestion));
+        let Some(Ok(applied)) = resolved.outcomes.first() else {
+            return None;
+        };
+        let index = LineIndex::new(&text);
+        let edits: Vec<TextEdit> = resolved
+            .edits
+            .iter()
+            .map(|e| TextEdit {
+                range: index.range(e.span),
+                new_text: e.replacement.clone(),
+            })
+            .collect();
+        if edits.is_empty() {
+            return None;
+        }
+        // Titles derive from the outcome: a structural edit names what it
+        // does (an insertion into another file names that file); an
+        // empty verbatim fix (the trailing-dot removal) is `Remove`; a
+        // verbatim fix that INSERTS (an empty span — `?` after a field's
+        // type) names the insertion, one that replaces names its payload;
+        // `is_preferred` only for a SINGLETON did-you-mean — N mutually
+        // exclusive fixes must never let the editor auto-apply a guess
+        // (the exact ambiguity RFC 0015 D2 exists to forbid), and a
+        // structural edit is not a spelling repair, so none is preferred.
+        let title = match applied.title() {
+            Some(title) => title,
+            None if kind == SuggestionKind::Fix && suggestion.replacement.is_empty() => {
+                "Remove".to_string()
+            }
+            None if kind == SuggestionKind::Fix => match resolved.edits.as_slice() {
+                [edit] if edit.span.start == edit.span.end => {
+                    format!("Insert `{}`", suggestion.replacement)
+                }
+                _ => format!("Apply fix: `{}`", suggestion.replacement),
+            },
+            None => format!("Replace with \"{}\"", suggestion.replacement),
+        };
+        // An edit in another file names it, whatever its kind: the
+        // reader picks an action that changes a file they are not
+        // looking at.
+        let title = match &entry.source {
+            Some(key) => format!("{title} in {key}"),
+            None => title,
+        };
+        let preferred = kind == SuggestionKind::DidYouMean && total == 1;
+        Some(CodeAction {
+            title,
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diag.clone()]),
+            edit: Some(self.workspace_edit(target, edits)),
+            is_preferred: preferred.then_some(true),
+            ..Default::default()
+        })
+    }
+
+    /// The file a suggestion of `own`'s diagnostic names by `key`, and its
+    /// editable text: the name is a workspace KEY (`Suggestion::source`
+    /// vocabulary — every component plain, never `..`, never absolute —
+    /// the check the CLI's foreign read makes, `Workspace::read_source`)
+    /// that names its file through `own`'s universe root (the rule every
+    /// related note is located by), so the path `may_write` judges cannot
+    /// climb. `None` for a name that is no key, a document with no root,
+    /// a file the action may not write or cannot read.
+    fn suggestion_target(&self, own: &Url, key: &str) -> Option<(Url, String)> {
+        let key = nml_validate::workspace::SourceKey::checked(key)?;
+        let root = self
+            .resolve_document(own)
+            .and_then(|r| r.root.map(|(root, _)| root))?;
+        let path = root.join(key.as_str());
+        if !self.may_write(&path) {
+            return None;
+        }
+        let uri = Url::from_file_path(&path).ok()?;
+        let text = self.editable_text(&uri, &path)?;
+        Some((uri, text))
+    }
+
+    /// Park what the raw `initialize` params of one frame said about
+    /// `workspace.diagnostics.refreshSupport` — LSP 3.17's spelling, which
+    /// lsp-types 0.94.1 drops on deserialization, read by
+    /// [`crate::session::NmlService`] from the request as the client sent it. Parked,
+    /// not applied: only the `initialize` HANDLER — which runs for the one
+    /// frame tower-lsp accepts — turns the capability on, so a duplicate
+    /// `initialize` declares nothing. Written on every frame, so the
+    /// accepted handshake's own value is the one its handler takes.
+    pub fn park_raw_refresh_declaration(&self, declared: bool) {
+        self.raw_refresh_declaration
+            .store(declared, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Take the parked declaration, clearing it.
+    fn take_raw_refresh_declaration(&self) -> bool {
+        self.raw_refresh_declaration
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Ask the client to send `**/*.nml` disk events — the file-watch
+    /// registration, and the second half of the freshness contract.
+    ///
+    /// LSP 3.17 has no static spelling for file watching, so
+    /// `workspace.didChangeWatchedFiles.dynamicRegistration` (half one, read
+    /// in `initialize`) is the only thing that says a client can answer this
+    /// request at all; the answer is half two — a client that DECLINES the
+    /// registration sends no events whatever it declared, and discovery must
+    /// fall back to stat-ing the disk. Both halves, and the transport gate
+    /// [`crate::ask`] adds, are refusals of the same shape, so one `is_err`
+    /// reads them all.
+    async fn ask_the_client_to_watch_nml_files(&self) {
+        if !self
+            .watching_files
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        let registration = Registration {
+            id: "nml-file-watcher".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(
+                serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                    watchers: vec![FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.nml".to_string()),
+                        kind: None,
+                    }],
+                })
+                .unwrap_or_default(),
+            ),
+        };
+        if self
+            .client
+            .ask(|c| c.register_capability(vec![registration]))
+            .await
+            .is_err()
+        {
+            self.watching_files
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Whether any open document OTHER than `uri` holds a cached report —
+    /// the documents a universe change can leave stale.
+    fn other_reports_cached(&self, uri: &Url) -> bool {
+        self.diags_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .any(|other| other != uri)
+    }
+
+    /// The actions of OTHER open documents whose suggestions edit `uri`
+    /// (their `source` names it) at an anchor inside `range` of `text` —
+    /// a manifest opened at the binding a denial points at offers the
+    /// grant there. Read from the cache's FRESH entries only (text and
+    /// resolver generation current), exactly as membership judges a
+    /// round-tripped diagnostic: a document whose diagnostics moved on
+    /// offers nothing here until its next pull.
+    fn actions_targeting(&self, uri: &Url, text: &str, range: Range) -> Vec<CodeAction> {
+        let generation = self.resolver.generation();
+        let fresh: Vec<(Url, String, Arc<Vec<Diagnostic>>)> = {
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self.diags_cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .iter()
+                .filter(|(other, entry)| {
+                    *other != uri
+                        && docs
+                            .get(other)
+                            .is_some_and(|current| entry.is_fresh(current, generation))
+                        && entry.items.iter().any(|d| {
+                            d.data
+                                .as_ref()
+                                .and_then(|data| data.get("suggestions"))
+                                .and_then(|s| s.as_array())
+                                .is_some_and(|s| s.iter().any(|e| e.get("source").is_some()))
+                        })
+                })
+                .map(|(other, entry)| (other.clone(), entry.text.clone(), Arc::clone(&entry.items)))
+                .collect()
+        };
+        let index = LineIndex::new(text);
+        let intersects = |anchor: Range| !(anchor.end < range.start || range.end < anchor.start);
+        let mut out = Vec::new();
+        for (other, other_text, items) in fresh {
+            for diag in items.iter() {
+                let Some(suggestions) = diag
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("suggestions"))
+                    .and_then(|s| s.as_array())
+                else {
+                    continue;
+                };
+                let parsed = parse_suggestion_entries(suggestions);
+                let total = parsed.len();
+                for entry in &parsed {
+                    let Some(key) = entry.source.as_deref() else {
+                        continue;
+                    };
+                    let names_this = self
+                        .suggestion_target(&other, key)
+                        .is_some_and(|(target, _)| target == *uri);
+                    if !names_this {
+                        continue;
+                    }
+                    // The anchor as this document's current text places it.
+                    if entry.end > text.len()
+                        || !intersects(
+                            index.range(nml_core::span::Span::new(entry.start, entry.end)),
+                        )
+                    {
+                        continue;
+                    }
+                    if let Some(action) =
+                        self.suggestion_action(&other, &other_text, entry, total, diag)
+                    {
+                        out.push(action);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// `nml/schemaInfo` (RFC 0030 introspection): which package validates a
     /// file, from where, at which hash, bound how — plus every degraded-state
     /// note. Registered as a custom JSON-RPC method; any LSP client can call
     /// it, the VS Code extension renders it.
+    ///
+    /// **This payload grows by ADDING keys, never by renaming or retyping
+    /// one.** The extension's version floats free of the server's (extension
+    /// 0.4.0 against crates 0.1.0), and two of the three rungs of the RFC 0035
+    /// discovery ladder hand it a separately released server: the `<tool> lsp`
+    /// provider binary, and a `nml.server.path` / `~/.cargo/bin/nml-lsp`
+    /// native build (`editors/vscode/INSTALL.md` builds server and extension
+    /// in independent steps). Only the bundled-WASM rung ships them together.
+    /// Its parser (`editors/vscode/src/contracts/schemaInfo.ts`) validates
+    /// every field by type and rejects the WHOLE payload if one is wrong, so a
+    /// retyped field renders as a plain green `$(check) nml` with the package,
+    /// hash, root and — the harm — the note warning all gone: a degraded
+    /// binding reported as healthy. A richer structure (e.g. a kernel binding
+    /// report) therefore arrives under a NEW key beside `binding`, with the
+    /// old key kept and documented as deprecated for one release.
+    /// `crates/nml-lsp/tests/harness.rs` pins the field types.
     pub async fn schema_info(&self, params: serde_json::Value) -> Result<serde_json::Value> {
         let uri = params
             .get("uri")
@@ -4199,6 +5244,18 @@ impl NmlLanguageServer {
         let Some(uri) = uri else {
             return Ok(serde_json::json!({ "error": "missing or invalid 'uri'" }));
         };
+        // A refused open buffer: unbound, and the cap row is its one note.
+        if let Some(row) = self.refused_buffer_row(&uri) {
+            return Ok(serde_json::json!({
+                "bound": false,
+                "notes": [{
+                    "message": row.message,
+                    "severity": nml_core::diagnostic::Severity::Error.to_string(),
+                    "code": null,
+                    "range": null,
+                }],
+            }));
+        }
         let Some(resolved) = self.resolve_document(&uri) else {
             return Ok(serde_json::json!({ "bound": false, "notes": [] }));
         };
@@ -4211,17 +5268,34 @@ impl NmlLanguageServer {
             docs.get(&uri).cloned()
         };
         let line_index = doc_text.as_deref().map(LineIndex::new);
+        // A note anchored at the document's first declaration parses the
+        // text once, and only when such a note exists.
+        let declaration: std::cell::OnceCell<Option<nml_core::span::Span>> =
+            std::cell::OnceCell::new();
+        let range_of = |sp: nml_core::span::Span| {
+            line_index
+                .as_ref()
+                .map(|li| serde_json::to_value(li.range(sp)).ok())
+        };
         let notes: Vec<serde_json::Value> = resolved
             .notes
             .iter()
             .map(|n| {
                 serde_json::json!({
                     "message": n.message,
-                    "severity": if n.warning { "warning" } else { "info" },
-                    "range": n
-                        .span
-                        .zip(line_index.as_ref())
-                        .map(|(sp, li)| serde_json::to_value(li.range(sp)).ok()),
+                    "severity": n.severity.to_string(),
+                    "code": n.code.map(|c| c.to_string()),
+                    "range": match n.anchor {
+                        packages::NoteAnchor::Top => None,
+                        packages::NoteAnchor::Declaration => declaration
+                            .get_or_init(|| {
+                                doc_text.as_deref().and_then(|text| {
+                                    first_declaration(&diagnostics::ParsedBuffer::parse(text).file)
+                                })
+                            })
+                            .and_then(range_of),
+                        packages::NoteAnchor::At(sp) => range_of(sp),
+                    },
                 })
             })
             .collect();
@@ -4230,6 +5304,35 @@ impl NmlLanguageServer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        // The universe root's facts, in the `--json` root object's
+        // vocabulary (`origin`, `fence`, `shadowed`): how the root was
+        // fixed — `editor` for a workspace folder, `derivedVcsFence` /
+        // `derivedTargetDir` for a document outside every folder — the
+        // fence entry's kind when it is a `.git` entry (`dir`, `file`,
+        // `symlink`, `other`: a FILE is a linked worktree's, a
+        // submodule's or a planted one), and the shadow above it, spelled
+        // from the root it sits above (`../../demo.package.nml`: never
+        // absolute, like `root`, and saying how far above) — what the
+        // CLI's root note says, for a status bar to say too. `null` each
+        // for a document with no universe.
+        let root_origin = resolved.root.as_ref().map(|(_, origin)| origin.tag());
+        let (root_fence, root_shadowed) = match resolved.root.as_ref() {
+            Some((root, nml_validate::workspace::RootOrigin::Derived { fence, shadowed })) => (
+                fence.entry_tag(),
+                shadowed
+                    .as_ref()
+                    .map(|shadow| packages::shadow_display(root, shadow.path())),
+            ),
+            _ => (None, None),
+        };
+        // Whether the universe DECIDES ("closed") or claims nothing
+        // ("open") — the kernel's own two words, the `--json` `binding`
+        // row's. ADDITIVE, per this payload's rule. The status bar had
+        // only `bound: false` for BOTH unbound states, so it gave the
+        // OPEN remedy over a CLOSED universe: *commit a
+        // `<name>.package.nml`* where a manifest already exists and the
+        // fix is a `files` glob. `null` when no universe was built.
+        let universe = resolved.universe.map(|u| u.label());
         Ok(match &resolved.resolution {
             Resolution::Bound(b) => serde_json::json!({
                 "bound": true,
@@ -4237,17 +5340,22 @@ impl NmlLanguageServer {
                 "version": b.package_version,
                 "contentHash": b.content_hash,
                 "binding": b.binding_name,
-                "source": b.source.label(),
-                "step": match b.step {
-                    packages::BindingStep::Pinned => "pinned",
-                    packages::BindingStep::AutoAssociated => "auto-associated",
-                },
+                "source": b.class.label(),
+                "step": b.step.label(),
                 // Workspace-relative — never an absolute host path, and never the
                 // `/workspace` WASI mount prefix on the wasm neutral server.
                 "root": packages::display_path(&b.root, &roots),
+                "rootOrigin": root_origin,
+                "rootFence": root_fence,
+                "rootShadowed": root_shadowed,
                 "shadowsStore": b.shadows_store,
+                "universe": universe,
+                // The binding's composition grant — the `--json` `binding`
+                // row's `layers` object, one spelling: what a denial's
+                // quick fix will produce, readable before it is applied.
+                "layers": layers_value(&resolved.grant),
                 "actions": if b.step == packages::BindingStep::AutoAssociated
-                    && b.source != packages::DefinitionSource::Builtin
+                    && b.class != nml_validate::workspace::ClaimClass::Builtin
                 {
                     serde_json::json!(["pin", "disableAutoAssociation"])
                 } else {
@@ -4255,7 +5363,15 @@ impl NmlLanguageServer {
                 },
                 "notes": notes,
             }),
-            Resolution::Unbound => serde_json::json!({ "bound": false, "notes": notes }),
+            Resolution::Unbound | Resolution::Refused => serde_json::json!({
+                "bound": false,
+                "notes": notes,
+                "layers": layers_value(&resolved.grant),
+                "rootOrigin": root_origin,
+                "rootFence": root_fence,
+                "rootShadowed": root_shadowed,
+                "universe": universe,
+            }),
         })
     }
 
@@ -4279,9 +5395,13 @@ impl NmlLanguageServer {
         )
     }
 
-    /// `nml/explainIndex {} → [{ code, summary }]` (RFC 0010 tier 2): every
-    /// diagnostic code with its one-line summary, in index order — the
-    /// discoverability surface behind the editor's explain-a-code palette.
+    /// `nml/explainIndex {} → [{ code, headline, summary }]` (RFC 0010 tier
+    /// 2): every diagnostic code with its one-line headline (the bold lead
+    /// its section opens with — what a palette row shows) and its
+    /// first-paragraph summary (what a search matches on), in index order —
+    /// the discoverability surface behind the editor's explain-a-code
+    /// palette. `headline` is an addition; a client that reads `summary`
+    /// alone reads what it did.
     /// Deliberately flat: band grouping would promote the allocation bands
     /// into wire API, which they are documented not to be. Params are
     /// accepted and ignored (tolerant of `{}`, `null`, or absent).
@@ -4289,17 +5409,30 @@ impl NmlLanguageServer {
         Ok(serde_json::Value::Array(
             nml_core::diagnostic::explain_index()
                 .into_iter()
-                .map(|(code, summary)| serde_json::json!({ "code": code, "summary": summary }))
+                .map(|(code, summary)| {
+                    serde_json::json!({
+                        "code": code,
+                        "headline": nml_core::diagnostic::explain_headline(code),
+                        "summary": summary,
+                    })
+                })
                 .collect(),
         ))
     }
 }
 
-/// Compute the full new text of an **existing** `nml-project.nml` for a
-/// pin/opt-out edit via the CST splice API (`nml_core::cst::edit`, RFC 0030
-/// P2) — a comment-preserving structural insert, not a line-offset text
-/// patch. `None` when the edit is redundant (already pinned / already opted
-/// out) or the file has no `project` block to target.
+/// The `nml-project.nml` a pin or opt-out creates when none is live: the
+/// bare `project` header the edit is inserted under, exactly as it would
+/// be into an existing config.
+const PROJECT_SKELETON: &str = "project Project:\n";
+
+/// Compute the full new text of an `nml-project.nml` — an existing one, or
+/// [`PROJECT_SKELETON`] for a config being created — for a pin/opt-out
+/// edit via the CST splice API (`nml_core::cst::edit`, RFC 0030 P2) — a
+/// comment-preserving structural insert nested by the file's own
+/// indentation (the canonical unit for the skeleton), not a line-offset
+/// text patch. `None` when the edit is redundant (already pinned /
+/// already opted out) or the file has no `project` block to target.
 fn project_file_insertion(text: &str, edit: &ProjectEdit) -> Option<String> {
     use nml_core::cst::edit::{EntryPosition, insert_entry_at_path};
     // Idempotency is decided structurally, through the SAME parser that reads
@@ -4334,7 +5467,7 @@ fn project_file_insertion(text: &str, edit: &ProjectEdit) -> Option<String> {
                 insert_entry_at_path(
                     text,
                     &["project"],
-                    &format!("schemaPackages:\n    - {name}"),
+                    &format!("schemaPackages:\n{}- {name}", nml_core::cst::INDENT_UNIT),
                     EntryPosition::AfterHeader,
                 )
             })
@@ -4354,6 +5487,15 @@ fn project_file_insertion(text: &str, edit: &ProjectEdit) -> Option<String> {
         }
     }
 }
+
+/// The name this server answers `initialize` with (LSP 3.17 `serverInfo.name`).
+///
+/// One string, in one place: the standalone `nml-lsp` binary and every schema
+/// provider that embeds [`crate::serve`] are the SAME server, so they answer
+/// with the same name. A client that spawned a project-declared `<tool> lsp`
+/// uses it to confirm that what it started really is an NML language server
+/// before it keeps talking to it.
+pub const SERVER_NAME: &str = "nml-lsp";
 
 #[tower_lsp::async_trait]
 impl LanguageServer for NmlLanguageServer {
@@ -4378,6 +5520,60 @@ impl LanguageServer for NmlLanguageServer {
             .unwrap_or(false);
         self.label_details_support
             .store(label_details, std::sync::atomic::Ordering::Relaxed);
+        // LSP 3.17 §WorkspaceEdit: `documentChanges` (versioned edits) and
+        // the resource operations are the client's to declare; the
+        // server's edits take the shape the client can apply.
+        let workspace_edit = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.workspace_edit.as_ref());
+        self.versioned_edits.store(
+            workspace_edit
+                .and_then(|w| w.document_changes)
+                .unwrap_or(false),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.creates_files.store(
+            workspace_edit
+                .and_then(|w| w.resource_operations.as_ref())
+                .is_some_and(|ops| ops.contains(&ResourceOperationKind::Create)),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // lsp-types' spelling of the capability (`workspace.diagnostic`),
+        // OR the specification's (`workspace.diagnostics`), which
+        // [`crate::session::NmlService`] read from the raw params of THIS frame
+        // before this handler ran and parked for the handler to take —
+        // so the capabilities of an `initialize` tower-lsp REFUSED (a
+        // duplicate: `invalid_request`, this handler never runs) reach
+        // nothing. The take is unconditional, never short-circuited: a
+        // parked declaration left behind would be read by the next
+        // handshake that ran.
+        let raw_refresh = self.take_raw_refresh_declaration();
+        let typed_refresh = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.diagnostic.as_ref())
+            .and_then(|d| d.refresh_support)
+            .unwrap_or(false);
+        self.refresh_diagnostics.store(
+            typed_refresh || raw_refresh,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // Half one of the freshness contract: the client says it can take a
+        // dynamic file-watch registration. Half two is the registration's
+        // own answer, in `initialized`.
+        self.watching_files.store(
+            params
+                .capabilities
+                .workspace
+                .as_ref()
+                .and_then(|w| w.did_change_watched_files.as_ref())
+                .and_then(|f| f.dynamic_registration)
+                .unwrap_or(false),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // RFC 0010 tier 2: the client may declare the command id it registered
         // for opening full error explanations. Declared ⇒ diagnostics grow an
         // "Explain NML0000" code action carrying that command; undeclared ⇒
@@ -4398,25 +5594,36 @@ impl LanguageServer for NmlLanguageServer {
             .map(|folders| folders.iter().map(|f| f.uri.clone()).collect())
             .or_else(|| params.root_uri.clone().map(|u| vec![u]))
             .unwrap_or_default();
-        *self
-            .workspace_roots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = roots
-            .iter()
-            .filter_map(|r| r.to_file_path().ok())
-            .filter_map(|p| dunce::canonicalize(&p).ok())
-            .collect();
-        if !roots.is_empty() {
-            self.index_workspace(&roots);
-            self.rebuild_schema_registry();
-            self.client
-                .log_message(
-                    MessageType::INFO,
-                    format!("NML: indexed {} workspace root(s)", roots.len()),
-                )
-                .await;
+        {
+            let mut folders: Vec<PathBuf> = roots.iter().filter_map(folder_path).collect();
+            folders.sort();
+            *self
+                .workspace_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = folders;
         }
+        // The index is deliberately NOT built here: `initialize` gates the
+        // whole handshake (the client may send nothing until it answers), and
+        // the sweep is the single most expensive thing the server does. It is
+        // queued for `initialized`, a notification the client does not wait
+        // on.
+        *self
+            .pending_index_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = roots;
         Ok(InitializeResult {
+            // LSP 3.17 §initialize: `serverInfo` is how a client learns WHAT
+            // answered its handshake. Every provider tool embeds
+            // [`crate::serve`], so this name is the PROTOCOL implementation's,
+            // not the embedding tool's — a client that launched `<tool> lsp`
+            // learns from it that an NML language server is on the other end,
+            // which is exactly the question "did the thing I spawned turn out
+            // to be one?". The version is the crate's, so a client can report
+            // it and a bug report names a build.
+            server_info: Some(ServerInfo {
+                name: SERVER_NAME.to_string(),
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            }),
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
@@ -4475,34 +5682,74 @@ impl LanguageServer for NmlLanguageServer {
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 semantic_tokens_provider: Some(crate::semantic_tokens::server_capabilities()),
+                // Workspace folders added or removed while the server
+                // runs are honoured (`workspace/didChangeWorkspaceFolders`):
+                // a folder added at runtime is indexed and governs its
+                // documents (they were "outside every folder" until a
+                // restart), a removed one leaves with its universe.
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                        supported: Some(true),
+                        change_notifications: Some(OneOf::Left(true)),
+                    }),
+                    file_operations: None,
+                }),
                 ..Default::default()
             },
-            ..Default::default()
         })
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        // Dynamic capability registration is a server→client *request*. The wasm
-        // neutral server (RFC 0035) is driven by a synchronous pump that cannot
-        // await one, so file-watch registration is native-only; under
-        // `wasm-wasi-core` the editor host drives file events without it.
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let registration = Registration {
-                id: "nml-file-watcher".to_string(),
-                method: "workspace/didChangeWatchedFiles".to_string(),
-                register_options: Some(
-                    serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
-                        watchers: vec![FileSystemWatcher {
-                            glob_pattern: GlobPattern::String("**/*.nml".to_string()),
-                            kind: None,
-                        }],
-                    })
-                    .unwrap_or_default(),
-                ),
-            };
-            let _ = self.client.register_capability(vec![registration]).await;
+        // The workspace sweep queued by `initialize`. Running it here keeps it
+        // off the handshake's critical path; ordering is still exact, because
+        // the client must send `initialized` before any other message and both
+        // transports (tower-lsp's ordered `buffer_unordered` feed and the wasm
+        // pump's strict read→call→write loop) deliver in arrival order.
+        let roots = std::mem::take(
+            &mut *self
+                .pending_index_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        if !roots.is_empty() {
+            let denials = self.index_workspace(&roots);
+            self.rebuild_schema_registry();
+            // A buffer opened while the sweep ran (an editor opens its
+            // active file right after `initialized`, and tower-lsp runs
+            // the handlers concurrently) was pulled against the unindexed
+            // universe, and a pull client pulls again only on an edit, a
+            // focus, or this request: ask a client that declared
+            // `refreshSupport` to pull now that the index stands. A
+            // client whose first open came after the sweep is asked
+            // nothing — no buffer is open at this point (`documents`
+            // also holds the indexed copies, so it is not the signal).
+            let opened_during_sweep = !self
+                .open_docs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+            if opened_during_sweep
+                && self
+                    .refresh_diagnostics
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                let _ = self.client.ask(|c| c.workspace_diagnostic_refresh()).await;
+            }
+            // Loud, fail-closed: what the kernel denied is not indexed,
+            // and the editor says so once per denial, as a warning.
+            for denial in denials {
+                self.client
+                    .log_message(MessageType::WARNING, format!("NML: {denial}"))
+                    .await;
+            }
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("NML: indexed {} workspace root(s)", roots.len()),
+                )
+                .await;
         }
+        self.ask_the_client_to_watch_nml_files().await;
         self.client
             .log_message(MessageType::INFO, "NML language server initialized")
             .await;
@@ -4524,7 +5771,25 @@ impl LanguageServer for NmlLanguageServer {
         // An unknown document (never opened, not indexed) has nothing to
         // report — an empty full report, never an error. A cache hit means
         // the *Unchanged* comparison below costs no re-validation (RFC 0010).
-        let items = self.cached_diagnostics(&uri).await.unwrap_or_default();
+        let generation_before = self.resolver.generation();
+        let items = self
+            .cached_diagnostics(&uri)
+            .await
+            .map(|(_, items)| items)
+            .unwrap_or_default();
+        // This pull rediscovered the universe (a universe input changed
+        // under it): every OTHER open document's cached report may now be
+        // stale — the actions offered from those reports with it. A client
+        // that declared `refreshSupport` is asked to re-pull them, once per
+        // change (the re-pulls hit the fresh cache and ask nothing).
+        if self
+            .refresh_diagnostics
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.resolver.generation() != generation_before
+            && self.other_reports_cached(&uri)
+        {
+            let _ = self.client.ask(|c| c.workspace_diagnostic_refresh()).await;
+        }
         // The fill path drains; a cache hit skips it — but other handlers may
         // have queued store events since, so the pull stays the reliable
         // delivery path (cheap no-op when empty).
@@ -4554,6 +5819,73 @@ impl LanguageServer for NmlLanguageServer {
         ))
     }
 
+    /// A workspace folder added while the server runs joins the roots and
+    /// is indexed exactly as at `initialized` (its denials said the same
+    /// way); a removed one leaves the roots with its universe and its
+    /// indexed (not open) documents. A document under an added folder
+    /// resolves under it from the next pull — the folder wins over the
+    /// derivation the document had outside every folder (R1).
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        let added: Vec<Url> = params.event.added.iter().map(|f| f.uri.clone()).collect();
+        let removed: Vec<PathBuf> = params
+            .event
+            .removed
+            .iter()
+            .filter_map(|f| folder_path(&f.uri))
+            .collect();
+        {
+            let mut roots = self
+                .workspace_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            roots.retain(|r| !removed.contains(r));
+            for root in added.iter().filter_map(folder_path) {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+            // An added folder takes its place among the others, never the
+            // end: the list's ORDER is the rule (an ancestor before its
+            // descendants), not an arrival log.
+            roots.sort();
+        }
+        if !removed.is_empty() {
+            self.resolver.invalidate_claims_for(&removed);
+            let open = self
+                .open_docs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let mut docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            let mut indexed = self.indexed_uris.lock().unwrap_or_else(|e| e.into_inner());
+            indexed.retain(|uri| {
+                let under = uri
+                    .to_file_path()
+                    .is_ok_and(|p| removed.iter().any(|r| p.starts_with(r)));
+                if under && !open.contains(uri) {
+                    docs.remove(uri);
+                }
+                !under
+            });
+        }
+        if !added.is_empty() {
+            let denials = self.index_workspace(&added);
+            for denial in denials {
+                self.client
+                    .log_message(MessageType::WARNING, format!("NML: {denial}"))
+                    .await;
+            }
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("NML: indexed {} workspace root(s)", added.len()),
+                )
+                .await;
+        }
+        // The registry and every document's diagnostics follow the roots.
+        self.rebuild_schema_registry();
+    }
+
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         self.open_docs
             .lock()
@@ -4561,12 +5893,20 @@ impl LanguageServer for NmlLanguageServer {
             .insert(params.text_document.uri.clone());
         // State only; the client pulls this document's diagnostics (didOpen
         // triggers a pull under the diagnostic-provider capability).
-        self.on_change(params.text_document.uri, params.text_document.text);
+        self.on_change(
+            params.text_document.uri,
+            params.text_document.text,
+            Some(params.text_document.version),
+        );
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         if let Some(change) = params.content_changes.into_iter().last() {
-            self.on_change(params.text_document.uri, change.text);
+            self.on_change(
+                params.text_document.uri,
+                change.text,
+                Some(params.text_document.version),
+            );
         }
     }
 
@@ -4576,17 +5916,36 @@ impl LanguageServer for NmlLanguageServer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&uri);
+        self.refused_buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&uri);
         self.diags_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&uri);
-        let was_model = uri.as_str().ends_with(".model.nml");
+        let was_model = is_schema_source(&uri);
         let indexed = self
             .indexed_uris
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .contains(&uri);
-        if !indexed {
+        if indexed {
+            // The document's truth is the DISK's again (LSP: after
+            // `didClose` the server no longer holds the client's text —
+            // an unsaved edit goes with the buffer): the indexed copy is
+            // re-read under the index's own bound, so a buffer refused
+            // past it (nothing stored) whose disk copy is under it is
+            // indexed again, and a copy that cannot be read is
+            // un-indexed and said, as the index says it. (The last
+            // buffer text used to stay in the index until a watcher
+            // event; a refused one left the document absent.)
+            if let Some(denial) = self.reindex_closed(&uri) {
+                self.client
+                    .log_message(MessageType::WARNING, format!("NML: {denial}"))
+                    .await;
+            }
+        } else {
             self.documents
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -4669,18 +6028,41 @@ impl LanguageServer for NmlLanguageServer {
                     if !eligible {
                         continue;
                     }
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        // Disk-backed like the startup index, so mark it
-                        // indexed: `did_close` drops non-indexed documents,
-                        // and without this a watcher-created file that was
-                        // opened then closed would vanish from the registry
-                        // (dependents stuck on "unknown" until the next
-                        // disk event) even though it still exists on disk.
-                        self.indexed_uris
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(change.uri.clone());
-                        self.on_change(change.uri, content);
+                    // Disk-backed like the startup index — read under the
+                    // SAME per-file bound the index uses (a tenant-committed
+                    // `.nml` created or grown while the editor is open was
+                    // read whole into the store: +96 MB for a 48 MiB file)
+                    // — and a refusal is SAID, as the
+                    // index says it, never skipped silently.
+                    match read_leaf(&path, MAX_INDEX_BYTES, INDEXED_FILE) {
+                        Ok(content) => {
+                            // Mark it indexed: `did_close` drops non-indexed
+                            // documents, and without this a watcher-created
+                            // file that was opened then closed would vanish
+                            // from the registry (dependents stuck on
+                            // "unknown" until the next disk event) even
+                            // though it still exists on disk.
+                            self.indexed_uris
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(change.uri.clone());
+                            let stamp = packages::disk_stamp(&path);
+                            self.on_change(change.uri.clone(), content, None);
+                            if let Some(stamp) = stamp {
+                                self.documents
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .note_disk(change.uri, stamp);
+                            }
+                        }
+                        Err(why) => {
+                            self.client
+                                .log_message(
+                                    MessageType::WARNING,
+                                    format!("NML: `{}` is not indexed: {why}", path.display()),
+                                )
+                                .await;
+                        }
                     }
                 }
                 FileChangeType::DELETED => {
@@ -4702,7 +6084,7 @@ impl LanguageServer for NmlLanguageServer {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&change.uri);
-                    if change.uri.as_str().ends_with(".model.nml") {
+                    if is_schema_source(&change.uri) {
                         // Other documents heal on their next pull.
                         self.rebuild_schema_registry();
                     }
@@ -4722,7 +6104,7 @@ impl LanguageServer for NmlLanguageServer {
         // Checked before the value branch — a field line with a default
         // (`port number = 80 #li`) has an `=` before the cursor, so the value
         // detector would otherwise claim it.
-        if uri.as_str().ends_with(".model.nml") {
+        if is_schema_source(&uri) {
             let in_directive_position = {
                 let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
                 docs.get(&uri)
@@ -4744,12 +6126,15 @@ impl LanguageServer for NmlLanguageServer {
                 if let packages::VocabularyOutcome::Covered(vocab) =
                     self.vocabulary_for_document(&uri)
                 {
-                    for d in &vocab.directives {
+                    // The language's merge-policy directives first, then the
+                    // package's declared entries (RFC 0019: the builtins are
+                    // merged into every vocabulary outcome).
+                    for e in vocab.vocabulary.entries() {
                         items.push(CompletionItem {
-                            label: d.name.clone(),
+                            label: e.name.to_string(),
                             kind: Some(CompletionItemKind::KEYWORD),
-                            detail: Some(d.arg.label().to_string()),
-                            documentation: Some(Documentation::String(d.doc.clone())),
+                            detail: Some(e.arg.label().to_string()),
+                            documentation: Some(Documentation::String(e.doc.to_string())),
                             ..Default::default()
                         });
                     }
@@ -4790,13 +6175,7 @@ impl LanguageServer for NmlLanguageServer {
             };
 
             if template_context.is_some() {
-                let namespaces: Vec<String> = {
-                    let pc = self
-                        .project_config
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    pc.template_namespaces.clone()
-                };
+                let namespaces: Vec<String> = self.project_config_of(&uri).template_namespaces;
                 for ns in &namespaces {
                     items.push(CompletionItem {
                         label: format!("{ns}."),
@@ -4994,7 +6373,7 @@ impl LanguageServer for NmlLanguageServer {
                                 if let Some(e) = index.enum_def(keyword) {
                                     for (i, variant) in e.variants.iter().enumerate() {
                                         items.push(CompletionItem {
-                                            label: format!("\"{variant}\""),
+                                            label: nml_core::source_policy::string_literal(variant),
                                             kind: Some(CompletionItemKind::ENUM_MEMBER),
                                             detail: Some("enum variant".to_string()),
                                             sort_text: Some(format!("0_{i:03}")),
@@ -5215,10 +6594,7 @@ impl LanguageServer for NmlLanguageServer {
                 }
             }
 
-            let pc = self
-                .project_config
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let pc = self.project_config_of(&uri);
             for kw in &pc.keywords {
                 if seen.insert(kw.clone()) {
                     items.push(CompletionItem {
@@ -5311,47 +6687,62 @@ impl LanguageServer for NmlLanguageServer {
         let line_index = LineIndex::new(&source);
 
         // 1. Machine-applicable suggestions the validator derived — never
-        //    re-derived, never parsed out of message text.
+        //    re-derived, never parsed out of message text. STALENESS is
+        //    settled by MEMBERSHIP, not by a version: an action is offered
+        //    only for a client diagnostic whose `data` equals a member's
+        //    `data` in the current cache — `data` is the one field the LSP
+        //    spec preserves verbatim between a report and `codeAction`,
+        //    the cache is keyed by exact text AND registry generation, and
+        //    the action consumes only `data` plus the current text. A
+        //    buffer edit or a registry rebuild (which no document version
+        //    can see) therefore yields NO action, never an edit at a stale
+        //    offset. Equal `data` on the current text yields the identical
+        //    action, so which member matched is immaterial.
+
+        // The cache (and its line index) is consulted only when some
+        // context diagnostic actually carries suggestion `data` — most
+        // code-action requests (selection menus over clean text) skip
+        // the clone, the compare and the index scan entirely.
+        let wants_suggestions = params.context.diagnostics.iter().any(|d| d.data.is_some());
+        let cached = if wants_suggestions {
+            self.cached_diagnostics(&uri).await
+        } else {
+            None
+        };
+        // Resolution and edit ranges use the exact text the cached
+        // diagnostics were computed against — never the snapshot above —
+        // so membership and the emitted edits stay coherent even if a
+        // `didChange` interleaves between the two reads.
+        let cache_text = cached.as_ref().map_or("", |(text, _)| text.as_str());
         for diag in &params.context.diagnostics {
-            let Some(suggestions) = diag
-                .data
+            let Some(data) = diag.data.as_ref() else {
+                continue;
+            };
+            let current = cached
                 .as_ref()
-                .and_then(|d| d.get("suggestions"))
-                .and_then(|s| s.as_array())
-            else {
+                .is_some_and(|(_, items)| items.iter().any(|d| d.data.as_ref() == Some(data)));
+            if !current {
+                continue;
+            }
+            let Some(suggestions) = data.get("suggestions").and_then(|s| s.as_array()) else {
                 continue;
             };
             let parsed = parse_suggestion_entries(suggestions);
             let total = parsed.len();
-            for (replacement, start, end, kind) in parsed {
-                let edit = TextEdit {
-                    range: line_index.range(nml_core::span::Span::new(start, end)),
-                    new_text: replacement.clone(),
-                };
-                let mut changes = std::collections::HashMap::new();
-                changes.insert(uri.clone(), vec![edit]);
-                // Titles derive from the suggestion KIND; `is_preferred` only
-                // for a SINGLETON did-you-mean — N mutually exclusive fixes
-                // must never let the editor auto-apply a guess (the exact
-                // ambiguity RFC 0015 D2 exists to forbid).
-                let title = if kind == "fix" {
-                    format!("Apply fix: `{replacement}`")
-                } else {
-                    format!("Replace with \"{replacement}\"")
-                };
-                let preferred = kind == "didYouMean" && total == 1;
-                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title,
-                    kind: Some(CodeActionKind::QUICKFIX),
-                    diagnostics: Some(vec![diag.clone()]),
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(changes),
-                        ..Default::default()
-                    }),
-                    is_preferred: preferred.then_some(true),
-                    ..Default::default()
-                }));
+            for entry in &parsed {
+                if let Some(action) = self.suggestion_action(&uri, cache_text, entry, total, diag) {
+                    push_unique_action(&mut actions, action);
+                }
             }
+        }
+
+        // 1b. The same insertions, offered ON THE FILE THEY EDIT: a manifest
+        //     opened at the binding a content file's denial points at (its
+        //     related location) offers the grant there too — from the fresh
+        //     cached diagnostics of the open documents that named this one,
+        //     never a re-validation.
+        for action in self.actions_targeting(&uri, &source, params.range) {
+            push_unique_action(&mut actions, action);
         }
 
         // 2. Pin / opt-out on auto-associated documents. Structural CST
@@ -5361,28 +6752,35 @@ impl LanguageServer for NmlLanguageServer {
         if let Some(resolved) = self.resolve_document(&uri) {
             if let Resolution::Bound(binding) = &resolved.resolution {
                 if binding.step == packages::BindingStep::AutoAssociated
-                    && binding.source != packages::DefinitionSource::Builtin
+                    && binding.class != nml_validate::workspace::ClaimClass::Builtin
+                    && uri.to_file_path().is_ok()
                 {
-                    if let Ok(path) = uri.to_file_path() {
-                        let name = &binding.package_name;
-                        if let Some(action) = self.project_edit_action(
-                            &path,
-                            &binding.root,
-                            format!("Pin schema package '{name}'"),
-                            ProjectEdit::Pin(name.clone()),
-                        ) {
-                            actions.push(CodeActionOrCommand::CodeAction(action));
-                        }
-                        if let Some(action) = self.project_edit_action(
-                            &path,
-                            &binding.root,
-                            format!(
-                                "Not a {name} project? Disable schema auto-association for this root"
-                            ),
-                            ProjectEdit::OptOut,
-                        ) {
-                            actions.push(CodeActionOrCommand::CodeAction(action));
-                        }
+                    let name = &binding.package_name;
+                    // The config a pin or opt-out belongs in — the
+                    // kernel's nearest live one — looked up once for
+                    // both actions.
+                    let config = self
+                        .with_workspace_view(&uri, |path, view| {
+                            self.resolver.project_config_path_for(path, view)
+                        })
+                        .flatten();
+                    if let Some(action) = self.project_edit_action(
+                        config.as_deref(),
+                        &binding.root,
+                        format!("Pin schema package '{name}'"),
+                        ProjectEdit::Pin(name.clone()),
+                    ) {
+                        actions.push(CodeActionOrCommand::CodeAction(action));
+                    }
+                    if let Some(action) = self.project_edit_action(
+                        config.as_deref(),
+                        &binding.root,
+                        format!(
+                            "Not a {name} project? Disable schema auto-association for this root"
+                        ),
+                        ProjectEdit::OptOut,
+                    ) {
+                        actions.push(CodeActionOrCommand::CodeAction(action));
                     }
                 }
             }
@@ -5485,14 +6883,20 @@ impl LanguageServer for NmlLanguageServer {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
+                        // The grant beside the binding, in `nml binding`'s
+                        // words: what composition this file is permitted.
+                        let layers = layers_summary(&resolved.grant)
+                            .map(|s| format!("\n\nlayers: {s}"))
+                            .unwrap_or_default();
                         let summary = format!(
-                        "**Schema package:** `{}` {} · `{}` · {} · binding `{}`\n\nroot: `{}`{}",
+                        "**Schema package:** `{}` {} · `{}` · {} · binding `{}`\n\nroot: `{}`{}{}",
                         b.package_name,
                         b.package_version,
                         format_args!("blake3:{}", nml_validate::store::hash8(&b.content_hash)),
-                        b.source.label(),
+                        b.class.label(),
                         b.binding_name,
                         packages::display_path(&b.root, &roots),
+                        layers,
                         if b.step == packages::BindingStep::AutoAssociated {
                             "\n\n_auto-associated — a `schemaPackages` pin makes this explicit_"
                         } else {
@@ -5536,7 +6940,7 @@ impl LanguageServer for NmlLanguageServer {
             // Directive hover (RFC 0030/0032): `#name` in a covered model file
             // renders the vocabulary entry. Unknown names get no hover — the
             // vocabulary diagnostic already explains them.
-            if uri.as_str().ends_with(".model.nml") {
+            if is_schema_source(&uri) {
                 if let Some(name) = directive_name_at(line, byte_col) {
                     // Covered files only: without a known vocabulary there is no
                     // entry to render (undetermined coverage already surfaced
@@ -5544,7 +6948,7 @@ impl LanguageServer for NmlLanguageServer {
                     if let packages::VocabularyOutcome::Covered(vocab) =
                         self.vocabulary_for_document(&uri)
                     {
-                        if let Some(d) = vocab.directives.iter().find(|d| d.name == name) {
+                        if let Some(d) = vocab.vocabulary.get(&name) {
                             return Ok(Some(Hover {
                                 contents: HoverContents::Markup(MarkupContent {
                                     kind: MarkupKind::Markdown,
@@ -5555,7 +6959,7 @@ impl LanguageServer for NmlLanguageServer {
                                         "**#{}** ({}) — {}",
                                         d.name,
                                         d.arg.label(),
-                                        escape_markdown_fences(&d.doc)
+                                        escape_markdown_fences(d.doc)
                                     ),
                                 }),
                                 range: None,
@@ -5764,14 +7168,15 @@ impl LanguageServer for NmlLanguageServer {
             return Ok(None);
         }
 
-        let docs: HashMap<Url, String> = self
-            .documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        // BORROWED, never copied: this map holds every indexed file's
+        // full text, so cloning it charged the whole workspace's bytes to
+        // one keystroke-frequency request. The readers below are free
+        // functions over the map and never re-enter the server, so the
+        // guard is simply held across them.
+        let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
         let mut locations = Vec::new();
 
-        for (doc_uri, source) in &docs {
+        for (doc_uri, source) in docs.iter() {
             let line_index = LineIndex::new(source);
             for range in find_references_in_source(source, &word, &line_index) {
                 locations.push(Location {
@@ -5999,7 +7404,40 @@ impl LanguageServer for NmlLanguageServer {
 
         let formatted = match nml_fmt::formatter::format_source(&source_clone) {
             Ok(f) => f,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                // Never a lossy rewrite: a document that does not parse is
+                // not formatted (RFC 0004's own rule), and the reason is
+                // SAID — as a log line, not a `window/showMessage` toast:
+                // the parse finding already marks the line, and
+                // format-on-save would otherwise toast every save (the
+                // documented practice of rust-analyzer's formatting handler
+                // for a parse error). `null` is LSP's "no edits".
+                let finding = e.to_diagnostic();
+                let at = nml_core::span::SourceMap::new(&source_clone).location(e.span().start);
+                let roots = self
+                    .workspace_roots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let name = uri
+                    .to_file_path()
+                    .map(|p| packages::source_name_of(&p, &roots))
+                    .unwrap_or_else(|_| uri.to_string());
+                let code = finding.code.map(|c| format!(" [{c}]")).unwrap_or_default();
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!(
+                            "NML: formatting skipped for {name}: {}:{}:{code} {} — the formatter \
+                             never rewrites a document it cannot round-trip; fix the parse error first",
+                            at.line,
+                            at.column,
+                            finding.rendered()
+                        ),
+                    )
+                    .await;
+                return Ok(None);
+            }
         };
         if formatted == source_clone {
             return Ok(None);
@@ -6055,7 +7493,20 @@ impl LanguageServer for NmlLanguageServer {
             return Ok(None);
         }
 
-        let desired = compute_indent_after_line(&lines, prev_line_idx);
+        // The unit is read at the previous line's first character — the
+        // header the new line nests under (LSP 3.17 §FormattingOptions'
+        // `tabSize` is the CLIENT's guess at this document; the tree
+        // knows, and tabs are never NML indentation).
+        let unit = {
+            let line_start: usize = source
+                .split_inclusive('\n')
+                .take(prev_line_idx)
+                .map(str::len)
+                .sum();
+            let content = lines[prev_line_idx].len() - lines[prev_line_idx].trim_start().len();
+            nml_core::cst::edit::indentation_unit_at(&source, line_start + content).len()
+        };
+        let desired = compute_indent_after_line(&lines, prev_line_idx, unit);
         let indent_str: String = " ".repeat(desired);
 
         let current_line_idx = pos.line as usize;
@@ -6102,37 +7553,44 @@ impl LanguageServer for NmlLanguageServer {
             return Ok(None);
         }
 
-        let docs: HashMap<Url, String> = self
-            .documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        // BORROWED, never copied: this map holds every indexed file's
+        // full text, so cloning it charged the whole workspace's bytes to
+        // one keystroke-frequency request. The readers below are free
+        // functions over the map and never re-enter the server, so the
+        // guard is simply held across them.
+        // The guard is released before the edit is built: the versioned
+        // shape reads the same map for each document's client version, and
+        // `std::sync::Mutex` is not re-entrant.
+        let per_file: Vec<(Url, Vec<TextEdit>)> = {
+            let docs = self.documents.lock().unwrap_or_else(|e| e.into_inner());
+            docs.iter()
+                .filter_map(|(doc_uri, source)| {
+                    let line_index = LineIndex::new(source);
+                    let refs = find_references_in_source(source, &word, &line_index);
+                    (!refs.is_empty()).then(|| {
+                        (
+                            doc_uri.clone(),
+                            refs.into_iter()
+                                .map(|range| TextEdit {
+                                    range,
+                                    new_text: new_name.clone(),
+                                })
+                                .collect(),
+                        )
+                    })
+                })
+                .collect()
+        };
 
-        for (doc_uri, source) in &docs {
-            let line_index = LineIndex::new(source);
-            let refs = find_references_in_source(source, &word, &line_index);
-            if !refs.is_empty() {
-                changes.insert(
-                    doc_uri.clone(),
-                    refs.into_iter()
-                        .map(|range| TextEdit {
-                            range,
-                            new_text: new_name.clone(),
-                        })
-                        .collect(),
-                );
-            }
+        if per_file.is_empty() {
+            return Ok(None);
         }
-
-        if changes.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            }))
-        }
+        // Through the ONE edit shape, like every other action: a rename
+        // spanning files is exactly what a VERSIONED edit is for — the
+        // client refuses it wholesale if any of those buffers moved on
+        // since. (It used to hand out plain `changes`, unversioned,
+        // whatever the client declared.)
+        Ok(Some(self.workspace_edits(per_file)))
     }
 
     async fn prepare_rename(
@@ -6191,8 +7649,102 @@ fn rename_word_byte_range(line: &str, byte_col: usize) -> (usize, usize) {
 
 // ── Tests ─────────────────────────────────────────────────────
 
+use crate::packages::canonical_above_roots;
+
 #[cfg(test)]
 mod tests {
+
+    /// Step 0e: a document path is canonical ABOVE its workspace root and
+    /// untouched below it. A link an author committed inside the root
+    /// reaches the kernel as the link (NML2083, as `nml check` says);
+    /// the editor used to canonicalize the whole path and judge the
+    /// link's TARGET under whatever binding claims it. An operator's
+    /// symlinked prefix above the root (a linked checkout, macOS's
+    /// `/tmp`) still resolves onto the canonical root; outside every
+    /// root the path stays as spelled (the kernel derives a root from
+    /// it, following links only above the fence).
+    #[cfg(unix)]
+    #[test]
+    fn a_document_path_is_canonical_above_its_root_and_untouched_below() {
+        let base = crate::scratch::Scratch::new("lsp-canon");
+        std::fs::create_dir_all(base.join("real/ws/tenants/cu")).unwrap();
+        let root = dunce::canonicalize(base.join("real/ws")).unwrap();
+        std::fs::write(root.join("tenants/cu/plain.flow.nml"), "").unwrap();
+        std::os::unix::fs::symlink("plain.flow.nml", root.join("tenants/cu/link.flow.nml"))
+            .unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("alias")).unwrap();
+        let roots = vec![root.clone()];
+        // Inside the root: the link is kept.
+        let inside = root.join("tenants/cu/link.flow.nml");
+        assert_eq!(super::canonical_above_roots(inside.clone(), &roots), inside);
+        // Through an operator's link ABOVE the root: the prefix resolves,
+        // the link below it does not.
+        let aliased = base.join("alias/ws/tenants/cu/link.flow.nml");
+        assert_eq!(super::canonical_above_roots(aliased, &roots), inside);
+        // Outside every root: as spelled — never resolved through a link
+        // the kernel has not judged.
+        let _ = std::fs::write(base.join("x.nml"), "");
+        assert_eq!(
+            super::canonical_above_roots(base.join("alias/../x.nml"), &roots),
+            base.join("alias/../x.nml")
+        );
+    }
+    /// A related note's file is read from disk
+    /// only up to [`MAX_LOCATE_BYTES`]; an open buffer is the truth at
+    /// any size.
+    #[test]
+    fn locating_a_notes_file_is_capped_at_max_locate_bytes() {
+        let base = crate::scratch::Scratch::new("lsp-locate");
+        let small = base.join("small.nml");
+        std::fs::write(&small, "model s:\n    a number\n").unwrap();
+        let big = base.join("big.nml");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_LOCATE_BYTES + 1)
+            .unwrap();
+        let docs = HashMap::new();
+        assert!(locate_source(&docs, &small).is_some_and(|(_, text)| text.contains("model s")));
+        assert!(
+            locate_source(&docs, &big).is_none(),
+            "over the cap: not read"
+        );
+        let mut docs = HashMap::new();
+        docs.insert(Url::from_file_path(&big).unwrap(), "buffered".to_string());
+        assert!(locate_source(&docs, &big).is_some_and(|(_, text)| text == "buffered"));
+    }
+
+    /// Code actions from one diagnostic's wire
+    /// suggestions are capped at [`MAX_SUGGESTION_ACTIONS`] VALID entries
+    /// — malformed padding neither counts nor buries a real one.
+    #[test]
+    fn suggestion_actions_are_capped_at_the_bound_after_validation() {
+        let valid = |i: usize| serde_json::json!({"replacement": format!("r{i}"), "start": 0, "end": 1, "kind": "fix"});
+        let entries: Vec<serde_json::Value> = (0..MAX_SUGGESTION_ACTIONS + 4).map(valid).collect();
+        assert_eq!(
+            parse_suggestion_entries(&entries).len(),
+            MAX_SUGGESTION_ACTIONS
+        );
+        let mut padded: Vec<serde_json::Value> = (0..MAX_SUGGESTION_ACTIONS + 4)
+            .map(|_| serde_json::json!({"start": 3, "end": 1}))
+            .collect();
+        padded.extend((0..MAX_SUGGESTION_ACTIONS - 1).map(valid));
+        assert_eq!(
+            parse_suggestion_entries(&padded).len(),
+            MAX_SUGGESTION_ACTIONS - 1
+        );
+        // An entry that names another document's `source` is that
+        // document's edit: kept, with its `source`, for the action to
+        // route there — never resolved against this document's text.
+        let elsewhere = serde_json::json!({
+            "replacement": "layers:\n    allowRefs:\n        - \"a\"",
+            "start": 152, "end": 163, "kind": "insert", "source": "demo.package.nml"
+        });
+        let routed = parse_suggestion_entries(std::slice::from_ref(&elsewhere));
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].source.as_deref(), Some("demo.package.nml"));
+        assert_eq!(parse_suggestion_entries(&[elsewhere, valid(0)]).len(), 2);
+    }
+
     /// The "Simplify number" decision function (RFC 0016 §1.10): offers
     /// the minimal cohort member for plain numbers, never for money
     /// (fmt re-canonicalizes money — the edit would revert on save),
@@ -6707,6 +8259,26 @@ project MyApp:
     // ── Scope extraction ──────────────────────────────────────
 
     #[test]
+    fn extract_schema_scope_reads_both_spellings_as_one_scope() {
+        assert_eq!(
+            extract_schema_scope("file:///path/to/workflow.schema.nml"),
+            "workflow"
+        );
+        assert_eq!(
+            extract_schema_scope("file:///path/to/workflow.model.nml"),
+            extract_schema_scope("file:///path/to/workflow.schema.nml")
+        );
+        assert_eq!(
+            extract_file_scope("file:///path/to/workflow.schema.nml"),
+            None,
+            "a schema source has no file scope"
+        );
+        let schema = Url::parse("file:///path/to/core.schema.nml").expect("url");
+        let instance = Url::parse("file:///path/to/core.flow.nml").expect("url");
+        assert!(is_schema_source(&schema) && !is_schema_source(&instance));
+    }
+
+    #[test]
     fn extract_schema_scope_workflow() {
         assert_eq!(
             extract_schema_scope("file:///path/to/workflow.model.nml"),
@@ -7177,20 +8749,20 @@ workflow VoiceAgent:
     #[test]
     fn indent_after_block_colon() {
         let lines = vec!["workflow RecipeAssistant:", "    steps:"];
-        assert_eq!(compute_indent_after_line(&lines, 0), 4);
-        assert_eq!(compute_indent_after_line(&lines, 1), 8);
+        assert_eq!(compute_indent_after_line(&lines, 0, 4), 4);
+        assert_eq!(compute_indent_after_line(&lines, 1, 4), 8);
     }
 
     #[test]
     fn indent_after_list_item_colon() {
         let lines = vec!["    steps:", "        - classify:"];
-        assert_eq!(compute_indent_after_line(&lines, 1), 12);
+        assert_eq!(compute_indent_after_line(&lines, 1, 4), 12);
     }
 
     #[test]
     fn indent_after_property() {
         let lines = vec!["        - classify:", "            provider = Groq"];
-        assert_eq!(compute_indent_after_line(&lines, 1), 12);
+        assert_eq!(compute_indent_after_line(&lines, 1, 4), 12);
     }
 
     #[test]
@@ -7202,19 +8774,19 @@ workflow VoiceAgent:
             "                        equals = \"clarify\"",
             "                    goto = \"respond\"",
         ];
-        assert_eq!(compute_indent_after_line(&lines, 4), 20);
+        assert_eq!(compute_indent_after_line(&lines, 4, 4), 20);
     }
 
     #[test]
     fn indent_after_blank_line_uses_prev_non_empty() {
         let lines = vec!["    steps:", "        - classify:", ""];
-        assert_eq!(compute_indent_after_line(&lines, 2), 12);
+        assert_eq!(compute_indent_after_line(&lines, 2, 4), 12);
     }
 
     #[test]
     fn indent_after_nested_block_colon() {
         let lines = vec!["        - router:", "            routes:"];
-        assert_eq!(compute_indent_after_line(&lines, 1), 16);
+        assert_eq!(compute_indent_after_line(&lines, 1, 4), 16);
     }
 
     #[test]
@@ -7223,31 +8795,38 @@ workflow VoiceAgent:
             "            system = \"\"\"",
             "            You are a helpful assistant.",
         ];
-        assert_eq!(compute_indent_after_line(&lines, 1), 12);
+        assert_eq!(compute_indent_after_line(&lines, 1, 4), 12);
     }
 
     #[test]
     fn indent_after_scalar_list_item() {
         let lines = vec!["enum providerType:", "    - \"anthropic\""];
-        assert_eq!(compute_indent_after_line(&lines, 1), 4);
+        assert_eq!(compute_indent_after_line(&lines, 1, 4), 4);
     }
 
     #[test]
     fn indent_after_comment_ending_with_colon() {
         let lines = vec!["    // this is a comment:"];
-        assert_eq!(compute_indent_after_line(&lines, 0), 4);
+        assert_eq!(compute_indent_after_line(&lines, 0, 4), 4);
     }
 
     #[test]
     fn indent_empty_source() {
         let lines: Vec<&str> = vec![];
-        assert_eq!(compute_indent_after_line(&lines, 0), 0);
+        assert_eq!(compute_indent_after_line(&lines, 0, 4), 0);
     }
 
     #[test]
     fn indent_at_top_level() {
         let lines = vec!["workflow RecipeAssistant:"];
-        assert_eq!(compute_indent_after_line(&lines, 0), 4);
+        assert_eq!(compute_indent_after_line(&lines, 0, 4), 4);
+    }
+
+    #[test]
+    fn indent_after_block_colon_steps_by_the_unit_given() {
+        let lines = vec!["workflow RecipeAssistant:", "  steps:"];
+        assert_eq!(compute_indent_after_line(&lines, 0, 2), 2);
+        assert_eq!(compute_indent_after_line(&lines, 1, 2), 4);
     }
 
     // ── ModelRef + discriminator helpers (share the parse-once / index walk) ──────
@@ -8111,12 +9690,12 @@ workflow VoiceAgent:
             1,
             "the ninth (valid) entry must survive malformed padding"
         );
-        assert_eq!(parsed[0].0, "real");
+        assert_eq!(parsed[0].replacement, "real");
         let nine: Vec<serde_json::Value> = (0..9).map(|i| valid(&format!("s{i}"))).collect();
         let capped = parse_suggestion_entries(&nine);
         assert_eq!(capped.len(), 8);
-        assert_eq!(capped[0].0, "s0");
-        assert_eq!(capped[7].0, "s7");
+        assert_eq!(capped[0].replacement, "s0");
+        assert_eq!(capped[7].replacement, "s7");
         // An inverted span fails closed like any other malformed entry — it
         // would otherwise round-trip as a spec-invalid LSP Range.
         let inverted =
@@ -9123,18 +10702,272 @@ workflow VoiceAgent:
 
     // ── Watched-file eligibility ──────────────────────────────
 
-    fn temp_workspace(tag: &str) -> std::path::PathBuf {
-        // pid + process-wide counter: pid alone collides when a re-used pid
-        // (or a same-process re-entry) hits the same tag.
-        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("nml-lsp-{tag}-{}-{nonce}", std::process::id()));
-        // Defensive: a prior run's leftovers (same pid recycled after a crash
-        // skipped the test's cleanup) must not leak stale files into this run.
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A guard-owned scratch workspace (removed on drop, a red assertion
+    /// included).
+    fn temp_workspace(tag: &str) -> crate::scratch::Scratch {
+        crate::scratch::Scratch::new(&format!("lsp-{tag}"))
+    }
+
+    /// The file a suggestion names is a workspace KEY (`SourceKey::checked`)
+    /// joined under the document's root — never a lexical join: a `..`
+    /// climb, an absolute path, a backslash, a `.` component, the empty
+    /// name (the root itself) and a depth past the bound name no target,
+    /// even where a file sits at the lexical join (the manifest one level
+    /// above the root here — `may_write` is containment over the joined
+    /// path, which a `..` keeps lexically inside the root). A key names
+    /// its file and the text an action edits; a document with no root
+    /// names nothing.
+    #[test]
+    fn a_quick_fix_target_is_a_workspace_key_never_a_lexical_join() {
+        let base = temp_workspace("suggestion-target-key");
+        let ws = base.join("inner");
+        fs::create_dir_all(ws.join("tenants/cu")).unwrap();
+        fs::write(
+            ws.join("demo.package.nml"),
+            nml_validate::test_support::DEMO_MANIFEST,
+        )
+        .unwrap();
+        fs::write(
+            ws.join("core.model.nml"),
+            nml_validate::test_support::DEMO_CORE,
+        )
+        .unwrap();
+        fs::write(
+            ws.join("tenants/cu/x.flow.nml"),
+            "thing a:\n    v = \"x\"\n",
+        )
+        .unwrap();
+        // The file a climb would reach: a manifest ABOVE the root.
+        fs::write(
+            base.join("demo.package.nml"),
+            nml_validate::test_support::DEMO_MANIFEST,
+        )
+        .unwrap();
+        let (service, _socket) =
+            crate::session::build_service(|client| NmlLanguageServer::with_store(client, None));
+        let server = service.inner();
+        let root = dunce::canonicalize(&ws).unwrap();
+        server.workspace_roots.lock().unwrap().push(root.clone());
+        let own = Url::from_file_path(root.join("tenants/cu/x.flow.nml")).unwrap();
+        let (target, text) = server
+            .suggestion_target(&own, "demo.package.nml")
+            .expect("a key names its file");
+        assert_eq!(
+            target,
+            Url::from_file_path(root.join("demo.package.nml")).unwrap()
+        );
+        assert_eq!(text, nml_validate::test_support::DEMO_MANIFEST);
+        let deep = "d/".repeat(65) + "demo.package.nml";
+        for bad in [
+            "../demo.package.nml",
+            "tenants/../../demo.package.nml",
+            "./demo.package.nml",
+            "tenants\\cu\\x.flow.nml",
+            "/etc/passwd",
+            "",
+            deep.as_str(),
+        ] {
+            assert!(
+                server.suggestion_target(&own, bad).is_none(),
+                "{bad:?} is no key, so no target"
+            );
+        }
+        // No root: no target, key or not.
+        let stray = Url::from_file_path(base.join("demo.package.nml")).unwrap();
+        assert!(
+            server
+                .suggestion_target(&stray, "demo.package.nml")
+                .is_none()
+        );
+    }
+
+    /// A workspace folder removed at runtime takes its cached universe
+    /// with it — dropped at `workspace/didChangeWorkspaceFolders`, not
+    /// by a later retention pass (which keeps every folder's universe).
+    /// The wire cannot see the difference (a re-added folder
+    /// rediscovers on any change and serves the same content
+    /// otherwise), so the cache itself is inspected.
+    #[tokio::test]
+    async fn a_removed_folders_universe_is_dropped_at_removal() {
+        use tower_lsp::LanguageServer;
+        use tower_lsp::lsp_types::{
+            DidChangeWorkspaceFoldersParams, WorkspaceFolder, WorkspaceFoldersChangeEvent,
+        };
+        let ws = temp_workspace("folder-removed");
+        fs::write(
+            ws.join("demo.package.nml"),
+            nml_validate::test_support::DEMO_MANIFEST,
+        )
+        .unwrap();
+        fs::write(
+            ws.join("core.model.nml"),
+            nml_validate::test_support::DEMO_CORE,
+        )
+        .unwrap();
+        fs::create_dir_all(ws.join("tenants/cu")).unwrap();
+        fs::write(
+            ws.join("tenants/cu/x.flow.nml"),
+            "thing a:\n    v = \"x\"\n",
+        )
+        .unwrap();
+        let (service, _socket) =
+            crate::session::build_service(|client| NmlLanguageServer::with_store(client, None));
+        let server = service.inner();
+        let root = dunce::canonicalize(&*ws).unwrap();
+        server.workspace_roots.lock().unwrap().push(root.clone());
+        let uri = Url::from_file_path(ws.join("tenants/cu/x.flow.nml")).unwrap();
+        assert!(server.resolve_document(&uri).is_some());
+        assert_eq!(server.resolver.cached_universe_roots(), vec![root.clone()]);
+        server
+            .did_change_workspace_folders(DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: Vec::new(),
+                    removed: vec![WorkspaceFolder {
+                        uri: Url::from_file_path(&root).unwrap(),
+                        name: "ws".to_string(),
+                    }],
+                },
+            })
+            .await;
+        assert!(
+            server.resolver.cached_universe_roots().is_empty(),
+            "the removed folder's universe lingers"
+        );
+    }
+
+    /// Two NESTED workspace folders: which one governs a document under
+    /// both must be a rule, not the order the client happened to send
+    /// them in. `workspace_roots` is kept SORTED, so an ancestor always
+    /// precedes its descendants and the "first root the path starts
+    /// with" that `PackageResolver::anchor_for` and
+    /// `packages::source_name_of` pick IS the outermost —
+    /// `packages::canonical_above_roots`'s rule, which the other two
+    /// used to agree with only by luck. Unsorted, the inner folder
+    /// governed when it arrived first, giving the same file a second
+    /// universe and a second `source` key.
+    #[tokio::test]
+    async fn nested_workspace_folders_are_ordered_outermost_first() {
+        let outer = temp_workspace("nested-order");
+        let canon_outer = dunce::canonicalize(&outer).unwrap();
+        let inner = canon_outer.join("sub");
+        fs::create_dir_all(&inner).unwrap();
+        let doc = inner.join("a.nml");
+        fs::write(&doc, "thing a:\n    v = \"x\"\n").unwrap();
+
+        let (service, _socket) =
+            crate::session::build_service(|client| NmlLanguageServer::with_store(client, None));
+        let server = service.inner();
+        // The client sends the INNER folder first.
+        server
+            .did_change_workspace_folders(DidChangeWorkspaceFoldersParams {
+                event: WorkspaceFoldersChangeEvent {
+                    added: vec![
+                        WorkspaceFolder {
+                            uri: Url::from_file_path(&inner).unwrap(),
+                            name: "inner".to_string(),
+                        },
+                        WorkspaceFolder {
+                            uri: Url::from_file_path(&canon_outer).unwrap(),
+                            name: "outer".to_string(),
+                        },
+                    ],
+                    removed: Vec::new(),
+                },
+            })
+            .await;
+        let roots = server.workspace_roots.lock().unwrap().clone();
+        assert_eq!(
+            roots,
+            vec![canon_outer.clone(), inner.clone()],
+            "an ancestor precedes its descendants whatever the client's order"
+        );
+        assert_eq!(
+            roots.iter().find(|r| doc.starts_with(r)),
+            Some(&canon_outer),
+            "the outermost folder governs"
+        );
+        assert_eq!(
+            packages::source_name_of(&doc, &roots),
+            "sub/a.nml",
+            "the finding's name is keyed under the governing root"
+        );
+
+        // The handshake's own capture obeys the same rule.
+        let (service, _socket) =
+            crate::session::build_service(|client| NmlLanguageServer::with_store(client, None));
+        let fresh = service.inner();
+        let folder = |p: &std::path::Path, name: &str| WorkspaceFolder {
+            uri: Url::from_file_path(p).unwrap(),
+            name: name.to_string(),
+        };
+        fresh
+            .initialize(InitializeParams {
+                workspace_folders: Some(vec![
+                    folder(&inner, "inner"),
+                    folder(&canon_outer, "outer"),
+                ]),
+                ..Default::default()
+            })
+            .await
+            .expect("initialize");
+        assert_eq!(
+            *fresh.workspace_roots.lock().unwrap(),
+            vec![canon_outer, inner],
+            "initialize sorts too"
+        );
+    }
+
+    #[test]
+    fn canonical_within_roots_contains_after_canonicalizing() {
+        // The order is the security property: canonicalize FIRST, then
+        // contain — so an in-root symlink whose target is outside FAILS
+        // (post-resolution containment), while an in-root alias of an
+        // in-root file passes as its canonical target. Zero roots, a
+        // missing path, and an outside path all fail closed.
+        let root = temp_workspace("cwr");
+        let inside = root.join("a.nml");
+        fs::write(&inside, "x").unwrap();
+        let canon_root = dunce::canonicalize(&root).unwrap();
+
+        let hit = canonical_within_roots(&inside, std::slice::from_ref(&canon_root))
+            .expect("inside resolves");
+        assert!(hit.starts_with(&canon_root));
+        assert!(
+            canonical_within_roots(&inside, &[]).is_none(),
+            "zero roots refuses everything"
+        );
+        assert!(
+            canonical_within_roots(&root.join("missing.nml"), std::slice::from_ref(&canon_root))
+                .is_none(),
+            "a path that cannot canonicalize fails closed"
+        );
+
+        let outside_dir = temp_workspace("cwr-outside");
+        let outside = outside_dir.join("b.nml");
+        fs::write(&outside, "y").unwrap();
+        assert!(
+            canonical_within_roots(&outside, std::slice::from_ref(&canon_root)).is_none(),
+            "containment is against the roots, not existence"
+        );
+
+        #[cfg(unix)]
+        {
+            // An in-root symlink pointing OUTSIDE the root: rejected —
+            // containment is judged on the canonical target.
+            let escape = root.join("escape.nml");
+            std::os::unix::fs::symlink(&outside, &escape).unwrap();
+            assert!(
+                canonical_within_roots(&escape, std::slice::from_ref(&canon_root)).is_none(),
+                "post-resolution containment closes the symlink escape"
+            );
+            // An in-root symlink to an in-root file: accepted, as the
+            // canonical target.
+            let alias = root.join("alias.nml");
+            std::os::unix::fs::symlink(&inside, &alias).unwrap();
+            let via = canonical_within_roots(&alias, std::slice::from_ref(&canon_root))
+                .expect("in-root alias resolves");
+            assert_eq!(via, dunce::canonicalize(&inside).unwrap());
+        }
     }
 
     #[test]
@@ -9145,8 +10978,6 @@ workflow VoiceAgent:
         let canon_root = dunce::canonicalize(&root).unwrap();
 
         assert!(watched_file_is_eligible(&file, &[canon_root]));
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -9158,9 +10989,6 @@ workflow VoiceAgent:
         let canon_root = dunce::canonicalize(&root).unwrap();
 
         assert!(!watched_file_is_eligible(&file, &[canon_root]));
-
-        fs::remove_dir_all(&root).ok();
-        fs::remove_dir_all(&elsewhere).ok();
     }
 
     #[test]
@@ -9170,8 +10998,6 @@ workflow VoiceAgent:
         fs::write(&file, "x").unwrap();
 
         assert!(!watched_file_is_eligible(&file, &[]));
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -9183,8 +11009,6 @@ workflow VoiceAgent:
             &root.join("nope.nml"),
             &[canon_root]
         ));
-
-        fs::remove_dir_all(&root).ok();
     }
 
     #[cfg(unix)]
@@ -9202,47 +11026,6 @@ workflow VoiceAgent:
             !watched_file_is_eligible(&link, &[canon_root]),
             "symlinks must be rejected even when placed inside a root"
         );
-
-        fs::remove_dir_all(&root).ok();
-        fs::remove_dir_all(&elsewhere).ok();
-    }
-
-    /// The workspace walk skips build/dependency dirs: `target` (where
-    /// `cargo package` copies full crate sources — `.nml` fixtures
-    /// included — so indexing it pollutes the registry with duplicate
-    /// definitions), `node_modules`, and anything hidden. A schema in a
-    /// normal source dir is still found.
-    #[test]
-    fn workspace_walk_skips_build_and_hidden_dirs() {
-        let root = temp_workspace("walk-deny");
-        for dir in ["target/package/x", "node_modules/pkg", ".cache", "src"] {
-            fs::create_dir_all(root.join(dir)).unwrap();
-        }
-        fs::write(root.join("target/package/x/a.model.nml"), "model a:\n").unwrap();
-        fs::write(root.join("node_modules/pkg/b.model.nml"), "model b:\n").unwrap();
-        fs::write(root.join(".cache/c.model.nml"), "model c:\n").unwrap();
-        fs::write(root.join("src/d.model.nml"), "model d:\n").unwrap();
-        // A symlinked schema is refused by the walk even when its target
-        // sits INSIDE the workspace — pinned here directly because the
-        // assembler-level assertion that used to cover the walk's symlink
-        // rule died with the dir-mates universe.
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            root.join("src/d.model.nml"),
-            root.join("src/link.model.nml"),
-        )
-        .unwrap();
-
-        let mut files = Vec::new();
-        Inner::find_nml_files(&root, &mut files, 0);
-
-        assert_eq!(
-            files,
-            vec![root.join("src/d.model.nml")],
-            "only the source-dir schema may be indexed"
-        );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     // ── Schema universe assembly ──────────────────────────────
@@ -9261,9 +11044,9 @@ workflow VoiceAgent:
         let missing = root.join("gone.model.nml");
 
         let read = |p: &Path| fs::read_to_string(p).ok();
+        let name_of = |p: &Path| p.to_string_lossy().into_owned();
         let declared = vec![a.clone(), missing.clone(), b.clone()];
-        let (sources, own_name) = declared_universe(&b, "model b:\n", &declared, &read);
-        assert_eq!(own_name, b.to_string_lossy());
+        let sources = declared_universe(&name_of(&b), "model b:\n", &declared, &read, &name_of);
         let names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
@@ -9274,14 +11057,12 @@ workflow VoiceAgent:
 
         // Undeclared own file: appended after the declared set.
         let c = root.join("c.model.nml");
-        let (sources, _) = declared_universe(&c, "model c:\n", &declared, &read);
+        let sources = declared_universe(&name_of(&c), "model c:\n", &declared, &read, &name_of);
         assert_eq!(
             sources.last().map(|(n, _)| n.as_str()),
             Some(c.to_string_lossy().as_ref()),
             "undeclared own file is appended last"
         );
-
-        fs::remove_dir_all(&root).ok();
     }
 
     /// Store-snapshot universe: the package's sources in declaration
@@ -9291,14 +11072,12 @@ workflow VoiceAgent:
     #[test]
     fn snapshot_universe_keeps_order_and_appends_buffer_last() {
         let sources = vec![
-            ("core".to_string(), "model a:\n".to_string()),
-            ("extra".to_string(), "model b:\n".to_string()),
+            ("core".to_string(), std::sync::Arc::from("model a:\n")),
+            ("extra".to_string(), std::sync::Arc::from("model b:\n")),
         ];
-        let own = Path::new("/ws/mine.model.nml");
-        let (out, own_name) = snapshot_universe(own, "model c:\n", &sources);
+        let out = snapshot_universe("mine.model.nml", "model c:\n", &sources);
         let names: Vec<&str> = out.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["core", "extra", "/ws/mine.model.nml"]);
-        assert_eq!(own_name, "/ws/mine.model.nml");
+        assert_eq!(names, vec!["core", "extra", "mine.model.nml"]);
         assert_eq!(out[2].1, "model c:\n", "buffer text is the live text");
     }
 
@@ -9307,12 +11086,11 @@ workflow VoiceAgent:
     /// sorted tail — the cap is a real pin, not a comment.
     #[test]
     fn registry_universe_is_sorted_capped_and_own_first() {
-        let own = Path::new("/ws/mine.model.nml");
+        let own_name = "mine.model.nml";
         let docs: Vec<(String, String)> = (0..MAX_UNIVERSE_FILES + 40)
-            .map(|i| (format!("/ws/m{i:04}.model.nml"), format!("model m{i}:\n")))
+            .map(|i| (format!("m{i:04}.model.nml"), format!("model m{i}:\n")))
             .collect();
-        let (sources, own_name, truncated) = registry_universe(own, "model mine:\n", docs);
-        assert_eq!(own_name, "/ws/mine.model.nml");
+        let (sources, truncated) = registry_universe(own_name, "model mine:\n", docs);
         assert_eq!(
             sources.len(),
             MAX_UNIVERSE_FILES,
@@ -9329,7 +11107,7 @@ workflow VoiceAgent:
         assert_eq!(tail, sorted, "members sorted for deterministic merge");
         assert_eq!(
             tail.last().copied(),
-            Some("/ws/m0126.model.nml"),
+            Some("m0126.model.nml"),
             "the cap drops the sorted tail, deterministically"
         );
 
@@ -9338,7 +11116,7 @@ workflow VoiceAgent:
         let small: Vec<(String, String)> = (0..3)
             .map(|i| (format!("/ws/s{i}.model.nml"), format!("model s{i}:\n")))
             .collect();
-        let (_, _, truncated) = registry_universe(own, "model mine:\n", small);
+        let (_, truncated) = registry_universe(own_name, "model mine:\n", small);
         assert!(!truncated, "an uncut set must not report truncation");
     }
 
@@ -9405,5 +11183,91 @@ workflow VoiceAgent:
         assert_eq!(format_named_value("greeting", &secret), "\"hunter2\"");
         // Non-string values keep their normal rendering.
         assert_eq!(format_named_value("maxKeys", &Value::number(3)), "3");
+    }
+
+    /// RFC 0026 decision 6: the fold matches the document's own row by
+    /// RANGE **and** code. Two rows at one range under different codes —
+    /// what a document may legitimately report — must not swap places: a
+    /// wrapper whose `cause` names the second folds into the second, the
+    /// first keeps its own `relatedInformation`, and no wrapper row is
+    /// published beside them.
+    #[test]
+    fn a_wrapper_folds_into_the_row_that_carries_its_cause() {
+        use tower_lsp::lsp_types::{Diagnostic, NumberOrString, Position, Range};
+        let range = Range::new(Position::new(1, 4), Position::new(1, 10));
+        let row = |code: &str| Diagnostic {
+            range,
+            code: Some(NumberOrString::String(code.to_string())),
+            message: format!("{code} says so"),
+            ..Default::default()
+        };
+        let mut rows = vec![row("NML0002"), row("NML2001")];
+        let note = packages::DegradedNote {
+            message: "manifest failed to load".to_string(),
+            severity: nml_core::diagnostic::Severity::Error,
+            code: Some(nml_core::diagnostic::codes::RESOLUTION_INPUT_UNLOADABLE),
+            anchor: packages::NoteAnchor::At(nml_core::span::Span::new(18, 24)),
+            related: Vec::new(),
+            suggestions: Vec::new(),
+            cause: Some(nml_core::diagnostic::codes::UNKNOWN_PROPERTY),
+        };
+        let uri = Url::parse("file:///ws/demo.package.nml").expect("a uri");
+        note_rows(
+            std::slice::from_ref(&note),
+            "package demo:\n    versio = \"0.1.0\"\n",
+            None,
+            &uri,
+            "demo.package.nml",
+            &|_| None,
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 2, "no wrapper row is published: {rows:?}");
+        assert!(
+            rows[0].related_information.is_none(),
+            "the row that is not the cause is untouched: {rows:?}"
+        );
+        let folded = rows[1]
+            .related_information
+            .as_ref()
+            .unwrap_or_else(|| panic!("the cause's row carries the context: {rows:?}"));
+        assert_eq!(folded.len(), 1, "{folded:?}");
+        assert_eq!(folded[0].message, LOAD_NOTE, "{folded:?}");
+    }
+}
+
+#[cfg(test)]
+mod folder_path_tests {
+    use super::folder_path;
+    use tower_lsp::lsp_types::Url;
+
+    /// A folder the platform cannot canonicalize keeps its spelling: WASI
+    /// has no `realpath` (every path fails there), and natively an absent
+    /// folder — the kernel refuses to anchor a universe at either unless
+    /// the spelling verifies. Dropping the folder instead made the
+    /// bundled WASM server treat every document as outside every folder.
+    #[test]
+    fn a_folder_that_cannot_be_canonicalized_keeps_its_spelling() {
+        let absent = std::env::temp_dir().join("nml-lsp-no-such-folder-a1b2c3");
+        let uri = Url::from_file_path(&absent).expect("absolute");
+        assert_eq!(folder_path(&uri), Some(absent));
+    }
+
+    /// Where `realpath` exists, an operator's own link is followed: the
+    /// folder opened through it and its target are one root.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_folder_is_canonical() {
+        let base = std::env::temp_dir().join(format!("nml-lsp-folder-path-{}", std::process::id()));
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let link = base.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let uri = Url::from_file_path(&link).expect("absolute");
+        assert_eq!(
+            folder_path(&uri),
+            Some(dunce::canonicalize(&real).expect("canonical"))
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

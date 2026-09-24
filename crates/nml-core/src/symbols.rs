@@ -2,8 +2,9 @@
 //!
 //! [`SymbolTable`] indexes the named declarations of a parsed file (blocks,
 //! arrays, consts, templates) and answers static questions about them:
-//! reference lookup, duplicate detection, const-chain resolution, and
-//! const-cycle / unresolved-reference diagnostics.
+//! reference lookup, const-chain resolution, and const-cycle /
+//! unresolved-reference diagnostics. A name declared twice is the parse's
+//! finding (NML1000, beside every parse), never re-derived here.
 //!
 //! This is *static* (parse-time) resolution. Runtime value resolution --
 //! `$ENV.KEY` secrets and `a | b` fallback chains -- lives in
@@ -12,11 +13,27 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
-use crate::diagnostic::{Diagnostic, codes};
+use crate::diagnostic::{Diagnostic, Suggestion, codes};
 use crate::span::Span;
 use crate::types::Value;
 
 /// Tracks named declarations for cross-reference resolution.
+/// Schema-definition keywords — block declarations that define vocabulary
+/// (`model` / `trait` / `enum`) rather than declaring instances; they can
+/// never be layer refs or carry `uses` (NML2062, RFC 0019). THE one owner
+/// of this language fact — engine, validator, CLI, and LSP all ask here.
+pub fn is_schema_keyword(kw: &str) -> bool {
+    matches!(kw, "model" | "trait" | "enum")
+}
+
+/// How many unresolved-reference findings per file get a did-you-mean:
+/// the diagnostic sink's own cap (`diagnostic::MAX_ERRORS`). Beyond it a
+/// suggestion is work no reader sees, and computing one per reference
+/// against every name is quadratic in the file.
+///
+/// LIMIT: reach=content guards=work surface=kernel shown="128" — unresolved references that carry a did-you-mean; every one is still reported
+const SUGGESTION_BUDGET: usize = crate::diagnostic::MAX_ERRORS;
+
 #[derive(Debug, Default)]
 pub struct SymbolTable {
     declarations: HashMap<String, Vec<DeclInfo>>,
@@ -120,26 +137,10 @@ impl SymbolTable {
     }
 
     /// Look up a declaration name, returning every declaration that uses it
-    /// (more than one indicates a duplicate).
+    /// (a best-effort tree holds more than one where the parse reported a
+    /// repeat, NML1000; tooling over such a tree sees every declaration).
     pub fn lookup(&self, name: &str) -> Option<&[DeclInfo]> {
         self.declarations.get(name).map(|v| v.as_slice())
-    }
-
-    /// Check for duplicate declarations and return diagnostics.
-    pub fn find_duplicates(&self) -> Vec<Diagnostic> {
-        let mut errors = Vec::new();
-        for (name, decls) in &self.declarations {
-            if decls.len() > 1 {
-                for dup in &decls[1..] {
-                    errors.push(
-                        Diagnostic::error(format!("duplicate declaration: '{name}'"))
-                            .with_code(codes::DUPLICATE_DECLARATION)
-                            .with_span(dup.span),
-                    );
-                }
-            }
-        }
-        errors
     }
 
     /// Return all registered declaration names.
@@ -263,11 +264,23 @@ impl SymbolTable {
                                 Diagnostic::error(format!("unresolved reference '{name}'"))
                                     .with_code(codes::UNRESOLVED_REFERENCE)
                                     .with_span(prop.value.span);
-                            if let Some(s) = crate::suggest::suggest(
-                                name,
-                                self.names().chain(local_names.iter().map(String::as_str)),
-                            ) {
-                                diag = diag.with_suggestion(s, prop.value.span);
+                            // Suggestion budget: a did-you-mean costs an
+                            // edit distance per candidate name, so N
+                            // unresolved references among N names is N²
+                            // distances — a tenant file made `nml check`
+                            // run for minutes. Only the first
+                            // `MAX_ERRORS` findings (the diagnostic
+                            // sink's own cap) get one; every reference is
+                            // still reported.
+                            if errors.len() < SUGGESTION_BUDGET {
+                                if let Some(s) = crate::suggest::suggest(
+                                    name,
+                                    self.names().chain(local_names.iter().map(String::as_str)),
+                                ) {
+                                    diag = diag.with_suggestion(
+                                        Suggestion::did_you_mean(s).at(prop.value.span),
+                                    );
+                                }
                             }
                             errors.push(diag);
                         }
@@ -316,6 +329,42 @@ fn collect_local_names_recursive(body: &Body, names: &mut HashSet<String>) {
 mod tests {
     use super::*;
     use crate::cst::parse_to_ast;
+
+    /// A did-you-mean per unresolved reference against every
+    /// name is N² edit distances — a 10 MB tenant file never finished.
+    /// The probe-count seam counts distance computations: with N
+    /// references among N names they are bounded by the budget
+    /// (`MAX_ERRORS`) times the candidates, never N². Every reference is
+    /// still reported; the first `MAX_ERRORS` carry a suggestion.
+    #[test]
+    fn suggestions_are_budgeted_never_quadratic() {
+        const N: usize = 600;
+        let mut src = String::from("workflow W:\n    steps:\n");
+        for i in 0..N {
+            // `stepNNNN` is a local name; `stopNNNN` is an unresolved
+            // reference one edit away from it.
+            src.push_str(&format!(
+                "        - step{i:04}:\n            next = stop{i:04}\n"
+            ));
+        }
+        let file = parse_to_ast(&src).unwrap();
+        let mut symbols = SymbolTable::new();
+        symbols.register_file(&file);
+        let before = crate::suggest::comparisons_on_this_thread();
+        let errors = symbols.find_unresolved_references(&file);
+        let comparisons = crate::suggest::comparisons_on_this_thread() - before;
+        assert_eq!(errors.len(), N, "every reference is reported");
+        let with_suggestion = errors.iter().filter(|d| !d.suggestions.is_empty()).count();
+        assert_eq!(
+            with_suggestion, SUGGESTION_BUDGET,
+            "the first MAX_ERRORS get one"
+        );
+        // Candidates per reference: the N local names (the `W`
+        // declaration is outside the length window). Budget × candidates
+        // exactly — and far below the N² an unbudgeted pass performs.
+        assert_eq!(comparisons, SUGGESTION_BUDGET * N);
+        assert!(comparisons < N * N);
+    }
 
     #[test]
     fn test_resolve_reference() {
@@ -438,18 +487,6 @@ mod tests {
             "model/trait/enum definitions should not be checked for value refs; errors: {:?}",
             errors
         );
-    }
-
-    #[test]
-    fn test_find_duplicates() {
-        let source =
-            "service Svc:\n    localMount = \"/\"\n\nservice Svc:\n    localMount = \"/other\"\n";
-        let file = parse_to_ast(source).unwrap();
-        let mut symbols = SymbolTable::new();
-        symbols.register_file(&file);
-
-        let errors = symbols.find_duplicates();
-        assert_eq!(errors.len(), 1);
     }
 
     #[test]

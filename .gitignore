@@ -1,5 +1,6 @@
 # Rust
 /target/
+/target-*/
 **/*.rs.bk
 
 # Python (scripts/ tooling)
@@ -18,9 +19,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# RFC drafts (local working docs)
-docs/rfcs/
-
 # Node (pnpm workspace)
 node_modules/
 
@@ -33,3 +31,4 @@ editors/vscode/dist/
 editors/vscode/server/
 editors/vscode/.vscode-test/
 docs/DOCUMENTATION-PLAN.md
+docs/rfcs/

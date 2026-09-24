@@ -7,6 +7,7 @@ import {
   expandHomePrefix,
   isPathInsideWorkspace,
   isPathInsideWorkspaceRoots,
+  providerWorkingDir,
 } from "../../pathSecurity";
 
 suite("pathSecurity/evaluateNeutralServerPathOverride", () => {
@@ -81,6 +82,17 @@ suite("pathSecurity/expandHomePrefix", () => {
   test("no expansion when the home directory is missing or relative", () => {
     assert.strictEqual(expandHomePrefix("~/x", ""), "~/x");
     assert.strictEqual(expandHomePrefix("~/x", "relative/home"), "~/x");
+  });
+});
+
+suite("pathSecurity/providerWorkingDir", () => {
+  test("the operator's home directory, when it is one", () => {
+    assert.strictEqual(providerWorkingDir("/Users/op", "/"), "/Users/op");
+  });
+
+  test("a homeless or relative home falls back to the filesystem root", () => {
+    assert.strictEqual(providerWorkingDir("", "/"), "/");
+    assert.strictEqual(providerWorkingDir("home", "/"), "/");
   });
 });
 

@@ -22,6 +22,10 @@ model package:
     formatVersion number
     // Root-marker filenames anchoring binding globs to a project root.
     rootMarkers []string?
+    // Declared budget units (RFC 0019 item 4): anchor-relative directory
+    // patterns (`tenants/*`) that replace the inference from the binding
+    // globs; the loader refuses one narrower than inference.
+    budgetUnits []string?
     // Modifier keywords legal in this package's configs (e.g. nudge's
     // allow/deny/grant/trust/block).
     modifiers []string?
@@ -49,6 +53,26 @@ model validator:
     files []string
     schemas []schema
     strict bool?
+    // Composition authority (RFC 0019): absent, composition under this
+    // binding is denied (NML2064). The block's SHAPE is judged here like
+    // every other field; its own rules — a glob the matcher rejects, a
+    // stack cap above the language's, a veto with nothing to veto — are
+    // the loader's (NML2081), which has the whole binding in hand.
+    layers layerGrant?
+
+// A binding's composition grant (RFC 0019 §Authorization) — pure data,
+// mirroring nml-core's `LayerGrant`.
+model layerGrant:
+    // The target allowlist: globs over the referenced instance's file
+    // KEY (root-relative, the binding's own matcher); empty = deny all.
+    allowRefs []string
+    // Vetoes inside the allowlist; deny wins, named by index (NML2065).
+    denyRefs []string?
+    // Distinct instances one linearized stack may hold, the declaring
+    // instance included (NML2066): a whole number from 1 (the shape, judged
+    // here — RFC 0018's exact `multipleOf`); at most the language cap (the
+    // loader's rule, NML2081); absent = the language cap alone.
+    maxStackDepth number(min = 1, multipleOf = 1)?
 
 enum directiveArg:
     - "none"
