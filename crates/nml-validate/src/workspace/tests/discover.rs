@@ -4094,6 +4094,7 @@ fn a_backslash_named_entry_is_skipped_not_joined() {
 /// so the push order is unsorted exactly when a dot-file, FIFO or link
 /// sorts before an unkeyable name. Deleting `sort_by_depth` left every
 /// test green too.
+#[cfg(unix)]
 #[test]
 fn the_walks_files_and_skipped_rows_come_out_in_their_stated_order() {
     let mut ws = Ws::new()

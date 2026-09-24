@@ -27,22 +27,31 @@ fn script_path(path: &Path) -> PathBuf {
 
 /// Fold absolute path components onto the mock's POSIX `/` tree without
 /// treating `\` inside a name as a separator (legal on Unix; scripted for
-/// unkeyable-name pins).
+/// unkeyable-name pins). Names are pushed byte-for-byte — lossy UTF-8
+/// folding would turn an unkeyable unix name into a plain one and desync
+/// the walk fuzz invariant from what [`discover`] reports.
 fn fold_scripted_absolute(names: &[OsString]) -> PathBuf {
-    let mut parts: Vec<String> = Vec::new();
+    let mut path = PathBuf::from("/");
+    let mut depth = 0usize;
     for name in names {
         match name.as_os_str() {
             name if name == "." => {}
             name if name == ".." => {
-                parts.pop();
+                if depth > 0 {
+                    path.pop();
+                    depth -= 1;
+                }
             }
-            name => parts.push(name.to_string_lossy().into_owned()),
+            name => {
+                path.push(name);
+                depth += 1;
+            }
         }
     }
-    if parts.is_empty() {
+    if depth == 0 {
         PathBuf::from("/")
     } else {
-        PathBuf::from(format!("/{}", parts.join("/")))
+        path
     }
 }
 
@@ -391,4 +400,5 @@ mod tests {
             ]
         );
     }
+
 }

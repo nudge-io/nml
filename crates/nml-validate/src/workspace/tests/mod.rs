@@ -8,6 +8,8 @@ mod claims;
 mod diag;
 mod discover;
 mod grants;
+#[cfg(unix)]
+mod mock;
 mod paths;
 mod ratchet;
 mod vocabulary;
@@ -157,10 +159,12 @@ impl Ws {
             .borrow()
             .iter()
             .map(|p| {
-                p.strip_prefix("/ws")
+                let spelled = p.to_string_lossy().replace('\\', "/");
+                spelled
+                    .strip_prefix("/ws/")
+                    .or_else(|| spelled.strip_prefix("ws/"))
                     .expect("reads stay under the root")
-                    .to_string_lossy()
-                    .into_owned()
+                    .to_string()
             })
             .collect()
     }

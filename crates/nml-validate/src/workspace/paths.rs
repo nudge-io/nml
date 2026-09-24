@@ -557,6 +557,26 @@ fn kind_at(fs: &dyn LstatFs, path: &Path) -> Result<Option<EntryKind>, FsError> 
 /// one (`C:.\x` — a prefix with no root, split here as if absolute with
 /// its head `.` kept). Their `.` clauses are live for exactly those
 /// operator-typed spellings (pinned in `tests/paths.rs`).
+#[cfg(windows)]
+fn windows_drive_relative_tail(rest: &str) -> Vec<OsString> {
+    let mut names = Vec::new();
+    let mut cur = String::new();
+    for ch in rest.chars() {
+        if ch == '/' || ch == '\\' {
+            if !cur.is_empty() {
+                names.push(OsString::from(cur));
+                cur.clear();
+            }
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.is_empty() {
+        names.push(OsString::from(cur));
+    }
+    names
+}
+
 pub(super) fn split_absolute(path: &Path) -> Option<(PathBuf, Vec<OsString>)> {
     // Windows: `/ws/...` is the operator's POSIX spelling (tests, CLI on
     // Unix-shaped paths). `is_absolute()` is false and `RootDir` becomes
@@ -584,6 +604,18 @@ pub(super) fn split_absolute(path: &Path) -> Option<(PathBuf, Vec<OsString>)> {
     }
     if !prefixed {
         return None;
+    }
+    // Drive-relative (`C:.\x`): no `RootDir`, and `components` drops `.`
+    // from a plain spelling — split the tail on `/` and `\` instead.
+    #[cfg(windows)]
+    if !path.has_root() && matches!(path.components().next(), Some(Component::Prefix(_))) {
+        let rest = path
+            .as_os_str()
+            .to_string_lossy()
+            .split(':')
+            .nth(1)
+            .unwrap_or("");
+        return Some((cur, windows_drive_relative_tail(rest)));
     }
     let names = components.map(|c| c.as_os_str().to_os_string()).collect();
     Some((cur, names))

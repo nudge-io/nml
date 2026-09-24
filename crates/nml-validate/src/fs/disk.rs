@@ -48,9 +48,7 @@ pub(super) fn absent_or_error(e: std::io::Error) -> Result<Option<()>, FsError> 
 }
 
 fn fs_error(e: std::io::Error) -> FsError {
-    if e.kind() == std::io::ErrorKind::PermissionDenied {
-        FsError::Denied
-    } else if is_access_denied(&e) {
+    if e.kind() == std::io::ErrorKind::PermissionDenied || is_access_denied(&e) {
         FsError::Denied
     } else if is_symlink_loop(&e) {
         FsError::SymlinkLoop
