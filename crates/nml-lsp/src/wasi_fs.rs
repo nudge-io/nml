@@ -68,9 +68,14 @@ impl DirEntryLike for Entry {
 /// content, never a second listing.
 ///
 /// The second component is platform-native time from that one `stat`:
-/// `last_write_time` on Windows (directory `len()` is often zero there, so
-/// the stamp leans on the write time), nanoseconds since the Unix epoch
+/// `last_write_time` on Windows, nanoseconds since the Unix epoch
 /// elsewhere. When the time cannot be read, the memo does not cache.
+///
+/// On Windows the first component is usually `len()` from that same `stat`,
+/// but directory `len()` is often zero on NTFS — and some Windows hosts do
+/// not bump `last_write_time` when a child is created or removed — so when
+/// `len()` is zero there the first component is the child count from one
+/// `read_dir` pass (still one syscall family; never file content).
 type Stamp = (u64, u64);
 
 /// A directory's entries as they were read: names with their kinds, in
@@ -84,7 +89,15 @@ fn stamp_of(dir: &Path) -> Option<Stamp> {
     {
         use std::os::windows::fs::MetadataExt;
         let t = meta.last_write_time();
-        (t != 0).then_some((meta.len(), t))
+        if t == 0 {
+            return None;
+        }
+        let size = if meta.len() == 0 {
+            std::fs::read_dir(dir).map(|rd| rd.count() as u64).ok()?
+        } else {
+            meta.len()
+        };
+        Some((size, t))
     }
     #[cfg(not(windows))]
     {
