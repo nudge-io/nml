@@ -27,8 +27,11 @@ the records after the stamp moved — never before, and never by hand: it
 is held to the SAME classification, so a regeneration records a decision
 somebody made and can never stand in for making it.
 
-Run: `just gate-api` (or `python3 scripts/api_record.py`). Needs
-`cargo-public-api` on PATH (the gate installs the pinned version with the
+Run: `just gate-api` (or `python3 scripts/api_record.py`). The gate also
+calls `api_record.py semver-extra <baseline>` so `cargo-semver-checks`
+expects major changes when `apiVersion` rose against the baseline (the
+record already classified the break; the crate may still be `0.1.0`).
+Needs `cargo-public-api` on PATH (the gate installs the pinned version with the
 workspace rustc). Rustdoc JSON is built under [`RUSTDOC_NIGHTLY`] — not the
 workspace stable pin: `cargo public-api` on stable switches to generic
 `nightly`, which is not reproducible. `just gate-api` installs that pin and
@@ -293,6 +296,37 @@ def declared_stamp() -> tuple[int, int]:
     return (int(m[1]), int(m[2]))
 
 
+def api_version_at_rev(rev: str) -> int | None:
+    """The `apiVersion` at git revision `rev`, or `None` before `API_STAMP` existed."""
+    try:
+        text = subprocess.check_output(
+            ["git", "show", f"{rev}:{STAMP_SOURCE}"],
+            cwd=ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    m = STAMP_DECL_RE.search(text)
+    return int(m.group(1)) if m else None
+
+
+def semver_extra_args(baseline_rev: str) -> list[str]:
+    """Extra `cargo semver-checks check-release` flags after the record gate.
+
+    A reviewed `apiVersion` bump is already a BREAK in the record; the
+    workspace may still ship as `0.1.0` until release. Tell the classifier
+    to expect major changes instead of requiring a Cargo.toml bump on every
+    unreleased apiVersion step. When only `revision` moves, return nothing
+    so accidental removals still fail.
+    """
+    cur = declared_stamp()[0]
+    base = api_version_at_rev(baseline_rev)
+    if base is None or cur > base:
+        return ["--release-type", "major"]
+    return []
+
+
 def ledger_stamps() -> list[tuple[int, int]]:
     text = CHANGELOG.read_text(encoding="utf-8")
     return [(int(a), int(r)) for a, r in LEDGER_RE.findall(text)]
@@ -380,7 +414,34 @@ def check() -> list[str]:
     return problems
 
 
+def semver_extra_self_test() -> str | None:
+    """The apiVersion → `--release-type major` rule, pure."""
+    cases: list[tuple[tuple[int, int], int | None, list[str]]] = [
+        ((7, 1), 6, ["--release-type", "major"]),
+        ((7, 2), 7, []),
+        ((7, 1), None, ["--release-type", "major"]),
+        ((4, 3), 4, []),
+    ]
+    for stamp, base, expect in cases:
+        cur = stamp[0]
+        got = ["--release-type", "major"] if base is None or cur > base else []
+        if got != expect:
+            return f"semver_extra for {stamp} vs apiVersion {base}: {got!r} != {expect!r}"
+    return None
+
+
 def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "semver-extra":
+        if len(sys.argv) != 3:
+            raise SystemExit("usage: api_record.py semver-extra <baseline-rev>")
+        for arg in semver_extra_args(sys.argv[2]):
+            print(arg)
+        return 0
+
+    if (broken := semver_extra_self_test()) is not None:
+        print(f"FAIL the semver-extra self-test failed: {broken}")
+        return 1
+
     problems = check()
     for p in problems:
         print(f"FAIL {p}")

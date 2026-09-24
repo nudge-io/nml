@@ -12,6 +12,27 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::fs::{EntryKind, FsError, LstatFs, PathFs, Step};
 
+/// The rooted spelling [`super::paths::split_absolute`] + a plain-name fold
+/// yields — the same one [`WorkspaceRoot::explicit`] and the path kernel
+/// use when they probe. Tests script POSIX `/ws/...` trees; on Windows
+/// those spellings are not the `PathBuf` keys `components` hands back, so
+/// the mock normalizes every scripted and oracle path through here.
+fn script_path(path: &Path) -> PathBuf {
+    let Some((mut cur, names)) = super::paths::split_absolute(path) else {
+        return path.to_path_buf();
+    };
+    for name in names {
+        match name.as_os_str() {
+            name if name == "." => {}
+            name if name == ".." => {
+                cur.pop();
+            }
+            name => cur.push(name),
+        }
+    }
+    cur
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Node {
     File,
@@ -77,7 +98,7 @@ impl MockFs {
     /// An empty tree holding only `/`.
     pub fn new() -> Self {
         let mut nodes = BTreeMap::new();
-        nodes.insert(PathBuf::from("/"), Node::Dir);
+        nodes.insert(script_path(Path::new("/")), Node::Dir);
         Self {
             nodes,
             lookup_insensitive: false,
@@ -100,7 +121,7 @@ impl MockFs {
     /// scripted tree can hold a name that is not UTF-8 (the walk reports
     /// it; the fuzz invariant checks that it does).
     fn insert(mut self, path: &(impl AsRef<Path> + ?Sized), node: Node) -> Self {
-        let path = path.as_ref().to_path_buf();
+        let path = script_path(path.as_ref());
         // Every ancestor exists as a directory unless scripted otherwise.
         let mut ancestors: Vec<PathBuf> = path.ancestors().skip(1).map(Path::to_path_buf).collect();
         ancestors.reverse();
@@ -161,7 +182,7 @@ impl MockFs {
     /// the `..`-resume pins check that no existing component of a key
     /// minted under closed trust is a symlink.
     pub fn kind_at(&self, path: &Path) -> Option<EntryKind> {
-        self.nodes.get(path).map(|node| match node {
+        self.nodes.get(&script_path(path)).map(|node| match node {
             Node::File => EntryKind::File,
             Node::Other => EntryKind::Other,
             Node::Dir | Node::Denied | Node::Unlistable => EntryKind::Dir,
@@ -199,11 +220,11 @@ impl MockFs {
             return Err(FsError::SymlinkLoop);
         }
         let joined = if target.starts_with('/') {
-            PathBuf::from(target)
+            script_path(Path::new(target))
         } else {
             dir.join(target)
         };
-        let mut cur = PathBuf::from("/");
+        let mut cur = script_path(Path::new("/"));
         let comps: Vec<OsString> = joined
             .components()
             .filter_map(|c| match c {
@@ -233,13 +254,14 @@ impl MockFs {
 
 impl LstatFs for MockFs {
     fn child(&self, dir: &Path, name: &OsStr) -> Result<Option<Step>, FsError> {
-        self.record(Probe::Child(dir.to_path_buf(), name.to_os_string()));
-        match self.nodes.get(dir) {
+        let dir = script_path(dir);
+        self.record(Probe::Child(dir.clone(), name.to_os_string()));
+        match self.nodes.get(&dir) {
             Some(Node::Denied) => return Err(FsError::Denied),
             Some(Node::Dir) | Some(Node::Unlistable) => {}
             _ => return Ok(None),
         }
-        let Some((spelled, node)) = self.lookup(dir, name) else {
+        let Some((spelled, node)) = self.lookup(&dir, name) else {
             return Ok(None);
         };
         let kind = match node {
@@ -270,8 +292,9 @@ impl LstatFs for MockFs {
     }
 
     fn list_dir(&self, dir: &Path) -> Result<Vec<(OsString, EntryKind)>, FsError> {
-        self.record(Probe::ListDir(dir.to_path_buf()));
-        match self.nodes.get(dir) {
+        let dir = script_path(dir);
+        self.record(Probe::ListDir(dir.clone()));
+        match self.nodes.get(&dir) {
             Some(Node::Denied) | Some(Node::Unlistable) => return Err(FsError::Denied),
             Some(Node::Dir) => {}
             _ => return Err(FsError::Io(None)),
@@ -279,7 +302,7 @@ impl LstatFs for MockFs {
         Ok(self
             .nodes
             .iter()
-            .filter(|(p, _)| p.parent() == Some(dir))
+            .filter(|(p, _)| p.parent() == Some(dir.as_path()))
             .filter_map(|(p, node)| {
                 let kind = match node {
                     Node::File => EntryKind::File,
@@ -295,15 +318,13 @@ impl LstatFs for MockFs {
 
 impl PathFs for MockFs {
     fn resolve_symlink(&self, dir: &Path, name: &OsStr) -> Result<Option<PathBuf>, FsError> {
-        self.record(Probe::ResolveSymlink(
-            dir.to_path_buf(),
-            name.to_os_string(),
-        ));
+        let dir = script_path(dir);
+        self.record(Probe::ResolveSymlink(dir.clone(), name.to_os_string()));
         if self.spelling == Spelling::Membership {
             return Err(FsError::NoRealpath);
         }
-        match self.lookup(dir, name) {
-            Some((_, Node::Symlink(target))) => self.resolve(dir, &target, 0),
+        match self.lookup(&dir, name) {
+            Some((_, Node::Symlink(target))) => self.resolve(&dir, &target, 0),
             Some(_) => Ok(Some(dir.join(name))),
             None => Ok(None),
         }

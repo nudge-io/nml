@@ -80,6 +80,8 @@ const ALLOWED: &[(&str, &str)] = &[
     ("workspace::grants", "glob"),
     ("workspace::grants", "workspace::claims"),
     ("workspace::mock", "fs"),
+    // scripted paths fold through the same `split_absolute` the kernel uses
+    ("workspace::mock", "workspace::paths"),
     ("workspace::notes", "workspace::claims"),
     ("workspace::notes", "workspace::diag"),
     ("workspace::notes", "workspace::discover"),

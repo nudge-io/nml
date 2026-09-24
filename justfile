@@ -378,7 +378,14 @@ gate-api:
     echo "gate-api: classifying against $base"
     # The record cannot see a new PRIVATE field on a public struct
     # (measured on `ast::Arm`): the classifier can, and names the lint.
-    cargo semver-checks check-release --workspace --baseline-rev "$base"
+    # A reviewed apiVersion bump is already a BREAK in the record; the
+    # workspace may still be 0.1.0 until release — `semver-extra` adds
+    # `--release-type major` only when apiVersion rose against the baseline.
+    semver_extra=()
+    while IFS= read -r arg; do
+        [ -n "$arg" ] && semver_extra+=("$arg")
+    done < <(python3 scripts/api_record.py semver-extra "$base")
+    cargo semver-checks check-release --workspace --baseline-rev "$base" "${semver_extra[@]}"
 
 # Fuzz ONE target for longer than the gate does (nightly; `cargo install
 # cargo-fuzz` first), seeding it with the tracked landmarks in
