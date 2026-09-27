@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The file names the channel AND components (rustfmt, clippy).
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       # The gate runner. Every gate command lives in the justfile and
       # NOWHERE else — `just gate-contract` fails this build if a workflow
       # runs one any other way (scripts/gate.py). Version-pinned like
@@ -54,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       # The gate runner. Every gate command lives in the justfile and
       # NOWHERE else — `just gate-contract` fails this build if a workflow
       # runs one any other way (scripts/gate.py). Version-pinned like
@@ -77,7 +77,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       # The gate runner. Every gate command lives in the justfile and
       # NOWHERE else — `just gate-contract` fails this build if a workflow
       # runs one any other way (scripts/gate.py). Version-pinned like
@@ -121,7 +121,7 @@ jobs:
       # fact.) The pinned toolchain is installed first only so `cargo` and
       # `just` exist at all.
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       # The gate runner. Every gate command lives in the justfile and
       # NOWHERE else — `just gate-contract` fails this build if a workflow
       # runs one any other way (scripts/gate.py). Version-pinned like
@@ -145,7 +145,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       # The gate runner. Every gate command lives in the justfile and
       # NOWHERE else — `just gate-contract` fails this build if a workflow
       # runs one any other way (scripts/gate.py). Version-pinned like
@@ -169,10 +169,10 @@ jobs:
       - run: rustup toolchain install
       # …plus nightly, reached ONLY via explicit `cargo +nightly` (the
       # resolver flag needs it; the pin file governs everything else).
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (SHA-pinned; channel via toolchain input)
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (SHA-pinned; channel via toolchain input)
         with:
           toolchain: nightly
-      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       # The gate runner. Every gate command lives in the justfile and
       # NOWHERE else — `just gate-contract` fails this build if a workflow
       # runs one any other way (scripts/gate.py). Version-pinned like
@@ -201,7 +201,7 @@ jobs:
           # The classifier needs the baseline commit, not just this one.
           fetch-depth: 0
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       # The gate runner. Every gate command lives in the justfile and
       # NOWHERE else — `just gate-contract` fails this build if a workflow
       # runs one any other way (scripts/gate.py). Version-pinned like
@@ -225,10 +225,10 @@ jobs:
       # pass over the RFC 0016 targets — a short bounded run per target so
       # a panic/invariant regression fails CI, while deep fuzzing stays a
       # scheduled/local activity.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (SHA-pinned; channel via toolchain input)
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (SHA-pinned; channel via toolchain input)
         with:
           toolchain: nightly
-      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           workspaces: fuzz
       # Version-pinned like every other tool in this workflow (the repo
