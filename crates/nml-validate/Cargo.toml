@@ -19,7 +19,7 @@ nml-core = { workspace = true }
 # checks compare blake3 hashes of the framed manifest+sources byte stream.
 blake3 = "1"
 # Locates the per-user schema-package store (XDG / Application Support).
-dirs = "6"
+dirs = "7"
 
 # The workspace kernel's realpath on Windows (RFC 0019 item 0, L3): NO
 # `\\?\` verbatim prefix — the LSP round-trips these paths through URIs,
@@ -58,7 +58,7 @@ serde = { workspace = true }
 # qualified paths) is seen as rustc sees it. Already in the lock (a
 # `serde_derive` dependency); test-only; the declared floor is the locked
 # version — the one the ratchet's pins were proven on.
-syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "visit"] }
+syn = { version = "3.0.3", default-features = false, features = ["full", "parsing", "visit"] }
 # The ratchet's macro-body walk names `TokenTree`; already in the lock (syn's
 # dependency). The floor is the locked version, as for `syn`: a `1` floor let the
 # minimal-versions job resolve 1.0.0, below what `syn` itself requires.
